@@ -40,7 +40,7 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const branch = '${{ steps.branch.outputs.branch }}';
+            const branch = '${{ steps.branch.outputs.branch }}' || 'main';
 
             // Get all releases (including drafts)
             const { data: releases } = await github.rest.repos.listReleases({
@@ -83,7 +83,8 @@ jobs:
             const body = draftRelease.body || '';
 
             core.setOutput('version', version);
-            core.setOutput('body', body);
+            // Don't pass body through outputs to avoid template literal issues
+            // The release workflow will fetch the draft release directly
             core.setOutput('tag_name', draftRelease.tag_name);
 
             console.log(`Branch: ${branch}`);
@@ -192,8 +193,6 @@ jobs:
             const tag = `v${version}`;
             const branch = '${{ env.branch }}';
             const sourceBranch = '${{ steps.branch.outputs.branch }}';
-            const draftBody = `${{ steps.draft-release.outputs.body }}`;
-
             const isPrerelease = releaseType !== 'stable';
             const prereleaseEmoji = isPrerelease ? '⚠️' : '🎉';
             const prereleaseText = isPrerelease ? 'Pre-release' : 'Stable Release';
@@ -209,9 +208,9 @@ jobs:
             - **Source Branch**: \`${sourceBranch}\`
             ${isPrerelease ? `- **Pre-release Type**: ${releaseType}` : ''}
 
-            ### Release Notes Preview
+            ### Release Notes
 
-            ${draftBody ? draftBody.substring(0, 500) + (draftBody.length > 500 ? '...' : '') : 'Release notes will be generated from merged PRs.'}
+            Release notes will be generated from the Release Drafter draft when this PR is merged.
 
             ### What happens when this PR is merged?
 
