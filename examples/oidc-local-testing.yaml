@@ -1,0 +1,38 @@
+# BuildKitOIDCConfig for local testing with mock OIDC server
+#
+# RECOMMENDED: Deploy mock-oidc in-cluster (works reliably)
+#   ./scripts/deploy-mock-oidc.sh
+#
+# ALTERNATIVE: Run mock-oidc on host machine
+#   1. Start the mock OIDC server:
+#      go run ./cmd/mock-oidc --port 8888
+#
+#   2. Update the issuer URL below to use the host gateway IP:
+#      - For Kind: docker network inspect kind -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
+#      - For Docker Desktop: host.docker.internal
+#
+#   3. Apply this config:
+#      kubectl apply -f examples/oidc-local-testing.yaml
+#
+# To generate a test token:
+#   kubectl exec -n buildkit-system deploy/mock-oidc -- /mock-oidc --print-token --actor my-user
+#
+#   Or locally:
+#   ./bin/mock-oidc --print-token --issuer http://mock-oidc.buildkit-system.svc:8888 --actor my-user
+#
+---
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitOIDCConfig
+metadata:
+  name: local-mock-oidc
+  namespace: buildkit-system
+spec:
+  # Use in-cluster service URL (deployed via scripts/deploy-mock-oidc.sh)
+  issuer: http://mock-oidc.buildkit-system.svc:8888
+  audience: buildkit-controller
+  enabled: true
+  claimsMapping:
+    # The 'actor' claim contains the user identity (simulating GitHub Actions)
+    user: "actor"
+    # The 'repository' claim contains pool access mapping (optional)
+    pools: "repository"

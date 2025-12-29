@@ -1,0 +1,24 @@
+1. Get the application URL by running these commands:
+{{- if .Values.controller.api.enabled }}
+  export POD_NAME=$(kubectl get pods --namespace {{ include "buildkit-controller.namespace" . }} -l "app.kubernetes.io/name={{ include "buildkit-controller.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -o jsonpath="{.items[0].metadata.name}")
+  export CONTAINER_PORT=$(kubectl get pod --namespace {{ include "buildkit-controller.namespace" . }} $POD_NAME -o jsonpath="{.spec.containers[0].ports[0].containerPort}")
+  echo "Visit http://127.0.0.1:8082 to use your application"
+  kubectl --namespace {{ include "buildkit-controller.namespace" . }} port-forward $POD_NAME 8082:$CONTAINER_PORT
+{{- end }}
+
+2. Verify the controller is running:
+  kubectl get pods --namespace {{ include "buildkit-controller.namespace" . }} -l "app.kubernetes.io/name={{ include "buildkit-controller.name" . }}"
+
+3. Check CRDs are installed:
+  kubectl get crds | grep buildkit
+
+4. Create your first BuildKitPool:
+  kubectl apply -f examples/pool-example.yaml
+
+5. Configure OIDC (optional):
+  kubectl apply -f examples/oidc-config-example.yaml
+
+For more information, see:
+- README: https://github.com/smrt-devops/buildkit-controller
+- Helm Chart README: ./helm/buildkit-controller/README.md
+

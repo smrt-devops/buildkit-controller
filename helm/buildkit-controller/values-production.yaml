@@ -1,0 +1,48 @@
+# Production values for buildkit-controller
+# Use with: helm install -f values-production.yaml
+
+image:
+  tag: v0.1.4
+
+gateway:
+  image:
+    tag: v0.1.4
+
+controller:
+  replicas: 2
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  leaderElection:
+    enabled: true
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+
+networkPolicy:
+  enabled: true
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: buildkit-system
+      ports:
+        - protocol: TCP
+          port: 8080 # Metrics
+        - protocol: TCP
+          port: 8081 # Health
+        - protocol: TCP
+          port: 8082 # API
+

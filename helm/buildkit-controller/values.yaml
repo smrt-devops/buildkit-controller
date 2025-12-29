@@ -1,0 +1,211 @@
+# Default values for buildkit-controller
+# This is a YAML-formatted file.
+# See README.md for detailed documentation
+
+# Namespace configuration
+namespace:
+  create: true
+  name: buildkit-system
+
+# Controller image configuration
+image:
+  registry: ghcr.io/smrt-devops
+  name: buildkit-controller/controller
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Gateway image configuration
+gateway:
+  image:
+    registry: ghcr.io/smrt-devops
+    name: buildkit-controller/gateway
+    tag: latest
+    pullPolicy: IfNotPresent
+
+# Controller configuration
+controller:
+  # Number of controller replicas
+  replicas: 2
+
+  # Dev mode disables API authentication - FOR LOCAL DEVELOPMENT ONLY
+  # WARNING: Never enable this in production!
+  devMode: false
+
+  # Resource limits
+  resources:
+    limits:
+      cpu: 500m
+      memory: 128Mi
+    requests:
+      cpu: 10m
+      memory: 64Mi
+
+  # Metrics configuration
+  metrics:
+    enabled: true
+    port: 8080
+
+  # Health probe configuration
+  healthProbe:
+    enabled: true
+    port: 8081
+
+  # API server configuration
+  api:
+    enabled: true
+    port: 8082
+    # Gateway API configuration for external access
+    # The Helm chart creates HTTPRoute resources but does not create Gateway resources.
+    # You must create and manage your own Gateway resource separately.
+    gatewayAPI:
+      enabled: false
+      hostname: "" # Hostname for the HTTPRoute, e.g., "api.buildkit.example.com"
+      gatewayClassName: "envoy" # GatewayClass to use (default: envoy for Envoy Gateway)
+      # Reference to existing Gateway resource that the HTTPRoute will attach to
+      # If name is empty, the Helm chart will create a Gateway automatically
+      gatewayRef:
+        name: "" # Name of the existing Gateway resource (leave empty to auto-create)
+        namespace: "" # Namespace of the Gateway resource (leave empty for same namespace)
+      # TLS configuration for the Gateway
+      tls:
+        autoGenerate: true # Auto-generate TLS secret (default: true)
+        secretName: "" # TLS secret name (if empty, uses {release-name}-api-tls)
+        secretNamespace: "" # TLS secret namespace (if empty, uses same namespace)
+    # Ingress configuration for external access (alternative to Gateway API)
+    ingress:
+      enabled: false
+      ingressClassName: "" # If not specified, uses cluster default
+      hostname: "" # Required when enabled, e.g., "api.buildkit.example.com"
+      annotations: {} # Additional annotations for Ingress resource
+      tls:
+        enabled: false
+        secretName: "" # TLS secret name (required when TLS enabled)
+
+  # Leader election
+  leaderElection:
+    enabled: true
+    id: "buildkit-controller.smrt-devops.net"
+
+# External ingress configuration
+# Controls which ingress types are supported for pools
+# Options:
+#   - ["ingress"] - Only Kubernetes Ingress (adds Ingress permissions)
+#   - ["gatewayapi"] - Only Gateway API (adds Gateway API permissions)
+#   - ["ingress", "gatewayapi"] - Both Ingress and Gateway API (adds both permissions)
+#   - [] (empty) - No external ingress support (internal cluster exposure only)
+# Pools can independently choose their ingress type via spec.gateway.ingress.enabled or spec.gateway.gatewayAPI.enabled
+# If a pool requests an ingress type not in this list, the controller will fail with a clear error
+ingress:
+  types: [] # List of supported ingress types: "ingress", "gatewayapi", or both
+
+# Service account configuration
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# RBAC configuration
+rbac:
+  create: true
+
+# CA configuration
+ca:
+  # CA secret name
+  secretName: buildkit-ca
+  # CA secret namespace
+  namespace: buildkit-system
+
+# Certificate configuration
+certificates:
+  # Default server certificate duration (e.g., "8760h" for 1 year)
+  # This is used when pool spec doesn't specify ServerCertDuration
+  defaultServerCertDuration: "8760h"
+
+  # Default client certificate duration (e.g., "8760h" for 1 year)
+  # This is used for API-issued client certificates
+  defaultClientCertDuration: "8760h"
+
+  # Default rotation window - how long before expiry to rotate certificates
+  # (e.g., "720h" for 30 days)
+  # This is used when pool spec doesn't specify RotateBeforeExpiry
+  defaultRotateBeforeExpiry: "720h"
+
+  # Default renewal time calculation - how long before expiry to set renewal time
+  # (e.g., "720h" for 30 days)
+  # This affects when the controller will requeue for rotation checks
+  defaultRenewalTime: "720h"
+
+# OIDC configuration
+oidc:
+  # Default OIDC configurations
+  configs: []
+  # Example:
+  # - name: github-actions
+  #   issuer: https://token.actions.githubusercontent.com
+  #   audience: buildkit-controller
+  #   enabled: true
+  #   claimsMapping:
+  #     user: "actor"
+  #     pools: "repository"
+
+# Local OIDC testing configuration (for development only)
+# This creates a BuildKitOIDCConfig that works with the mock-oidc server
+# Usage: go run ./cmd/mock-oidc --port 8888
+localOidc:
+  enabled: false
+  # For Kind clusters, use the docker network gateway IP
+  # Find with: docker network inspect kind -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
+  issuer: "http://172.18.0.1:8888"
+  audience: "buildkit-controller"
+  claimsMapping:
+    user: "actor"
+    pools: "repository"
+
+# Image pull secrets
+imagePullSecrets:
+  - name: ghcr-login-secret
+
+# Node selector, tolerations, and affinity
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# Pod security context
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+# Security context for containers
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+
+# Additional labels
+labels: {}
+
+# Additional annotations
+annotations: {}
+
+# Pod disruption budget
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+# Service monitor for Prometheus (if using Prometheus Operator)
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+
+# Network policies
+networkPolicy:
+  enabled: false
+  ingress: []
+  egress: []

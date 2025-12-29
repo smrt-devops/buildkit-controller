@@ -1,0 +1,84 @@
+name: Build with BuildKit Pool
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  POOL_NAME: ci-buildkit
+  NAMESPACE: buildkit
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Required for OIDC
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get OIDC Token
+        id: oidc
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const token = await core.getIDToken('buildkit-controller')
+            core.setOutput('token', token)
+
+      - name: Request BuildKit Certificate
+        run: |
+          # Request certificate via HTTP API using OIDC token
+          RESPONSE=$(curl -s -X POST http://buildkit-controller:8082/api/v1/certs/request \
+            -H "Authorization: Bearer ${{ steps.oidc.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"pools\": [\"${POOL_NAME}\"]}")
+
+          echo "$RESPONSE" | jq -r '.caCert' | base64 -d > ${{ runner.temp }}/ca.crt
+          echo "$RESPONSE" | jq -r '.clientCert' | base64 -d > ${{ runner.temp }}/client.crt
+          echo "$RESPONSE" | jq -r '.clientKey' | base64 -d > ${{ runner.temp }}/client.key
+
+          echo "BUILDKIT_TLS_CERT=${{ runner.temp }}/client.crt" >> $GITHUB_ENV
+          echo "BUILDKIT_TLS_KEY=${{ runner.temp }}/client.key" >> $GITHUB_ENV
+          echo "BUILDKIT_TLS_CA=${{ runner.temp }}/ca.crt" >> $GITHUB_ENV
+
+      - name: Get BuildKit Endpoint
+        run: |
+          ENDPOINT=$(kubectl get buildkitpool ${POOL_NAME} -n ${NAMESPACE} \
+            -o jsonpath='{.status.endpoint}' | sed 's|tcp://||')
+          echo "BUILDKIT_HOST=tcp://${ENDPOINT}" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create Buildx Builder
+        run: |
+          docker buildx create \
+            --name buildkit-builder \
+            --driver remote \
+            ${BUILDKIT_HOST} \
+            --tls-ca-cert ${BUILDKIT_TLS_CA} \
+            --tls-cert ${BUILDKIT_TLS_CERT} \
+            --tls-key ${BUILDKIT_TLS_KEY} \
+            --use
+
+      - name: Build and Push
+        run: |
+          docker buildx build \
+            --builder buildkit-builder \
+            --platform linux/amd64,linux/arm64 \
+            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}:buildcache \
+            --cache-to type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max \
+            --tag ghcr.io/${{ github.repository }}:${{ github.sha }} \
+            --tag ghcr.io/${{ github.repository }}:latest \
+            --push \
+            .
+
+      - name: Build Status
+        if: failure()
+        run: |
+          echo "Build failed!"
+          docker buildx inspect buildkit-builder

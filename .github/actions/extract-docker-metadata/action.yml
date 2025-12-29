@@ -1,0 +1,37 @@
+name: "Extract Docker Metadata"
+description: "Extract metadata for Docker images using docker/metadata-action"
+inputs:
+  image-name:
+    description: "Full image name (registry/repository/image)"
+    required: true
+  image-tag:
+    description: "Optional custom image tag"
+    required: false
+    default: ""
+outputs:
+  tags:
+    description: "Generated tags"
+    value: ${{ steps.meta.outputs.tags }}
+  labels:
+    description: "Generated labels"
+    value: ${{ steps.meta.outputs.labels }}
+  digest:
+    description: "Image digest"
+    value: ${{ steps.meta.outputs.digest }}
+runs:
+  using: "composite"
+  steps:
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ inputs.image-name }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=semver,pattern={{major}}
+          type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && github.ref_type != 'tag' }}
+          type=raw,value=${{ inputs.image-tag }},enable=${{ inputs.image-tag != '' }}
+          type=semver,pattern={{version}},prerelease={{prerelease}}

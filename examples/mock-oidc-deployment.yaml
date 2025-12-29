@@ -1,0 +1,72 @@
+# Deploy mock-oidc server inside the cluster for local testing
+# Usage:
+#   1. Build and load the image: make docker-build-mock-oidc && kind load docker-image mock-oidc:dev
+#   2. Apply this manifest: kubectl apply -f examples/mock-oidc-deployment.yaml
+#   3. Apply the OIDC config: kubectl apply -f examples/oidc-local-testing.yaml
+#
+# Or use the quick script: ./scripts/deploy-mock-oidc.sh
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-oidc
+  namespace: buildkit-system
+  labels:
+    app: mock-oidc
+    app.kubernetes.io/name: mock-oidc
+    app.kubernetes.io/component: testing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-oidc
+  template:
+    metadata:
+      labels:
+        app: mock-oidc
+    spec:
+      containers:
+        - name: mock-oidc
+          image: ghcr.io/smrt-devops/buildkit-controller/mock-oidc:latest
+          imagePullPolicy: Always
+          args:
+            - --port=8888
+            - --issuer=http://mock-oidc.buildkit-system.svc:8888
+          ports:
+            - containerPort: 8888
+              name: http
+          resources:
+            limits:
+              cpu: 100m
+              memory: 64Mi
+            requests:
+              cpu: 10m
+              memory: 32Mi
+          livenessProbe:
+            httpGet:
+              path: /.well-known/openid-configuration
+              port: 8888
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /.well-known/openid-configuration
+              port: 8888
+            initialDelaySeconds: 2
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-oidc
+  namespace: buildkit-system
+  labels:
+    app: mock-oidc
+spec:
+  selector:
+    app: mock-oidc
+  ports:
+    - port: 8888
+      targetPort: 8888
+      name: http
+  type: ClusterIP

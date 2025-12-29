@@ -1,0 +1,31 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata:
+  name: minimal-pool
+  namespace: buildkit-system
+spec:
+  scaling: {}
+  resources:
+    buildkit:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: 2000m
+        memory: 2Gi
+    sidecar:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        cpu: 100m
+        memory: 64Mi
+  cache:
+    gc: {}
+  tls: {}
+  auth: {}
+  networking: {}
+  gateway: {} # Uses defaults: enabled=true, replicas=1
+  observability:
+    metrics: {}
+    logging: {}

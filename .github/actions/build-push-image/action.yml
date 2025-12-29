@@ -1,0 +1,94 @@
+name: "Build and Push Docker Image"
+description: "Build and push a Docker image with caching"
+inputs:
+  context:
+    description: "Build context path"
+    required: false
+    default: "."
+  dockerfile:
+    description: "Path to Dockerfile"
+    required: true
+  platforms:
+    description: "Target platforms (comma-separated)"
+    required: true
+  tags:
+    description: "Image tags (newline-separated)"
+    required: true
+  labels:
+    description: "Image labels (newline-separated)"
+    required: false
+    default: ""
+  push:
+    description: "Whether to push the image"
+    required: false
+    default: "false"
+  registry:
+    description: "Container registry URL"
+    required: true
+  image-name:
+    description: "Image name for cache"
+    required: true
+  cache-from-gha:
+    description: "Use GitHub Actions cache"
+    required: false
+    default: "true"
+  cache-from-registry:
+    description: "Use registry cache"
+    required: false
+    default: "true"
+outputs:
+  digest:
+    description: "Image digest"
+    value: ${{ steps.build.outputs.digest }}
+runs:
+  using: "composite"
+  steps:
+    - name: Prepare cache configuration
+      id: cache
+      shell: bash
+      run: |
+        CACHE_FROM=""
+        CACHE_TO=""
+
+        if [ "${{ inputs.cache-from-gha }}" = "true" ]; then
+          CACHE_FROM="type=gha"
+          CACHE_TO="type=gha,mode=max"
+        fi
+
+        if [ "${{ inputs.cache-from-registry }}" = "true" ]; then
+          REGISTRY_CACHE="type=registry,ref=${{ inputs.registry }}/${{ inputs.image-name }}:buildcache,oci-mediatypes=true"
+          if [ -n "$CACHE_FROM" ]; then
+            CACHE_FROM="$CACHE_FROM"$'\n'"$REGISTRY_CACHE"
+            CACHE_TO="$CACHE_TO"$'\n'"$REGISTRY_CACHE,mode=max"
+          else
+            CACHE_FROM="$REGISTRY_CACHE"
+            CACHE_TO="$REGISTRY_CACHE,mode=max"
+          fi
+        fi
+
+        {
+          echo "cache-from<<EOF"
+          echo "$CACHE_FROM"
+          echo "EOF"
+        } >> $GITHUB_OUTPUT
+
+        {
+          echo "cache-to<<EOF"
+          echo "$CACHE_TO"
+          echo "EOF"
+        } >> $GITHUB_OUTPUT
+
+    - name: Build and push image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.dockerfile }}
+        platforms: ${{ inputs.platforms }}
+        push: ${{ inputs.push }}
+        tags: ${{ inputs.tags }}
+        labels: ${{ inputs.labels }}
+        cache-from: ${{ steps.cache.outputs.cache-from }}
+        cache-to: ${{ steps.cache.outputs.cache-to }}
+        build-args: |
+          BUILDKIT_INLINE_CACHE=1

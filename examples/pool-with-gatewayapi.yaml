@@ -1,0 +1,63 @@
+# Example BuildKitPool using Gateway API with an existing Gateway resource.
+# This example references the Gateway created by l4-gateway.yaml (AWS Load Balancer Controller).
+#
+# Prerequisites:
+# 1. Create the Gateway resources from l4-gateway.yaml
+# 2. Apply this BuildKitPool configuration
+#
+# The controller will create a TLSRoute that attaches to the existing Gateway
+# instead of creating its own Gateway resource.
+---
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata:
+  name: pool-with-gatewayapi
+  namespace: buildkit-system
+spec:
+  scaling:
+    min: 1
+    max: 5
+    mode: auto
+  resources:
+    buildkit:
+      limits:
+        cpu: 2
+        memory: 4Gi
+      requests:
+        cpu: 500m
+        memory: 1Gi
+    sidecar:
+      limits:
+        cpu: 500m
+        memory: 512Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
+  cache:
+    backends:
+      - type: local
+        local:
+          storageClass: gp3
+          size: 100Gi
+  tls:
+    enabled: true
+    mode: auto
+  auth:
+    methods:
+      - type: mtls
+        mtls:
+          required: true
+  networking:
+    serviceType: ClusterIP
+  gateway:
+    enabled: true
+    # Gateway API configuration using an existing Gateway
+    gatewayAPI:
+      enabled: true
+      hostname: "buildkit.example.com"
+      # Reference to existing Gateway (e.g., AWS Load Balancer Controller Gateway)
+      gatewayRef:
+        name: "buildkit-listener-gateway" # From l4-gateway.yaml
+        namespace: "buildkit-system" # Same namespace as the Gateway
+  buildkitImage: moby/buildkit:master-rootless
+  gatewayImage: ghcr.io/smrt-devops/buildkit-controller/gateway:latest

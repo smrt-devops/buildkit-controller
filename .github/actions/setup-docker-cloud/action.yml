@@ -1,0 +1,42 @@
+name: "Setup Docker Cloud Builder and Login"
+description: "Setup Docker Buildx with cloud driver and login to container registry"
+inputs:
+  registry:
+    description: "Container registry URL"
+    required: true
+  username:
+    description: "Registry username"
+    required: true
+  password:
+    description: "Registry password/token"
+    required: true
+  docker-hub-username:
+    description: "Docker Hub username (required for cloud builder)"
+    required: true
+  docker-hub-password:
+    description: "Docker Hub password/token (required for cloud builder)"
+    required: true
+  cloud-endpoint:
+    description: "Docker Cloud Builder endpoint (e.g., smrtdevops25/builder-1)"
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ inputs.docker-hub-username }}
+        password: ${{ inputs.docker-hub-password }}
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.username }}
+        password: ${{ inputs.password }}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        driver: cloud
+        endpoint: ${{ inputs.cloud-endpoint }}

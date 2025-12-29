@@ -1,0 +1,12 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitOIDCConfig
+metadata:
+  name: mock-oidc
+  namespace: buildkit-system
+spec:
+  issuer: http://mock-oidc.buildkit-system.svc:8888
+  audience: buildkit-controller
+  enabled: true
+  claimsMapping:
+    user: "actor"
+    pools: "repository"

@@ -1,0 +1,72 @@
+{{- range .Values.oidc.configs }}
+{{- if .enabled }}
+---
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitOIDCConfig
+metadata:
+  name: {{ .name }}
+  namespace: {{ include "buildkit-controller.namespace" $ }}
+  labels:
+    {{- include "buildkit-controller.labels" $ | nindent 4 }}
+spec:
+  issuer: {{ .issuer }}
+  audience: {{ .audience }}
+  enabled: {{ .enabled | default true }}
+  {{- if .claimsMapping }}
+  claimsMapping:
+    {{- if .claimsMapping.user }}
+    user: {{ .claimsMapping.user }}
+    {{- end }}
+    {{- if .claimsMapping.pools }}
+    pools: {{ .claimsMapping.pools }}
+    {{- end }}
+  {{- end }}
+  {{- if .clientID }}
+  clientID: {{ .clientID }}
+  {{- end }}
+  {{- if .clientSecretRef }}
+  clientSecretRef:
+    name: {{ .clientSecretRef.name }}
+    {{- if .clientSecretRef.namespace }}
+    namespace: {{ .clientSecretRef.namespace }}
+    {{- end }}
+    {{- if .clientSecretRef.key }}
+    key: {{ .clientSecretRef.key }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Local OIDC config for development/testing with mock-oidc server
+*/}}
+{{- if .Values.localOidc }}
+{{- if .Values.localOidc.enabled }}
+---
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitOIDCConfig
+metadata:
+  name: local-mock-oidc
+  namespace: {{ include "buildkit-controller.namespace" . }}
+  labels:
+    {{- include "buildkit-controller.labels" . | nindent 4 }}
+    app.kubernetes.io/component: local-testing
+  annotations:
+    helm.sh/hook-weight: "0"
+    description: "Mock OIDC config for local testing - DO NOT USE IN PRODUCTION"
+spec:
+  issuer: {{ .Values.localOidc.issuer | default "http://172.18.0.1:8888" }}
+  audience: {{ .Values.localOidc.audience | default "buildkit-controller" }}
+  enabled: true
+  {{- if .Values.localOidc.claimsMapping }}
+  claimsMapping:
+    {{- if .Values.localOidc.claimsMapping.user }}
+    user: {{ .Values.localOidc.claimsMapping.user }}
+    {{- end }}
+    {{- if .Values.localOidc.claimsMapping.pools }}
+    pools: {{ .Values.localOidc.claimsMapping.pools }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+{{- end }}
+

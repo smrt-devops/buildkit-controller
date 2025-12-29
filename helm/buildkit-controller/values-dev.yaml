@@ -1,0 +1,80 @@
+# Development values for buildkit-controller
+# Use with: helm install -f values-dev.yaml
+
+image:
+  registry: "" # Empty registry for local images
+  name: buildkit-controller
+  tag: dev
+  pullPolicy: IfNotPresent
+
+gateway:
+  image:
+    registry: "" # Empty registry for local images
+    name: buildkit-controller-gateway
+    tag: dev
+    pullPolicy: IfNotPresent
+
+# Disable image pull secrets for local development
+imagePullSecrets: []
+
+# External ingress configuration
+# List of supported ingress types for pools
+# Options: ["ingress"], ["gatewayapi"], ["ingress", "gatewayapi"], or [] (internal only)
+# Pools can independently choose their ingress type, but it must be in this list
+ingress:
+  types: ["gatewayapi"] # Support Gateway API (can add "ingress" to support both)
+
+controller:
+  replicas: 1
+  resources:
+    limits:
+      cpu: 200m
+      memory: 64Mi
+    requests:
+      cpu: 10m
+      memory: 32Mi
+  leaderElection:
+    enabled: false
+  # API GatewayAPI configuration for local development
+  # TLS is mandatory when GatewayAPI is enabled
+  api:
+    enabled: true
+    port: 8082
+    gatewayAPI:
+      enabled: true
+      hostname: "api.buildkit.local"
+      gatewayClassName: "envoy" # Use envoy GatewayClass (Envoy Gateway)
+      # Leave gatewayRef empty to auto-create Gateway, or specify to use existing Gateway
+      gatewayRef:
+        name: "" # Empty = auto-create Gateway, or specify existing Gateway name
+        namespace: "" # Same namespace
+      tls:
+        autoGenerate: true # Auto-generate TLS secret
+        secretName: "buildkit-controller-api-tls" # Secret name for TLS certificate
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: false # Allow writes for development
+
+serviceMonitor:
+  enabled: false
+
+networkPolicy:
+  enabled: false
+
+# Local OIDC testing configuration
+# Set localOidc.enabled to true to create a BuildKitOIDCConfig for local testing
+# This requires the mock-oidc server to be running (go run ./cmd/mock-oidc)
+localOidc:
+  enabled: false
+  # For Kind clusters, use the docker network gateway IP
+  # You can find this with: docker network inspect kind -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
+  # Common values: 172.18.0.1 (Docker), host.docker.internal (Docker Desktop)
+  issuer: "http://172.18.0.1:8888"
+  audience: "buildkit-controller"
+  claimsMapping:
+    user: "actor"
+    pools: "repository"

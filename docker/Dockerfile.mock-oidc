@@ -1,0 +1,17 @@
+# Dockerfile for mock-oidc server (testing only)
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /mock-oidc ./cmd/mock-oidc
+
+FROM alpine:3.19
+RUN apk --no-cache add ca-certificates
+COPY --from=builder /mock-oidc /mock-oidc
+
+EXPOSE 8888
+ENTRYPOINT ["/mock-oidc"]
+

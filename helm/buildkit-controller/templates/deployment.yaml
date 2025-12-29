@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "buildkit-controller.fullname" . }}
+  namespace: {{ include "buildkit-controller.namespace" . }}
+  labels:
+    {{- include "buildkit-controller.labels" . | nindent 4 }}
+    control-plane: buildkit-controller
+  {{- with .Values.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "buildkit-controller.selectorLabels" . | nindent 6 }}
+      control-plane: buildkit-controller
+  replicas: {{ .Values.controller.replicas }}
+  template:
+    metadata:
+      labels:
+        {{- include "buildkit-controller.selectorLabels" . | nindent 8 }}
+        control-plane: buildkit-controller
+      {{- with .Values.annotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "buildkit-controller.serviceAccountName" . }}
+      terminationGracePeriodSeconds: 10
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - command:
+        - /manager
+        {{- if or .Values.controller.leaderElection.enabled .Values.controller.metrics.enabled .Values.controller.healthProbe.enabled .Values.controller.api.enabled .Values.controller.devMode }}
+        args:
+        {{- if .Values.controller.leaderElection.enabled }}
+        - --leader-elect
+        {{- end }}
+        {{- if .Values.controller.metrics.enabled }}
+        - --metrics-bind-address=:{{ .Values.controller.metrics.port }}
+        {{- end }}
+        {{- if .Values.controller.healthProbe.enabled }}
+        - --health-probe-bind-address=:{{ .Values.controller.healthProbe.port }}
+        {{- end }}
+        {{- if .Values.controller.api.enabled }}
+        - --api-bind-address=:{{ .Values.controller.api.port }}
+        {{- end }}
+        {{- if .Values.controller.devMode }}
+        - --dev-mode
+        {{- end }}
+        {{- end }}
+        image: "{{ include "buildkit-controller.image" . }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        name: manager
+        {{- with .Values.securityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- if .Values.controller.healthProbe.enabled }}
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: {{ .Values.controller.healthProbe.port }}
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: {{ .Values.controller.healthProbe.port }}
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        {{- end }}
+        {{- with .Values.controller.resources }}
+        resources:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: GATEWAY_IMAGE
+          value: {{ include "buildkit-controller.gatewayImage" . | quote }}
+        - name: ALLOWED_INGRESS_TYPES
+          value: {{ join "," .Values.ingress.types | quote }}
+        {{- if .Values.certificates }}
+        - name: CERT_DEFAULT_SERVER_DURATION
+          value: {{ .Values.certificates.defaultServerCertDuration | quote }}
+        - name: CERT_DEFAULT_CLIENT_DURATION
+          value: {{ .Values.certificates.defaultClientCertDuration | quote }}
+        - name: CERT_DEFAULT_ROTATE_BEFORE_EXPIRY
+          value: {{ .Values.certificates.defaultRotateBeforeExpiry | quote }}
+        - name: CERT_DEFAULT_RENEWAL_TIME
+          value: {{ .Values.certificates.defaultRenewalTime | quote }}
+        {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

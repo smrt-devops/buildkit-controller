@@ -1,0 +1,17 @@
+apiVersion: v2
+name: buildkit-controller
+description: A Helm chart for BuildKit Kubernetes Operator
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - buildkit
+  - kubernetes
+  - operator
+  - ci/cd
+home: https://github.com/smrt-devops/buildkit-controller
+sources:
+  - https://github.com/smrt-devops/buildkit-controller
+maintainers:
+  - name: BuildKit Team
+icon: https://raw.githubusercontent.com/moby/buildkit/master/docs/buildkit-logo.png

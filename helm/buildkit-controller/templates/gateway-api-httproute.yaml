@@ -1,0 +1,26 @@
+{{- if and .Values.controller.api.enabled .Values.controller.api.gatewayAPI.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "buildkit-controller.fullname" . }}-api-route
+  namespace: {{ include "buildkit-controller.namespace" . }}
+  labels:
+    {{- include "buildkit-controller.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ .Values.controller.api.gatewayAPI.gatewayRef.name | default (printf "%s-api-gateway" (include "buildkit-controller.fullname" .)) }}
+      namespace: {{ .Values.controller.api.gatewayAPI.gatewayRef.namespace | default (include "buildkit-controller.namespace" .) }}
+  hostnames:
+    {{- if .Values.controller.api.gatewayAPI.hostname }}
+    - {{ .Values.controller.api.gatewayAPI.hostname }}
+    {{- end }}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: {{ include "buildkit-controller.fullname" . }}-api
+          port: {{ .Values.controller.api.port }}
+{{- end }}
+

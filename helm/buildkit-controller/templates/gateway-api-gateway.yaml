@@ -1,0 +1,34 @@
+{{- if and .Values.controller.api.enabled .Values.controller.api.gatewayAPI.enabled }}
+{{- if not .Values.controller.api.gatewayAPI.gatewayRef.name }}
+{{- /* Only create Gateway if gatewayRef is not specified (user wants us to manage it) */}}
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ printf "%s-api-gateway" (include "buildkit-controller.fullname" .) }}
+  namespace: {{ include "buildkit-controller.namespace" . }}
+  labels:
+    {{- include "buildkit-controller.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api-gateway
+spec:
+  gatewayClassName: {{ .Values.controller.api.gatewayAPI.gatewayClassName | default "envoy" }}
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      {{- if .Values.controller.api.gatewayAPI.hostname }}
+      hostname: {{ .Values.controller.api.gatewayAPI.hostname | quote }}
+      {{- end }}
+      allowedRoutes:
+        namespaces:
+          from: Same
+      tls:
+        mode: Terminate
+        {{- $secretName := .Values.controller.api.gatewayAPI.tls.secretName | default (printf "%s-api-tls" (include "buildkit-controller.fullname" .)) }}
+        {{- $secretNamespace := .Values.controller.api.gatewayAPI.tls.secretNamespace | default (include "buildkit-controller.namespace" .) }}
+        certificateRefs:
+          - name: {{ $secretName }}
+            {{- if ne $secretNamespace (include "buildkit-controller.namespace" .) }}
+            namespace: {{ $secretNamespace }}
+            {{- end }}
+{{- end }}
+{{- end }}

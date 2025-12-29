@@ -1,0 +1,40 @@
+{{- if .Values.controller.metrics.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "buildkit-controller.fullname" . }}-metrics
+  namespace: {{ include "buildkit-controller.namespace" . }}
+  labels:
+    {{- include "buildkit-controller.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.controller.metrics.port }}
+      targetPort: {{ .Values.controller.metrics.port }}
+      protocol: TCP
+      name: metrics
+  selector:
+    {{- include "buildkit-controller.selectorLabels" . | nindent 4 }}
+    control-plane: buildkit-controller
+{{- end }}
+
+{{- if .Values.controller.api.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "buildkit-controller.fullname" . }}-api
+  namespace: {{ include "buildkit-controller.namespace" . }}
+  labels:
+    {{- include "buildkit-controller.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.controller.api.port }}
+      targetPort: {{ .Values.controller.api.port }}
+      protocol: TCP
+      name: api
+  selector:
+    {{- include "buildkit-controller.selectorLabels" . | nindent 4 }}
+    control-plane: buildkit-controller
+{{- end }}
+

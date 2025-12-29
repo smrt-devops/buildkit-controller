@@ -1,0 +1,10 @@
+bin/
+.certs/
+config/crd/bases/*.yaml
+!config/crd/bases/.gitkeep
+.git/
+.gitignore
+README.md
+*.md
+.vscode/
+.idea/

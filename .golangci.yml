@@ -1,0 +1,179 @@
+# golangci-lint configuration v2
+# See https://golangci-lint.run/usage/configuration/ for more information
+# This configuration is compatible with golangci-lint 2.7.2+
+
+version: "2"
+
+run:
+  tests: true
+
+linters:
+  enable:
+    # Error detection
+    - errcheck
+    - errorlint
+    - err113
+
+    # Code style
+    - whitespace
+    - misspell
+
+    # Code complexity
+    - gocyclo
+    - gocognit
+    - funlen
+
+    # Best practices
+    - gosec
+    - gocritic
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - unparam
+    - unconvert
+    - prealloc
+
+    # Performance
+    - bodyclose
+    - noctx
+    - rowserrcheck
+
+    # Documentation
+    - godot
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    goconst:
+      min-len: 3
+      min-occurrences: 2
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+      disabled-checks:
+        - dupImport
+        - ifElseChain
+        - octalLiteral
+        - whyNoLint
+        - wrapperFunc
+    gocyclo:
+      min-complexity: 30
+    gocognit:
+      min-complexity: 65
+    funlen:
+      lines: 250
+      statements: 70
+    govet:
+      enable-all: true
+      disable:
+        - shadow
+        - fieldalignment
+    lll:
+      line-length: 140
+    misspell:
+      locale: US
+    revive:
+      rules:
+        - name: exported
+          severity: warning
+        - name: var-naming
+          severity: warning
+        - name: var-declaration
+          severity: warning
+        - name: package-comments
+          severity: warning
+        - name: range
+          severity: warning
+        - name: increment-decrement
+          severity: warning
+        - name: error-return
+          severity: warning
+    staticcheck:
+      checks: ["all"]
+    whitespace:
+      multi-if: true
+      multi-func: true
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # Exclude generated files
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+      - path: zz_generated
+        linters:
+          - all
+      - path: _generated
+        linters:
+          - all
+      # Exclude some linters from test files
+      - path: _test\.go
+        linters:
+          - funlen
+          - gocognit
+      # Allow long lines in test files
+      - path: _test\.go
+        linters:
+          - lll
+      # Exclude field alignment from API types (they need specific field order for JSON)
+      - path: api/v1alpha1/.*_types\.go
+        linters:
+          - govet
+      # Disable field alignment checks globally (struct field order is often intentional)
+      - text: "fieldalignment:"
+        linters:
+          - govet
+      # Exclude common false positives
+      - text: "Error return value of .((os\\.)?std(out|err)\\..*|.*Close|.*Flush|os\\.Remove(All)?|.*printf?|os\\.(Un)?Setenv). is not checked"
+        linters:
+          - errcheck
+      - text: "exported function .* should have comment"
+        linters:
+          - revive
+      - text: "exported type .* should have comment"
+        linters:
+          - revive
+      # Exclude err113 from API types (they use dynamic errors for better error messages)
+      - path: api/v1alpha1/.*_types\.go
+        linters:
+          - err113
+      # Disable err113 globally (style preference, not critical)
+      - text: "do not define dynamic errors"
+        linters:
+          - err113
+      # Disable unparam for parse functions (error return kept for API consistency)
+      - text: "parseActiveConnections.*result 1.*error.*is always nil"
+        linters:
+          - unparam
+      - text: "parseTotalConnections.*result 1.*error.*is always nil"
+        linters:
+          - unparam
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

@@ -1,0 +1,253 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  REGISTRY: ghcr.io
+  CONTROLLER_IMAGE: ${{ github.repository }}/controller
+  GATEWAY_IMAGE: ${{ github.repository }}/gateway
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - run: make test
+
+  build-images:
+    name: Build Images
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PAT }}
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: cloud
+          endpoint: ${{ vars.DOCKER_USER }}/builder-1
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta-controller
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.CONTROLLER_IMAGE }}
+          tags: |
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=semver,pattern=v{{major}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+      - uses: docker/build-push-action@v5
+        name: Build and push controller
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-controller.outputs.tags }}
+          labels: ${{ steps.meta-controller.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: docker/metadata-action@v5
+        id: meta-gateway
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.GATEWAY_IMAGE }}
+          tags: |
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=semver,pattern=v{{major}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+      - uses: docker/build-push-action@v5
+        name: Build and push gateway
+        with:
+          context: .
+          file: docker/Dockerfile.gateway
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-gateway.outputs.tags }}
+          labels: ${{ steps.meta-gateway.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-cli:
+    name: Build CLI
+    runs-on: ${{ matrix.os }}
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: bkctl-linux-amd64
+            goos: linux
+            goarch: amd64
+          - os: ubuntu-latest
+            asset: bkctl-linux-arm64
+            goos: linux
+            goarch: arm64
+          - os: macos-latest
+            asset: bkctl-darwin-amd64
+            goos: darwin
+            goarch: amd64
+          - os: macos-latest
+            asset: bkctl-darwin-arm64
+            goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - run: |
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+          go build -trimpath -ldflags="-w -s" \
+          -o ${{ matrix.asset }} ./cmd/bkctl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          retention-days: 7
+
+  publish-helm:
+    name: Publish Helm Chart
+    runs-on: ubuntu-latest
+    needs: build-images
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: "3.14.0"
+      - name: Extract version
+        id: version
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+      - name: Update chart version
+        run: |
+          sed -i "s/^version:.*/version: ${{ steps.version.outputs.version }}/" ./helm/buildkit-controller/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${{ steps.version.outputs.version }}\"/" ./helm/buildkit-controller/Chart.yaml
+      - run: helm lint ./helm/buildkit-controller
+      - run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ${{ env.REGISTRY }} \
+            -u ${{ github.actor }} \
+            --password-stdin
+      - run: |
+          helm package ./helm/buildkit-controller \
+            --destination ./charts \
+            --version ${{ steps.version.outputs.version }}
+      - run: |
+          helm push ./charts/buildkit-controller-${{ steps.version.outputs.version }}.tgz \
+            oci://${{ env.REGISTRY }}/${{ github.repository }}/charts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart
+          path: ./charts/*.tgz
+          retention-days: 30
+
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [build-cli, publish-helm]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract version
+        id: version
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          IS_PRERELEASE=$(echo "$VERSION" | grep -qE '-(alpha|beta|rc)' && echo "true" || echo "false")
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "is_prerelease=${IS_PRERELEASE}" >> $GITHUB_OUTPUT
+          echo "major=${MAJOR}" >> $GITHUB_OUTPUT
+          echo "minor=${MINOR}" >> $GITHUB_OUTPUT
+      - name: Download CLI binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bkctl-*
+          merge-multiple: true
+          path: ./artifacts/bkctl
+      - name: Download Helm chart
+        uses: actions/download-artifact@v4
+        with:
+          name: helm-chart
+          path: ./artifacts/helm
+      - name: Verify artifacts
+        run: |
+          echo "CLI binaries:"
+          ls -lh artifacts/bkctl/ || echo "No binaries found"
+          echo ""
+          echo "Helm chart:"
+          ls -lh artifacts/helm/ || echo "No chart found"
+      - name: Create checksums
+        run: |
+          cd artifacts
+          find bkctl -type f -name 'bkctl*' -exec sha256sum {} \; > checksums.txt
+          find helm -type f -name '*.tgz' -exec sha256sum {} \; >> checksums.txt
+          cat checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          files: |
+            artifacts/bkctl/bkctl-*
+            artifacts/helm/**/*.tgz
+            artifacts/checksums.txt
+          body: |
+            ## Release ${{ github.ref_name }}
+
+            ${{ steps.version.outputs.is_prerelease == 'true' && '⚠️ **Pre-release**' || '🎉 **Stable Release**' }}
+
+            ### Installation
+
+            #### Helm Chart
+
+            ```bash
+            helm install buildkit-controller \
+              oci://${{ env.REGISTRY }}/${{ github.repository }}/charts/buildkit-controller \
+              --version ${{ steps.version.outputs.version }} \
+              --namespace buildkit-system \
+              --create-namespace
+            ```
+
+            #### Docker Images
+
+            ```bash
+            docker pull ${{ env.REGISTRY }}/${{ env.CONTROLLER_IMAGE }}:v${{ steps.version.outputs.version }}
+            docker pull ${{ env.REGISTRY }}/${{ env.GATEWAY_IMAGE }}:v${{ steps.version.outputs.version }}
+            ```
+
+            #### bkctl CLI
+
+            Download the appropriate binary for your platform from the assets below:
+            - `bkctl-linux-amd64` - Linux x86_64
+            - `bkctl-linux-arm64` - Linux ARM64
+            - `bkctl-darwin-amd64` - macOS Intel
+            - `bkctl-darwin-arm64` - macOS Apple Silicon
+
+            **Note:** Docker images are pushed to the registry and cannot be attached directly to GitHub releases. Use the pull commands above to retrieve them.
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ steps.version.outputs.is_prerelease == 'true' }}

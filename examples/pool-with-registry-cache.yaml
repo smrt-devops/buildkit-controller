@@ -1,0 +1,42 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata:
+  name: pool-with-registry-cache
+  namespace: buildkit-system
+spec:
+  scaling: {}
+  resources:
+    buildkit:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: 2000m
+        memory: 2Gi
+    sidecar:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        cpu: 100m
+        memory: 64Mi
+  cache:
+    backends:
+      - type: registry
+        registry:
+          endpoint: ghcr.io
+          mode: max
+          compression: zstd
+          # Optional: credentialsSecret: registry-credentials
+    gc:
+      enabled: true
+      schedule: "0 2 * * *" # Daily at 2 AM
+      keepStorage: "10GB"
+      keepDuration: "168h" # 7 days
+  tls: {}
+  auth: {}
+  networking: {}
+  gateway: {}
+  observability:
+    metrics: {}
+    logging: {}
