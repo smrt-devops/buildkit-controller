@@ -250,7 +250,18 @@ After configuring everything, test the workflows:
 - **Solution**:
   - Check workflow permissions (needs `contents: write`)
   - Verify `.github/release-drafter.yml` exists
-  - Check workflow runs on PR merges to `main`
+  - Check workflow runs on pushes to `main` (triggers automatically when PRs are merged)
+
+### Multiple Draft Releases Created
+
+- **Issue**: Release Drafter created multiple draft releases (one from branch, one from main)
+- **Solution**:
+  - The workflow has been updated to only trigger on pushes to `main` (which happens when PRs are merged)
+  - Delete the duplicate draft releases manually:
+    1. Go to **Releases** page
+    2. Find draft releases
+    3. Delete the one that's not from `main` (or keep the one with the correct version)
+  - Future drafts will only be created/updated when PRs are merged to `main`
 
 ### Branch Protection Blocking Merges
 

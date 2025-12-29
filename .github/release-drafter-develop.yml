@@ -1,5 +1,5 @@
-name-template: "v$RESOLVED_VERSION"
-tag-template: "v$RESOLVED_VERSION"
+name-template: "v$RESOLVED_VERSION-beta"
+tag-template: "v$RESOLVED_VERSION-beta"
 
 categories:
   - title: "🚀 Features"
@@ -85,7 +85,7 @@ template: |
   ```bash
   helm install buildkit-controller \
     oci://ghcr.io/$OWNER/$REPOSITORY/charts/buildkit-controller \
-    --version $RESOLVED_VERSION \
+    --version $RESOLVED_VERSION-beta \
     --namespace buildkit-system \
     --create-namespace
   ```
@@ -93,8 +93,8 @@ template: |
   ### Docker Images
 
   ```bash
-  docker pull ghcr.io/$OWNER/$REPOSITORY/controller:v$RESOLVED_VERSION
-  docker pull ghcr.io/$OWNER/$REPOSITORY/gateway:v$RESOLVED_VERSION
+  docker pull ghcr.io/$OWNER/$REPOSITORY/controller:v$RESOLVED_VERSION-beta
+  docker pull ghcr.io/$OWNER/$REPOSITORY/gateway:v$RESOLVED_VERSION-beta
   ```
 
   ## Full Changelog
