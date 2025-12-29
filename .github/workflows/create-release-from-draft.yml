@@ -169,14 +169,33 @@ jobs:
       - name: Update Chart.yaml version
         run: |
           CHART_FILE="helm/buildkit-controller/Chart.yaml"
+          HAS_CHANGES=false
+
           if [ -f "$CHART_FILE" ]; then
             VERSION="${{ steps.final-version.outputs.version }}"
+            # Store original content
+            ORIGINAL=$(cat "$CHART_FILE")
+            
+            # Update version
             sed -i.bak "s/^version:.*/version: ${VERSION}/" "$CHART_FILE"
             sed -i.bak "s/^appVersion:.*/appVersion: \"${VERSION}\"/" "$CHART_FILE"
             rm -f "${CHART_FILE}.bak"
-            git add "$CHART_FILE"
-            git commit -m "chore: update Chart.yaml to version ${VERSION}" || true
+            
+            # Check if there are actual changes
+            if ! git diff --quiet "$CHART_FILE"; then
+              git add "$CHART_FILE"
+              git commit -m "chore: update Chart.yaml to version ${VERSION}"
+              HAS_CHANGES=true
+            fi
           fi
+
+          # If no changes were made, create an empty commit to ensure PR can be created
+          if [ "$HAS_CHANGES" = "false" ]; then
+            git commit --allow-empty -m "chore: prepare release v${{ steps.final-version.outputs.version }}"
+            echo "Created empty commit to enable PR creation"
+          fi
+
+          echo "has_changes=${HAS_CHANGES}" >> $GITHUB_ENV
 
       - name: Push branch
         run: |
