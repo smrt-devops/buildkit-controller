@@ -4,24 +4,32 @@ on:
   push:
     branches:
       - main
-  pull_request:
-    types: [opened, reopened, synchronize, closed]
-    branches:
-      - main
+      # Uncomment to enable pre-release drafting from develop/beta branches
+      # - develop
+      # - beta
 
 permissions:
   contents: write
   pull-requests: write
 
 jobs:
-  update-release-draft:
-    name: Update Release Draft
+  update-release-draft-main:
+    name: Update Release Draft (Main)
     runs-on: ubuntu-latest
-    # Only run on main branch pushes or when PRs are merged
-    if: |
-      github.event_name == 'push' && github.ref == 'refs/heads/main' ||
-      github.event_name == 'pull_request' && github.event.pull_request.merged == true
+    if: github.ref == 'refs/heads/main'
     steps:
       - uses: release-drafter/release-drafter@v6
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Uncomment to enable pre-release drafting from develop branch
+  # update-release-draft-develop:
+  #   name: Update Release Draft (Develop)
+  #   runs-on: ubuntu-latest
+  #   if: github.ref == 'refs/heads/develop'
+  #   steps:
+  #     - uses: release-drafter/release-drafter@v6
+  #       env:
+  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #       with:
+  #         config-name: release-drafter-develop.yml

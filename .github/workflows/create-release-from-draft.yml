@@ -40,6 +40,8 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
+            const branch = '${{ steps.branch.outputs.branch }}';
+
             // Get all releases (including drafts)
             const { data: releases } = await github.rest.repos.listReleases({
               owner: context.repo.owner,
@@ -47,24 +49,46 @@ jobs:
               per_page: 100
             });
 
-            // Find the latest draft release
-            const draftRelease = releases.find(r => r.draft === true);
+            // Find draft releases
+            const draftReleases = releases.filter(r => r.draft === true);
+
+            let draftRelease;
+
+            if (branch === 'main') {
+              // For main branch, find draft without pre-release suffix
+              draftRelease = draftReleases.find(r => 
+                r.tag_name && !r.tag_name.includes('-beta') && !r.tag_name.includes('-alpha') && !r.tag_name.includes('-rc')
+              );
+              
+              // Fallback to any draft if no stable draft found
+              if (!draftRelease && draftReleases.length > 0) {
+                draftRelease = draftReleases[0];
+                console.log(`Warning: No stable draft found, using: ${draftRelease.tag_name}`);
+              }
+            } else {
+              // For pre-release branches, prefer drafts with matching suffix
+              // For now, just use the first draft (can be enhanced to match branch type)
+              draftRelease = draftReleases[0];
+            }
 
             if (!draftRelease || !draftRelease.tag_name) {
-              core.setFailed('No draft release found. Ensure Release Drafter has created a draft release.');
+              core.setFailed(`No draft release found for branch '${branch}'. Ensure Release Drafter has created a draft release.`);
               return;
             }
 
-            // Extract version from tag (remove 'v' prefix)
-            const version = draftRelease.tag_name.replace(/^v/, '');
+            // Extract version from tag (remove 'v' prefix and any pre-release suffix)
+            let version = draftRelease.tag_name.replace(/^v/, '');
+            // Remove pre-release suffixes for base version
+            version = version.replace(/-beta$/, '').replace(/-alpha$/, '').replace(/-rc$/, '');
             const body = draftRelease.body || '';
 
             core.setOutput('version', version);
             core.setOutput('body', body);
             core.setOutput('tag_name', draftRelease.tag_name);
 
+            console.log(`Branch: ${branch}`);
             console.log(`Found draft release: ${draftRelease.tag_name}`);
-            console.log(`Version: ${version}`);
+            console.log(`Base version: ${version}`);
 
       - name: Determine release type from branch
         id: release-type
