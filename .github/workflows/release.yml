@@ -11,7 +11,7 @@ env:
   GATEWAY_IMAGE: ${{ github.repository }}/gateway
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -19,17 +19,53 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
-      - run: make test
+
+      - name: Install controller-gen
+        run: |
+          mkdir -p bin
+          GOBIN=$(pwd)/bin go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.19.0
+
+      - name: Generate CRDs
+        run: |
+          ./bin/controller-gen crd webhook paths="./..." \
+            output:crd:artifacts:config=helm/buildkit-controller/crds
+
+      - name: Generate DeepCopy methods
+        run: |
+          ./bin/controller-gen object:headerFile="hack/boilerplate.go.txt" paths="./..."
+
+      - name: Check code formatting
+        run: |
+          go fmt ./...
+          if [ -n "$(git diff --name-only)" ]; then
+            echo "❌ Code is not formatted. Please run 'go fmt ./...'"
+            git diff
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: |
+          go vet ./...
+
+      - name: Run tests
+        run: |
+          go test ./... -coverprofile cover.out
 
   build-images:
     name: Build Images
     runs-on: ubuntu-latest
     needs: test
+    environment:
+      name: release
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/login-action@v3
@@ -168,6 +204,9 @@ jobs:
     name: Create Release
     runs-on: ubuntu-latest
     needs: [build-cli, publish-helm]
+    environment:
+      name: release
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
     permissions:
       contents: write
     steps:
@@ -207,6 +246,88 @@ jobs:
           find bkctl -type f -name 'bkctl*' -exec sha256sum {} \; > checksums.txt
           find helm -type f -name '*.tgz' -exec sha256sum {} \; >> checksums.txt
           cat checksums.txt
+      - name: Get release notes from draft (if available)
+        id: release-notes
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tag = '${{ github.ref_name }}';
+
+            // Try to find a draft release with this tag
+            const { data: releases } = await github.rest.repos.listReleases({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100
+            });
+
+            const draftRelease = releases.find(r => r.tag_name === tag && r.draft === true);
+
+            if (draftRelease && draftRelease.body) {
+              core.setOutput('body', draftRelease.body);
+              core.setOutput('found', 'true');
+              return;
+            }
+
+            core.setOutput('found', 'false');
+
+      - name: Generate release body
+        id: release-body
+        if: steps.release-notes.outputs.found != 'true'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          IS_PRERELEASE="${{ steps.version.outputs.is_prerelease }}"
+          REGISTRY="${{ env.REGISTRY }}"
+          REPO="${{ github.repository }}"
+          CONTROLLER_IMG="${{ env.CONTROLLER_IMAGE }}"
+          GATEWAY_IMG="${{ env.GATEWAY_IMAGE }}"
+
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            RELEASE_TYPE="⚠️ **Pre-release**"
+          else
+            RELEASE_TYPE="🎉 **Stable Release**"
+          fi
+
+          cat > /tmp/release-body.md <<EOF
+          ## Release ${{ github.ref_name }}
+
+          $RELEASE_TYPE
+
+          ### Installation
+
+          #### Helm Chart
+
+          \`\`\`bash
+          helm install buildkit-controller \\
+            oci://$REGISTRY/$REPO/charts/buildkit-controller \\
+            --version $VERSION \\
+            --namespace buildkit-system \\
+            --create-namespace
+          \`\`\`
+
+          #### Docker Images
+
+          \`\`\`bash
+          docker pull $REGISTRY/$CONTROLLER_IMG:v$VERSION
+          docker pull $REGISTRY/$GATEWAY_IMG:v$VERSION
+          \`\`\`
+
+          #### bkctl CLI
+
+          Download the appropriate binary for your platform from the assets below:
+          - \`bkctl-linux-amd64\` - Linux x86_64
+          - \`bkctl-linux-arm64\` - Linux ARM64
+          - \`bkctl-darwin-amd64\` - macOS Intel
+          - \`bkctl-darwin-arm64\` - macOS Apple Silicon
+
+          **Note:** Docker images are pushed to the registry and cannot be attached directly to GitHub releases. Use the pull commands above to retrieve them.
+          EOF
+
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          cat /tmp/release-body.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
@@ -215,39 +336,8 @@ jobs:
             artifacts/bkctl/bkctl-*
             artifacts/helm/**/*.tgz
             artifacts/checksums.txt
-          body: |
-            ## Release ${{ github.ref_name }}
-
-            ${{ steps.version.outputs.is_prerelease == 'true' && '⚠️ **Pre-release**' || '🎉 **Stable Release**' }}
-
-            ### Installation
-
-            #### Helm Chart
-
-            ```bash
-            helm install buildkit-controller \
-              oci://${{ env.REGISTRY }}/${{ github.repository }}/charts/buildkit-controller \
-              --version ${{ steps.version.outputs.version }} \
-              --namespace buildkit-system \
-              --create-namespace
-            ```
-
-            #### Docker Images
-
-            ```bash
-            docker pull ${{ env.REGISTRY }}/${{ env.CONTROLLER_IMAGE }}:v${{ steps.version.outputs.version }}
-            docker pull ${{ env.REGISTRY }}/${{ env.GATEWAY_IMAGE }}:v${{ steps.version.outputs.version }}
-            ```
-
-            #### bkctl CLI
-
-            Download the appropriate binary for your platform from the assets below:
-            - `bkctl-linux-amd64` - Linux x86_64
-            - `bkctl-linux-arm64` - Linux ARM64
-            - `bkctl-darwin-amd64` - macOS Intel
-            - `bkctl-darwin-arm64` - macOS Apple Silicon
-
-            **Note:** Docker images are pushed to the registry and cannot be attached directly to GitHub releases. Use the pull commands above to retrieve them.
-          generate_release_notes: true
+          body: ${{ steps.release-notes.outputs.found == 'true' && steps.release-notes.outputs.body || steps.release-body.outputs.body }}
+          generate_release_notes: ${{ steps.release-notes.outputs.found != 'true' }}
           draft: false
           prerelease: ${{ steps.version.outputs.is_prerelease == 'true' }}
+          make_latest: ${{ steps.version.outputs.is_prerelease != 'true' }}

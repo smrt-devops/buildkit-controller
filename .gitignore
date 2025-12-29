@@ -38,3 +38,4 @@ config/crd/bases/*.yaml
 # Helm charts (generated during CI/CD)
 charts/
 
+examples/chart/

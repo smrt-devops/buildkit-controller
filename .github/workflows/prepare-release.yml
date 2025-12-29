@@ -1,0 +1,299 @@
+name: Prepare Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (leave empty to auto-detect from Release Drafter)"
+        required: false
+        type: string
+      release_type:
+        description: "Release type (auto-detected from branch if not specified)"
+        required: false
+        type: choice
+        options:
+          - auto
+          - stable
+          - beta
+          - alpha
+          - rc
+        default: auto
+      pre_release_suffix:
+        description: "Pre-release suffix (beta, alpha, rc) - only used if release_type is auto and not on main"
+        required: false
+        type: choice
+        options:
+          - beta
+          - alpha
+          - rc
+        default: beta
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create-release-pr:
+    name: Create Release PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Get current branch
+        id: branch
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          echo "branch=${BRANCH}" >> $GITHUB_OUTPUT
+          echo "Current branch: ${BRANCH}"
+
+      - name: Get version from Release Drafter (if not specified)
+        id: draft-version
+        if: inputs.version == ''
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // Get all releases (including drafts)
+            const { data: releases } = await github.rest.repos.listReleases({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100
+            });
+
+            // Find the latest draft release
+            const draftRelease = releases.find(r => r.draft === true);
+
+            if (draftRelease && draftRelease.tag_name) {
+              // Extract version from tag (remove 'v' prefix)
+              const version = draftRelease.tag_name.replace(/^v/, '');
+              core.setOutput('version', version);
+              core.setOutput('found', 'true');
+              console.log(`Found draft release with version: ${version}`);
+            } else {
+              core.setOutput('found', 'false');
+              console.log('No draft release found');
+            }
+
+      - name: Get latest stable version from tags
+        id: latest-tag
+        if: steps.draft-version.outputs.found != 'true'
+        run: |
+          # Get the latest tag matching v* pattern
+          LATEST_TAG=$(git tag -l "v*" | sort -V | tail -1)
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No existing tags found, starting at 0.1.0"
+            echo "version=0.1.0" >> $GITHUB_OUTPUT
+            echo "found=false" >> $GITHUB_OUTPUT
+          else
+            # Remove 'v' prefix
+            VERSION="${LATEST_TAG#v}"
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "Latest tag: ${LATEST_TAG}, version: ${VERSION}"
+          fi
+
+      - name: Determine version and release type
+        id: version-info
+        run: |
+          # Use provided version or auto-detected version
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+            echo "Using provided version: ${VERSION}"
+          elif [ "${{ steps.draft-version.outputs.found }}" = "true" ]; then
+            VERSION="${{ steps.draft-version.outputs.version }}"
+            echo "Using version from Release Drafter: ${VERSION}"
+          elif [ "${{ steps.latest-tag.outputs.found }}" = "true" ]; then
+            VERSION="${{ steps.latest-tag.outputs.version }}"
+            echo "Using latest tag version: ${VERSION}"
+          else
+            VERSION="0.1.0"
+            echo "No version found, using default: ${VERSION}"
+          fi
+
+          # Remove 'v' prefix if present
+          VERSION="${VERSION#v}"
+
+          # Determine release type
+          RELEASE_TYPE="${{ inputs.release_type }}"
+          BRANCH="${{ steps.branch.outputs.branch }}"
+          PRE_RELEASE_SUFFIX="${{ inputs.pre_release_suffix }}"
+
+          # If auto, determine from branch
+          if [ "$RELEASE_TYPE" = "auto" ]; then
+            if [ "$BRANCH" = "main" ]; then
+              RELEASE_TYPE="stable"
+              echo "Branch is 'main', using stable release"
+            else
+              # For non-main branches, use pre-release
+              RELEASE_TYPE="$PRE_RELEASE_SUFFIX"
+              echo "Branch is '${BRANCH}', using ${RELEASE_TYPE} pre-release"
+            fi
+          fi
+
+          # If version already has pre-release suffix, extract base version
+          if [[ "$VERSION" =~ -(alpha|beta|rc)\. ]]; then
+            BASE_VERSION=$(echo "$VERSION" | sed -E 's/-(alpha|beta|rc)\.[0-9]+$//')
+            PRE_RELEASE_NUM=$(echo "$VERSION" | sed -E 's/.*-(alpha|beta|rc)\.([0-9]+)$/\2/')
+            PRE_RELEASE_TYPE=$(echo "$VERSION" | sed -E 's/.*-((alpha|beta|rc))\.[0-9]+$/\1/')
+            
+            # If release type changed, reset to 1, otherwise increment
+            if [ "$RELEASE_TYPE" != "stable" ] && [ "$PRE_RELEASE_TYPE" = "$RELEASE_TYPE" ]; then
+              # Same pre-release type, increment number
+              PRE_RELEASE_NUM=$((PRE_RELEASE_NUM + 1))
+              VERSION="${BASE_VERSION}-${RELEASE_TYPE}.${PRE_RELEASE_NUM}"
+            elif [ "$RELEASE_TYPE" = "stable" ]; then
+              # Moving to stable, use base version
+              VERSION="$BASE_VERSION"
+            else
+              # Different pre-release type, start at 1
+              VERSION="${BASE_VERSION}-${RELEASE_TYPE}.1"
+            fi
+          elif [ "$RELEASE_TYPE" != "stable" ]; then
+            # Stable version, but need pre-release - add suffix
+            VERSION="${VERSION}-${RELEASE_TYPE}.1"
+          fi
+          # If stable and no pre-release suffix, VERSION is already correct
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "release_type=${RELEASE_TYPE}" >> $GITHUB_OUTPUT
+          echo "Final version: ${VERSION}, type: ${RELEASE_TYPE}"
+
+      - name: Validate version format
+        id: validate-version
+        run: |
+          VERSION="${{ steps.version-info.outputs.version }}"
+
+          # Check if version matches semantic versioning (with optional pre-release)
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
+            echo "❌ Invalid version format: $VERSION"
+            echo "Version must follow semantic versioning: X.Y.Z or X.Y.Z-alpha.N or X.Y.Z-beta.N or X.Y.Z-rc.N"
+            exit 1
+          fi
+
+          echo "✅ Version format is valid: $VERSION"
+
+      - name: Check if tag exists
+        run: |
+          TAG="v${{ steps.version-info.outputs.version }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "❌ Tag $TAG already exists!"
+            exit 1
+          else
+            echo "✅ Tag $TAG does not exist"
+          fi
+
+      - name: Create release branch
+        run: |
+          BRANCH_NAME="release/v${{ steps.version-info.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH_NAME"
+          echo "branch=${BRANCH_NAME}" >> $GITHUB_ENV
+
+      - name: Update Chart.yaml version (optional)
+        run: |
+          CHART_FILE="helm/buildkit-controller/Chart.yaml"
+          if [ -f "$CHART_FILE" ]; then
+            VERSION="${{ steps.version-info.outputs.version }}"
+            # Update version in Chart.yaml (if it exists)
+            sed -i.bak "s/^version:.*/version: ${VERSION}/" "$CHART_FILE"
+            sed -i.bak "s/^appVersion:.*/appVersion: \"${VERSION}\"/" "$CHART_FILE"
+            rm -f "${CHART_FILE}.bak"
+            
+            if git diff --quiet "$CHART_FILE"; then
+              echo "No changes to Chart.yaml"
+            else
+              git add "$CHART_FILE"
+              git commit -m "chore: update Chart.yaml to version ${VERSION}" || echo "No changes to commit"
+            fi
+          fi
+
+      - name: Push branch
+        run: |
+          git push origin "${{ env.branch }}"
+
+      - name: Create Pull Request
+        id: create-pr
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const version = '${{ steps.version-info.outputs.version }}';
+            const releaseType = '${{ steps.version-info.outputs.release_type }}';
+            const tag = `v${version}`;
+            const branch = '${{ env.branch }}';
+            const sourceBranch = '${{ steps.branch.outputs.branch }}';
+
+            const isPrerelease = releaseType !== 'stable';
+            const prereleaseEmoji = isPrerelease ? '⚠️' : '🎉';
+            const prereleaseText = isPrerelease ? 'Pre-release' : 'Stable Release';
+
+            const body = `## ${prereleaseEmoji} Release ${prereleaseText}: v${version}
+
+            This PR prepares the release of version \`v${version}\`.
+
+            ### Release Information
+            - **Version**: \`v${version}\`
+            - **Type**: ${prereleaseText}
+            - **Tag**: \`${tag}\`
+            - **Source Branch**: \`${sourceBranch}\`
+            ${isPrerelease ? `- **Pre-release Type**: ${releaseType}` : ''}
+
+            ### What happens when this PR is merged?
+
+            1. ✅ Tag \`${tag}\` will be created automatically
+            2. 🐳 Docker images will be built and pushed with tags:
+               - \`${tag}\` (exact version)
+               - \`v${version.split('.')[0]}.${version.split('.')[1]}\` (major.minor)
+               - \`v${version.split('.')[0]}\` (major)
+               ${!isPrerelease ? '- `latest` (stable releases only)' : ''}
+            3. 📦 Helm chart will be published to OCI registry
+            4. 📝 GitHub release will be created with:
+               - Auto-generated release notes
+               - Installation instructions
+               - CLI binaries for all platforms
+
+            ### Pre-merge Checklist
+
+            - [ ] All CI checks pass
+            - [ ] Required approvals obtained
+            - [ ] Release notes reviewed (will be auto-generated)
+            - [ ] Version number is correct
+
+            ### After Merge
+
+            The release workflow will run automatically. Monitor the [Actions tab](https://github.com/${{ github.repository }}/actions) for progress.
+
+            ---
+
+            **Note**: This PR was created automatically by the Prepare Release workflow.
+            `;
+
+            const pr = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Release v${version}`,
+              head: branch,
+              base: 'main',
+              body: body
+            });
+
+            // Add labels
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.data.number,
+              labels: ['release', releaseType]
+            });
+
+            return pr.data.number;
+
+      - name: Output PR URL
+        run: |
+          echo "✅ Release PR created: #${{ steps.create-pr.outputs.result }}"
+          echo "PR URL: https://github.com/${{ github.repository }}/pull/${{ steps.create-pr.outputs.result }}"

@@ -1,0 +1,157 @@
+name: Release PR Checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  check-release-pr:
+    name: Check Release PR
+    runs-on: ubuntu-latest
+    # Only run on PRs with release/ prefix in branch name
+    if: startsWith(github.head_ref, 'release/')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from branch
+        id: version
+        run: |
+          BRANCH_NAME="${{ github.head_ref }}"
+          VERSION="${BRANCH_NAME#release/}"
+          # Remove 'v' prefix if present
+          VERSION="${VERSION#v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Extracted version: ${VERSION}"
+
+      - name: Validate version format
+        id: validate-version
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # Check if version matches semantic versioning (with optional pre-release)
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
+            echo "❌ Invalid version format: $VERSION"
+            echo "Version must follow semantic versioning: X.Y.Z or X.Y.Z-alpha.N or X.Y.Z-beta.N or X.Y.Z-rc.N"
+            exit 1
+          fi
+
+          echo "✅ Version format is valid: $VERSION"
+
+          # Determine release type
+          if [[ "$VERSION" =~ -(alpha|beta|rc)\. ]]; then
+            RELEASE_TYPE="prerelease"
+            echo "release_type=${RELEASE_TYPE}" >> $GITHUB_OUTPUT
+          else
+            RELEASE_TYPE="stable"
+            echo "release_type=${RELEASE_TYPE}" >> $GITHUB_OUTPUT
+          fi
+
+          echo "Release type: ${RELEASE_TYPE}"
+
+      - name: Check if tag exists
+        id: check-tag
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "❌ Tag $TAG already exists!"
+            echo "tag_exists=true" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "✅ Tag $TAG does not exist"
+            echo "tag_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate Chart.yaml version
+        id: validate-chart
+        run: |
+          CHART_FILE="helm/buildkit-controller/Chart.yaml"
+          if [ ! -f "$CHART_FILE" ]; then
+            echo "⚠️ Chart.yaml not found, will be updated automatically on release"
+            echo "chart_valid=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          CURRENT_VERSION=$(grep "^version:" "$CHART_FILE" | sed 's/version: *//' | tr -d '"' | tr -d "'" | xargs)
+          EXPECTED_VERSION="${{ steps.version.outputs.version }}"
+
+          if [ "$CURRENT_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "⚠️ Chart.yaml version ($CURRENT_VERSION) does not match release version ($EXPECTED_VERSION)"
+            echo "Chart version will be updated automatically on release"
+          else
+            echo "✅ Chart.yaml version matches: $CURRENT_VERSION"
+          fi
+
+          echo "chart_valid=true" >> $GITHUB_OUTPUT
+
+      - name: Check PR title format
+        id: check-title
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          EXPECTED_TITLE="Release v${{ steps.version.outputs.version }}"
+
+          if [[ "$PR_TITLE" != "$EXPECTED_TITLE" ]]; then
+            echo "⚠️ PR title should be: $EXPECTED_TITLE"
+            echo "Current title: $PR_TITLE"
+            echo "title_valid=false" >> $GITHUB_OUTPUT
+          else
+            echo "✅ PR title is correct: $PR_TITLE"
+            echo "title_valid=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const version = '${{ steps.version.outputs.version }}';
+            const releaseType = '${{ steps.validate-version.outputs.release_type }}';
+            const tagExists = '${{ steps.check-tag.outputs.tag_exists }}' === 'true';
+            const chartValid = '${{ steps.validate-chart.outputs.chart_valid }}' === 'true';
+            const titleValid = '${{ steps.check-title.outputs.title_valid }}' === 'true';
+
+            let status = '✅';
+            let issues = [];
+
+            if (tagExists) {
+              status = '❌';
+              issues.push('Tag `v' + version + '` already exists');
+            }
+
+            if (!titleValid) {
+              issues.push('PR title should be: `Release v' + version + '`');
+            }
+
+            const body = `## Release PR Validation
+
+            ${status} **Release Version**: \`v${version}\`
+            ${status} **Release Type**: ${releaseType === 'prerelease' ? 'Pre-release' : 'Stable Release'}
+
+            ${issues.length > 0 ? '### ⚠️ Issues Found:\n\n' + issues.map(i => '- ' + i).join('\n') + '\n\n' : ''}
+            ### Next Steps:
+
+            1. Ensure all CI checks pass
+            2. Get required approvals
+            3. Merge this PR to trigger the release
+
+            Once merged, the release workflow will:
+            - Create tag \`v${version}\`
+            - Build and push Docker images
+            - Publish Helm chart
+            - Create GitHub release
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });

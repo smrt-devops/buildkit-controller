@@ -1,0 +1,66 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install controller-gen
+        run: |
+          mkdir -p bin
+          GOBIN=$(pwd)/bin go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.19.0
+
+      - name: Generate CRDs
+        run: |
+          ./bin/controller-gen crd webhook paths="./..." \
+            output:crd:artifacts:config=helm/buildkit-controller/crds
+          echo "✅ CRDs generated to helm/buildkit-controller/crds/"
+
+      - name: Generate DeepCopy methods
+        run: |
+          ./bin/controller-gen object:headerFile="hack/boilerplate.go.txt" paths="./..."
+
+      - name: Check code formatting
+        run: |
+          go fmt ./...
+          if [ -n "$(git diff --name-only)" ]; then
+            echo "❌ Code is not formatted. Please run 'go fmt ./...'"
+            git diff
+            exit 1
+          fi
+          echo "✅ Code is properly formatted"
+
+      - name: Run go vet
+        run: |
+          go vet ./...
+          echo "✅ go vet passed"
+
+      - name: Run tests
+        run: |
+          go test ./... -coverprofile cover.out -v
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: cover.out
+          retention-days: 7
