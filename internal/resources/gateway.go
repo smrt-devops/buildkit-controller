@@ -183,11 +183,9 @@ func NewGatewayService(pool *buildkitv1alpha1.BuildKitPool) *corev1.Service {
 		"buildkit.smrt-devops.net/purpose": "gateway",
 	}
 
+	// Gateway service type - defaults to ClusterIP if not specified
+	// Supports various setups: ClusterIP (for Istio/Envoy sidecars), LoadBalancer (direct access), NodePort, etc.
 	serviceType := corev1.ServiceTypeClusterIP
-	if pool.Spec.Networking.ServiceType != "" {
-		serviceType = corev1.ServiceType(pool.Spec.Networking.ServiceType)
-	}
-	// Allow gateway-specific service type override
 	if pool.Spec.Gateway.ServiceType != "" {
 		serviceType = corev1.ServiceType(pool.Spec.Gateway.ServiceType)
 	}
@@ -213,6 +211,28 @@ func NewGatewayService(pool *buildkitv1alpha1.BuildKitPool) *corev1.Service {
 		gatewayServicePort.NodePort = *pool.Spec.Gateway.NodePort
 	}
 
+	serviceSpec := corev1.ServiceSpec{
+		Type: serviceType,
+		Selector: map[string]string{
+			"buildkit.smrt-devops.net/pool":    pool.Name,
+			"buildkit.smrt-devops.net/purpose": "gateway",
+		},
+		Ports: []corev1.ServicePort{
+			gatewayServicePort,
+			{
+				Name:       "metrics",
+				Port:       GatewayMetricsPort,
+				TargetPort: intstr.FromInt(GatewayMetricsPort),
+				Protocol:   corev1.ProtocolTCP,
+			},
+		},
+	}
+
+	// Set LoadBalancerClass if specified and service type is LoadBalancer
+	if serviceType == corev1.ServiceTypeLoadBalancer && pool.Spec.Gateway.LoadBalancerClass != nil {
+		serviceSpec.LoadBalancerClass = pool.Spec.Gateway.LoadBalancerClass
+	}
+
 	service := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        serviceName,
@@ -220,22 +240,7 @@ func NewGatewayService(pool *buildkitv1alpha1.BuildKitPool) *corev1.Service {
 			Labels:      labels,
 			Annotations: pool.Spec.Networking.Annotations,
 		},
-		Spec: corev1.ServiceSpec{
-			Type: serviceType,
-			Selector: map[string]string{
-				"buildkit.smrt-devops.net/pool":    pool.Name,
-				"buildkit.smrt-devops.net/purpose": "gateway",
-			},
-			Ports: []corev1.ServicePort{
-				gatewayServicePort,
-				{
-					Name:       "metrics",
-					Port:       GatewayMetricsPort,
-					TargetPort: intstr.FromInt(GatewayMetricsPort),
-					Protocol:   corev1.ProtocolTCP,
-				},
-			},
-		},
+		Spec: serviceSpec,
 	}
 
 	return service

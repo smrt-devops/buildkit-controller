@@ -73,13 +73,13 @@ controller:
         secretNamespace: "" # TLS secret namespace (if empty, uses same namespace)
     # Ingress configuration for external access (alternative to Gateway API)
     ingress:
-      enabled: false
-      ingressClassName: "" # If not specified, uses cluster default
-      hostname: "" # Required when enabled, e.g., "api.buildkit.example.com"
+      enabled: true
+      ingressClassName: "tailscale" # If not specified, uses cluster default
+      hostname: "buildkit-controller-api.elf-woodpecker.ts.net" # Required when enabled, e.g., "api.buildkit.example.com"
       annotations: {} # Additional annotations for Ingress resource
       tls:
-        enabled: false
-        secretName: "" # TLS secret name (required when TLS enabled)
+        enabled: true
+        # secretName: "" # TLS secret name (required when TLS enabled)
 
   # Leader election
   leaderElection:
@@ -96,7 +96,7 @@ controller:
 # Pools can independently choose their ingress type via spec.gateway.ingress.enabled or spec.gateway.gatewayAPI.enabled
 # If a pool requests an ingress type not in this list, the controller will fail with a clear error
 ingress:
-  types: [] # List of supported ingress types: "ingress", "gatewayapi", or both
+  types: ["ingress", "gatewayapi"] # List of supported ingress types: "ingress", "gatewayapi", or both
 
 # Service account configuration
 serviceAccount:
@@ -152,18 +152,18 @@ oidc:
 # This creates a BuildKitOIDCConfig that works with the mock-oidc server
 # Usage: go run ./cmd/mock-oidc --port 8888
 localOidc:
-  enabled: false
+  enabled: true
   # For Kind clusters, use the docker network gateway IP
   # Find with: docker network inspect kind -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
-  issuer: "http://172.18.0.1:8888"
+  issuer: http://mock-oidc.buildkit-system.svc:8888
   audience: "buildkit-controller"
   claimsMapping:
     user: "actor"
     pools: "repository"
 
 # Image pull secrets
-imagePullSecrets:
-  - name: ghcr-login-secret
+imagePullSecrets: []
+# - name: ghcr-login-secret
 
 # Node selector, tolerations, and affinity
 nodeSelector: {}

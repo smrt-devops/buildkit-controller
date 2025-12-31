@@ -107,8 +107,10 @@ type GatewayConfig struct {
 	// Defaults to 24h
 	MaxTokenTTL string `json:"maxTokenTTL,omitempty"`
 
-	// ServiceType overrides the service type for the gateway
-	// Defaults to the pool's networking.serviceType
+	// ServiceType is the Kubernetes service type for the gateway
+	// Defaults to ClusterIP (suitable for Istio/Envoy sidecars, ingress controllers, etc.)
+	// Can be set to LoadBalancer for direct external access, or NodePort for node-based access
+	// +kubebuilder:default=ClusterIP
 	// +optional
 	ServiceType ServiceType `json:"serviceType,omitempty"`
 
@@ -123,6 +125,11 @@ type GatewayConfig struct {
 	// +kubebuilder:validation:Minimum=30000
 	// +kubebuilder:validation:Maximum=32767
 	NodePort *int32 `json:"nodePort,omitempty"`
+
+	// LoadBalancerClass is the load balancer class for LoadBalancer service type
+	// Only used when serviceType is LoadBalancer
+	// +optional
+	LoadBalancerClass *string `json:"loadBalancerClass,omitempty"`
 
 	// GatewayAPI configuration for external access via Kubernetes Gateway API
 	// +optional

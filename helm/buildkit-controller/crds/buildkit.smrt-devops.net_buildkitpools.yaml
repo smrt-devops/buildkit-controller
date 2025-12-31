@@ -14,995 +14,1035 @@ spec:
     singular: buildkitpool
   scope: Namespaced
   versions:
-  - additionalPrinterColumns:
-    - jsonPath: .status.phase
-      name: Phase
-      type: string
-    - jsonPath: .status.gateway.ready
-      name: Gateway
-      priority: 1
-      type: string
-    - jsonPath: .status.workers.total
-      name: Workers
-      type: integer
-    - jsonPath: .status.workers.ready
-      name: Ready
-      type: integer
-    - jsonPath: .status.workers.desired
-      name: Desired
-      priority: 1
-      type: integer
-    - jsonPath: .status.workers.needed
-      name: Needed
-      priority: 1
-      type: integer
-    - jsonPath: .status.workers.idle
-      name: Idle
-      priority: 1
-      type: integer
-    - jsonPath: .status.workers.allocated
-      name: Allocated
-      type: integer
-    - jsonPath: .status.connections.active
-      name: Connections
-      type: integer
-    - jsonPath: .status.endpoint
-      name: Endpoint
-      priority: 1
-      type: string
-    - jsonPath: .metadata.creationTimestamp
-      name: Age
-      type: date
-    name: v1alpha1
-    schema:
-      openAPIV3Schema:
-        description: BuildKitPool is the Schema for the buildkitpools API.
-        properties:
-          apiVersion:
-            description: |-
-              APIVersion defines the versioned schema of this representation of an object.
-              Servers should convert recognized schemas to the latest internal value, and
-              may reject unrecognized values.
-              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
-            type: string
-          kind:
-            description: |-
-              Kind is a string value representing the REST resource this object represents.
-              Servers may infer this from the endpoint the client submits requests to.
-              Cannot be updated.
-              In CamelCase.
-              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
-            type: string
-          metadata:
-            type: object
-          spec:
-            description: BuildKitPoolSpec defines the desired state of BuildKitPool.
-            properties:
-              auth:
-                description: Authentication
-                properties:
-                  methods:
-                    description: Methods is a list of authentication methods
-                    items:
-                      description: AuthMethod defines an authentication method.
-                      properties:
-                        mtls:
-                          description: MTLS configuration (when type is mtls)
-                          properties:
-                            clientCASecret:
-                              description: ClientCASecret is the name of the secret
-                                containing client CA certificate
-                              type: string
+    - additionalPrinterColumns:
+        - jsonPath: .status.phase
+          name: Phase
+          type: string
+        - jsonPath: .status.gateway.ready
+          name: Gateway
+          priority: 1
+          type: string
+        - jsonPath: .status.workers.total
+          name: Workers
+          type: integer
+        - jsonPath: .status.workers.ready
+          name: Ready
+          type: integer
+        - jsonPath: .status.workers.desired
+          name: Desired
+          priority: 1
+          type: integer
+        - jsonPath: .status.workers.needed
+          name: Needed
+          priority: 1
+          type: integer
+        - jsonPath: .status.workers.idle
+          name: Idle
+          priority: 1
+          type: integer
+        - jsonPath: .status.workers.allocated
+          name: Allocated
+          type: integer
+        - jsonPath: .status.connections.active
+          name: Connections
+          type: integer
+        - jsonPath: .status.endpoint
+          name: Endpoint
+          priority: 1
+          type: string
+        - jsonPath: .metadata.creationTimestamp
+          name: Age
+          type: date
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: BuildKitPool is the Schema for the buildkitpools API.
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              description: BuildKitPoolSpec defines the desired state of BuildKitPool.
+              properties:
+                auth:
+                  description: Authentication
+                  properties:
+                    methods:
+                      description: Methods is a list of authentication methods
+                      items:
+                        description: AuthMethod defines an authentication method.
+                        properties:
+                          mtls:
+                            description: MTLS configuration (when type is mtls)
+                            properties:
+                              clientCASecret:
+                                description:
+                                  ClientCASecret is the name of the secret
+                                  containing client CA certificate
+                                type: string
+                              required:
+                                default: true
+                                description: Required requires mTLS (client certificates)
+                                type: boolean
+                            type: object
+                          oidc:
+                            description: OIDC configuration (when type is oidc)
+                            properties:
+                              audience:
+                                description: Audience is the expected audience
+                                type: string
+                              claimsMapping:
+                                description:
+                                  ClaimsMapping maps OIDC claims to user/pool
+                                  information
+                                properties:
+                                  pools:
+                                    description:
+                                      Pools is the claim name for pool access
+                                      list
+                                    type: string
+                                  user:
+                                    description: User is the claim name for user identity
+                                    type: string
+                                type: object
+                              issuer:
+                                description: Issuer is the OIDC issuer URL
+                                type: string
                             required:
-                              default: true
-                              description: Required requires mTLS (client certificates)
-                              type: boolean
-                          type: object
-                        oidc:
-                          description: OIDC configuration (when type is oidc)
-                          properties:
-                            audience:
-                              description: Audience is the expected audience
-                              type: string
-                            claimsMapping:
-                              description: ClaimsMapping maps OIDC claims to user/pool
-                                information
-                              properties:
-                                pools:
-                                  description: Pools is the claim name for pool access
-                                    list
-                                  type: string
-                                user:
-                                  description: User is the claim name for user identity
-                                  type: string
-                              type: object
-                            issuer:
-                              description: Issuer is the OIDC issuer URL
-                              type: string
-                          required:
-                          - audience
-                          - claimsMapping
-                          - issuer
-                          type: object
-                        token:
-                          description: Token configuration (when type is token)
-                          properties:
-                            secretRef:
-                              description: |-
-                                SecretRef is the name of the secret containing tokens
-                                Format: key = token, value = JSON with user and pools
-                              type: string
-                          required:
-                          - secretRef
-                          type: object
-                        type:
-                          description: Type is the auth method type (mtls, token,
-                            oidc)
-                          enum:
-                          - mtls
-                          - token
-                          - oidc
-                          type: string
-                      required:
-                      - type
-                      type: object
-                    type: array
-                  rbac:
-                    description: RBAC is RBAC configuration
-                    properties:
-                      enabled:
-                        default: true
-                        description: Enabled enables RBAC
-                        type: boolean
-                      rules:
-                        description: Rules are RBAC rules
-                        items:
-                          description: RBACRule defines an RBAC rule.
-                          properties:
-                            pools:
-                              description: Pools is a list of pool names (supports
-                                wildcards)
-                              items:
+                              - audience
+                              - claimsMapping
+                              - issuer
+                            type: object
+                          token:
+                            description: Token configuration (when type is token)
+                            properties:
+                              secretRef:
+                                description: |-
+                                  SecretRef is the name of the secret containing tokens
+                                  Format: key = token, value = JSON with user and pools
                                 type: string
-                              type: array
-                            users:
-                              description: Users is a list of user patterns (supports
-                                wildcards)
-                              items:
-                                type: string
-                              type: array
-                          required:
-                          - pools
-                          - users
-                          type: object
-                        type: array
-                    type: object
-                type: object
-              buildkitConfig:
-                description: |-
-                  BuildKit configuration (standard buildkitd.toml)
-                  If not provided, defaults will be generated
-                type: string
-              buildkitImage:
-                description: |-
-                  BuildkitImage is the buildkit daemon image to use
-                  Defaults to moby/buildkit:master-rootless
-                type: string
-              cache:
-                description: Cache configuration
-                properties:
-                  backends:
-                    description: Backends is a list of cache backends
-                    items:
-                      description: CacheBackend defines a cache backend.
+                            required:
+                              - secretRef
+                            type: object
+                          type:
+                            description:
+                              Type is the auth method type (mtls, token,
+                              oidc)
+                            enum:
+                              - mtls
+                              - token
+                              - oidc
+                            type: string
+                        required:
+                          - type
+                        type: object
+                      type: array
+                    rbac:
+                      description: RBAC is RBAC configuration
                       properties:
-                        local:
-                          description: Local configuration (when type is local)
-                          properties:
-                            size:
-                              description: Size is the size of the cache volume
-                              type: string
-                            storageClass:
-                              description: StorageClass is the storage class for the
-                                PVC
-                              type: string
-                          required:
-                          - size
-                          - storageClass
+                        enabled:
+                          default: true
+                          description: Enabled enables RBAC
+                          type: boolean
+                        rules:
+                          description: Rules are RBAC rules
+                          items:
+                            description: RBACRule defines an RBAC rule.
+                            properties:
+                              pools:
+                                description:
+                                  Pools is a list of pool names (supports
+                                  wildcards)
+                                items:
+                                  type: string
+                                type: array
+                              users:
+                                description:
+                                  Users is a list of user patterns (supports
+                                  wildcards)
+                                items:
+                                  type: string
+                                type: array
+                            required:
+                              - pools
+                              - users
+                            type: object
+                          type: array
+                      type: object
+                  type: object
+                buildkitConfig:
+                  description: |-
+                    BuildKit configuration (standard buildkitd.toml)
+                    If not provided, defaults will be generated
+                  type: string
+                buildkitImage:
+                  description: |-
+                    BuildkitImage is the buildkit daemon image to use
+                    Defaults to moby/buildkit:master-rootless
+                  type: string
+                cache:
+                  description: Cache configuration
+                  properties:
+                    backends:
+                      description: Backends is a list of cache backends
+                      items:
+                        description: CacheBackend defines a cache backend.
+                        properties:
+                          local:
+                            description: Local configuration (when type is local)
+                            properties:
+                              size:
+                                description: Size is the size of the cache volume
+                                type: string
+                              storageClass:
+                                description:
+                                  StorageClass is the storage class for the
+                                  PVC
+                                type: string
+                            required:
+                              - size
+                              - storageClass
+                            type: object
+                          registry:
+                            description: Registry configuration (when type is registry)
+                            properties:
+                              compression:
+                                default: zstd
+                                description:
+                                  Compression is the compression algorithm
+                                  (zstd, gzip)
+                                type: string
+                              credentialsSecret:
+                                description:
+                                  CredentialsSecret is the name of the secret
+                                  containing registry credentials
+                                type: string
+                              endpoint:
+                                description: Endpoint is the registry endpoint
+                                type: string
+                              insecure:
+                                description: Insecure allows insecure registry connections
+                                type: boolean
+                              mode:
+                                default: max
+                                description: Mode is the cache mode (min, max)
+                                type: string
+                            required:
+                              - endpoint
+                            type: object
+                          s3:
+                            description: S3 configuration (when type is s3)
+                            properties:
+                              bucket:
+                                description: Bucket is the S3 bucket name
+                                type: string
+                              credentialsSecret:
+                                description:
+                                  CredentialsSecret is the name of the secret
+                                  containing AWS credentials
+                                type: string
+                              endpoint:
+                                description:
+                                  Endpoint is the S3 endpoint (defaults to
+                                  s3.amazonaws.com)
+                                type: string
+                              region:
+                                description: Region is the AWS region
+                                type: string
+                            required:
+                              - bucket
+                              - region
+                            type: object
+                          type:
+                            description:
+                              Type is the cache backend type (registry, s3,
+                              local)
+                            enum:
+                              - registry
+                              - s3
+                              - local
+                            type: string
+                        required:
+                          - type
+                        type: object
+                      type: array
+                    gc:
+                      description: GC is garbage collection configuration
+                      properties:
+                        enabled:
+                          default: true
+                          description: Enabled enables garbage collection
+                          type: boolean
+                        keepDuration:
+                          description: KeepDuration is the duration to keep cache entries
+                          type: string
+                        keepStorage:
+                          description: KeepStorage is the amount of storage to keep
+                          type: string
+                        schedule:
+                          description:
+                            'Schedule is the cron schedule for GC (defaults
+                            to daily at 2 AM: "0 2 * * *")'
+                          type: string
+                      type: object
+                  required:
+                    - gc
+                  type: object
+                gateway:
+                  description: Gateway configuration for the pool gateway
+                  properties:
+                    enabled:
+                      default: true
+                      description: Enabled enables the gateway (defaults to true)
+                      type: boolean
+                    gatewayAPI:
+                      description:
+                        GatewayAPI configuration for external access via
+                        Kubernetes Gateway API
+                      properties:
+                        annotations:
+                          additionalProperties:
+                            type: string
+                          description: |-
+                            Annotations to add to Gateway resources
+                            Only used when GatewayRef is not specified
                           type: object
-                        registry:
-                          description: Registry configuration (when type is registry)
+                        enabled:
+                          description:
+                            Enabled enables Gateway API resources for external
+                            access
+                          type: boolean
+                        gatewayClassName:
+                          description: |-
+                            GatewayClassName is the GatewayClass name to use
+                            If not specified, defaults to "envoy" (Envoy Gateway)
+                            Common values: "envoy" (Envoy Gateway), "contour", "kong", "istio"
+                            Only used when GatewayRef is not specified
+                          type: string
+                        gatewayName:
+                          description: |-
+                            GatewayName is the name of the Gateway resource to create
+                            If not specified, defaults to {pool-name}-gateway
+                            Only used when GatewayRef is not specified
+                          type: string
+                        gatewayRef:
+                          description: |-
+                            GatewayRef references an existing Gateway resource to use
+                            If specified, the controller will not create a Gateway resource
+                            and will use the referenced Gateway for routing. This allows
+                            customers to use their own Gateway configurations.
+
+                            When GatewayRef is specified, GatewayClassName, GatewayName,
+                            and Annotations are ignored since the Gateway already exists.
+
+                            Example:
+                              gatewayRef:
+                                name: "my-gateway"
+                                namespace: "gateway-system"
                           properties:
-                            compression:
-                              default: zstd
-                              description: Compression is the compression algorithm
-                                (zstd, gzip)
+                            name:
+                              description:
+                                Name is the name of the existing Gateway
+                                resource
                               type: string
-                            credentialsSecret:
-                              description: CredentialsSecret is the name of the secret
-                                containing registry credentials
+                            namespace:
+                              description: |-
+                                Namespace is the namespace of the Gateway resource
+                                If not specified, uses the pool's namespace
                               type: string
-                            endpoint:
-                              description: Endpoint is the registry endpoint
-                              type: string
-                            insecure:
-                              description: Insecure allows insecure registry connections
+                          type: object
+                        hostname:
+                          description: |-
+                            Hostname is the hostname for the Gateway
+                            Required when enabled - used for TLS certificate generation
+                          type: string
+                        tls:
+                          description: |-
+                            TLS configuration for Gateway API
+                            TLS is mandatory when Gateway API is enabled
+                            If not specified, TLS secret will be auto-generated from the hostname
+                          properties:
+                            autoGenerate:
+                              default: true
+                              description: |-
+                                AutoGenerate enables automatic TLS secret generation
+                                When true (default), the controller will generate a TLS secret
+                                with a certificate valid for the Gateway API hostname
                               type: boolean
                             mode:
-                              default: max
-                              description: Mode is the cache mode (min, max)
+                              default: passthrough
+                              description: |-
+                                Mode is the TLS mode (terminate, passthrough)
+                                Defaults to "passthrough" - required because pool gateway needs to validate client certificates
+                                With passthrough, TLS is terminated at the pool gateway, which can extract allocation tokens
+                                from client certificates. The pool gateway's certificate (which includes the Gateway API
+                                hostname) will be presented to clients.
+                              enum:
+                                - terminate
+                                - passthrough
                               type: string
-                          required:
-                          - endpoint
+                            secretName:
+                              description: |-
+                                SecretName is the name of the TLS secret for terminate mode
+                                If not specified, will be auto-generated as {pool-name}-gateway-api-tls
+                                The secret will be created in the same namespace as the pool
+                              type: string
+                            secretNamespace:
+                              description: |-
+                                SecretNamespace is the namespace for the TLS secret
+                                If not specified, uses the pool's namespace
+                              type: string
                           type: object
-                        s3:
-                          description: S3 configuration (when type is s3)
-                          properties:
-                            bucket:
-                              description: Bucket is the S3 bucket name
-                              type: string
-                            credentialsSecret:
-                              description: CredentialsSecret is the name of the secret
-                                containing AWS credentials
-                              type: string
-                            endpoint:
-                              description: Endpoint is the S3 endpoint (defaults to
-                                s3.amazonaws.com)
-                              type: string
-                            region:
-                              description: Region is the AWS region
-                              type: string
-                          required:
-                          - bucket
-                          - region
-                          type: object
-                        type:
-                          description: Type is the cache backend type (registry, s3,
-                            local)
-                          enum:
-                          - registry
-                          - s3
-                          - local
-                          type: string
-                      required:
-                      - type
                       type: object
-                    type: array
-                  gc:
-                    description: GC is garbage collection configuration
-                    properties:
-                      enabled:
-                        default: true
-                        description: Enabled enables garbage collection
-                        type: boolean
-                      keepDuration:
-                        description: KeepDuration is the duration to keep cache entries
-                        type: string
-                      keepStorage:
-                        description: KeepStorage is the amount of storage to keep
-                        type: string
-                      schedule:
-                        description: 'Schedule is the cron schedule for GC (defaults
-                          to daily at 2 AM: "0 2 * * *")'
-                        type: string
-                    type: object
-                required:
-                - gc
-                type: object
-              gateway:
-                description: Gateway configuration for the pool gateway
-                properties:
-                  enabled:
-                    default: true
-                    description: Enabled enables the gateway (defaults to true)
-                    type: boolean
-                  gatewayAPI:
-                    description: GatewayAPI configuration for external access via
-                      Kubernetes Gateway API
-                    properties:
-                      annotations:
-                        additionalProperties:
+                    ingress:
+                      description:
+                        Ingress configuration for external access via Kubernetes
+                        Ingress
+                      properties:
+                        annotations:
+                          additionalProperties:
+                            type: string
+                          description: Annotations to add to Ingress resources
+                          type: object
+                        enabled:
+                          description:
+                            Enabled enables Ingress resources for external
+                            access
+                          type: boolean
+                        hostname:
+                          description: |-
+                            Hostname is the hostname for the Ingress
+                            Required when enabled
                           type: string
-                        description: |-
-                          Annotations to add to Gateway resources
-                          Only used when GatewayRef is not specified
-                        type: object
-                      enabled:
-                        description: Enabled enables Gateway API resources for external
-                          access
-                        type: boolean
-                      gatewayClassName:
-                        description: |-
-                          GatewayClassName is the GatewayClass name to use
-                          If not specified, defaults to "envoy" (Envoy Gateway)
-                          Common values: "envoy" (Envoy Gateway), "contour", "kong", "istio"
-                          Only used when GatewayRef is not specified
-                        type: string
-                      gatewayName:
-                        description: |-
-                          GatewayName is the name of the Gateway resource to create
-                          If not specified, defaults to {pool-name}-gateway
-                          Only used when GatewayRef is not specified
-                        type: string
-                      gatewayRef:
-                        description: |-
-                          GatewayRef references an existing Gateway resource to use
-                          If specified, the controller will not create a Gateway resource
-                          and will use the referenced Gateway for routing. This allows
-                          customers to use their own Gateway configurations.
-
-                          When GatewayRef is specified, GatewayClassName, GatewayName,
-                          and Annotations are ignored since the Gateway already exists.
-
-                          Example:
-                            gatewayRef:
-                              name: "my-gateway"
-                              namespace: "gateway-system"
-                        properties:
-                          name:
-                            description: Name is the name of the existing Gateway
-                              resource
-                            type: string
-                          namespace:
-                            description: |-
-                              Namespace is the namespace of the Gateway resource
-                              If not specified, uses the pool's namespace
-                            type: string
-                        type: object
-                      hostname:
-                        description: |-
-                          Hostname is the hostname for the Gateway
-                          Required when enabled - used for TLS certificate generation
-                        type: string
-                      tls:
-                        description: |-
-                          TLS configuration for Gateway API
-                          TLS is mandatory when Gateway API is enabled
-                          If not specified, TLS secret will be auto-generated from the hostname
-                        properties:
-                          autoGenerate:
-                            default: true
-                            description: |-
-                              AutoGenerate enables automatic TLS secret generation
-                              When true (default), the controller will generate a TLS secret
-                              with a certificate valid for the Gateway API hostname
-                            type: boolean
-                          mode:
-                            default: passthrough
-                            description: |-
-                              Mode is the TLS mode (terminate, passthrough)
-                              Defaults to "passthrough" - required because pool gateway needs to validate client certificates
-                              With passthrough, TLS is terminated at the pool gateway, which can extract allocation tokens
-                              from client certificates. The pool gateway's certificate (which includes the Gateway API
-                              hostname) will be presented to clients.
-                            enum:
-                            - terminate
-                            - passthrough
-                            type: string
-                          secretName:
-                            description: |-
-                              SecretName is the name of the TLS secret for terminate mode
-                              If not specified, will be auto-generated as {pool-name}-gateway-api-tls
-                              The secret will be created in the same namespace as the pool
-                            type: string
-                          secretNamespace:
-                            description: |-
-                              SecretNamespace is the namespace for the TLS secret
-                              If not specified, uses the pool's namespace
-                            type: string
-                        type: object
-                    type: object
-                  ingress:
-                    description: Ingress configuration for external access via Kubernetes
-                      Ingress
-                    properties:
-                      annotations:
-                        additionalProperties:
+                        ingressClassName:
+                          description: |-
+                            IngressClassName is the IngressClass name to use
+                            If not specified, uses the cluster's default IngressClass
                           type: string
-                        description: Annotations to add to Ingress resources
-                        type: object
-                      enabled:
-                        description: Enabled enables Ingress resources for external
-                          access
-                        type: boolean
-                      hostname:
-                        description: |-
-                          Hostname is the hostname for the Ingress
-                          Required when enabled
-                        type: string
-                      ingressClassName:
-                        description: |-
-                          IngressClassName is the IngressClass name to use
-                          If not specified, uses the cluster's default IngressClass
-                        type: string
-                      tls:
-                        description: TLS configuration for Ingress
-                        properties:
-                          enabled:
-                            description: Enabled enables TLS
-                            type: boolean
-                          secretName:
-                            description: |-
-                              SecretName is the name of the TLS secret
-                              Required when enabled
-                            type: string
-                        type: object
-                    type: object
-                  maxTokenTTL:
-                    description: |-
-                      MaxTokenTTL is the maximum allowed TTL for allocation tokens
-                      Defaults to 24h
-                    type: string
-                  nodePort:
-                    description: |-
-                      NodePort is the node port for NodePort service type
-                      Only used when serviceType is NodePort
-                    format: int32
-                    maximum: 32767
-                    minimum: 30000
-                    type: integer
-                  port:
-                    description: |-
-                      Port overrides the service port for the gateway
-                      Defaults to 1235
-                    format: int32
-                    type: integer
-                  replicas:
-                    default: 1
-                    description: Replicas is the number of gateway replicas for HA
-                    format: int32
-                    minimum: 1
-                    type: integer
-                  resources:
-                    description: Resources for the gateway pods
-                    properties:
-                      cpu:
-                        description: CPU limit
-                        type: string
-                      memory:
-                        description: Memory limit
-                        type: string
-                    type: object
-                  serviceType:
-                    description: |-
-                      ServiceType overrides the service type for the gateway
-                      Defaults to the pool's networking.serviceType
-                    enum:
-                    - ClusterIP
-                    - LoadBalancer
-                    - NodePort
-                    type: string
-                  tokenTTL:
-                    description: |-
-                      TokenTTL is the default TTL for allocation tokens
-                      Defaults to 1h
-                    type: string
-                type: object
-              gatewayImage:
-                description: |-
-                  GatewayImage is the gateway image to use
-                  Defaults to ghcr.io/smrt-devops/buildkit-controller/gateway:latest
-                type: string
-              networking:
-                description: Networking & Exposure
-                properties:
-                  allowedCIDRs:
-                    description: AllowedCIDRs is a list of allowed CIDR blocks
-                    items:
+                        tls:
+                          description: TLS configuration for Ingress
+                          properties:
+                            enabled:
+                              description: Enabled enables TLS
+                              type: boolean
+                            secretName:
+                              description: |-
+                                SecretName is the name of the TLS secret
+                                Required when enabled
+                              type: string
+                          type: object
+                      type: object
+                    maxTokenTTL:
+                      description: |-
+                        MaxTokenTTL is the maximum allowed TTL for allocation tokens
+                        Defaults to 24h
                       type: string
-                    type: array
-                  annotations:
-                    additionalProperties:
-                      type: string
-                    description: Annotations are annotations to add to the service
-                    type: object
-                  external:
-                    description: External configuration for external access
-                    properties:
-                      annotations:
-                        additionalProperties:
+                    nodePort:
+                      description: |-
+                        NodePort is the node port for NodePort service type
+                        Only used when serviceType is NodePort
+                      format: int32
+                      maximum: 32767
+                      minimum: 30000
+                      type: integer
+                    port:
+                      description: |-
+                        Port overrides the service port for the gateway
+                        Defaults to 1235
+                      format: int32
+                      type: integer
+                    replicas:
+                      default: 1
+                      description: Replicas is the number of gateway replicas for HA
+                      format: int32
+                      minimum: 1
+                      type: integer
+                    resources:
+                      description: Resources for the gateway pods
+                      properties:
+                        cpu:
+                          description: CPU limit
                           type: string
-                        description: Annotations are annotations for external-dns,
-                          load balancer, etc.
-                        type: object
-                      enabled:
-                        description: Enabled enables external access
-                        type: boolean
-                      hostname:
-                        description: Hostname is the external hostname
-                        type: string
-                    type: object
-                  port:
-                    default: 1235
-                    description: Port is the service port (defaults to 1235 for sidecar)
-                    format: int32
-                    type: integer
+                        memory:
+                          description: Memory limit
+                          type: string
+                      type: object
                   serviceType:
                     default: ClusterIP
-                    description: ServiceType is the Kubernetes service type
-                    enum:
-                    - ClusterIP
-                    - LoadBalancer
-                    - NodePort
-                    type: string
-                type: object
-              observability:
-                description: Observability
-                properties:
-                  logging:
-                    description: Logging configuration
-                    properties:
-                      format:
-                        default: json
-                        description: Format is the log format (json, text)
-                        type: string
-                      level:
-                        default: info
-                        description: Level is the log level (debug, info, warn, error)
-                        type: string
-                    type: object
-                  metrics:
-                    description: Metrics configuration
-                    properties:
-                      enabled:
-                        default: true
-                        description: Enabled enables metrics
-                        type: boolean
-                      port:
-                        default: 9090
-                        description: Port is the metrics port
-                        format: int32
-                        type: integer
-                    type: object
-                required:
-                - logging
-                - metrics
-                type: object
-              resources:
-                description: Resource allocation
-                properties:
-                  buildkit:
-                    description: Buildkit resources for the buildkitd container
-                    properties:
-                      claims:
-                        description: |-
-                          Claims lists the names of resources, defined in spec.resourceClaims,
-                          that are used by this container.
-
-                          This field depends on the
-                          DynamicResourceAllocation feature gate.
-
-                          This field is immutable. It can only be set for containers.
-                        items:
-                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
-                          properties:
-                            name:
-                              description: |-
-                                Name must match the name of one entry in pod.spec.resourceClaims of
-                                the Pod where this field is used. It makes that resource available
-                                inside a container.
-                              type: string
-                            request:
-                              description: |-
-                                Request is the name chosen for a request in the referenced claim.
-                                If empty, everything from the claim is made available, otherwise
-                                only the result of this request.
-                              type: string
-                          required:
-                          - name
-                          type: object
-                        type: array
-                        x-kubernetes-list-map-keys:
-                        - name
-                        x-kubernetes-list-type: map
-                      limits:
-                        additionalProperties:
-                          anyOf:
-                          - type: integer
-                          - type: string
-                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                          x-kubernetes-int-or-string: true
-                        description: |-
-                          Limits describes the maximum amount of compute resources allowed.
-                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
-                        type: object
-                      requests:
-                        additionalProperties:
-                          anyOf:
-                          - type: integer
-                          - type: string
-                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                          x-kubernetes-int-or-string: true
-                        description: |-
-                          Requests describes the minimum amount of compute resources required.
-                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
-                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
-                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
-                        type: object
-                    type: object
-                  sidecar:
-                    description: Sidecar resources for the auth-proxy container
-                    properties:
-                      claims:
-                        description: |-
-                          Claims lists the names of resources, defined in spec.resourceClaims,
-                          that are used by this container.
-
-                          This field depends on the
-                          DynamicResourceAllocation feature gate.
-
-                          This field is immutable. It can only be set for containers.
-                        items:
-                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
-                          properties:
-                            name:
-                              description: |-
-                                Name must match the name of one entry in pod.spec.resourceClaims of
-                                the Pod where this field is used. It makes that resource available
-                                inside a container.
-                              type: string
-                            request:
-                              description: |-
-                                Request is the name chosen for a request in the referenced claim.
-                                If empty, everything from the claim is made available, otherwise
-                                only the result of this request.
-                              type: string
-                          required:
-                          - name
-                          type: object
-                        type: array
-                        x-kubernetes-list-map-keys:
-                        - name
-                        x-kubernetes-list-type: map
-                      limits:
-                        additionalProperties:
-                          anyOf:
-                          - type: integer
-                          - type: string
-                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                          x-kubernetes-int-or-string: true
-                        description: |-
-                          Limits describes the maximum amount of compute resources allowed.
-                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
-                        type: object
-                      requests:
-                        additionalProperties:
-                          anyOf:
-                          - type: integer
-                          - type: string
-                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                          x-kubernetes-int-or-string: true
-                        description: |-
-                          Requests describes the minimum amount of compute resources required.
-                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
-                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
-                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
-                        type: object
-                    type: object
-                required:
-                - buildkit
-                - sidecar
-                type: object
-              scaling:
-                description: Scaling behavior
-                properties:
-                  max:
-                    default: 10
-                    description: Max is the maximum number of replicas
-                    format: int32
-                    minimum: 1
-                    type: integer
-                  min:
-                    default: 0
                     description: |-
-                      Min is the minimum number of idle/available workers to maintain in the pool
-                      Similar to GitHub Actions ARC: this is the number of available workers that should always be ready.
-                      When workers are allocated, the desired total becomes min + allocated workers.
-                      Example: if min=4 and 1 worker is allocated, desired=5 (4 idle + 1 allocated).
-                      Set to 0 for scale-to-zero (no idle workers maintained).
-                    format: int32
-                    minimum: 0
-                    type: integer
-                  mode:
-                    default: auto
-                    description: Mode is the scaling mode (auto, manual, dynamic)
+                      ServiceType is the Kubernetes service type for the gateway
+                      Defaults to ClusterIP (suitable for Istio/Envoy sidecars, ingress controllers, etc.)
+                      Can be set to LoadBalancer for direct external access, or NodePort for node-based access
                     enum:
-                    - auto
-                    - manual
-                    - dynamic
+                      - ClusterIP
+                      - LoadBalancer
+                      - NodePort
                     type: string
-                  scaleDownDelay:
-                    description: |-
-                      ScaleDownDelay is the delay before scaling down when idle
-                      Defaults to 15m
-                    type: string
-                  scaleDownSchedule:
-                    description: |-
-                      ScaleDownSchedule is a cron expression that defines when to scale the pool to zero
-                      even if min > 0. This allows pools to scale down during off-hours (e.g., nights/weekends).
-                      When the current time matches the cron schedule, the pool will scale to 0 workers
-                      regardless of the min setting. The cron expression uses standard 5-field format:
-                      "minute hour day-of-month month day-of-week"
-                      Examples:
-                        "0 0 * * *" - Every day at midnight
-                        "0 18 * * 1-5" - Every weekday at 6 PM
-                        "0 0 * * 0,6" - Every Saturday and Sunday at midnight
-                      If not specified, the pool will always respect the min setting.
-                    type: string
-                  targetActiveConnections:
-                    default: 10
-                    description: TargetActiveConnections is the target number of active
-                      connections per pod before scaling up
-                    format: int32
-                    minimum: 1
-                    type: integer
-                  targetCPUUtilization:
-                    default: 70
-                    description: TargetCPUUtilization is the target CPU utilization
-                      percentage for HPA
-                    format: int32
-                    maximum: 100
-                    minimum: 1
-                    type: integer
-                  targetMemoryUtilization:
-                    default: 80
-                    description: TargetMemoryUtilization is the target memory utilization
-                      percentage for HPA
-                    format: int32
-                    maximum: 100
-                    minimum: 1
-                    type: integer
-                type: object
-              tls:
-                description: TLS configuration
-                properties:
-                  auto:
-                    description: Auto configuration (when mode is auto)
-                    properties:
-                      organization:
-                        description: Organization is the organization name for certificates
-                        type: string
-                      rotateBeforeExpiry:
-                        description: |-
-                          RotateBeforeExpiry is when to rotate certificates before expiry
-                          Defaults to 720h (30 days)
-                        type: string
-                      serverCertDuration:
-                        description: |-
-                          ServerCertDuration is the duration for server certificates
-                          Defaults to 8760h (1 year)
-                        type: string
-                    type: object
-                  enabled:
-                    default: true
-                    description: Enabled enables TLS
-                    type: boolean
-                  manual:
-                    description: Manual configuration (when mode is manual)
-                    properties:
-                      caSecret:
-                        description: CASecret is the name of the secret containing
-                          CA certificate
-                        type: string
-                      serverCertSecret:
-                        description: ServerCertSecret is the name of the secret containing
-                          server certificate
-                        type: string
-                    required:
-                    - caSecret
-                    - serverCertSecret
-                    type: object
-                  mode:
-                    default: auto
-                    description: Mode is the TLS mode (auto, manual)
-                    enum:
-                    - auto
-                    - manual
-                    type: string
-                type: object
-            required:
-            - auth
-            - cache
-            - networking
-            - observability
-            - resources
-            - scaling
-            - tls
-            type: object
-          status:
-            description: BuildKitPoolStatus defines the observed state of BuildKitPool.
-            properties:
-              conditions:
-                description: Conditions represent the latest available observations
-                  of the pool's state
-                items:
-                  description: Condition contains details for one aspect of the current
-                    state of this API Resource.
+                    loadBalancerClass:
+                      description: |-
+                        LoadBalancerClass is the load balancer class for LoadBalancer service type
+                        Only used when serviceType is LoadBalancer
+                        Example: "tailscale" for Tailscale load balancer
+                      type: string
+                    tokenTTL:
+                      description: |-
+                        TokenTTL is the default TTL for allocation tokens
+                        Defaults to 1h
+                      type: string
+                  type: object
+                gatewayImage:
+                  description: |-
+                    GatewayImage is the gateway image to use
+                    Defaults to ghcr.io/smrt-devops/buildkit-controller/gateway:latest
+                  type: string
+                networking:
+                  description: Networking & Exposure
                   properties:
-                    lastTransitionTime:
-                      description: |-
-                        lastTransitionTime is the last time the condition transitioned from one status to another.
-                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
-                      format: date-time
+                    allowedCIDRs:
+                      description: AllowedCIDRs is a list of allowed CIDR blocks
+                      items:
+                        type: string
+                      type: array
+                    annotations:
+                      additionalProperties:
+                        type: string
+                      description: Annotations are annotations to add to the service
+                      type: object
+                    external:
+                      description: External configuration for external access
+                      properties:
+                        annotations:
+                          additionalProperties:
+                            type: string
+                          description:
+                            Annotations are annotations for external-dns,
+                            load balancer, etc.
+                          type: object
+                        enabled:
+                          description: Enabled enables external access
+                          type: boolean
+                        hostname:
+                          description: Hostname is the external hostname
+                          type: string
+                      type: object
+                    port:
+                      default: 1235
+                      description: Port is the service port (defaults to 1235 for sidecar)
+                      format: int32
+                      type: integer
+                    serviceType:
+                      default: ClusterIP
+                      description: ServiceType is the Kubernetes service type
+                      enum:
+                        - ClusterIP
+                        - LoadBalancer
+                        - NodePort
                       type: string
-                    message:
+                  type: object
+                observability:
+                  description: Observability
+                  properties:
+                    logging:
+                      description: Logging configuration
+                      properties:
+                        format:
+                          default: json
+                          description: Format is the log format (json, text)
+                          type: string
+                        level:
+                          default: info
+                          description: Level is the log level (debug, info, warn, error)
+                          type: string
+                      type: object
+                    metrics:
+                      description: Metrics configuration
+                      properties:
+                        enabled:
+                          default: true
+                          description: Enabled enables metrics
+                          type: boolean
+                        port:
+                          default: 9090
+                          description: Port is the metrics port
+                          format: int32
+                          type: integer
+                      type: object
+                  required:
+                    - logging
+                    - metrics
+                  type: object
+                resources:
+                  description: Resource allocation
+                  properties:
+                    buildkit:
+                      description: Buildkit resources for the buildkitd container
+                      properties:
+                        claims:
+                          description: |-
+                            Claims lists the names of resources, defined in spec.resourceClaims,
+                            that are used by this container.
+
+                            This field depends on the
+                            DynamicResourceAllocation feature gate.
+
+                            This field is immutable. It can only be set for containers.
+                          items:
+                            description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                            properties:
+                              name:
+                                description: |-
+                                  Name must match the name of one entry in pod.spec.resourceClaims of
+                                  the Pod where this field is used. It makes that resource available
+                                  inside a container.
+                                type: string
+                              request:
+                                description: |-
+                                  Request is the name chosen for a request in the referenced claim.
+                                  If empty, everything from the claim is made available, otherwise
+                                  only the result of this request.
+                                type: string
+                            required:
+                              - name
+                            type: object
+                          type: array
+                          x-kubernetes-list-map-keys:
+                            - name
+                          x-kubernetes-list-type: map
+                        limits:
+                          additionalProperties:
+                            anyOf:
+                              - type: integer
+                              - type: string
+                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                            x-kubernetes-int-or-string: true
+                          description: |-
+                            Limits describes the maximum amount of compute resources allowed.
+                            More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                          type: object
+                        requests:
+                          additionalProperties:
+                            anyOf:
+                              - type: integer
+                              - type: string
+                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                            x-kubernetes-int-or-string: true
+                          description: |-
+                            Requests describes the minimum amount of compute resources required.
+                            If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                            otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                            More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                          type: object
+                      type: object
+                    sidecar:
+                      description: Sidecar resources for the auth-proxy container
+                      properties:
+                        claims:
+                          description: |-
+                            Claims lists the names of resources, defined in spec.resourceClaims,
+                            that are used by this container.
+
+                            This field depends on the
+                            DynamicResourceAllocation feature gate.
+
+                            This field is immutable. It can only be set for containers.
+                          items:
+                            description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                            properties:
+                              name:
+                                description: |-
+                                  Name must match the name of one entry in pod.spec.resourceClaims of
+                                  the Pod where this field is used. It makes that resource available
+                                  inside a container.
+                                type: string
+                              request:
+                                description: |-
+                                  Request is the name chosen for a request in the referenced claim.
+                                  If empty, everything from the claim is made available, otherwise
+                                  only the result of this request.
+                                type: string
+                            required:
+                              - name
+                            type: object
+                          type: array
+                          x-kubernetes-list-map-keys:
+                            - name
+                          x-kubernetes-list-type: map
+                        limits:
+                          additionalProperties:
+                            anyOf:
+                              - type: integer
+                              - type: string
+                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                            x-kubernetes-int-or-string: true
+                          description: |-
+                            Limits describes the maximum amount of compute resources allowed.
+                            More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                          type: object
+                        requests:
+                          additionalProperties:
+                            anyOf:
+                              - type: integer
+                              - type: string
+                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                            x-kubernetes-int-or-string: true
+                          description: |-
+                            Requests describes the minimum amount of compute resources required.
+                            If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                            otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                            More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                          type: object
+                      type: object
+                  required:
+                    - buildkit
+                    - sidecar
+                  type: object
+                scaling:
+                  description: Scaling behavior
+                  properties:
+                    max:
+                      default: 10
+                      description: Max is the maximum number of replicas
+                      format: int32
+                      minimum: 1
+                      type: integer
+                    min:
+                      default: 0
                       description: |-
-                        message is a human readable message indicating details about the transition.
-                        This may be an empty string.
-                      maxLength: 32768
-                      type: string
-                    observedGeneration:
-                      description: |-
-                        observedGeneration represents the .metadata.generation that the condition was set based upon.
-                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
-                        with respect to the current state of the instance.
-                      format: int64
+                        Min is the minimum number of idle/available workers to maintain in the pool
+                        Similar to GitHub Actions ARC: this is the number of available workers that should always be ready.
+                        When workers are allocated, the desired total becomes min + allocated workers.
+                        Example: if min=4 and 1 worker is allocated, desired=5 (4 idle + 1 allocated).
+                        Set to 0 for scale-to-zero (no idle workers maintained).
+                      format: int32
                       minimum: 0
                       type: integer
-                    reason:
-                      description: |-
-                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
-                        Producers of specific condition types may define expected values and meanings for this field,
-                        and whether the values are considered a guaranteed API.
-                        The value should be a CamelCase string.
-                        This field may not be empty.
-                      maxLength: 1024
-                      minLength: 1
-                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
-                      type: string
-                    status:
-                      description: status of the condition, one of True, False, Unknown.
+                    mode:
+                      default: auto
+                      description: Mode is the scaling mode (auto, manual, dynamic)
                       enum:
-                      - "True"
-                      - "False"
-                      - Unknown
+                        - auto
+                        - manual
+                        - dynamic
                       type: string
-                    type:
-                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
-                      maxLength: 316
-                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                    scaleDownDelay:
+                      description: |-
+                        ScaleDownDelay is the delay before scaling down when idle
+                        Defaults to 15m
                       type: string
-                  required:
-                  - lastTransitionTime
-                  - message
-                  - reason
-                  - status
-                  - type
+                    scaleDownSchedule:
+                      description: |-
+                        ScaleDownSchedule is a cron expression that defines when to scale the pool to zero
+                        even if min > 0. This allows pools to scale down during off-hours (e.g., nights/weekends).
+                        When the current time matches the cron schedule, the pool will scale to 0 workers
+                        regardless of the min setting. The cron expression uses standard 5-field format:
+                        "minute hour day-of-month month day-of-week"
+                        Examples:
+                          "0 0 * * *" - Every day at midnight
+                          "0 18 * * 1-5" - Every weekday at 6 PM
+                          "0 0 * * 0,6" - Every Saturday and Sunday at midnight
+                        If not specified, the pool will always respect the min setting.
+                      type: string
+                    targetActiveConnections:
+                      default: 10
+                      description:
+                        TargetActiveConnections is the target number of active
+                        connections per pod before scaling up
+                      format: int32
+                      minimum: 1
+                      type: integer
+                    targetCPUUtilization:
+                      default: 70
+                      description:
+                        TargetCPUUtilization is the target CPU utilization
+                        percentage for HPA
+                      format: int32
+                      maximum: 100
+                      minimum: 1
+                      type: integer
+                    targetMemoryUtilization:
+                      default: 80
+                      description:
+                        TargetMemoryUtilization is the target memory utilization
+                        percentage for HPA
+                      format: int32
+                      maximum: 100
+                      minimum: 1
+                      type: integer
                   type: object
-                type: array
-              connections:
-                description: Connections contains connection statistics
-                properties:
-                  active:
-                    description: Active is the current number of active connections
-                    format: int32
-                    type: integer
-                  lastConnectionTime:
-                    description: LastConnectionTime is when the last connection was
-                      established
-                    format: date-time
-                    type: string
-                  total:
-                    description: Total is the total number of connections since pool
-                      creation
-                    format: int64
-                    type: integer
-                type: object
-              endpoint:
-                description: Endpoint is the gateway endpoint for client connections
-                type: string
-              gateway:
-                description: Gateway status
-                properties:
-                  deploymentName:
-                    description: DeploymentName is the name of the gateway deployment
-                    type: string
-                  ready:
-                    description: Ready indicates if the gateway is ready
-                    type: boolean
-                  readyReplicas:
-                    description: ReadyReplicas is the number of ready gateway replicas
-                    format: int32
-                    type: integer
-                  replicas:
-                    description: Replicas is the number of gateway replicas
-                    format: int32
-                    type: integer
-                  serviceName:
-                    description: ServiceName is the name of the gateway service
-                    type: string
-                type: object
-              lastActivityTime:
-                description: LastActivityTime is the last time there was activity
-                format: date-time
-                type: string
-              lastScaleTime:
-                description: LastScaleTime is the last time workers were scaled
-                format: date-time
-                type: string
-              phase:
-                description: Phase is the current phase (Pending, Running, ScaledToZero,
-                  Failed)
-                enum:
-                - Pending
-                - Running
-                - ScaledToZero
-                - Failed
-                type: string
-              serverCert:
-                description: ServerCert contains server certificate information (for
-                  gateway)
-                properties:
-                  notAfter:
-                    description: NotAfter is when the certificate expires
-                    format: date-time
-                    type: string
-                  notBefore:
-                    description: NotBefore is when the certificate is valid from
-                    format: date-time
-                    type: string
-                  renewalTime:
-                    description: RenewalTime is when the certificate should be renewed
-                    format: date-time
-                    type: string
-                type: object
-              tlsSecretName:
-                description: TLSSecretName is the name of the secret containing gateway
-                  TLS certificates
-                type: string
-              workerTLSSecretName:
-                description: WorkerTLSSecretName is the name of the secret for worker
-                  mTLS
-                type: string
-              workers:
-                description: Workers status
-                properties:
-                  allocated:
-                    description: Allocated is the number of allocated workers
-                    format: int32
-                    type: integer
-                  desired:
-                    description: |-
-                      Desired is the desired total number of workers (min idle + allocated workers)
-                      This ensures we always maintain min idle workers available, similar to GitHub Actions ARC.
-                      Formula: min (idle workers to maintain) + allocated workers
-                      Example: if min=4 and 1 worker is allocated, desired=5 (4 idle + 1 allocated)
-                    format: int32
-                    type: integer
-                  failed:
-                    description: Failed is the number of failed workers
-                    format: int32
-                    type: integer
-                  idle:
-                    description: Idle is the number of idle (unallocated) workers
-                    format: int32
-                    type: integer
-                  needed:
-                    description: |-
-                      Needed is the number of additional workers needed to meet desired count
-                      Calculated as: max(0, desired - (ready + provisioning))
-                      This helps with scheduling decisions and scaling actions.
-                    format: int32
-                    type: integer
-                  provisioning:
-                    description: Provisioning is the number of workers being provisioned
-                    format: int32
-                    type: integer
-                  ready:
-                    description: Ready is the number of ready workers
-                    format: int32
-                    type: integer
-                  total:
-                    description: Total is the total number of workers
-                    format: int32
-                    type: integer
-                type: object
-            type: object
-        required:
-        - metadata
-        - spec
-        type: object
-    served: true
-    storage: true
-    subresources:
-      status: {}
+                tls:
+                  description: TLS configuration
+                  properties:
+                    auto:
+                      description: Auto configuration (when mode is auto)
+                      properties:
+                        organization:
+                          description: Organization is the organization name for certificates
+                          type: string
+                        rotateBeforeExpiry:
+                          description: |-
+                            RotateBeforeExpiry is when to rotate certificates before expiry
+                            Defaults to 720h (30 days)
+                          type: string
+                        serverCertDuration:
+                          description: |-
+                            ServerCertDuration is the duration for server certificates
+                            Defaults to 8760h (1 year)
+                          type: string
+                      type: object
+                    enabled:
+                      default: true
+                      description: Enabled enables TLS
+                      type: boolean
+                    manual:
+                      description: Manual configuration (when mode is manual)
+                      properties:
+                        caSecret:
+                          description:
+                            CASecret is the name of the secret containing
+                            CA certificate
+                          type: string
+                        serverCertSecret:
+                          description:
+                            ServerCertSecret is the name of the secret containing
+                            server certificate
+                          type: string
+                      required:
+                        - caSecret
+                        - serverCertSecret
+                      type: object
+                    mode:
+                      default: auto
+                      description: Mode is the TLS mode (auto, manual)
+                      enum:
+                        - auto
+                        - manual
+                      type: string
+                  type: object
+              required:
+                - auth
+                - cache
+                - networking
+                - observability
+                - resources
+                - scaling
+                - tls
+              type: object
+            status:
+              description: BuildKitPoolStatus defines the observed state of BuildKitPool.
+              properties:
+                conditions:
+                  description:
+                    Conditions represent the latest available observations
+                    of the pool's state
+                  items:
+                    description:
+                      Condition contains details for one aspect of the current
+                      state of this API Resource.
+                    properties:
+                      lastTransitionTime:
+                        description: |-
+                          lastTransitionTime is the last time the condition transitioned from one status to another.
+                          This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                        format: date-time
+                        type: string
+                      message:
+                        description: |-
+                          message is a human readable message indicating details about the transition.
+                          This may be an empty string.
+                        maxLength: 32768
+                        type: string
+                      observedGeneration:
+                        description: |-
+                          observedGeneration represents the .metadata.generation that the condition was set based upon.
+                          For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                          with respect to the current state of the instance.
+                        format: int64
+                        minimum: 0
+                        type: integer
+                      reason:
+                        description: |-
+                          reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                          Producers of specific condition types may define expected values and meanings for this field,
+                          and whether the values are considered a guaranteed API.
+                          The value should be a CamelCase string.
+                          This field may not be empty.
+                        maxLength: 1024
+                        minLength: 1
+                        pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                        type: string
+                      status:
+                        description: status of the condition, one of True, False, Unknown.
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                        type: string
+                      type:
+                        description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                        maxLength: 316
+                        pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                connections:
+                  description: Connections contains connection statistics
+                  properties:
+                    active:
+                      description: Active is the current number of active connections
+                      format: int32
+                      type: integer
+                    lastConnectionTime:
+                      description:
+                        LastConnectionTime is when the last connection was
+                        established
+                      format: date-time
+                      type: string
+                    total:
+                      description:
+                        Total is the total number of connections since pool
+                        creation
+                      format: int64
+                      type: integer
+                  type: object
+                endpoint:
+                  description: Endpoint is the gateway endpoint for client connections
+                  type: string
+                gateway:
+                  description: Gateway status
+                  properties:
+                    deploymentName:
+                      description: DeploymentName is the name of the gateway deployment
+                      type: string
+                    ready:
+                      description: Ready indicates if the gateway is ready
+                      type: boolean
+                    readyReplicas:
+                      description: ReadyReplicas is the number of ready gateway replicas
+                      format: int32
+                      type: integer
+                    replicas:
+                      description: Replicas is the number of gateway replicas
+                      format: int32
+                      type: integer
+                    serviceName:
+                      description: ServiceName is the name of the gateway service
+                      type: string
+                  type: object
+                lastActivityTime:
+                  description: LastActivityTime is the last time there was activity
+                  format: date-time
+                  type: string
+                lastScaleTime:
+                  description: LastScaleTime is the last time workers were scaled
+                  format: date-time
+                  type: string
+                phase:
+                  description:
+                    Phase is the current phase (Pending, Running, ScaledToZero,
+                    Failed)
+                  enum:
+                    - Pending
+                    - Running
+                    - ScaledToZero
+                    - Failed
+                  type: string
+                serverCert:
+                  description:
+                    ServerCert contains server certificate information (for
+                    gateway)
+                  properties:
+                    notAfter:
+                      description: NotAfter is when the certificate expires
+                      format: date-time
+                      type: string
+                    notBefore:
+                      description: NotBefore is when the certificate is valid from
+                      format: date-time
+                      type: string
+                    renewalTime:
+                      description: RenewalTime is when the certificate should be renewed
+                      format: date-time
+                      type: string
+                  type: object
+                tlsSecretName:
+                  description:
+                    TLSSecretName is the name of the secret containing gateway
+                    TLS certificates
+                  type: string
+                workerTLSSecretName:
+                  description:
+                    WorkerTLSSecretName is the name of the secret for worker
+                    mTLS
+                  type: string
+                workers:
+                  description: Workers status
+                  properties:
+                    allocated:
+                      description: Allocated is the number of allocated workers
+                      format: int32
+                      type: integer
+                    desired:
+                      description: |-
+                        Desired is the desired total number of workers (min idle + allocated workers)
+                        This ensures we always maintain min idle workers available, similar to GitHub Actions ARC.
+                        Formula: min (idle workers to maintain) + allocated workers
+                        Example: if min=4 and 1 worker is allocated, desired=5 (4 idle + 1 allocated)
+                      format: int32
+                      type: integer
+                    failed:
+                      description: Failed is the number of failed workers
+                      format: int32
+                      type: integer
+                    idle:
+                      description: Idle is the number of idle (unallocated) workers
+                      format: int32
+                      type: integer
+                    needed:
+                      description: |-
+                        Needed is the number of additional workers needed to meet desired count
+                        Calculated as: max(0, desired - (ready + provisioning))
+                        This helps with scheduling decisions and scaling actions.
+                      format: int32
+                      type: integer
+                    provisioning:
+                      description: Provisioning is the number of workers being provisioned
+                      format: int32
+                      type: integer
+                    ready:
+                      description: Ready is the number of ready workers
+                      format: int32
+                      type: integer
+                    total:
+                      description: Total is the total number of workers
+                      format: int32
+                      type: integer
+                  type: object
+              type: object
+          required:
+            - metadata
+            - spec
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}

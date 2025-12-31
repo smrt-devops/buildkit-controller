@@ -1,0 +1,43 @@
+# Example BuildKitPool with ClusterIP service type (for Istio/Envoy sidecars or ingress controllers)
+# The gateway service will be ClusterIP, allowing Istio/Envoy sidecars or ingress controllers
+# to route traffic to it without exposing it directly.
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata:
+  name: buildkit-pool
+  namespace: buildkit-system
+spec:
+  scaling:
+    min: 0
+    max: 10
+    mode: auto
+  resources:
+    buildkit:
+      limits:
+        cpu: 2
+        memory: 4Gi
+      requests:
+        cpu: 500m
+        memory: 1Gi
+  cache:
+    backends:
+      - type: local
+        local:
+          storageClass: gp3
+          size: 100Gi
+  tls:
+    enabled: true
+    mode: auto
+  auth:
+    methods:
+      - type: mtls
+        mtls:
+          required: true
+  gateway:
+    enabled: true
+    # ClusterIP is the default - suitable for Istio/Envoy sidecars, ingress controllers, etc.
+    # No need to specify serviceType if using ClusterIP
+    # serviceType: ClusterIP
+    port: 1235
+  buildkitImage: moby/buildkit:master-rootless
+  gatewayImage: ghcr.io/smrt-devops/buildkit-controller/gateway:latest

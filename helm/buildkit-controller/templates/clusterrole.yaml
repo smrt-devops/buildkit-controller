@@ -100,7 +100,11 @@ rules:
   - get
   - patch
   - update
-{{- if has "ingress" .Values.ingress.types }}
+{{- if or (has "ingress" .Values.ingress.types) (not .Values.ingress.types) }}
+{{- /* Grant Ingress permissions if:
+     1. ingress is explicitly in ingress.types, OR
+     2. ingress.types is empty (controller defaults to allowing both ingress types)
+     This matches the controller's behavior in main.go where empty ALLOWED_INGRESS_TYPES defaults to both */}}
 - apiGroups:
   - networking.k8s.io
   resources:
@@ -122,7 +126,11 @@ rules:
   - patch
   - update
 {{- end }}
-{{- if has "gatewayapi" .Values.ingress.types }}
+{{- if or (has "gatewayapi" .Values.ingress.types) (not .Values.ingress.types) }}
+{{- /* Grant Gateway API permissions if:
+     1. gatewayapi is explicitly in ingress.types, OR
+     2. ingress.types is empty (controller defaults to allowing both ingress types)
+     This matches the controller's behavior in main.go where empty ALLOWED_INGRESS_TYPES defaults to both */}}
 - apiGroups:
   - gateway.networking.k8s.io
   resources:

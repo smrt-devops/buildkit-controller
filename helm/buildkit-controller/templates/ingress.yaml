@@ -6,6 +6,7 @@ metadata:
   namespace: {{ include "buildkit-controller.namespace" . }}
   labels:
     {{- include "buildkit-controller.labels" . | nindent 4 }}
+    tailscale.com/proxy-class: acceptroutes
   {{- with .Values.controller.api.ingress.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -14,22 +15,15 @@ spec:
   {{- if .Values.controller.api.ingress.ingressClassName }}
   ingressClassName: {{ .Values.controller.api.ingress.ingressClassName }}
   {{- end }}
-  rules:
-    - host: {{ .Values.controller.api.ingress.hostname | required "controller.api.ingress.hostname is required when ingress is enabled" }}
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: {{ include "buildkit-controller.fullname" . }}-api
-                port:
-                  number: {{ .Values.controller.api.port }}
-  {{- if and .Values.controller.api.ingress.tls.enabled .Values.controller.api.ingress.tls.secretName }}
+  defaultBackend:
+    service:
+      name: {{ include "buildkit-controller.fullname" . }}-api
+      port:
+        number: {{ .Values.controller.api.port }}
+  {{- if .Values.controller.api.ingress.tls.enabled }}
   tls:
     - hosts:
-        - {{ .Values.controller.api.ingress.hostname }}
-      secretName: {{ .Values.controller.api.ingress.tls.secretName }}
+      - buildkit-controller-api
   {{- end }}
 {{- end }}
 

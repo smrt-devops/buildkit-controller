@@ -246,7 +246,7 @@ jobs:
           find bkctl -type f -name 'bkctl*' -exec sha256sum {} \; > checksums.txt
           find helm -type f -name '*.tgz' -exec sha256sum {} \; >> checksums.txt
           cat checksums.txt
-      - name: Get release notes from draft (if available)
+      - name: Get draft release (if available)
         id: release-notes
         uses: actions/github-script@v7
         continue-on-error: true
@@ -255,18 +255,20 @@ jobs:
           script: |
             const tag = '${{ github.ref_name }}';
 
-            // Try to find a draft release with this tag
+            // Get all releases (including drafts)
             const { data: releases } = await github.rest.repos.listReleases({
               owner: context.repo.owner,
               repo: context.repo.repo,
               per_page: 100
             });
 
+            // Find draft release with this tag
             const draftRelease = releases.find(r => r.tag_name === tag && r.draft === true);
 
             if (draftRelease && draftRelease.body) {
               core.setOutput('body', draftRelease.body);
               core.setOutput('found', 'true');
+              core.setOutput('release_id', draftRelease.id.toString());
               return;
             }
 
@@ -328,8 +330,30 @@ jobs:
           cat /tmp/release-body.md >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
+      - name: Update draft release to published (if exists)
+        if: steps.release-notes.outputs.found == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const releaseId = parseInt('${{ steps.release-notes.outputs.release_id }}');
+            const isPrerelease = '${{ steps.version.outputs.is_prerelease }}' === 'true';
+
+            // Update the draft release to publish it
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: releaseId,
+              draft: false,
+              prerelease: isPrerelease,
+              make_latest: !isPrerelease
+            });
+
+            console.log(`Updated draft release ${releaseId} to published release`);
+
       - uses: softprops/action-gh-release@v2
         with:
+          release_id: ${{ steps.release-notes.outputs.found == 'true' && steps.release-notes.outputs.release_id || '' }}
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
           files: |

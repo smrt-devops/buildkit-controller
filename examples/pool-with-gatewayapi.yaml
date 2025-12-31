@@ -47,8 +47,6 @@ spec:
       - type: mtls
         mtls:
           required: true
-  networking:
-    serviceType: ClusterIP
   gateway:
     enabled: true
     # Gateway API configuration using an existing Gateway
