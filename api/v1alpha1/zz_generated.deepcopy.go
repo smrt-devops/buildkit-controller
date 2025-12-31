@@ -662,6 +662,11 @@ func (in *GatewayConfig) DeepCopyInto(out *GatewayConfig) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.LoadBalancerClass != nil {
+		in, out := &in.LoadBalancerClass, &out.LoadBalancerClass
+		*out = new(string)
+		**out = **in
+	}
 	if in.GatewayAPI != nil {
 		in, out := &in.GatewayAPI, &out.GatewayAPI
 		*out = new(GatewayAPIConfig)
