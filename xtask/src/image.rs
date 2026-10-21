@@ -1,0 +1,299 @@
+//! `cargo xtask image`: build a Linux container image of `buildkit-controller`
+//! `cargo xtask image` builds a Linux container image of `buildkit-controller`
+//! for the host architecture. It needs no network access beyond the host's
+//! cached crates and local base images.
+//!
+//! The task vendors sources on the host (`cargo vendor`) and compiles them
+//! offline inside the official `rust` image that matches `rust-toolchain.toml`.
+//! A named volume keeps the target directory, so rebuilds are incremental. The
+//! COPY-only `docker/Dockerfile` then packages the binary.
+
+use std::path::Path;
+use std::process::Command;
+
+use anyhow::{Context, Result, bail};
+
+use crate::root;
+
+/// Named Docker volume holding the in-container target directory.
+const TARGET_VOLUME: &str = "buildkit-controller-image-target";
+/// Binary name produced by the server crate.
+const BINARY: &str = "buildkit-controller";
+
+/// Run a command and fail with its status if it does not succeed.
+fn run(cmd: &mut Command) -> Result<()> {
+    let status = cmd.status().with_context(|| format!("running {cmd:?}"))?;
+    if !status.success() {
+        bail!("{cmd:?} failed with {status}");
+    }
+    Ok(())
+}
+
+/// Builder image for the pinned toolchain channel, read from
+/// `docker/builder-image` (`rust:<major>.<minor>-trixie@sha256:<digest>`).
+/// Trixie keeps the build glibc equal to the distroless debian13 runtime. The
+/// recorded tag must match the channel, so a toolchain bump cannot silently
+/// keep building on a stale image.
+fn rust_image(toolchain_toml: &str, pinned: &str) -> Result<String> {
+    let channel = toolchain_toml
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("channel"))
+        .and_then(|l| l.split('"').nth(1))
+        .context("no channel in rust-toolchain.toml")?;
+    let mut parts = channel.split('.');
+    let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+        bail!("unexpected toolchain channel {channel:?}");
+    };
+    let tag = format!("rust:{major}.{minor}-trixie");
+    let pinned = pinned.trim();
+    if pinned
+        .strip_prefix(&tag)
+        .is_some_and(|d| d.starts_with("@sha256:"))
+    {
+        Ok(pinned.to_owned())
+    } else {
+        bail!("docker/builder-image must be {tag}@sha256:<digest>, found {pinned:?}")
+    }
+}
+
+/// Vendor all dependencies unless the vendor directory is newer than `Cargo.lock`.
+fn vendor(root: &Path, work: &Path) -> Result<()> {
+    let vendor = work.join("vendor");
+    let stamp = work.join("vendor.stamp");
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let fresh = match (mtime(&stamp), mtime(&root.join("Cargo.lock"))) {
+        (Some(s), Some(l)) => s >= l && vendor.is_dir(),
+        _ => false,
+    };
+    if fresh {
+        return Ok(());
+    }
+    run(Command::new("cargo")
+        .current_dir(root)
+        .args(["vendor", "--locked", "--versioned-dirs"])
+        .arg(&vendor)
+        .stdout(std::process::Stdio::null()))?;
+    std::fs::write(&stamp, b"").context("writing vendor stamp")
+}
+
+/// The target volume of this checkout. Cargo judges freshness by mtime, so with
+/// a volume shared by several worktrees, another checkout's later build can
+/// make this checkout's edits look up to date and ship a stale binary. One
+/// volume per checkout path avoids that, and also avoids concurrent builds
+/// sharing a volume.
+fn target_volume(root: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    root.hash(&mut h);
+    format!("{TARGET_VOLUME}-{:016x}", h.finish())
+}
+
+/// Label on each per-checkout target volume: the checkout's absolute path.
+const CHECKOUT_LABEL: &str = "buildkit-controller.checkout";
+
+/// Create this checkout's target volume with its label. `docker volume create`
+/// never relabels an existing volume. When nothing uses an unlabelled volume
+/// (one from before the label existed), this recreates it. Otherwise it prints
+/// a hint to remove the volume by hand.
+fn ensure_volume(root: &Path) -> Result<()> {
+    let name = target_volume(root);
+    let label = Command::new("docker")
+        .args(["volume", "inspect", "--format"])
+        .arg(format!("{{{{index .Labels \"{CHECKOUT_LABEL}\"}}}}"))
+        .arg(&name)
+        .output()
+        .context("running docker volume inspect")?;
+    let have = String::from_utf8_lossy(&label.stdout);
+    let have = have.trim();
+    if label.status.success() && (have.is_empty() || have == "<no value>") {
+        let removed = Command::new("docker")
+            .args(["volume", "rm", &name])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !removed {
+            eprintln!("volume {name} is unlabelled and in use; once idle: docker volume rm {name}");
+        }
+    }
+    run(Command::new("docker")
+        .args(["volume", "create", "--label"])
+        .arg(format!("{CHECKOUT_LABEL}={}", root.display()))
+        .arg(&name)
+        .stdout(std::process::Stdio::null()))
+}
+
+/// Pick which of `volumes` to remove. Each entry is the volume name and its
+/// checkout label, which is empty when the volume is unlabelled. This removes
+/// the old shared volume and labelled volumes whose checkout no longer exists.
+/// It keeps unlabelled hashed volumes because their checkout is unknown.
+fn prunable(volumes: &[(String, String)], exists: impl Fn(&Path) -> bool) -> Vec<String> {
+    volumes
+        .iter()
+        .filter(|(name, label)| {
+            name == TARGET_VOLUME
+                || (name.starts_with(&format!("{TARGET_VOLUME}-"))
+                    && !label.is_empty()
+                    && !exists(Path::new(label)))
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Remove orphaned target volumes. Never removes one whose checkout still exists.
+pub(crate) fn prune() -> Result<()> {
+    let out = Command::new("docker")
+        .args(["volume", "ls", "--format"])
+        .arg(format!(
+            "{{{{.Name}}}}\t{{{{.Label \"{CHECKOUT_LABEL}\"}}}}"
+        ))
+        .output()
+        .context("running docker volume ls")?;
+    if !out.status.success() {
+        bail!("docker volume ls failed with {}", out.status);
+    }
+    let volumes: Vec<(String, String)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| {
+            let (n, v) = l.split_once('\t').unwrap_or((l, ""));
+            (n.to_owned(), v.trim().to_owned())
+        })
+        .collect();
+    for name in prunable(&volumes, Path::exists) {
+        match Command::new("docker")
+            .args(["volume", "rm", &name])
+            .output()
+        {
+            Ok(o) if o.status.success() => println!("removed {name}"),
+            _ => eprintln!("could not remove {name} (in use?)"),
+        }
+    }
+    Ok(())
+}
+
+/// Compile the release binary in the rust image and copy it to `out`.
+fn compile(root: &Path, work: &Path, image: &str, out: &Path) -> Result<()> {
+    ensure_volume(root)?;
+    // Same layout that `cargo vendor` prints, with container paths.
+    std::fs::write(
+        work.join("cargo-config.toml"),
+        "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"/work/vendor\"\n",
+    )?;
+    let mount = |src: &Path, dst: &str, mode: &str| format!("{}:{dst}:{mode}", src.display());
+    // rust-toolchain.toml decides the toolchain: rustup installs the pinned
+    // version when the image ships a different one, which needs the network.
+    // Local-only fallback for an offline Docker: set BK_IMAGE_PREINSTALLED=1 to
+    // build with the toolchain the image ships instead (CI never sets it).
+    let pick = if std::env::var_os("BK_IMAGE_PREINSTALLED").is_some() {
+        "export RUSTUP_TOOLCHAIN=\"$(rustup toolchain list | head -n1 | cut -d' ' -f1)\"; "
+    } else {
+        ""
+    };
+    let script = format!(
+        "set -eu; {pick}\
+         cargo build --release --locked --offline -p buildkit-controller --bin {BINARY} \
+           --config /work/cargo-config.toml; \
+         cp /target/release/{BINARY} /out/{BINARY}"
+    );
+    run(Command::new("docker")
+        .args(["run", "--rm", "-w", "/src"])
+        .args([
+            "-e",
+            "CARGO_NET_OFFLINE=true",
+            "-e",
+            "CARGO_TARGET_DIR=/target",
+        ])
+        .args(["-v", &mount(root, "/src", "ro")])
+        .args(["-v", &mount(work, "/work", "ro")])
+        .args(["-v", &mount(out, "/out", "rw")])
+        .args(["-v", &format!("{}:/target", target_volume(root))])
+        .args([image, "sh", "-c", &script]))
+}
+
+/// Build the image, tag it, and optionally load it into a kind cluster.
+pub(crate) fn image(tag: &str, load_kind: Option<&str>) -> Result<()> {
+    let root = root();
+    let work = root.join("target/image");
+    let ctx = work.join("ctx");
+    std::fs::create_dir_all(&ctx)?;
+    let toolchain = std::fs::read_to_string(root.join("rust-toolchain.toml"))
+        .context("reading rust-toolchain.toml")?;
+    let pinned = std::fs::read_to_string(root.join("docker/builder-image"))
+        .context("reading docker/builder-image")?;
+    let rust = rust_image(&toolchain, &pinned)?;
+
+    vendor(&root, &work)?;
+    compile(&root, &work, &rust, &ctx).context(
+        "compiling in the rust image; if rustup could not download the pinned toolchain \
+         and Docker is offline, retry with BK_IMAGE_PREINSTALLED=1 (local builds only)",
+    )?;
+    std::fs::copy(root.join("docker/Dockerfile"), ctx.join("Dockerfile"))
+        .context("copying Dockerfile")?;
+    run(Command::new("docker").args(["build", "-t", tag]).arg(&ctx))?;
+    if let Some(cluster) = load_kind {
+        run(&mut crate::kube::kind_load(tag, cluster))?;
+    }
+    println!("built {tag}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression (soak): one shared volume let another worktree's newer
+    /// build make this checkout's edits look up to date.
+    #[test]
+    fn target_volume_is_per_checkout_and_stable() {
+        let a = target_volume(Path::new("/w/a"));
+        assert_eq!(a, target_volume(Path::new("/w/a")));
+        assert_ne!(a, target_volume(Path::new("/w/b")));
+        assert!(a.starts_with(TARGET_VOLUME));
+    }
+
+    #[test]
+    fn prune_selects_orphans_and_the_legacy_volume_only() {
+        let live = std::env::temp_dir();
+        let gone = live.join("bk-prune-no-such-checkout");
+        let v = |n: &str, l: &Path| (format!("{TARGET_VOLUME}{n}"), l.display().to_string());
+        let vols = vec![
+            (TARGET_VOLUME.to_owned(), String::new()),
+            v("-aaaa", &live),
+            v("-bbbb", &gone),
+            v("-cccc", Path::new("")),
+            ("other-volume".into(), gone.display().to_string()),
+        ];
+        let got = prunable(&vols, Path::exists);
+        assert_eq!(
+            got,
+            vec![TARGET_VOLUME.to_owned(), format!("{TARGET_VOLUME}-bbbb")]
+        );
+    }
+
+    #[test]
+    fn rust_image_follows_channel() {
+        let toml = "[toolchain]\nchannel = \"1.96.0\"\n";
+        let pin = "rust:1.96-trixie@sha256:abc\n";
+        assert_eq!(
+            rust_image(toml, pin).ok().as_deref(),
+            Some("rust:1.96-trixie@sha256:abc")
+        );
+        assert!(rust_image("[toolchain]\n", pin).is_err());
+        assert!(rust_image("channel = \"stable\"\n", pin).is_err());
+        // stale pin after a toolchain bump, bookworm, or an unpinned tag
+        assert!(rust_image("channel = \"1.97.0\"\n", pin).is_err());
+        assert!(rust_image(toml, "rust:1.96-bookworm@sha256:abc").is_err());
+        assert!(rust_image(toml, "rust:1.96-trixie").is_err());
+    }
+
+    /// A toolchain bump without a matching `docker/builder-image` bump fails here.
+    #[test]
+    fn repo_builder_pin_matches_toolchain() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let read = |p: &str| std::fs::read_to_string(root.join(p));
+        let toolchain = read("rust-toolchain.toml").unwrap_or_default();
+        let pinned = read("docker/builder-image").unwrap_or_default();
+        assert!(
+            rust_image(&toolchain, &pinned).is_ok(),
+            "stale docker/builder-image"
+        );
+    }
+}

@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: scaling-max-501, namespace: default}
+spec:
+  scaling: {min: 501, max: 501}

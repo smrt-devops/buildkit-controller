@@ -1,0 +1,12 @@
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+pools:
+  - name: amd64
+    namespace: ci-builders
+    spec:
+      scaling: {min: 2, max: 10}
+      access:
+        rules:
+          - oidc: {issuer: https://token.actions.githubusercontent.com, claims: {repository_owner: smrt-devops}}
+  - name: small
+    namespace: ci-builders
+    spec: {}

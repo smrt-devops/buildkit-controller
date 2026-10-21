@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: platforms-nine, namespace: default}
+spec:
+  platforms: [linux/a1, linux/a2, linux/a3, linux/a4, linux/a5, linux/a6, linux/a7, linux/a8, linux/a9]

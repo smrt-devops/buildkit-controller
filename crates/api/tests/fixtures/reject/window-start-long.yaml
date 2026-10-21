@@ -1,0 +1,6 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: window-start-long, namespace: default}
+spec:
+  scaling:
+    schedule: [{start: "08:00:00", end: "18:00", min: 1}]

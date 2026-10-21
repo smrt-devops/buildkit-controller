@@ -1,0 +1,5 @@
+---
+source: crates/server/src/render/tests.rs
+expression: err.to_string()
+---
+template conflict: spec.template.metadata.labels[app.kubernetes.io/name] (label key is reserved by the controller)

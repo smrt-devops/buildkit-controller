@@ -1,0 +1,59 @@
+# Contributing
+
+Read [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) first. Contributions are licensed under Apache 2.0.
+
+## Reporting bugs and requesting features
+
+Search the [existing issues](https://github.com/smrt-devops/buildkit-controller/issues) first, then use the [bug report](.github/ISSUE_TEMPLATE/bug_report.md) or [feature request](.github/ISSUE_TEMPLATE/feature_request.md) template. A bug report needs the controller and Kubernetes versions, the steps to reproduce, the expected and actual behavior, and relevant logs. Report security problems as described in [SECURITY.md](SECURITY.md), not in public issues.
+
+## Development setup
+
+You need the Rust toolchain pinned in `rust-toolchain.toml` (rustup installs it on first use), Docker, `kubectl`, `kind` and `helm`. The last three are only for the cluster checks.
+
+```sh
+git clone https://github.com/smrt-devops/buildkit-controller.git
+cd buildkit-controller
+cargo build --workspace --locked
+```
+
+The workspace has `crates/api` (CRD and API types, and the HTTP client), `crates/server` (the `buildkit-controller` binary), and `xtask` (the task runner). The GitHub Action in `action/` is JavaScript (bundled to `action/dist`).
+
+## Checks
+
+Run these before opening a pull request. CI runs the same four.
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo deny check
+```
+
+Clippy denies `unwrap`, `expect` and `unsafe` outside tests. Use `thiserror` for errors in library crates, `anyhow` in binaries, and `tracing` with structured fields for logs.
+
+`cargo xtask --help` lists the other tasks.
+
+| Task | What it does |
+|---|---|
+| `cargo xtask crdgen` | Regenerates the CRD YAML in the Helm chart. Never edit that file by hand. `--check` fails when it is stale. |
+| `cargo xtask helm-test` | Lints the chart and compares `helm template` output with golden files. `--update` rewrites them. |
+| `cargo xtask crd-verify`, `render-verify` | Apply the CRD and sample pools to a throwaway kind cluster with server-side dry run. |
+| `cargo xtask alloc-verify`, `api-verify`, `reconcile-verify`, `runtime-verify`, `edge-verify`, `helm-verify` | End-to-end checks on a throwaway kind cluster. They use a private kubeconfig and never touch `~/.kube/config`. |
+| `cargo xtask perf --loopback` | Runs the in-process loopback edge benchmark. It needs no kind cluster and no Docker. Plain `perf` uses the kind rig. |
+| `cargo xtask image` | Builds the controller image for your architecture. `--load-kind <cluster>` also loads it into kind. If Docker has no network, `BK_IMAGE_PREINSTALLED=1` builds with the toolchain the rust image ships instead of the pinned one; use it for local builds only. |
+
+Every task that creates a kind cluster names it `bk-<task>`. Set `BK_KIND_SUFFIX=foo` to get `bk-<task>-foo` instead, so parallel checkouts do not share a cluster. It is the only override; there are no per-task cluster variables.
+
+## Pull requests
+
+1. Branch from `main`.
+2. Add a test that fails without your change.
+3. Update the docs and `examples/` when behavior changes. The CRD doc comments in `crates/api` are the field reference, so regenerate the CRD with `cargo xtask crdgen` when you change them.
+4. Use [Conventional Commits](https://www.conventionalcommits.org/) for messages, for example `fix(server/edge): close connections when a pod disappears`.
+5. Open the pull request, fill in the template and link the issue.
+
+A pull request needs one maintainer approval and passing CI. If you change the CRD types, run `cargo xtask crdgen` and commit the result.
+
+## Releases
+
+Maintainers tag `vX.Y.Z`. The release workflow builds the image for amd64 and arm64, signs it, packages the chart, and publishes GitHub's generated release notes. See [.github/workflows/README.md](.github/workflows/README.md).

@@ -1,0 +1,6 @@
+edge: {endpoint: "tcp://[2001:db8::1]:8444", serverName: bk.example.com}
+replicaCount: 1
+shutdown: {delay: 5s, drainTimeout: 5m30s}
+service: {type: LoadBalancer, loadBalancerClass: example.com/lb, externalTrafficPolicy: Local}
+auth:
+  oidc: [{url: "https://token.actions.githubusercontent.com", audiences: [buildkit-controller]}]

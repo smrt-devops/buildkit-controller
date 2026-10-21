@@ -1,0 +1,6 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: mount-unknown-volume, namespace: default}
+spec:
+  template:
+    spec: {containers: [{name: buildkitd, volumeMounts: [{name: nope, mountPath: /data}]}]}

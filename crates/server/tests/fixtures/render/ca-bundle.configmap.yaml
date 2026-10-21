@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+data:
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    Zml4dHVyZS1ub3QtYS1yZWFsLWNlcnQ=
+    -----END CERTIFICATE-----
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: buildkit-controller
+  name: buildkit-controller-ca-bundle
+  namespace: buildkit-system

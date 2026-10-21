@@ -1,0 +1,5 @@
+---
+source: crates/server/src/render/tests.rs
+expression: err.to_string()
+---
+template conflict: spec.template.spec.containers[0].volumeMounts[0].mountPath (is under a controller-owned path)

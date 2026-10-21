@@ -1,0 +1,48 @@
+# The mock OIDC issuer's server: socat terminating TLS and answering the two
+# The mock OIDC issuer's server. socat terminates TLS and answers the two
+# paths from files in the `mock-oidc` Secret, which the harness creates.
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: mock-oidc-handler, namespace: bk-oidc}
+data:
+  handler.sh: |
+    read -r method path rest
+    while read -r h; do [ "$h" = "$(printf '\r')" ] && break; [ -z "$h" ] && break; done
+    case $path in
+      /.well-known/openid-configuration) f=discovery.json ;;
+      /jwks) f=jwks.json ;;
+      *) printf 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'; exit 0 ;;
+    esac
+    printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n\r\n' "$(wc -c < "/secret/$f")"
+    cat "/secret/$f"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: mock-oidc, namespace: bk-oidc}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: mock-oidc}}
+  template:
+    metadata: {labels: {app: mock-oidc}}
+    spec:
+      containers:
+        - name: socat
+          image: alpine/socat:latest
+          imagePullPolicy: Never
+          args:
+            - "OPENSSL-LISTEN:8443,reuseaddr,fork,verify=0,cert=/secret/tls.crt,key=/secret/tls.key"
+            - "SYSTEM:sh /handler/handler.sh"
+          ports: [{containerPort: 8443}]
+          volumeMounts:
+            - {name: secret, mountPath: /secret}
+            - {name: handler, mountPath: /handler}
+      volumes:
+        - {name: secret, secret: {secretName: mock-oidc}}
+        - {name: handler, configMap: {name: mock-oidc-handler}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: mock-oidc, namespace: bk-oidc}
+spec:
+  selector: {app: mock-oidc}
+  ports: [{port: 443, targetPort: 8443}]

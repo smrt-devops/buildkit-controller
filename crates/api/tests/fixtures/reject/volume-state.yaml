@@ -1,0 +1,6 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: volume-state, namespace: default}
+spec:
+  template:
+    spec: {volumes: [{name: state, emptyDir: {}}]}

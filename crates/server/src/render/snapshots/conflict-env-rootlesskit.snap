@@ -1,0 +1,5 @@
+---
+source: crates/server/src/render/tests.rs
+expression: err.to_string()
+---
+template conflict: spec.template.spec.containers[0].env[0].name (env name prefix is reserved by the controller)

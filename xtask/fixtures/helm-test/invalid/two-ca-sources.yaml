@@ -1,0 +1,3 @@
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+auth:
+  oidc: [{url: "https://x.example.com", audiences: [a], caBundle: "PEM", caBundleFile: /ca.pem}]

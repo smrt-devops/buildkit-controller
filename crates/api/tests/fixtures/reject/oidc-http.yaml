@@ -1,0 +1,6 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: oidc-http, namespace: default}
+spec:
+  access:
+    rules: [{oidc: {issuer: "http://a", claims: {a: b}}}]

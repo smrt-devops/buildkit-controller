@@ -1,0 +1,6 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: label-name-reserved, namespace: default}
+spec:
+  template:
+    metadata: {labels: {app.kubernetes.io/name: x}}

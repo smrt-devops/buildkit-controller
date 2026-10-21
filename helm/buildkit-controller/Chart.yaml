@@ -1,0 +1,11 @@
+apiVersion: v2
+name: buildkit-controller
+description: Kubernetes controller that serves warm, exclusive, mTLS-protected BuildKit workers to CI.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.30.0-0"
+keywords: [buildkit, kubernetes, ci, controller]
+home: https://github.com/smrt-devops/buildkit-controller
+sources:
+  - https://github.com/smrt-devops/buildkit-controller

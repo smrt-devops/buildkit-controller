@@ -1,0 +1,31 @@
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+cacheDefaults:
+  registry: {repository: ghcr.io/org/buildkit-cache}
+pools:
+  # Takes the chart default repository.
+  - name: defaulted
+    namespace: ci-builders
+    spec: {scaling: {max: 4}}
+  # Both layers from the pool item, merged over spec.workers.cache.
+  - name: both
+    namespace: ci-builders
+    cache:
+      registry: {repository: ghcr.io/org/app-cache, importFrom: [app-main]}
+      local: {size: 50Gi, maxVolumes: 2, keysPerVolume: 4}
+    spec:
+      workers:
+        cache: {sizeLimit: 10Gi}
+  # Keeps its own spec.workers.cache.registry repository and gains the item's mode.
+  - name: own-repo
+    namespace: ci-builders
+    cache:
+      registry: {mode: min}
+    spec:
+      workers:
+        cache:
+          registry: {repository: registry.example.com/team/cache}
+  # Opts out of the default.
+  - name: opted-out
+    namespace: ci-builders
+    cache:
+      registry: {enabled: false}

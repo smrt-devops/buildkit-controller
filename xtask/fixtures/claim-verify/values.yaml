@@ -1,0 +1,29 @@
+# Values for `cargo xtask claim-verify`: the chart on kind with claims on and
+# one pool that admits claims from namespace claim-ok only. The edge endpoint
+# is the in-cluster Service, so a pod can use the claim Secret as written.
+image: {repository: buildkit-controller, tag: dev, pullPolicy: Never}
+fullnameOverride: bkc
+replicaCount: 1
+service: {type: ClusterIP}
+shutdown: {delay: 0s, drainTimeout: 30s}
+logFormat: text
+edge:
+  endpoint: tcp://bkc.bk-claim.svc:8444
+  serverName: bkc.bk-claim.svc
+claims:
+  enabled: true
+  namespaces: [claim-ok, claim-denied]
+pools:
+  - name: verify
+    namespace: bk-claim-pool
+    spec:
+      scaling: {min: 1, max: 2}
+      access:
+        rules:
+          - claims: {namespaces: [claim-ok]}
+      template:
+        spec:
+          containers:
+            - name: buildkitd
+              image: moby/buildkit:v0.34.0-rootless
+              imagePullPolicy: Never

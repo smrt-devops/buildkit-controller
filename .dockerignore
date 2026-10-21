@@ -1,0 +1,9 @@
+target/
+.certs/
+.git/
+.gitignore
+.github/
+README.md
+*.md
+.vscode/
+.idea/

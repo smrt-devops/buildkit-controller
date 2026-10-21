@@ -1,0 +1,160 @@
+{{- $fn := include "bkc.fullname" . -}}
+{{- $ns := .Release.Namespace -}}
+{{- $subjects := list (dict "kind" "ServiceAccount" "name" $fn "namespace" $ns) -}}
+{{- $workload := list
+  (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitpools") "verbs" (list "get" "list" "watch"))
+  (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitpools/status") "verbs" (list "patch"))
+  (dict "apiGroups" (list "") "resources" (list "pods") "verbs" (list "get" "list" "watch" "create" "patch" "delete"))
+  (dict "apiGroups" (list "") "resources" (list "secrets") "verbs" (list "create" "patch" "delete"))
+  (dict "apiGroups" (list "") "resources" (list "serviceaccounts") "verbs" (list "create" "patch"))
+  (dict "apiGroups" (list "") "resources" (list "persistentvolumeclaims") "verbs" (list "get" "list" "create" "patch" "delete"))
+  (dict "apiGroups" (list "networking.k8s.io") "resources" (list "networkpolicies") "verbs" (list "create" "patch")) -}}
+{{- /* Always cluster-wide: TokenReview. */ -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fn }}-{{ $ns }}-tokenreview
+  labels: {{- include "bkc.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fn }}-{{ $ns }}-tokenreview
+  labels: {{- include "bkc.labels" . | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: {{ $fn }}-{{ $ns }}-tokenreview}
+subjects: {{- toYaml $subjects | nindent 2 }}
+---
+{{- if .Values.watchNamespace }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fn }}-workload
+  namespace: {{ .Values.watchNamespace }}
+  labels: {{- include "bkc.labels" . | nindent 4 }}
+rules: {{- toYaml $workload | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fn }}-workload
+  namespace: {{ .Values.watchNamespace }}
+  labels: {{- include "bkc.labels" . | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: {{ $fn }}-workload}
+subjects: {{- toYaml $subjects | nindent 2 }}
+{{- else }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fn }}-{{ $ns }}-workload
+  labels: {{- include "bkc.labels" . | nindent 4 }}
+rules: {{- toYaml $workload | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fn }}-{{ $ns }}-workload
+  labels: {{- include "bkc.labels" . | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: {{ $fn }}-{{ $ns }}-workload}
+subjects: {{- toYaml $subjects | nindent 2 }}
+{{- end }}
+---
+{{- /* Controller namespace only: Lease, the CA and serving Secrets, CA Events and the CA bundle ConfigMap. */}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fn }}
+  namespace: {{ $ns }}
+  labels: {{- include "bkc.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [{{ $fn }}-leader]
+    verbs: [get, list, watch, update]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [{{ $fn }}-ca]
+    verbs: [get, list, watch, update]
+  {{- with .Values.edge.tls.secretName }}
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [{{ . | quote }}]
+    verbs: [get, list, watch]
+  {{- end }}
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [{{ $fn }}-ca-bundle]
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fn }}
+  namespace: {{ $ns }}
+  labels: {{- include "bkc.labels" . | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: {{ $fn }}}
+subjects: {{- toYaml $subjects | nindent 2 }}
+{{- if .Values.claims.enabled }}
+{{- if empty .Values.claims.namespaces }}
+{{- fail "claims.namespaces must list the namespaces whose claims the controller serves" }}
+{{- end }}
+---
+{{- /* BuildKitClaim controller: claims in any namespace, Secrets only in claims.namespaces. */}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fn }}-{{ $ns }}-claims
+  labels: {{- include "bkc.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [buildkit.smrt-devops.net]
+    resources: [buildkitclaims]
+    verbs: [get, list, watch]
+  - apiGroups: [buildkit.smrt-devops.net]
+    resources: [buildkitclaims/status]
+    verbs: [get, patch, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fn }}-{{ $ns }}-claims
+  labels: {{- include "bkc.labels" . | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: {{ $fn }}-{{ $ns }}-claims}
+subjects: {{- toYaml $subjects | nindent 2 }}
+{{- range $cns := .Values.claims.namespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fn }}-{{ $ns }}-claims
+  namespace: {{ $cns }}
+  labels: {{- include "bkc.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fn }}-{{ $ns }}-claims
+  namespace: {{ $cns }}
+  labels: {{- include "bkc.labels" $ | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: {{ $fn }}-{{ $ns }}-claims}
+subjects: {{- toYaml $subjects | nindent 2 }}
+{{- end }}
+{{- end }}

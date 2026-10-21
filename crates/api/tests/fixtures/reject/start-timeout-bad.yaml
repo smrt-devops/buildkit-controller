@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: start-timeout-bad, namespace: default}
+spec:
+  workers: {startTimeout: 5x}

@@ -1,0 +1,6 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: runtimeclass-bad, namespace: default}
+spec:
+  template:
+    spec: {runtimeClassName: Bad_Name}

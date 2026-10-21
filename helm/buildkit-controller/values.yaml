@@ -1,0 +1,139 @@
+# buildkit-controller. edge.endpoint and edge.serverName are required.
+
+image:
+  repository: ghcr.io/smrt-devops/buildkit-controller
+  tag: ""            # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 2
+autoscaling:         # HPA on CPU; off by default
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 80
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+resources:
+  requests: {cpu: 100m, memory: 128Mi}
+  limits: {memory: 512Mi}
+
+logLevel: info
+logFormat: json
+
+# "" watches every namespace (ClusterRole); a namespace name scopes the
+# controller and its RBAC to that one namespace.
+watchNamespace: ""
+
+edge:
+  endpoint: ""       # required, tcp://<host>:<port>, returned to clients
+  serverName: ""     # required DNS name, in the serving certificate
+  allocationDomain: ""
+  extraNames: []
+  tls:
+    secretName: ""   # "" = self-issued; else a kubernetes.io/tls Secret in the release namespace
+  handshakeTimeout: 10s
+  maxConnections: 10000      # established connections per replica; taken after the handshake
+  maxHandshakes: 1024        # connections still in the TLS handshake, per replica
+  maxHandshakesPerIp: 32     # in-handshake connections from one client address (IPv4, or IPv6 /64); 0 = no cap
+
+api:
+  maxConnections: 4096       # open API connections per replica
+  maxConnectionsPerIp: 128   # open API connections from one client address; 0 = no cap
+
+auth:
+  # The chart ships no issuers. Example:
+  # - url: https://token.actions.githubusercontent.com
+  #   audiences: [buildkit-controller]
+  #   caBundle: ""               # inline PEM, exclusive with caBundleFile / caBundleConfigMap
+  #   caBundleConfigMap: {name: my-ca, key: ca.crt}   # mounted; sets caBundleFile
+  oidc: []
+  serviceAccount:
+    enabled: true
+    audiences: [buildkit-controller]   # never the API server audience (https://kubernetes.default.svc...)
+    maxConcurrentReviews: 32           # TokenReview calls in flight per replica; more callers get 503
+    maxReviewsPerIp: 4                 # TokenReview calls in flight per client address; 0 = no cap
+    reservedReviews: 8                 # of maxConcurrentReviews, held for service accounts that passed a review recently
+    recentSubjectTtl: 10m              # how long a service account that passed a review counts as recently seen
+
+workerNetwork:
+  deniedCIDRs: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, 127.0.0.0/8, 168.63.129.16/32, "fc00::/7", "fe80::/10", "64:ff9b::/96", "64:ff9b:1::/48"]
+  extraDeniedCIDRs: []
+  # Pod, service and node ranges of this cluster, both families. IPv6 egress stays
+  # closed until an IPv6 range is listed here.
+  clusterCIDRs: []
+  dns:
+    namespace: kube-system
+    podLabels: {k8s-app: kube-dns}
+    cidrs: []
+
+shutdown:
+  delay: 5s
+  drainTimeout: 300s
+
+service:
+  type: LoadBalancer  # ClusterIP | NodePort | LoadBalancer
+  annotations: {}
+  loadBalancerClass: ""
+  externalTrafficPolicy: Local   # keeps client source IPs, which the per-address caps count; "" = Cluster (SNAT)
+  ports:
+    api: 8443
+    edge: 8444
+  nodePorts: {api: null, edge: null}
+
+metrics:
+  port: 8080          # ops port: /healthz /readyz /metrics (own ClusterIP Service)
+  serviceMonitor:
+    enabled: false    # true, or "auto" (only when the CRD exists)
+    interval: 30s
+    labels: {}
+
+serviceAccount:
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+# BuildKitClaim support, see docs/architecture.md (BuildKitClaim). Installs the claim CRD, runs the
+# claim controller on the leader and lets it read claims in every namespace. Secret
+# get/create/delete is granted by a Role in each of `namespaces` only, and the controller
+# refuses claims from any other namespace. `namespaces` is required when enabled. Pools
+# still admit claims with an access rule `claims: {namespaces: [...]}`.
+claims:
+  enabled: false
+  namespaces: []
+
+# One BuildKitPool per item: {name, namespace, spec}; the chart copies spec unchanged.
+# namespace defaults to watchNamespace and must not be the release namespace, which
+# holds the CA Secret. The chart does not create namespaces; label each one
+# pod-security.kubernetes.io/enforce=privileged.
+#
+# An item may also set `cache: {registry: {...}, local: {...}}`, which the chart merges
+# over spec.workers.cache (see docs/architecture.md, Build cache). Every caller a pool admits can
+# write cache that later callers of that pool read, so enable cache only on pools whose
+# rules admit one trust domain.
+#
+#   pools:
+#     - name: amd64
+#       namespace: ci-builders
+#       cache:
+#         registry: {repository: ghcr.io/org/buildkit-cache, importFrom: [app-main]}
+#         local: {size: 50Gi, maxVolumes: 4}
+#       spec: {scaling: {min: 2, max: 10}, access: {rules: [...]}}
+pools: []
+
+# Chart-wide cache defaults. registry.repository goes into every pool that sets no
+# registry repository of its own, which turns the registry cache on for it. A pool
+# opts out with `cache: {registry: {enabled: false}}`.
+cacheDefaults:
+  registry:
+    repository: ""

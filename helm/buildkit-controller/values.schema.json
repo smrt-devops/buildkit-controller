@@ -1,0 +1,176 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["edge"],
+  "properties": {
+    "replicaCount": {"type": "integer", "minimum": 1},
+    "watchNamespace": {"type": "string"},
+    "logLevel": {"type": "string"},
+    "logFormat": {"enum": ["json", "text"]},
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string"},
+        "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "edge": {
+      "type": "object",
+      "required": ["endpoint", "serverName"],
+      "properties": {
+        "endpoint": {"type": "string", "pattern": "^tcp://(\\[[0-9A-Fa-f:.]+\\]|[^/:\\[\\]]+):[0-9]+$"},
+        "serverName": {"type": "string", "pattern": "^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$"},
+        "allocationDomain": {"type": "string"},
+        "extraNames": {"type": "array", "items": {"type": "string"}},
+        "tls": {"type": "object", "properties": {"secretName": {"type": "string"}}},
+        "handshakeTimeout": {"type": "string", "pattern": "^([0-9]+h)?([0-9]+m)?([0-9]+s)?$", "minLength": 2},
+        "maxConnections": {"type": "integer", "minimum": 1},
+        "maxHandshakes": {"type": "integer", "minimum": 1},
+        "maxHandshakesPerIp": {"type": "integer", "minimum": 0}
+      }
+    },
+    "api": {
+      "type": "object",
+      "properties": {
+        "maxConnections": {"type": "integer", "minimum": 1},
+        "maxConnectionsPerIp": {"type": "integer", "minimum": 0}
+      }
+    },
+    "auth": {
+      "type": "object",
+      "properties": {
+        "oidc": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["url", "audiences"],
+            "additionalProperties": false,
+            "not": {"anyOf": [
+              {"required": ["caBundle", "caBundleFile"], "properties": {"caBundle": {"minLength": 1}, "caBundleFile": {"minLength": 1}}},
+              {"required": ["caBundle", "caBundleConfigMap"], "properties": {"caBundle": {"minLength": 1}}},
+              {"required": ["caBundleFile", "caBundleConfigMap"], "properties": {"caBundleFile": {"minLength": 1}}}
+            ]},
+            "properties": {
+              "url": {"type": "string", "pattern": "^https://"},
+              "audiences": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+              "jwksUrl": {"type": "string"},
+              "caBundle": {"type": "string"},
+              "caBundleFile": {"type": "string"},
+              "caBundleConfigMap": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {"name": {"type": "string", "minLength": 1}, "key": {"type": "string"}}
+              }
+            }
+          }
+        },
+        "serviceAccount": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "audiences": {"type": "array", "items": {"type": "string", "not": {"pattern": "^https://kubernetes\\.default\\.svc"}}},
+            "maxConcurrentReviews": {"type": "integer", "minimum": 1},
+            "maxReviewsPerIp": {"type": "integer", "minimum": 0},
+            "reservedReviews": {"type": "integer", "minimum": 0},
+            "recentSubjectTtl": {"type": "string", "pattern": "^([0-9]+h)?([0-9]+m)?([0-9]+s)?$", "minLength": 2}
+          }
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "properties": {
+        "type": {"enum": ["ClusterIP", "NodePort", "LoadBalancer"]},
+        "externalTrafficPolicy": {"enum": ["", "Cluster", "Local"]},
+        "ports": {
+          "type": "object",
+          "properties": {
+            "api": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "edge": {"type": "integer", "minimum": 1, "maximum": 65535}
+          }
+        }
+      }
+    },
+    "claims": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "namespaces": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", "maxLength": 63}}
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "serviceMonitor": {"type": "object", "properties": {"enabled": {"enum": [true, false, "auto"]}}}
+      }
+    },
+    "shutdown": {
+      "type": "object",
+      "properties": {
+        "delay": {"type": "string", "minLength": 1, "pattern": "^([0-9]+h)?([0-9]+m)?([0-9]+s)?$"},
+        "drainTimeout": {"type": "string", "minLength": 1, "pattern": "^([0-9]+h)?([0-9]+m)?([0-9]+s)?$"}
+      }
+    },
+    "pools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "namespace": {"type": "string"},
+          "spec": {"type": "object"},
+          "cache": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "registry": {"$ref": "#/definitions/registryCache"},
+              "local": {"$ref": "#/definitions/localCache"}
+            }
+          }
+        }
+      }
+    },
+    "cacheDefaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "registry": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {"repository": {"type": "string", "maxLength": 255}}
+        }
+      }
+    }
+  },
+  "definitions": {
+    "quantity": {"type": ["string", "integer"]},
+    "registryCache": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": {"type": "string", "maxLength": 255},
+        "enabled": {"type": "boolean"},
+        "mode": {"enum": ["max", "min"]},
+        "ref": {"type": "string", "minLength": 1, "maxLength": 255},
+        "defaultKey": {"type": "string", "pattern": "^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$", "maxLength": 63},
+        "importFrom": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "localCache": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "size": {"$ref": "#/definitions/quantity"},
+        "storageClass": {"type": "string", "maxLength": 253},
+        "maxVolumes": {"type": "integer", "minimum": 1, "maximum": 500},
+        "affinity": {"enum": ["soft", "off"]},
+        "keysPerVolume": {"type": "integer", "minimum": 1, "maximum": 32},
+        "gcKeepStorage": {"$ref": "#/definitions/quantity"}
+      }
+    }
+  }
+}

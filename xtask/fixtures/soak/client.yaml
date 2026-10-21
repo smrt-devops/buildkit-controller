@@ -1,0 +1,84 @@
+# Soak client (`cargo xtask soak`): curl drives the API, buildctl (copied
+# Soak client (`cargo xtask soak`). curl drives the API. buildctl, copied from
+# the buildkit image by the init container, builds through the edge.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: soak-client, namespace: bk-soak}
+---
+# Reads the CA bundle ConfigMap, as a client that refreshes its trust does.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: soak-client-bundle, namespace: buildkit-system}
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [buildkit-controller-ca-bundle]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: soak-client-bundle, namespace: buildkit-system}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: soak-client-bundle}
+subjects: [{kind: ServiceAccount, name: soak-client, namespace: bk-soak}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: client, namespace: bk-soak, labels: {app: soak-client}}
+spec:
+  serviceAccountName: soak-client
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile: {type: RuntimeDefault}
+  initContainers:
+    - name: tools
+      image: WORKER_IMAGE
+      imagePullPolicy: Never
+      command: [sh, -c]
+      args:
+        - |
+          set -e
+          cp /usr/bin/buildctl /tools/
+          mkdir -p /work/small/bin /work/small/lib
+          cp /bin/busybox /work/small/bin/
+          cp -L /lib/ld-musl-*.so.1 /lib/libc.musl-*.so.1 /work/small/lib/
+          printf 'FROM scratch\nCOPY lib/ /lib/\nCOPY bin/ /bin/\n' > /work/small/Dockerfile
+          echo 'RUN ["/bin/busybox", "sh", "-c", "/bin/busybox echo built-through-edge > /ok; /bin/busybox cat /ok"]' >> /work/small/Dockerfile
+      securityContext: &sc
+        allowPrivilegeEscalation: false
+        capabilities: {drop: [ALL]}
+      volumeMounts: [{name: tools, mountPath: /tools}, {name: work, mountPath: /work}]
+  containers:
+    - name: client
+      image: CURL_IMAGE
+      imagePullPolicy: Never
+      command: [sh, /script/client.sh]
+      securityContext: *sc
+      resources:
+        requests: {cpu: 100m, memory: 256Mi, ephemeral-storage: 1Gi}
+        limits: {memory: 1Gi, ephemeral-storage: 4Gi}
+      volumeMounts:
+        - {name: tools, mountPath: /tools}
+        - {name: work, mountPath: /work}
+        - {name: script, mountPath: /script}
+        - {name: user-ca, mountPath: /user-ca}
+        - {name: bk-token, mountPath: /var/run/secrets/bk}
+  volumes:
+    - {name: tools, emptyDir: {}}
+    - {name: work, emptyDir: {}}
+    - {name: script, configMap: {name: soak-client}}
+    - {name: user-ca, secret: {secretName: soak-user-ca}}
+    - name: bk-token
+      projected:
+        sources:
+          - serviceAccountToken: {audience: buildkit-controller, path: token, expirationSeconds: 3600}
+---
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: soak, namespace: bk-soak}
+spec:
+  scaling: {min: 3, max: 6}
+  allocation: {defaultTTL: 1m, maxTTL: 1m, queueTimeout: 3m}
+  access:
+    rules:
+      - serviceAccount: {name: soak-client}

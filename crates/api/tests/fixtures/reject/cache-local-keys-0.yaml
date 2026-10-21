@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: cache-local-keys-0, namespace: default}
+spec:
+  workers: {cache: {local: {keysPerVolume: 0}}}

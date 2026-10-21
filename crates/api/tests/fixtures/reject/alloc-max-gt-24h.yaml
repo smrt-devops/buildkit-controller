@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: alloc-max-gt-24h, namespace: default}
+spec:
+  allocation: {maxTTL: 25h}

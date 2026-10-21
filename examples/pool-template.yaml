@@ -1,0 +1,50 @@
+# A pool that runs on a dedicated node group with larger resources.
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata:
+  name: amd64-large
+  namespace: ci
+spec:
+  platforms: [linux/amd64]
+  scaling:
+    min: 1
+    max: 20
+    idleTimeout: 15m
+    timeZone: Europe/Dublin
+    schedule:
+      - days: [Mon, Tue, Wed, Thu, Fri]
+        start: "08:00"
+        end: "18:00"
+        min: 4
+  template:
+    metadata:
+      labels:
+        team: platform
+    spec:
+      nodeSelector:
+        pool: builders
+      tolerations:
+        - key: dedicated
+          value: builds
+          effect: NoSchedule
+      containers:
+        - name: buildkitd
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+              ephemeral-storage: 20Gi
+            limits:
+              memory: 16Gi
+              ephemeral-storage: 100Gi
+  workers:
+    startTimeout: 5m
+  allocation:
+    defaultTTL: 30m
+    maxTTL: 4h
+    queueTimeout: 5m
+  access:
+    rules:
+      - serviceAccount:
+          namespace: ci
+          name: builder

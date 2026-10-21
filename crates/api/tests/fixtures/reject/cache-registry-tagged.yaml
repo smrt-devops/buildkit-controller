@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: cache-registry-tagged, namespace: default}
+spec:
+  workers: {cache: {registry: {repository: "ghcr.io/org/cache:x"}}}

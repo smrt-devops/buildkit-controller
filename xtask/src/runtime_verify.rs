@@ -1,0 +1,354 @@
+//! `cargo xtask runtime-verify`: two controller replicas against a throwaway
+//! `cargo xtask runtime-verify` runs two controller replicas against a
+//! throwaway kind cluster. It shows exactly one leader, failover within the
+//! spec bound after SIGKILL of the leader, `/readyz` turning true only after
+//! `InitDone` (the CRD is applied late on purpose), and Lease release on
+//! SIGTERM.
+//!
+//! The cluster uses a private kubeconfig under `target/runtime-verify`. The
+//! task never reads or writes the user's `~/.kube/config`, and it deletes the
+//! cluster on every exit path.
+
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail, ensure};
+
+static CLUSTER: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| super::kind_cluster("bk-runtime-verify"));
+const NAMESPACE: &str = "bk-runtime";
+/// leaseDuration (15 s) plus slack for polling and the contender's timer.
+const FAILOVER_BOUND: Duration = Duration::from_secs(20);
+
+struct Env {
+    kubeconfig: PathBuf,
+}
+
+impl Env {
+    fn kind(&self, args: &[&str]) -> Result<std::process::Output> {
+        crate::kube::kind(&self.kubeconfig)
+            .args(args)
+            .arg("--kubeconfig")
+            .arg(&self.kubeconfig)
+            .output()
+            .context("running kind")
+    }
+
+    fn kubectl(&self, args: &[&str]) -> Result<String> {
+        let out = crate::kube::kubectl(&self.kubeconfig)
+            .args(args)
+            .output()
+            .context("running kubectl")?;
+        ensure!(
+            out.status.success(),
+            "kubectl {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn lease_holder(&self) -> Result<String> {
+        self.kubectl(&[
+            "-n",
+            NAMESPACE,
+            "get",
+            "lease",
+            "buildkit-controller-leader",
+            "-o",
+            "jsonpath={.spec.holderIdentity}",
+        ])
+    }
+}
+
+/// Deletes the cluster and kills replicas when dropped.
+struct Cleanup {
+    env: Env,
+    children: Vec<Child>,
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for c in &mut self.children {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        let _ = self
+            .env
+            .kind(&["delete", "cluster", "--name", CLUSTER.as_str()]);
+    }
+}
+
+/// One replica and its listener ports. Both replicas run on the host, so no
+/// port may be shared: the second replica would fail to bind and exit.
+struct Replica {
+    name: &'static str,
+    ops: u16,
+    api: u16,
+    edge: u16,
+}
+
+/// The two replicas. Both run on the host.
+const REPLICAS: [Replica; 2] = [
+    Replica {
+        name: "r1",
+        ops: 18081,
+        api: 18441,
+        edge: 18451,
+    },
+    Replica {
+        name: "r2",
+        ops: 18082,
+        api: 18442,
+        edge: 18452,
+    },
+];
+
+fn http(port: u16, path: &str) -> Option<(u16, String)> {
+    let out = Command::new("curl")
+        .args(["-s", "-m", "2", "-w", "\n%{http_code}"])
+        .arg(format!("http://127.0.0.1:{port}{path}"))
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let (body, code) = text.rsplit_once('\n')?;
+    Some((code.trim().parse().ok()?, body.to_owned()))
+}
+
+fn is_leader(port: u16) -> Option<bool> {
+    let (_, body) = http(port, "/metrics")?;
+    body.lines()
+        .find_map(|l| l.strip_prefix("buildkit_leader "))
+        .map(|v| v.trim() == "1")
+}
+
+fn wait_for(what: &str, limit: Duration, mut f: impl FnMut() -> bool) -> Result<Duration> {
+    let start = Instant::now();
+    while start.elapsed() < limit {
+        if f() {
+            return Ok(start.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    bail!("timed out after {limit:?} waiting for {what}")
+}
+
+fn write_config(dir: &Path, r: &Replica) -> Result<PathBuf> {
+    let path = dir.join(format!("{}.yaml", r.name));
+    std::fs::write(
+        &path,
+        format!(
+            "listen:\n  ops: 127.0.0.1:{}\n  api: 127.0.0.1:{}\n  edge: 127.0.0.1:{}\nedge:\n  endpoint: tcp://bk.example.com:8444\n  serverName: bk.example.com\nshutdown:\n  delay: 0s\n  drainTimeout: 10s\n",
+            r.ops, r.api, r.edge
+        ),
+    )?;
+    Ok(path)
+}
+
+#[allow(clippy::too_many_lines, reason = "one linear scenario script")]
+pub fn runtime_verify() -> Result<()> {
+    let root = crate::root();
+    let work = root.join("target/runtime-verify");
+    std::fs::create_dir_all(&work)?;
+    let env = Env {
+        kubeconfig: work.join("kubeconfig"),
+    };
+
+    let built = Command::new("cargo")
+        .args(["build", "--locked", "-p", "buildkit-controller"])
+        .current_dir(&root)
+        .status()?;
+    ensure!(built.success(), "cargo build failed");
+    let bin = root.join("target/debug/buildkit-controller");
+
+    let _ = env.kind(&["delete", "cluster", "--name", CLUSTER.as_str()]);
+    let mut cleanup = Cleanup {
+        env,
+        children: Vec::new(),
+    };
+    let created = cleanup.env.kind(&[
+        "create",
+        "cluster",
+        "--name",
+        CLUSTER.as_str(),
+        "--wait",
+        "120s",
+    ])?;
+    ensure!(
+        created.status.success(),
+        "kind create: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    cleanup.env.kubectl(&["create", "namespace", NAMESPACE])?;
+
+    let replicas = &REPLICAS;
+    for r in replicas {
+        let cfg = write_config(&work, r)?;
+        let log = std::fs::File::create(work.join(format!("{}.log", r.name)))?;
+        let child = Command::new(&bin)
+            .args(["--config"])
+            .arg(&cfg)
+            .env("KUBECONFIG", &cleanup.env.kubeconfig)
+            .env("POD_NAME", r.name)
+            .env("POD_NAMESPACE", NAMESPACE)
+            .env("LOG_LEVEL", "info")
+            .stderr(Stdio::from(log))
+            .spawn()
+            .context("starting replica")?;
+        cleanup.children.push(child);
+    }
+
+    // 1. No CRD yet. The Pool store cannot reach InitDone, so /readyz is 503 and names it.
+    wait_for("both ops ports up", Duration::from_secs(30), || {
+        replicas
+            .iter()
+            .all(|r| http(r.ops, "/healthz").is_some_and(|(c, _)| c == 200))
+    })?;
+    std::thread::sleep(Duration::from_secs(3));
+    for r in replicas {
+        let (code, body) = http(r.ops, "/readyz").context("readyz")?;
+        ensure!(
+            code == 503 && body.contains("pool_store"),
+            "{}: expected 503 naming pool_store before InitDone, got {code} {body:?}",
+            r.name
+        );
+        println!(
+            "PASS {} /readyz before InitDone -> {code} {}",
+            r.name,
+            body.trim()
+        );
+    }
+
+    // 2. Apply the CRD. The stores sync (watch backoff <= 30 s) and /readyz turns 200.
+    let crd = root.join("helm/buildkit-controller/crds/buildkitpools.yaml");
+    cleanup
+        .env
+        .kubectl(&["apply", "--server-side", "-f", &crd.to_string_lossy()])?;
+    cleanup.env.kubectl(&[
+        "wait",
+        "--for=condition=established",
+        "--timeout=60s",
+        "crd/buildkitpools.buildkit.smrt-devops.net",
+    ])?;
+    let t = wait_for("/readyz 200 on both", Duration::from_secs(90), || {
+        replicas
+            .iter()
+            .all(|r| http(r.ops, "/readyz").is_some_and(|(c, _)| c == 200))
+    })?;
+    println!("PASS /readyz 200 on both replicas {t:.1?} after the CRD appeared (InitDone)");
+
+    // 3. Exactly one leader, and it is the Lease holder.
+    wait_for("a leader", Duration::from_secs(30), || {
+        replicas.iter().any(|r| is_leader(r.ops) == Some(true))
+    })?;
+    std::thread::sleep(Duration::from_secs(5));
+    let leaders: Vec<&Replica> = replicas
+        .iter()
+        .filter(|r| is_leader(r.ops) == Some(true))
+        .collect();
+    ensure!(
+        leaders.len() == 1,
+        "expected exactly one leader, got {}",
+        leaders.len()
+    );
+    let holder = cleanup.env.lease_holder()?;
+    ensure!(
+        holder == leaders[0].name,
+        "lease holder {holder} != leader {}",
+        leaders[0].name
+    );
+    println!("PASS exactly one leader: {holder} (Lease holderIdentity agrees)");
+
+    // 4. Failover. SIGKILL the leader.
+    let li = replicas
+        .iter()
+        .position(|r| r.name == holder)
+        .context("leader index")?;
+    let survivor = &replicas[1 - li];
+    cleanup.children[li].kill()?;
+    let killed = Instant::now();
+    let took = wait_for("failover", FAILOVER_BOUND, || {
+        is_leader(survivor.ops) == Some(true)
+    })?;
+    ensure!(killed.elapsed() <= FAILOVER_BOUND);
+    let new_holder = cleanup.env.lease_holder()?;
+    ensure!(
+        new_holder == survivor.name,
+        "lease holder after failover: {new_holder}"
+    );
+    println!(
+        "PASS failover {took:.1?} after SIGKILL of {holder} (bound {FAILOVER_BOUND:?}; spec leaseDuration 15s)"
+    );
+
+    // 5. SIGTERM the survivor. It releases the Lease and exits 0.
+    let pid = cleanup.children[1 - li].id().to_string();
+    ensure!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()?
+            .success()
+    );
+    let status = {
+        let start = Instant::now();
+        loop {
+            if let Some(s) = cleanup.children[1 - li].try_wait()? {
+                break s;
+            }
+            ensure!(
+                start.elapsed() < Duration::from_secs(30),
+                "survivor did not exit after SIGTERM"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    ensure!(status.success(), "survivor exit: {status}");
+    let released = cleanup.env.lease_holder()?;
+    ensure!(
+        released.is_empty(),
+        "Lease still held by {released:?} after SIGTERM"
+    );
+    println!("PASS SIGTERM: exit 0 and Lease holderIdentity cleared");
+    println!("runtime-verify: all checks passed");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `listen:` address in a replica config.
+    fn listen_addrs(yaml: &str) -> Vec<String> {
+        yaml.lines()
+            .skip_while(|l| *l != "listen:")
+            .skip(1)
+            .take_while(|l| l.starts_with("  "))
+            .filter_map(|l| l.split_once(": ").map(|(_, v)| v.to_owned()))
+            .collect()
+    }
+
+    /// Both replicas run on the host, so they must not share a listener:
+    /// the second one would fail to bind and exit.
+    #[test]
+    fn replicas_bind_distinct_listeners() {
+        let dir = std::env::temp_dir().join(format!("rv-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut all = Vec::new();
+        for r in &REPLICAS {
+            let yaml = std::fs::read_to_string(write_config(&dir, r).unwrap()).unwrap();
+            let addrs = listen_addrs(&yaml);
+            for key in ["ops", "api", "edge"] {
+                assert!(
+                    yaml.contains(&format!("\n  {key}: 127.0.0.1:")),
+                    "{} sets no {key} listener",
+                    r.name
+                );
+            }
+            all.extend(addrs);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut uniq = all.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), all.len(), "shared listener in {all:?}");
+    }
+}

@@ -1,0 +1,10 @@
+# The smallest useful pool. It has no access rules, so it denies every caller
+# until you add some (see pool-github-oidc.yaml).
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata:
+  name: minimal
+  namespace: ci
+spec:
+  scaling:
+    max: 5

@@ -1,0 +1,8 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: mount-dotdot-mid, namespace: default}
+spec:
+  template:
+    spec:
+      volumes: [{name: v, emptyDir: {}}]
+      containers: [{name: buildkitd, volumeMounts: [{name: v, mountPath: "/a/../certs"}]}]

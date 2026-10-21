@@ -1,0 +1,5 @@
+---
+source: crates/server/src/render/tests.rs
+expression: err.to_string()
+---
+template conflict: spec.template.metadata.labels[buildkit.smrt-devops.net/state] (label key is reserved by the controller)

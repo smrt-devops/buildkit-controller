@@ -1,0 +1,67 @@
+[workspace]
+resolver = "3"
+members = ["crates/api", "crates/server", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/smrt-devops/buildkit-controller"
+rust-version = "1.96"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+base64 = "0.22.1"
+bytes = "1.12.1"
+http-body = "1.1.0"
+hyper = { version = "1.12.0", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1.21", features = ["http1", "http2", "server-graceful", "service", "tokio"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+insta = "1.49.0"
+jiff = { version = "0.2.38", default-features = false, features = ["std", "tzdb-zoneinfo"] }
+json-patch = "4.2.0"
+jsonwebtoken = { version = "11.1.0", default-features = false }
+k8s-openapi = { version = "0.28.0", default-features = false, features = ["v1_35", "schemars"] }
+kube-core = { version = "4.2.0", features = ["schema"] }
+kube-derive = "4.2.0"
+kube = { version = "4.2.0", default-features = false, features = ["client", "derive", "runtime", "rustls-tls"] }
+pem = "4.0.0"
+prometheus-client = "0.25.1"
+proptest = "1.12.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rcgen = { version = "0.14.10", features = ["x509-parser", "zeroize"] }
+ring = "0.17.14"
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+rustls-webpki = { version = "0.103.15", default-features = false, features = ["std", "ring"] }
+schemars = "1.2.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde-saphyr = "2.0.0"
+thiserror = "2.0.21"
+time = "0.3.55"
+tokio = { version = "1.54.0", features = ["macros", "rt-multi-thread", "signal"] }
+socket2 = { version = "0.6.5", features = ["all"] }
+tokio-rustls = { version = "0.26.6", default-features = false }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+webpki-roots = "1.0.9"
+x509-parser = "0.18.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

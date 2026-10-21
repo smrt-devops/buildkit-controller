@@ -1,0 +1,5 @@
+---
+source: crates/server/src/render/tests.rs
+expression: err.to_string()
+---
+template conflict: spec.template.metadata.annotations[buildkit.smrt-devops.net/alloc] (annotation key prefix buildkit.smrt-devops.net/ is reserved)

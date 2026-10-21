@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: alloc-queue-gt-max, namespace: default}
+spec:
+  allocation: {queueTimeout: 11m}

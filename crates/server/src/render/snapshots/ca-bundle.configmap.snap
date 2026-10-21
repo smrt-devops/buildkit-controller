@@ -1,0 +1,13 @@
+---
+source: crates/server/src/render/tests.rs
+expression: y
+---
+apiVersion: v1
+kind: ConfigMap
+data:
+  ca.crt: PEM
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: buildkit-controller
+  name: buildkit-controller-ca-bundle
+  namespace: buildkit-system

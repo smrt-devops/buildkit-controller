@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: cidr-host-bits, namespace: default}
+spec:
+  network: {egress: {allowCIDRs: ["10.1.2.3/16"]}}

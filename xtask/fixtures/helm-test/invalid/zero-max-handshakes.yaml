@@ -1,0 +1,1 @@
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com, maxHandshakes: 0}

@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: egress-bad-enum, namespace: default}
+spec:
+  network: {egress: {internet: Maybe}}

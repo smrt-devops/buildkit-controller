@@ -1,0 +1,5 @@
+---
+source: crates/server/src/render/tests.rs
+expression: err.to_string()
+---
+template conflict: spec.template.spec.containers[0].resources.limits[memory] (limit is required); spec.template.spec.containers[0].resources.limits[ephemeral-storage] (limit is required)

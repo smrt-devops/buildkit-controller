@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: env-valuefrom-empty, namespace: default}
+spec:
+  template: {spec: {containers: [{name: buildkitd, env: [{name: A, valueFrom: {}}]}]}}

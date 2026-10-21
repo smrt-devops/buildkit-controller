@@ -1,0 +1,18 @@
+# Access rules for GitLab CI, or any OIDC issuer. The Helm values must list the
+# issuer under auth.oidc with the same url, for example
+#   auth.oidc[0].url=https://gitlab.example.com
+#   auth.oidc[0].audiences={buildkit-controller}
+# The CI job requests a token with that audience, and the claims below match its payload.
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata:
+  name: gitlab
+  namespace: ci
+spec:
+  access:
+    rules:
+      - oidc:
+          issuer: https://gitlab.example.com
+          claims:
+            namespace_path: platform
+            ref_protected: "true"

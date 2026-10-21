@@ -1,0 +1,304 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+permissions: {}
+
+env:
+  IMAGE: ghcr.io/smrt-devops/buildkit-controller
+
+jobs:
+  gate:
+    name: Gate (tag on main with green CI)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require a commit on main whose CI passed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # fetch-depth 0 already fetched origin/main with the checkout credentials.
+          if ! git merge-base --is-ancestor "$SHA" refs/remotes/origin/main; then
+            echo "::error::$SHA is not reachable from main; refusing to release"
+            exit 1
+          fi
+          # rust.yml covers fmt, clippy, test, deny and the image build. Require its push run on this exact commit.
+          n="$(gh api "repos/$REPO/actions/workflows/rust.yml/runs?head_sha=$SHA&event=push&status=success" --jq .total_count)"
+          if [ "$n" -lt 1 ]; then
+            echo "::error::no successful push run of rust.yml on $SHA"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: gate
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm # native runner, no QEMU
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # Same binary the local `cargo xtask image` ships: release, locked.
+      # Built on a trixie-compatible glibc (ubuntu 24.04 has a different glibc, so
+      # build inside the pinned rust trixie image to match distroless/cc-debian13).
+      # cargo-auditable embeds the crate list in the binary so syft can put the crates in the SBOM.
+      - name: Compile in the pinned trixie rust image
+        env:
+          AUDITABLE_VERSION: "0.7.5"
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker run --rm -e AUDITABLE_VERSION -v "$PWD:/src" -w /src -v "$PWD/dist:/out" "$(cat docker/builder-image)" \
+            sh -euc 'cargo install cargo-auditable --version "${AUDITABLE_VERSION}" --locked
+              cargo auditable build --release --locked -p buildkit-controller --bin buildkit-controller --target-dir /tmp/target
+              cp /tmp/target/release/buildkit-controller /out/buildkit-controller'
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The runtime stage is docker/Dockerfile itself, so CI builds the same image as a local build.
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: dist
+          file: docker/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          provenance: false
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  index:
+    name: Create index under a pending tag
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: digests
+          pattern: digest-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The pending tag stays after the release. GHCR cannot untag without deleting the version,
+      # and that version is the release digest itself. It is harmless: the digest is scanned before
+      # anything signs it, and it is the same digest the version tag points to.
+      - id: manifest
+        name: Create multi-arch index under a pending tag
+        working-directory: digests
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2046
+          docker buildx imagetools create -t "${IMAGE}:pending-${SHA}" \
+            $(printf "${IMAGE}@sha256:%s " *)
+          digest="$(docker buildx imagetools inspect "${IMAGE}:pending-${SHA}" --format '{{json .Manifest}}' | jq -r .digest)"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+  scan:
+    name: Scan the unsigned digest
+    needs: index
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read # no OIDC token and no write scope next to the scanner
+    env:
+      TRIVY_VERSION: "0.74.0"
+      TRIVY_SHA256: "2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a"
+      SYFT_VERSION: "1.54.0"
+      SYFT_SHA256: "54a87372498168b2d033e876fd41fa4e8035b872699e525a57046e1f2f09c860"
+    steps:
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install checksum-pinned trivy
+        run: |
+          set -euo pipefail
+          curl -sSfL --proto =https -o trivy.tgz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
+          tar -xzf trivy.tgz trivy
+      - name: Fail on fixable critical vulnerabilities
+        env:
+          DIGEST: ${{ needs.index.outputs.digest }}
+        run: ./trivy image --severity CRITICAL --ignore-unfixed --exit-code 1 "${IMAGE}@${DIGEST}"
+      - name: Install checksum-pinned syft
+        run: |
+          set -euo pipefail
+          curl -sSfL --proto =https -o syft.tgz  "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          echo "${SYFT_SHA256}  syft.tgz" | sha256sum -c -
+          tar -xzf syft.tgz syft
+      - name: Generate SBOM (syft, reads the cargo-auditable section)
+        env:
+          DIGEST: ${{ needs.index.outputs.digest }}
+        run: ./syft "${IMAGE}@${DIGEST}" -o spdx-json=sbom.spdx.json
+      - name: Check the SBOM lists Rust crates
+        run: |
+          set -euo pipefail
+          n="$(jq '[.packages[] | select(.externalRefs[]?.referenceLocator | strings | startswith("pkg:cargo/"))] | length' sbom.spdx.json)"
+          echo "cargo packages in SBOM: $n"
+          [ "$n" -gt 50 ]
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    name: Sign, SBOM, provenance
+    needs: [index, scan]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write # cosign pushes signatures and attestations next to the image
+      id-token: write # cosign keyless + attestations
+      attestations: write
+    steps:
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - name: Sign index and per-arch manifests (keyless, GitHub OIDC)
+        env:
+          DIGEST: ${{ needs.index.outputs.digest }}
+        run: cosign sign --yes --recursive "${IMAGE}@${DIGEST}"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sbom
+      - name: Attach SBOM as a signed attestation
+        env:
+          DIGEST: ${{ needs.index.outputs.digest }}
+        run: cosign attest --yes --type spdxjson --predicate sbom.spdx.json "${IMAGE}@${DIGEST}"
+      - name: SLSA build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ needs.index.outputs.digest }}
+          push-to-registry: true
+
+  tag:
+    name: Publish version and sha tags
+    needs: [index, sign]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Add the human-readable tags
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          DIGEST: ${{ needs.index.outputs.digest }}
+        run: |
+          set -euo pipefail
+          version="${REF_NAME#v}"
+          docker buildx imagetools create -t "${IMAGE}:${version}" -t "${IMAGE}:sha-${SHA}" "${IMAGE}@${DIGEST}"
+
+  helm:
+    name: Package Helm chart
+    needs: tag
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the release and upload assets
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - name: helm package
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="${REF_NAME#v}"
+          helm package helm/buildkit-controller --version "$version" --app-version "$version" --destination dist
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: dist/*.tgz
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  action-tag:
+    name: Move major tag for the GitHub Action
+    needs: helm
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # force-update the vN tag
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Move vN tag
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ ! -f action/action.yml ]; then
+            echo "no action/action.yml at this tag; skipping major tag move"
+            exit 0
+          fi
+          major="${REF_NAME%%.*}"
+          # Move vN only when this tag is the highest stable semver in its major, so a
+          # backport (v0.3.1 after v0.4.0) cannot move v0 back.
+          highest="$(git ls-remote --tags --refs origin "refs/tags/${major}.*" |
+            sed 's|.*refs/tags/||' | grep -v -- - | sort -V | tail -n1)"
+          if [ "$highest" != "$REF_NAME" ]; then
+            echo "$REF_NAME is not the highest ${major}.* tag ($highest); leaving $major alone"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -fa "$major" -m "Release $REF_NAME" "$GITHUB_SHA"
+          git push --force origin "refs/tags/$major"

@@ -1,0 +1,41 @@
+buildkit-controller {{ .Chart.AppVersion }} installed in {{ .Release.Namespace }}.
+
+API URL (HTTPS, port {{ .Values.service.ports.api }}):
+{{- if eq .Values.service.type "LoadBalancer" }}
+  export HOST=$(kubectl -n {{ .Release.Namespace }} get svc {{ include "bkc.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}')
+  echo "https://$HOST:{{ .Values.service.ports.api }}"
+{{- else if eq .Values.service.type "NodePort" }}
+  kubectl -n {{ .Release.Namespace }} get svc {{ include "bkc.fullname" . }}   # <node address>:<api nodePort>
+{{- else }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "bkc.fullname" . }} {{ .Values.service.ports.api }}:{{ .Values.service.ports.api }}
+  # then https://localhost:{{ .Values.service.ports.api }}
+{{- end }}
+
+The edge endpoint returned to clients is {{ .Values.edge.endpoint }}; point DNS for
+{{ .Values.edge.serverName }} at the Service's edge port ({{ .Values.service.ports.edge }}).
+{{- if .Values.auth.oidc }}
+
+OIDC issuers configured:
+{{- range .Values.auth.oidc }}
+  {{ .url }} (audiences: {{ join ", " .audiences }})
+{{- end }}
+From GitHub Actions, request an ID token for one of those audiences (permissions: id-token: write)
+and pass the API URL and pool name to the BuildKit controller action. The pool's access rules must
+match the repository.
+{{- else }}
+
+No OIDC issuer is configured (auth.oidc is empty), so only Kubernetes ServiceAccount
+tokens (TokenReview) can authenticate. To use GitHub Actions, add the issuer
+https://token.actions.githubusercontent.com with an audience under auth.oidc.
+{{- end }}
+{{- if not .Values.pools }}
+
+The chart created no pools. Add them under `pools:` in values, or apply BuildKitPool objects separately.
+{{- end }}
+
+Requirements for the build sandbox (see "Requirements" in the chart README):
+  - The CNI must enforce NetworkPolicy. On one that ignores it (kindnet, the default
+    EKS VPC CNI) builds reach every pod and the cloud metadata endpoint.
+  - Each pool namespace must allow privileged pods:
+      kubectl label namespace <pool-namespace> pod-security.kubernetes.io/enforce=privileged
+    Without it pools report Degraded/PodCreateFailed.

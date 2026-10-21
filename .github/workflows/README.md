@@ -1,0 +1,8 @@
+# Workflows
+
+- `rust.yml` (Rust): on every pull request and push to main, runs `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, `cargo deny check`, and an image build that does not push.
+- `action.yml` (Action): on pushes to main and on pull requests that touch `action/` or `docs/ci/`, tests the JavaScript GitHub Action and runs shellcheck on `docs/ci/buildkit-allocate.sh`.
+- `audit.yml` (Audit): nightly `cargo deny check advisories`, so a new RUSTSEC advisory shows up without a code change.
+- `release.yml` (Release): on `vX.Y.Z` tags. A gate job requires the tag commit to be on main with green Rust checks. Builds linux/amd64 and linux/arm64 natively, pushes the multi-arch index by digest, signs it and the per-arch manifests with cosign (keyless), attaches an SPDX SBOM that lists the Rust crates (built with `cargo auditable`) and SLSA provenance, scans the unsigned digest with a checksum-pinned Trivy binary in a job with read-only package access, signs only after the scan passes, and only then adds the version and `sha-` tags, packages the Helm chart onto the GitHub release, and moves the `vN` tag that the GitHub Action is published under, only when the new tag is the highest stable version in its major.
+
+Release notes are the notes GitHub generates from merged pull requests. No workflow needs a repository secret beyond the built-in `GITHUB_TOKEN`. Every third-party action is pinned to a full commit SHA with its version in a comment, and Renovate keeps the pins current (see [RENOVATE.md](../RENOVATE.md)).

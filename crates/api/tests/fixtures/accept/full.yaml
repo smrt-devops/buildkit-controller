@@ -1,0 +1,61 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: full, namespace: default}
+spec:
+  platforms: [linux/amd64, linux/arm64/v8]
+  template:
+    metadata:
+      labels: {team: ci}
+      annotations: {note: x}
+    spec:
+      nodeSelector: {pool: builds}
+      tolerations: [{key: dedicated, value: builds, effect: NoSchedule}]
+      runtimeClassName: gvisor
+      priorityClassName: high
+      imagePullSecrets: [{name: reg}]
+      volumes:
+      - {name: cfg, configMap: {name: c}}
+      - {name: sec, secret: {secretName: s}}
+      - {name: tmp, emptyDir: {}}
+      - name: proj
+        projected:
+          sources:
+          - configMap: {name: c}
+          - secret: {name: s}
+          - downwardAPI: {items: [{path: name, fieldRef: {fieldPath: metadata.name}}]}
+      containers:
+      - name: buildkitd
+        image: moby/buildkit:v0.34.0-rootless
+        imagePullPolicy: Always
+        resources:
+          requests: {cpu: "1", memory: 2Gi}
+          limits: {memory: 8Gi, ephemeral-storage: 40Gi}
+        env:
+        - {name: HTTP_PROXY, value: "http://proxy:3128"}
+        - name: FROM_SECRET
+          valueFrom: {secretKeyRef: {name: s, key: k}}
+        - name: FROM_CM
+          valueFrom: {configMapKeyRef: {name: c, key: k}}
+        - name: POD
+          valueFrom: {fieldRef: {fieldPath: metadata.name}}
+        volumeMounts:
+        - {name: cfg, mountPath: /etc/extra}
+        - {name: tmp, mountPath: /scratch/tmp}
+  workers:
+    buildkitdConfig: "[worker.oci]\n  max-parallelism = 4\n"
+    startTimeout: 5m
+    cache: {sizeLimit: 10Gi}
+  network:
+    egress: {internet: Deny, allowCIDRs: ["10.0.0.0/8", "fd00::/8"]}
+  scaling:
+    min: 1
+    max: 20
+    idleTimeout: 30m
+    timeZone: Europe/Berlin
+    schedule:
+    - {days: [Mon, Tue], start: "08:00", end: "18:00", min: 3}
+  access:
+    rules:
+    - oidc: {issuer: https://token.actions.githubusercontent.com, claims: {repository_owner: "smrt-*"}}
+    - serviceAccount: {namespace: ci, name: builder}
+  allocation: {defaultTTL: 2h, maxTTL: 12h, queueTimeout: 0s, maxQueueTimeout: 30m}

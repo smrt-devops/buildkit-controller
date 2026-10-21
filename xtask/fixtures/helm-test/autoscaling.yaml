@@ -1,0 +1,4 @@
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+autoscaling: {enabled: true, minReplicas: 2, maxReplicas: 6, targetCPUUtilizationPercentage: 70}
+podDisruptionBudget: {enabled: false}
+service: {type: ClusterIP}

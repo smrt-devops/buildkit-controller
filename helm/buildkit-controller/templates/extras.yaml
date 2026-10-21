@@ -1,0 +1,80 @@
+{{- $fn := include "bkc.fullname" . -}}
+{{- $replicas := ternary .Values.autoscaling.minReplicas .Values.replicaCount .Values.autoscaling.enabled }}
+{{- /* A PDB that allows no disruption would block node drains. */}}
+{{- if and .Values.podDisruptionBudget.enabled (gt (int $replicas) (int .Values.podDisruptionBudget.minAvailable)) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fn }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "bkc.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels: {{- include "bkc.selectorLabels" . | nindent 6 }}
+---
+{{- end }}
+{{- if .Values.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $fn }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "bkc.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: {{ $fn }}}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}}
+---
+{{- end }}
+{{- $sm := .Values.metrics.serviceMonitor.enabled }}
+{{- if or (eq (toString $sm) "true") (and (eq (toString $sm) "auto") (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1")) }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ $fn }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "bkc.labels" . | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.labels }}{{ toYaml . | nindent 4 }}{{ end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "bkc.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: metrics
+  endpoints:
+    - {port: metrics, path: /metrics, interval: {{ .Values.metrics.serviceMonitor.interval }}}
+---
+{{- end }}
+{{- range .Values.pools }}
+{{- /* Workers need a privileged-PSA namespace; keep them away from the CA Secret in the release namespace. */}}
+{{- $ns := .namespace | default $.Values.watchNamespace }}
+{{- if or (not $ns) (eq $ns $.Release.Namespace) }}
+{{- fail (printf "pools[%s]: set namespace to a dedicated pool namespace other than the release namespace %s" (toString .name) $.Release.Namespace) }}
+{{- end }}
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata:
+  name: {{ .name }}
+  namespace: {{ $ns }}
+  labels: {{- include "bkc.labels" $ | nindent 4 }}
+{{- /* cache goes over spec.workers.cache; cacheDefaults fills a missing registry repository. */}}
+{{- $spec := deepCopy (default (dict) .spec) }}
+{{- $workers := default (dict) (get $spec "workers") }}
+{{- $cache := mergeOverwrite (deepCopy (default (dict) (get $workers "cache"))) (deepCopy (default (dict) .cache)) }}
+{{- $defaultRepo := dig "registry" "repository" "" $.Values.cacheDefaults }}
+{{- if and $defaultRepo (not (dig "registry" "repository" "" $cache)) }}
+{{- $_ := set $cache "registry" (merge (dict "repository" $defaultRepo) (default (dict) (get $cache "registry"))) }}
+{{- end }}
+{{- if $cache }}
+{{- $_ := set $workers "cache" $cache }}
+{{- $_ := set $spec "workers" $workers }}
+{{- end }}
+spec: {{- toYaml $spec | nindent 2 }}
+---
+{{- end }}

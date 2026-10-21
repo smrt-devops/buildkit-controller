@@ -1,0 +1,14 @@
+pools:
+  - name: verify
+    namespace: bk-helm-pool
+    spec:
+      scaling: {min: 1}
+      access:
+        rules:
+          - serviceAccount: {name: builder}
+      template:
+        spec:
+          containers:
+            - name: buildkitd
+              image: moby/buildkit:v0.34.0-rootless
+              imagePullPolicy: Never

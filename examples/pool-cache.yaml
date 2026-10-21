@@ -1,0 +1,34 @@
+# A pool with both cache layers (see docs/architecture.md, Build cache).
+#
+# Registry: every build of a cache key imports and exports
+# ghcr.io/example/buildkit-cache:<key>, so concurrent builds share it. A branch
+# build also reads the trunk cache through importFrom, without writing to it.
+# CI jobs log in to ghcr.io themselves. The controller holds no credentials.
+#
+# Local: slots 0 and 1 each keep a 50Gi PVC as the buildkitd state directory.
+# A volume serves one build at a time, so it speeds up only the build that
+# lands on its slot. Use a StorageClass with volumeBindingMode: WaitForFirstConsumer.
+#
+# Every caller this pool admits can write cache that later callers read, so the
+# rule admits one repository only.
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata:
+  name: app
+  namespace: ci
+spec:
+  scaling: {min: 2, max: 8}
+  workers:
+    cache:
+      registry:
+        repository: ghcr.io/example/buildkit-cache
+        importFrom: [app-main]
+      local:
+        size: 50Gi
+        maxVolumes: 2
+  access:
+    rules:
+      - oidc:
+          issuer: https://token.actions.githubusercontent.com
+          claims:
+            repository: example/app

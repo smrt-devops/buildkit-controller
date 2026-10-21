@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: cache-size-small, namespace: default}
+spec:
+  workers: {cache: {local: {size: 512Mi}}}

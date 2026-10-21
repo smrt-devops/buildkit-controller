@@ -1,0 +1,6 @@
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+watchNamespace: ci
+pools:
+  - name: nons
+    spec: {}
+topologySpreadConstraints: [{maxSkew: 1, topologyKey: topology.kubernetes.io/zone, whenUnsatisfiable: ScheduleAnyway, labelSelector: {matchLabels: {a: b}}}]

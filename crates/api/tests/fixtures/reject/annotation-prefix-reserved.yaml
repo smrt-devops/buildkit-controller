@@ -1,0 +1,6 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: annotation-prefix-reserved, namespace: default}
+spec:
+  template:
+    metadata: {annotations: {buildkit.smrt-devops.net/a: x}}

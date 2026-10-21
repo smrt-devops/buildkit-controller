@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: idle-short, namespace: default}
+spec:
+  scaling: {idleTimeout: 59s}

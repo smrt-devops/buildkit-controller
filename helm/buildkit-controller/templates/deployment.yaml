@@ -1,0 +1,103 @@
+{{- $fn := include "bkc.fullname" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fn }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "bkc.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels: {{- include "bkc.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "bkc.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}{{ toYaml . | nindent 8 }}{{ end }}
+      annotations:
+        checksum/config: {{ include "bkc.config" . | sha256sum }}
+        {{- with .Values.podAnnotations }}{{ toYaml . | nindent 8 }}{{ end }}
+    spec:
+      serviceAccountName: {{ $fn }}
+      terminationGracePeriodSeconds: {{ add (include "bkc.seconds" .Values.shutdown.delay | int) (include "bkc.seconds" .Values.shutdown.drainTimeout | int) 10 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: controller
+          image: {{ include "bkc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: [ALL]}
+          env:
+            - {name: LOG_LEVEL, value: {{ .Values.logLevel | quote }}}
+            - {name: LOG_FORMAT, value: {{ .Values.logFormat | quote }}}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          ports:
+            - {name: api, containerPort: 8443}
+            - {name: edge, containerPort: 8444}
+            - {name: ops, containerPort: {{ .Values.metrics.port }}}
+          startupProbe:
+            httpGet: {path: /healthz, port: ops}
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: {path: /healthz, port: ops}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: ops}
+            periodSeconds: 5
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - {name: config, mountPath: /etc/buildkit-controller, readOnly: true}
+            {{- range $i, $iss := .Values.auth.oidc }}
+            {{- if $iss.caBundleConfigMap }}
+            - {name: oidc-ca-{{ $i }}, mountPath: /etc/buildkit-controller/oidc-ca/{{ $i }}, readOnly: true}
+            {{- end }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap: {name: {{ $fn }}-config}
+        {{- range $i, $iss := .Values.auth.oidc }}
+        {{- if $iss.caBundleConfigMap }}
+        - name: oidc-ca-{{ $i }}
+          configMap: {name: {{ $iss.caBundleConfigMap.name }}}
+        {{- end }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.affinity }}
+      affinity: {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if not .Values.topologySpreadConstraints }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {{- include "bkc.selectorLabels" . | nindent 20 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints: {{- toYaml . | nindent 8 }}
+      {{- end }}

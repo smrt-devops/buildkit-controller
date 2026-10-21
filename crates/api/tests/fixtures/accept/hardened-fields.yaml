@@ -1,0 +1,13 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: hardened-fields, namespace: default}
+spec:
+  network: {egress: {allowCIDRs: ["10.2.0.0/16", "2001:db8::/32", "10.1.2.3/32"]}}
+  template:
+    spec:
+      priorityClassName: builds-low
+      volumes: [{name: v, projected: {sources: [{secret: {name: s}}, {configMap: {name: c}}]}}]
+      containers:
+        - name: buildkitd
+          env: [{name: A, valueFrom: {secretKeyRef: {name: s, key: k}}}]
+          volumeMounts: [{name: v, mountPath: /data, subPath: x, mountPropagation: HostToContainer}]

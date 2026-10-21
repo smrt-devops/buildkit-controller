@@ -1,0 +1,22 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Build output
+dist/
+!/action/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Certificates
+.certs/
+
+# Helm charts (generated during CI/CD)
+charts/
+
+examples/chart/

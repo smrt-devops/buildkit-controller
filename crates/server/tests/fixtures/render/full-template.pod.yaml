@@ -1,0 +1,179 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    buildkit.smrt-devops.net/alloc: free
+    buildkit.smrt-devops.net/internal-ca: 0123456789abcdef
+    buildkit.smrt-devops.net/worker-cert-not-after: "2026-11-19T12:00:00Z"
+    buildkit.smrt-devops.net/worker-nonce: 00000000000000aa
+    example.com/note: full
+  labels:
+    app.kubernetes.io/managed-by: buildkit-controller
+    app.kubernetes.io/name: buildkitd
+    buildkit.smrt-devops.net/pool: full-template
+    buildkit.smrt-devops.net/state: free
+    buildkit.smrt-devops.net/template-hash: 3dd93463a1
+    cost-center: "1234"
+    team: ci
+  name: full-template-0
+  namespace: render-verify
+  ownerReferences:
+  - apiVersion: buildkit.smrt-devops.net/v1alpha1
+    controller: true
+    kind: BuildKitPool
+    name: full-template
+    uid: 2f6c1f4e-3b0a-4c43-9a55-5d4f0c7b1a10
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: pool
+            operator: In
+            values:
+            - builders
+  automountServiceAccountToken: false
+  containers:
+  - args:
+    - --addr=unix:///run/user/1000/buildkit/buildkitd.sock
+    - --addr=tcp://0.0.0.0:1234
+    - --tlscacert=/certs/ca.crt
+    - --tlscert=/certs/tls.crt
+    - --tlskey=/certs/tls.key
+    - --config=/etc/buildkit/buildkitd.toml
+    - --oci-worker-no-process-sandbox
+    env:
+    - name: HTTPS_PROXY
+      value: http://proxy.internal:3128
+    - name: NODE_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: spec.nodeName
+    - name: NETRC_USER
+      valueFrom:
+        secretKeyRef:
+          key: user
+          name: netrc
+    image: registry.example.com/buildkit:v0.34.0-rootless
+    imagePullPolicy: Always
+    name: buildkitd
+    ports:
+    - containerPort: 1234
+      name: buildkit
+      protocol: TCP
+    readinessProbe:
+      exec:
+        command:
+        - buildctl
+        - --addr
+        - unix:///run/user/1000/buildkit/buildkitd.sock
+        - debug
+        - workers
+      failureThreshold: 3
+      periodSeconds: 1
+      timeoutSeconds: 5
+    resources:
+      limits:
+        cpu: "8"
+        ephemeral-storage: 100Gi
+        memory: 16Gi
+      requests:
+        cpu: "2"
+        ephemeral-storage: 10Gi
+        memory: 4Gi
+    securityContext:
+      privileged: false
+    volumeMounts:
+    - mountPath: /certs
+      name: certs
+      readOnly: true
+    - mountPath: /etc/buildkit/buildkitd.toml
+      name: certs
+      readOnly: true
+      subPath: buildkitd.toml
+    - mountPath: /home/user/.local/share/buildkit
+      name: state
+    - mountPath: /etc/ssl/registry
+      name: registry-ca
+      readOnly: true
+    - mountPath: /home/user/.netrc
+      name: netrc
+      readOnly: true
+      subPath: netrc
+    - mountPath: /scratch
+      name: scratch
+  enableServiceLinks: false
+  hostIPC: false
+  hostNetwork: false
+  hostPID: false
+  imagePullSecrets:
+  - name: regcred
+  nodeSelector:
+    disktype: ssd
+    kubernetes.io/arch: amd64
+  priorityClassName: build-low
+  restartPolicy: Never
+  runtimeClassName: gvisor
+  securityContext:
+    appArmorProfile:
+      type: Unconfined
+    fsGroup: 1000
+    runAsGroup: 1000
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile:
+      type: Unconfined
+  serviceAccountName: full-template-buildkit-worker
+  terminationGracePeriodSeconds: 5
+  tolerations:
+  - effect: NoSchedule
+    key: dedicated
+    operator: Equal
+    value: builds
+  topologySpreadConstraints:
+  - labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: buildkitd
+    maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+  volumes:
+  - name: certs
+    secret:
+      defaultMode: 288
+      items:
+      - key: tls.crt
+        path: tls.crt
+      - key: tls.key
+        path: tls.key
+      - key: ca.crt
+        path: ca.crt
+      - key: buildkitd.toml
+        path: buildkitd.toml
+      secretName: full-template-0-00000000000000aa
+  - emptyDir:
+      sizeLimit: 50Gi
+    name: state
+  - configMap:
+      name: registry-ca
+    name: registry-ca
+  - name: netrc
+    secret:
+      secretName: netrc
+  - emptyDir:
+      medium: Memory
+      sizeLimit: 512Mi
+    name: scratch
+  - name: bundle
+    projected:
+      sources:
+      - configMap:
+          name: registry-ca
+      - secret:
+          name: netrc
+      - downwardAPI:
+          items:
+          - fieldRef:
+              fieldPath: metadata.labels
+            path: labels

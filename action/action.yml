@@ -1,0 +1,57 @@
+name: BuildKit Controller allocation
+description: Allocate BuildKit workers from a buildkit-controller and expose them as a buildx remote builder.
+author: smrt-devops
+inputs:
+  url:
+    description: Controller API base URL, e.g. https://bk.example.com:8443
+    required: true
+  pools:
+    description: Pools to allocate, one <namespace>/<pool> per entry (comma or newline separated).
+    required: true
+  ttl:
+    description: Allocation TTL, e.g. 3600, 90m or 1h (default is the pool default).
+    required: false
+  queue-timeout:
+    description: How long to wait in the queue, e.g. 300 or 5m (default is the pool default).
+    required: false
+  audience:
+    description: OIDC token audience.
+    required: false
+    default: buildkit-controller
+  builder-name:
+    description: Name of the buildx builder (default bk-<first allocation id>).
+    required: false
+  ca-cert:
+    description: PEM CA certificate to trust for the API listener (default is system roots).
+    required: false
+  cache:
+    description: Cache layers to use, auto, registry, local or none (default auto, every layer the pool enables).
+    required: false
+    default: auto
+  cache-key:
+    description: Cache key for both layers, 1 to 63 of [A-Za-z0-9._-] (default the pool registry defaultKey, else the pool name).
+    required: false
+  cache-mode:
+    description: Overrides the pool mode in cache-to, max or min.
+    required: false
+  cache-from:
+    description: Extra --cache-from values, one per line, added after the ones the controller returns.
+    required: false
+outputs:
+  builder:
+    description: Name of the buildx builder.
+  platforms:
+    description: Comma-joined union of the pool platforms.
+  allocation-ids:
+    description: Comma-joined allocation ids.
+  cache-to:
+    description: --cache-to values, one per line, for the cache-to input of docker/build-push-action. Empty when no registry cache applies.
+  cache-from:
+    description: --cache-from values, one per line, for the cache-from input of docker/build-push-action.
+  cache-args:
+    description: The same values as --cache-from=... and --cache-to=... flags, space separated, for docker buildx build.
+runs:
+  using: node24
+  main: dist/main.js
+  post: dist/post.js
+  post-if: always()

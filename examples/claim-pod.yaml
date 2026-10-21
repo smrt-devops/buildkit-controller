@@ -1,0 +1,57 @@
+# A BuildKitClaim and a pod that builds through it. Needs the chart installed
+# with `claims.enabled: true` and `ci` in `claims.namespaces`, and a pool
+# whose access rules admit the `ci` namespace, for example:
+#
+#   spec:
+#     access:
+#       rules:
+#       - claims: {namespaces: [ci]}
+#
+# The controller writes Secret `build-42-buildkit` once the claim is Bound.
+# Deleting the claim releases the worker; the Secret goes with it.
+# If the worker pod goes away before the TTL, the claim turns Lost and its
+# Secret is deleted. Create a new claim; a lost one is never rebound.
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitClaim
+metadata:
+  name: build-42
+  namespace: ci
+spec:
+  poolRef: {namespace: ci, name: default}
+  ttl: 30m
+---
+# In Tekton, this is one step that mounts the Secret as a workspace or volume.
+# The pod stays Pending (CreateContainerConfigError) until the Secret exists.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: build-42
+  namespace: ci
+spec:
+  restartPolicy: Never
+  containers:
+  - name: build
+    image: moby/buildkit:v0.34.0-rootless
+    command: [sh, -c]
+    args:
+    - |
+      printf 'FROM busybox\nRUN echo built > /out\n' > /tmp/Dockerfile
+      buildctl --addr "$BUILDKIT_HOST" \
+        --tlsservername "$BUILDKIT_SERVER_NAME" \
+        --tlscacert /certs/ca.crt --tlscert /certs/tls.crt --tlskey /certs/tls.key \
+        build --frontend dockerfile.v0 --local context=/tmp --local dockerfile=/tmp
+    env:
+    - name: BUILDKIT_HOST
+      valueFrom: {secretKeyRef: {name: build-42-buildkit, key: endpoint}}
+    - name: BUILDKIT_SERVER_NAME
+      valueFrom: {secretKeyRef: {name: build-42-buildkit, key: server-name}}
+    volumeMounts:
+    - {name: certs, mountPath: /certs, readOnly: true}
+  volumes:
+  - name: certs
+    secret: {secretName: build-42-buildkit}
+# With buildx instead of buildctl:
+#   docker buildx create --name claim --driver remote \
+#     --driver-opt cacert=/certs/ca.crt,cert=/certs/tls.crt,key=/certs/tls.key,servername=$BUILDKIT_SERVER_NAME \
+#     "$BUILDKIT_HOST"
+#   docker buildx build --builder claim .

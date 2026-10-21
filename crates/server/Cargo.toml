@@ -1,0 +1,73 @@
+[package]
+name = "buildkit-controller"
+description = "buildkit-controller (buildkit-controller workspace member)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "buildkit-controller"
+path = "src/main.rs"
+
+[features]
+# Render scenario matrix used by `cargo xtask`; not part of the production surface.
+fixtures = []
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+http-body = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+futures = "0.3.34"
+buildkit-controller-api = { path = "../api", version = "0.1.0" }
+clap = { workspace = true }
+jsonwebtoken = { workspace = true }
+jiff = { workspace = true }
+json-patch = { workspace = true }
+k8s-openapi = { workspace = true }
+kube = { workspace = true, features = ["ring", "jsonpatch"] }
+pem = { workspace = true }
+prometheus-client = { workspace = true }
+rcgen = { workspace = true }
+reqwest = { workspace = true }
+ring = { workspace = true }
+rustls = { workspace = true, features = ["ring"] }
+rustls-pki-types = { workspace = true }
+rustls-webpki = { workspace = true }
+serde = { workspace = true }
+serde-saphyr = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+socket2 = { workspace = true }
+tokio = { workspace = true, features = ["time", "sync", "net", "signal", "rt-multi-thread", "io-util"] }
+tokio-rustls = { workspace = true, features = ["ring"] }
+tokio-util = "0.7.20"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+webpki-roots = { workspace = true }
+x509-parser = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }
+hyper = { workspace = true, features = ["client"] }
+insta = { workspace = true }
+proptest = { workspace = true }
+rcgen = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "loopback"
+harness = false

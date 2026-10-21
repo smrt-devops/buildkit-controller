@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: platforms-dup, namespace: default}
+spec:
+  platforms: [linux/amd64, linux/amd64]

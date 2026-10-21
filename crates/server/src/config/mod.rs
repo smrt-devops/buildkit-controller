@@ -1,0 +1,848 @@
+//! Typed configuration from the YAML file, flags and environment.
+//!
+//! [`Config::from_yaml`] parses and validates; every validation problem is
+//! collected into one [`ConfigError::Invalid`] so the operator sees them all
+//! (exit code 2). [`Settings`] bundles the file with the flag/env values.
+
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use buildkit_controller_api::v1alpha1::Duration as CrdDuration;
+use clap::Parser;
+use serde::Deserialize;
+
+/// Config errors.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// The file could not be read.
+    #[error("reading config {path}: {source}")]
+    Read {
+        /// File path.
+        path: String,
+        /// Cause.
+        source: std::io::Error,
+    },
+    /// The file is not valid YAML for the schema (unknown keys included).
+    #[error("parsing config: {0}")]
+    Parse(String),
+    /// One or more validation rules failed.
+    #[error("invalid configuration:\n  - {}", .0.join("\n  - "))]
+    Invalid(Vec<String>),
+}
+
+/// Command line.
+#[derive(Clone, Debug, Parser)]
+#[command(name = "buildkit-controller", version, about)]
+pub struct Cli {
+    /// Config file.
+    #[arg(
+        long,
+        env = "BUILDKIT_CONTROLLER_CONFIG",
+        default_value = "/etc/buildkit-controller/config.yaml"
+    )]
+    pub config: PathBuf,
+    /// Log filter, e.g. `info` or `buildkit_controller=debug`.
+    #[arg(long, env = "LOG_LEVEL", default_value = "info")]
+    pub log_level: String,
+    /// Log encoding.
+    #[arg(long, env = "LOG_FORMAT", value_enum, default_value = "json")]
+    pub log_format: LogFormat,
+    /// Lease identity and log field `replica`.
+    #[arg(skip)]
+    pub pod_name: String,
+    /// Controller namespace.
+    #[arg(skip)]
+    pub pod_namespace: String,
+}
+
+/// Log encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum LogFormat {
+    /// One JSON object per line.
+    Json,
+    /// Human readable.
+    Text,
+}
+
+/// Everything the process was configured with.
+#[derive(Clone, Debug)]
+pub struct Settings {
+    /// Flags and environment.
+    pub cli: Cli,
+    /// The validated file.
+    pub config: Config,
+}
+
+impl Settings {
+    /// Read `POD_NAME` / `POD_NAMESPACE`, load and validate the file.
+    pub fn load(mut cli: Cli, env: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let mut problems = Vec::new();
+        for (var, slot) in [
+            ("POD_NAME", &mut cli.pod_name),
+            ("POD_NAMESPACE", &mut cli.pod_namespace),
+        ] {
+            match env(var).filter(|v| !v.is_empty()) {
+                Some(v) => *slot = v,
+                None => problems.push(format!("environment variable {var} is required")),
+            }
+        }
+        let text = std::fs::read_to_string(&cli.config).map_err(|source| ConfigError::Read {
+            path: cli.config.display().to_string(),
+            source,
+        })?;
+        let config = match Config::from_yaml(&text) {
+            Ok(c) => c,
+            Err(ConfigError::Invalid(mut more)) => {
+                problems.append(&mut more);
+                return Err(ConfigError::Invalid(problems));
+            }
+            Err(e) => return Err(e),
+        };
+        if problems.is_empty() {
+            Ok(Self { cli, config })
+        } else {
+            Err(ConfigError::Invalid(problems))
+        }
+    }
+}
+
+/// The YAML file.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct Config {
+    /// `""` = all namespaces.
+    pub watch_namespace: String,
+    /// Listen addresses.
+    pub listen: Listen,
+    /// API listener limits.
+    pub api: Api,
+    /// Kubernetes client settings.
+    pub kube: Kube,
+    /// Leader election.
+    pub leader_election: LeaderElection,
+    /// PKI.
+    pub pki: Pki,
+    /// Edge.
+    pub edge: Edge,
+    /// Authentication.
+    pub auth: Auth,
+    /// Worker `NetworkPolicy` inputs.
+    pub worker_network: WorkerNetwork,
+    /// Shutdown timing.
+    pub shutdown: Shutdown,
+    /// The `BuildKitClaim` controller.
+    pub claims: Claims,
+}
+
+/// `listen`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Listen {
+    /// HTTPS API.
+    pub api: SocketAddr,
+    /// mTLS edge.
+    pub edge: SocketAddr,
+    /// Plaintext ops port.
+    pub ops: SocketAddr,
+}
+
+impl Default for Listen {
+    fn default() -> Self {
+        Self {
+            api: SocketAddr::from(([0, 0, 0, 0], 8443)),
+            edge: SocketAddr::from(([0, 0, 0, 0], 8444)),
+            ops: SocketAddr::from(([0, 0, 0, 0], 8080)),
+        }
+    }
+}
+
+/// `api`: limits of the `listen.api` listener.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct Api {
+    /// Open API connections per replica; more are closed on accept.
+    pub max_connections: u32,
+    /// Open API connections from one client address; more are closed on accept. 0: no cap.
+    pub max_connections_per_ip: u32,
+}
+
+impl Default for Api {
+    fn default() -> Self {
+        Self {
+            max_connections: 4096,
+            max_connections_per_ip: 128,
+        }
+    }
+}
+
+/// `kube`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct Kube {
+    /// Timeout of every non-watch API call.
+    pub request_timeout: CrdDuration,
+}
+
+impl Default for Kube {
+    fn default() -> Self {
+        Self {
+            request_timeout: CrdDuration::new("5s"),
+        }
+    }
+}
+
+/// `leaderElection`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct LeaderElection {
+    /// Lease object name.
+    pub lease_name: String,
+    /// Lease duration.
+    pub lease_duration: CrdDuration,
+    /// Renew and retry cadence.
+    pub renew_interval: CrdDuration,
+    /// Self-fence margin.
+    pub fence_margin: CrdDuration,
+}
+
+impl Default for LeaderElection {
+    fn default() -> Self {
+        Self {
+            lease_name: "buildkit-controller-leader".into(),
+            lease_duration: CrdDuration::new("15s"),
+            renew_interval: CrdDuration::new("2s"),
+            fence_margin: CrdDuration::new("5s"),
+        }
+    }
+}
+
+/// `pki`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct Pki {
+    /// CA Secret name.
+    pub ca_secret_name: String,
+    /// TEST ONLY (`cargo xtask soak`). Short leaf lifetimes. Unset in
+    /// production, where leaves follow the normal lifetimes.
+    pub test_leaf_lifetimes: Option<TestLeafLifetimes>,
+}
+
+/// `pki.testLeafLifetimes` (TEST ONLY): makes leaf renewals happen within
+/// minutes. CA lifetimes are never affected.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TestLeafLifetimes {
+    /// Worker serving cert validity (production 30 days).
+    pub worker_validity: CrdDuration,
+    /// The worker Secret is reissued with less than this left (production 10 days).
+    pub worker_renew_before: CrdDuration,
+    /// A free worker pod is retired with less than this left (production 25 h).
+    pub worker_min_left: CrdDuration,
+    /// Edge/API serving and edge client cert validity (production 30 days / 24 h).
+    pub edge_validity: CrdDuration,
+}
+
+impl Default for Pki {
+    fn default() -> Self {
+        Self {
+            ca_secret_name: "buildkit-controller-ca".into(),
+            test_leaf_lifetimes: None,
+        }
+    }
+}
+
+/// `edge`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct Edge {
+    /// `tcp://host:port` returned to clients (required).
+    pub endpoint: String,
+    /// DNS name returned as serverName (required).
+    pub server_name: String,
+    /// Wildcard allocation domain, or empty.
+    pub allocation_domain: String,
+    /// Extra DNS names / IPs in the serving cert.
+    pub extra_names: Vec<String>,
+    /// Service name for SANs.
+    pub service_name: String,
+    /// Serving TLS.
+    pub tls: EdgeTls,
+    /// Client handshake timeout.
+    pub handshake_timeout: CrdDuration,
+    /// Upstream connect timeout.
+    pub upstream_connect_timeout: CrdDuration,
+    /// Established connection cap.
+    pub max_connections: u32,
+    /// In-handshake connection cap.
+    pub max_handshakes: u32,
+    /// In-handshake connections from one client address. 0: no cap.
+    pub max_handshakes_per_ip: u32,
+}
+
+impl Default for Edge {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            server_name: String::new(),
+            allocation_domain: String::new(),
+            extra_names: Vec::new(),
+            service_name: "buildkit-controller".into(),
+            tls: EdgeTls::default(),
+            handshake_timeout: CrdDuration::new("10s"),
+            upstream_connect_timeout: CrdDuration::new("5s"),
+            max_connections: 10_000,
+            max_handshakes: 1024,
+            max_handshakes_per_ip: 32,
+        }
+    }
+}
+
+/// `edge.tls`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct EdgeTls {
+    /// `""` = self-issued.
+    pub secret_name: String,
+}
+
+/// `auth`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct Auth {
+    /// OIDC issuers.
+    pub oidc: Vec<Oidc>,
+    /// Service account tokens.
+    pub service_account: ServiceAccountAuth,
+}
+
+/// One OIDC issuer.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Oidc {
+    /// Exact `iss`, https only.
+    pub url: String,
+    /// Accepted audiences.
+    #[serde(default)]
+    pub audiences: Vec<String>,
+    /// `""` = discovery.
+    #[serde(default)]
+    pub jwks_url: String,
+    /// Extra trusted CA certificates (inline PEM) for this issuer's HTTPS
+    /// fetches. Exclusive with `ca_bundle_file`.
+    #[serde(default)]
+    pub ca_bundle: String,
+    /// Path to a PEM file of extra trusted CAs. Exclusive with `ca_bundle`.
+    #[serde(default)]
+    pub ca_bundle_file: String,
+}
+
+impl Oidc {
+    /// The issuer's extra CA certificates. Empty when neither option is set.
+    ///
+    /// # Errors
+    /// Both options set, an unreadable file, or PEM without a certificate.
+    pub fn ca_certs(&self) -> Result<Vec<rustls_pki_types::CertificateDer<'static>>, String> {
+        let (what, pem) = match (self.ca_bundle.is_empty(), self.ca_bundle_file.is_empty()) {
+            (true, true) => return Ok(Vec::new()),
+            (false, false) => return Err("caBundle and caBundleFile are mutually exclusive".into()),
+            (false, true) => ("caBundle".to_owned(), self.ca_bundle.clone()),
+            (true, false) => (
+                format!("caBundleFile {}", self.ca_bundle_file),
+                std::fs::read_to_string(&self.ca_bundle_file)
+                    .map_err(|e| format!("caBundleFile {}: {e}", self.ca_bundle_file))?,
+            ),
+        };
+        let certs = pem::parse_many(pem.as_bytes())
+            .map_err(|e| format!("{what} is not valid PEM: {e}"))?
+            .into_iter()
+            .filter(|p| p.tag() == "CERTIFICATE")
+            .map(|p| rustls_pki_types::CertificateDer::from(p.into_contents()))
+            .collect::<Vec<_>>();
+        if certs.is_empty() {
+            return Err(format!("{what} contains no CERTIFICATE block"));
+        }
+        let mut probe = rustls::RootCertStore::empty();
+        for c in &certs {
+            probe
+                .add(c.clone())
+                .map_err(|e| format!("{what} has an invalid certificate: {e}"))?;
+        }
+        Ok(certs)
+    }
+}
+
+/// `auth.serviceAccount`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct ServiceAccountAuth {
+    /// Enabled.
+    pub enabled: bool,
+    /// Accepted audiences.
+    pub audiences: Vec<String>,
+    /// `TokenReview` calls in flight per replica; more callers get 503.
+    pub max_concurrent_reviews: u32,
+    /// `TokenReview` calls in flight for one client address; more get 503. 0: no cap.
+    pub max_reviews_per_ip: u32,
+    /// `TokenReview` slots (of `max_concurrent_reviews`) held back for service accounts that
+    /// passed a review within `recent_subject_ttl`. Cut to fit below `max_concurrent_reviews`.
+    pub reserved_reviews: u32,
+    /// How long a service account that passed a review counts as recently seen.
+    pub recent_subject_ttl: CrdDuration,
+}
+
+impl Default for ServiceAccountAuth {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            audiences: vec!["buildkit-controller".into()],
+            max_concurrent_reviews: 32,
+            max_reviews_per_ip: 4,
+            reserved_reviews: 8,
+            recent_subject_ttl: CrdDuration::new("10m"),
+        }
+    }
+}
+
+/// `workerNetwork`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct WorkerNetwork {
+    /// Denied CIDRs.
+    #[serde(rename = "deniedCIDRs")]
+    pub denied_cidrs: Vec<String>,
+    /// Extra denied CIDRs.
+    #[serde(rename = "extraDeniedCIDRs")]
+    pub extra_denied_cidrs: Vec<String>,
+    /// The cluster's pod, service and node CIDRs.
+    #[serde(rename = "clusterCIDRs")]
+    pub cluster_cidrs: Vec<String>,
+    /// DNS allowance.
+    pub dns: Dns,
+}
+
+impl Default for WorkerNetwork {
+    fn default() -> Self {
+        let d = crate::render::WorkerNetwork::default();
+        Self {
+            denied_cidrs: d.denied_cidrs,
+            extra_denied_cidrs: d.extra_denied_cidrs,
+            cluster_cidrs: d.cluster_cidrs,
+            dns: Dns {
+                namespace: d.dns.namespace,
+                pod_labels: d.dns.pod_labels,
+                cidrs: d.dns.cidrs,
+            },
+        }
+    }
+}
+
+/// `workerNetwork.dns`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct Dns {
+    /// DNS pods namespace.
+    pub namespace: String,
+    /// DNS pod labels.
+    pub pod_labels: BTreeMap<String, String>,
+    /// DNS CIDRs.
+    pub cidrs: Vec<String>,
+}
+
+impl Default for Dns {
+    fn default() -> Self {
+        WorkerNetwork::default().dns
+    }
+}
+
+/// `shutdown`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct Shutdown {
+    /// Pause between going unready and closing listeners.
+    pub delay: CrdDuration,
+    /// Drain budget.
+    pub drain_timeout: CrdDuration,
+}
+
+impl Default for Shutdown {
+    fn default() -> Self {
+        Self {
+            delay: CrdDuration::new("5s"),
+            drain_timeout: CrdDuration::new("300s"),
+        }
+    }
+}
+
+/// `claims`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Claims {
+    /// Run the claim controller on the leader. Off by default.
+    pub enabled: bool,
+    /// Namespaces whose claims are served. The chart grants Secret access in
+    /// these only; a claim elsewhere fails with `NamespaceNotServed`.
+    pub namespaces: Vec<String>,
+}
+
+/// Leader election timing, validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ElectionTiming {
+    /// `leaseDuration`.
+    pub lease_duration: Duration,
+    /// `renewInterval`.
+    pub renew_interval: Duration,
+    /// `fenceMargin`.
+    pub fence_margin: Duration,
+    /// `kube.requestTimeout`.
+    pub request_timeout: Duration,
+}
+
+impl ElectionTiming {
+    /// `leaseDuration - fenceMargin`. The leader stops leading this long after it last sent a renewal.
+    #[must_use]
+    pub fn renew_deadline(&self) -> Duration {
+        self.lease_duration.saturating_sub(self.fence_margin)
+    }
+}
+
+fn secs(d: &CrdDuration, field: &str, problems: &mut Vec<String>) -> Duration {
+    if let Ok(s) = d.seconds() {
+        return Duration::from_secs(s);
+    }
+    problems.push(format!(
+        "{field}: `{}` is not a duration like 5s, 2m, 1h30m",
+        d.as_str()
+    ));
+    Duration::ZERO
+}
+
+/// A validated duration as `time::Duration` (zero if unparsable, which
+/// validation has already rejected).
+fn dur(d: &CrdDuration) -> time::Duration {
+    time::Duration::seconds(
+        d.seconds()
+            .map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX)),
+    )
+}
+
+/// Smallest `pki.testLeafLifetimes.edgeValidity` (see `validate_test_leaf`).
+const MIN_TEST_EDGE_VALIDITY: Duration = Duration::from_mins(3);
+
+fn is_dns_name(s: &str) -> bool {
+    let s = s.strip_suffix('.').unwrap_or(s);
+    !s.is_empty()
+        && s.len() <= 253
+        && s.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+impl Config {
+    /// Parse and validate a config file body.
+    pub fn from_yaml(text: &str) -> Result<Self, ConfigError> {
+        let cfg: Self =
+            serde_saphyr::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        cfg.validate().map(|()| cfg)
+    }
+
+    /// Election timing; call only on a validated config.
+    #[must_use]
+    pub fn election_timing(&self) -> ElectionTiming {
+        let mut ignore = Vec::new();
+        ElectionTiming {
+            lease_duration: secs(&self.leader_election.lease_duration, "", &mut ignore),
+            renew_interval: secs(&self.leader_election.renew_interval, "", &mut ignore),
+            fence_margin: secs(&self.leader_election.fence_margin, "", &mut ignore),
+            request_timeout: self.request_timeout(),
+        }
+    }
+
+    /// `kube.requestTimeout`; call only on a validated config.
+    #[must_use]
+    pub fn request_timeout(&self) -> Duration {
+        Duration::from_secs(self.kube.request_timeout.seconds().unwrap_or(5))
+    }
+
+    /// `shutdown.delay`; call only on a validated config.
+    #[must_use]
+    pub fn shutdown_delay(&self) -> Duration {
+        Duration::from_secs(self.shutdown.delay.seconds().unwrap_or(0))
+    }
+
+    /// `shutdown.drainTimeout`; call only on a validated config.
+    #[must_use]
+    pub fn drain_timeout(&self) -> Duration {
+        Duration::from_secs(self.shutdown.drain_timeout.seconds().unwrap_or(0))
+    }
+
+    /// Check every config rule, returning all failures.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let mut p = Vec::new();
+        if self.claims.enabled && self.claims.namespaces.is_empty() {
+            p.push(
+                "claims.namespaces must list at least one namespace when claims.enabled is true"
+                    .into(),
+            );
+        }
+        let rt = secs(&self.kube.request_timeout, "kube.requestTimeout", &mut p);
+        let ld = secs(
+            &self.leader_election.lease_duration,
+            "leaderElection.leaseDuration",
+            &mut p,
+        );
+        let ri = secs(
+            &self.leader_election.renew_interval,
+            "leaderElection.renewInterval",
+            &mut p,
+        );
+        let fm = secs(
+            &self.leader_election.fence_margin,
+            "leaderElection.fenceMargin",
+            &mut p,
+        );
+        for (d, f) in [
+            (&self.edge.handshake_timeout, "edge.handshakeTimeout"),
+            (
+                &self.edge.upstream_connect_timeout,
+                "edge.upstreamConnectTimeout",
+            ),
+            (&self.shutdown.delay, "shutdown.delay"),
+            (&self.shutdown.drain_timeout, "shutdown.drainTimeout"),
+        ] {
+            secs(d, f, &mut p);
+        }
+        if rt.is_zero() {
+            p.push("kube.requestTimeout must be positive".into());
+        }
+        if ri.is_zero() {
+            p.push("leaderElection.renewInterval must be positive".into());
+        }
+        if self.leader_election.lease_name.is_empty() {
+            p.push("leaderElection.leaseName must not be empty".into());
+        }
+        if fm < rt {
+            p.push(format!(
+                "leaderElection.fenceMargin ({fm:?}) must be >= kube.requestTimeout ({rt:?})"
+            ));
+        }
+        if ri + rt >= ld.saturating_sub(fm) {
+            p.push(format!(
+                "renewInterval + requestTimeout must be < leaseDuration - fenceMargin ({ri:?} + {rt:?} >= {ld:?} - {fm:?})"
+            ));
+        }
+        self.validate_edge(&mut p);
+        self.validate_auth(&mut p);
+        self.validate_network(&mut p);
+        self.validate_test_leaf(&mut p);
+        if p.is_empty() {
+            Ok(())
+        } else {
+            Err(ConfigError::Invalid(p))
+        }
+    }
+
+    fn validate_edge(&self, p: &mut Vec<String>) {
+        let e = &self.edge;
+        for (v, f) in [
+            (e.max_connections, "edge.maxConnections"),
+            (e.max_handshakes, "edge.maxHandshakes"),
+            (self.api.max_connections, "api.maxConnections"),
+        ] {
+            if v == 0 {
+                p.push(format!("{f} must be at least 1"));
+            }
+        }
+        match e
+            .endpoint
+            .strip_prefix("tcp://")
+            .and_then(|r| r.rsplit_once(':'))
+        {
+            Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => {}
+            _ => p.push(format!(
+                "edge.endpoint must be tcp://<host>:<port> (got `{}`)",
+                e.endpoint
+            )),
+        }
+        if !is_dns_name(&e.server_name) {
+            p.push(format!(
+                "edge.serverName must be a DNS name (got `{}`)",
+                e.server_name
+            ));
+        }
+        if !e.allocation_domain.is_empty() && !is_dns_name(&e.allocation_domain) {
+            p.push(format!(
+                "edge.allocationDomain must be empty or a DNS name (got `{}`)",
+                e.allocation_domain
+            ));
+        }
+    }
+
+    fn validate_auth(&self, p: &mut Vec<String>) {
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, o) in self.auth.oidc.iter().enumerate() {
+            if !o.url.starts_with("https://") {
+                p.push(format!(
+                    "auth.oidc[{i}].url must be https (got `{}`)",
+                    o.url
+                ));
+            }
+            if !seen.insert(o.url.as_str()) {
+                p.push(format!("auth.oidc[{i}].url `{}` is duplicated", o.url));
+            }
+            if o.audiences.is_empty() {
+                p.push(format!("auth.oidc[{i}].audiences must be non-empty"));
+            }
+            if !o.jwks_url.is_empty() && !o.jwks_url.starts_with("https://") {
+                p.push(format!("auth.oidc[{i}].jwksUrl must be https"));
+            }
+            if let Err(e) = o.ca_certs() {
+                p.push(format!("auth.oidc[{i}]: {e}"));
+            }
+        }
+        if self.auth.service_account.enabled && self.auth.service_account.audiences.is_empty() {
+            p.push("auth.serviceAccount.audiences must be non-empty when enabled".into());
+        }
+        for a in &self.auth.service_account.audiences {
+            if a.starts_with("https://kubernetes.default.svc") {
+                p.push(format!(
+                    "auth.serviceAccount.audiences must not include the API server audience `{a}`"
+                ));
+            }
+        }
+        if self.auth.service_account.enabled
+            && self.auth.service_account.max_concurrent_reviews == 0
+        {
+            p.push("auth.serviceAccount.maxConcurrentReviews must be at least 1".into());
+        }
+        secs(
+            &self.auth.service_account.recent_subject_ttl,
+            "auth.serviceAccount.recentSubjectTtl",
+            p,
+        );
+    }
+
+    fn validate_network(&self, p: &mut Vec<String>) {
+        let n = &self.worker_network;
+        // The NetworkPolicy API refuses host bits, IPv4-mapped IPv6 and an `except` entry
+        // equal to its `0.0.0.0/0` or `::/0` block. One bad entry fails every pool's
+        // NetworkPolicy apply, so refuse it at load.
+        for (f, list, except) in [
+            ("workerNetwork.deniedCIDRs", &n.denied_cidrs, true),
+            (
+                "workerNetwork.extraDeniedCIDRs",
+                &n.extra_denied_cidrs,
+                true,
+            ),
+            ("workerNetwork.clusterCIDRs", &n.cluster_cidrs, true),
+            ("workerNetwork.dns.cidrs", &n.dns.cidrs, false),
+        ] {
+            for c in list {
+                if !buildkit_controller_api::v1alpha1::is_canonical_cidr(c) {
+                    p.push(format!(
+                        "{f}: `{c}` is not a canonical CIDR (no bits set beyond the prefix length, no IPv4-mapped IPv6)"
+                    ));
+                } else if except && c.ends_with("/0") {
+                    p.push(format!("{f}: `{c}` would deny a whole address family"));
+                }
+            }
+        }
+        if n.dns.pod_labels.is_empty() && n.dns.cidrs.is_empty() {
+            p.push("workerNetwork.dns needs non-empty podLabels or cidrs".into());
+        }
+    }
+
+    fn validate_test_leaf(&self, p: &mut Vec<String>) {
+        let Some(lt) = &self.pki.test_leaf_lifetimes else {
+            return;
+        };
+        let f = "pki.testLeafLifetimes";
+        let wv = secs(&lt.worker_validity, &format!("{f}.workerValidity"), p);
+        let rb = secs(
+            &lt.worker_renew_before,
+            &format!("{f}.workerRenewBefore"),
+            p,
+        );
+        let ml = secs(&lt.worker_min_left, &format!("{f}.workerMinLeft"), p);
+        let ev = secs(&lt.edge_validity, &format!("{f}.edgeValidity"), p);
+        if ml.is_zero() || ml >= rb || rb >= wv {
+            p.push(format!(
+                "{f}: need 0 < workerMinLeft < workerRenewBefore < workerValidity ({ml:?}, {rb:?}, {wv:?})"
+            ));
+        }
+        // Renewal is due (2V - BACKDATE) / 3 after issue (2/3 of V plus the 5 m
+        // backdate); at or under 2m30s it is due at once and the loader would
+        // reissue on every step. 3 m leaves 20 s between renewals.
+        if ev < MIN_TEST_EDGE_VALIDITY {
+            p.push(format!(
+                "{f}.edgeValidity must be at least {MIN_TEST_EDGE_VALIDITY:?} (got {ev:?})"
+            ));
+        }
+    }
+
+    /// Logs a startup warning when the test-only `pki.testLeafLifetimes` is
+    /// set; returns whether it did.
+    pub fn warn_test_knobs(&self) -> bool {
+        let Some(lt) = &self.pki.test_leaf_lifetimes else {
+            return false;
+        };
+        tracing::warn!(
+            worker_validity = lt.worker_validity.as_str(),
+            worker_renew_before = lt.worker_renew_before.as_str(),
+            worker_min_left = lt.worker_min_left.as_str(),
+            edge_validity = lt.edge_validity.as_str(),
+            "pki.testLeafLifetimes is set: TEST ONLY short leaf lifetimes, never for production"
+        );
+        true
+    }
+
+    /// Leaf validities. They are production unless `pki.testLeafLifetimes` is set.
+    #[must_use]
+    pub fn leaf_validity(&self) -> crate::pki::LeafValidity {
+        let Some(t) = &self.pki.test_leaf_lifetimes else {
+            return crate::pki::LeafValidity::default();
+        };
+        let e = dur(&t.edge_validity);
+        crate::pki::LeafValidity {
+            worker_serving: dur(&t.worker_validity),
+            edge_serving: e,
+            edge_client: e,
+        }
+    }
+
+    /// `(renew_before, min_left)` for worker certs when the test knob is set.
+    #[must_use]
+    pub fn test_worker_thresholds(&self) -> Option<(time::Duration, time::Duration)> {
+        self.pki
+            .test_leaf_lifetimes
+            .as_ref()
+            .map(|t| (dur(&t.worker_renew_before), dur(&t.worker_min_left)))
+    }
+
+    /// The settings `render` reads.
+    #[must_use]
+    pub fn render_config(&self, controller_namespace: &str) -> crate::render::RenderConfig {
+        let n = &self.worker_network;
+        crate::render::RenderConfig {
+            controller_namespace: controller_namespace.to_owned(),
+            worker_network: crate::render::WorkerNetwork {
+                denied_cidrs: n.denied_cidrs.clone(),
+                extra_denied_cidrs: n.extra_denied_cidrs.clone(),
+                cluster_cidrs: n.cluster_cidrs.clone(),
+                dns: crate::render::WorkerDns {
+                    namespace: n.dns.namespace.clone(),
+                    pod_labels: n.dns.pod_labels.clone(),
+                    cidrs: n.dns.cidrs.clone(),
+                },
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

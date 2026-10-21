@@ -1,0 +1,10 @@
+# Values for `cargo xtask helm-verify`: the real chart on kind, one pool.
+# Values for `cargo xtask helm-verify`. It installs the real chart on kind with one pool.
+image: {repository: buildkit-controller, tag: dev, pullPolicy: Never}
+replicaCount: 2
+service: {type: ClusterIP}
+shutdown: {delay: 0s, drainTimeout: 30s}
+logFormat: text
+edge:
+  endpoint: tcp://bk.example.com:8444
+  serverName: bk.example.com

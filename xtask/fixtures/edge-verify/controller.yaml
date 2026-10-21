@@ -1,0 +1,140 @@
+# Minimal in-cluster controller for `cargo xtask edge-verify` (the Helm chart
+# comes later). The binary runs every component: election, reconciler, alloc,
+# http (API) and edge.
+#
+# RBAC, derived from the controller's API calls and a seed for the Helm chart:
+#   cluster-wide (watchNamespace "" = all namespaces):
+#     pods                       list/watch (runtime/stores.rs), create/patch/delete
+#                                (reconcile/ops.rs, alloc/backend.rs)
+#     buildkitpools              list/watch (runtime/stores.rs, reconcile/driver.rs)
+#     buildkitpools/status       patch (reconcile/ops.rs, alloc/backend.rs)
+#     secrets                    create/update/patch/delete (reconcile/ops.rs, the CA;
+#                                reconcile/spawn.rs: per-pod worker Secrets)
+#     configmaps, serviceaccounts,
+#     networkpolicies            server-side apply = create/patch (reconcile/exec.rs)
+#     events.k8s.io events       create (reconcile/ops.rs)
+#     tokenreviews               create (auth/token_review.rs)
+#   controller namespace only:
+#     secrets                    list/watch, field-selected CA and serving Secrets
+#                                (runtime/stores.rs)
+#     leases                     get/create/update (election/kube_api.rs get_opt,
+#                                create, replace) and list/watch (its watcher)
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: buildkit-controller, namespace: buildkit-system}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: buildkit-controller-edge-verify}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list, watch, create, patch, delete]
+  - apiGroups: [buildkit.smrt-devops.net]
+    resources: [buildkitpools]
+    verbs: [list, watch]
+  - apiGroups: [buildkit.smrt-devops.net]
+    resources: [buildkitpools/status]
+    verbs: [patch]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [configmaps, serviceaccounts]
+    verbs: [create, patch]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [create, patch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [create]
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: buildkit-controller-edge-verify}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: buildkit-controller-edge-verify}
+subjects: [{kind: ServiceAccount, name: buildkit-controller, namespace: buildkit-system}]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: buildkit-controller, namespace: buildkit-system}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [list, watch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: buildkit-controller, namespace: buildkit-system}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: buildkit-controller}
+subjects: [{kind: ServiceAccount, name: buildkit-controller, namespace: buildkit-system}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: buildkit-controller, namespace: buildkit-system}
+data:
+  config.yaml: |
+    edge:
+      endpoint: tcp://bk.example.com:8444
+      serverName: bk.example.com
+    shutdown:
+      delay: 0s
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: buildkit-controller, namespace: buildkit-system}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: buildkit-controller}}
+  template:
+    # The worker NetworkPolicy admits pods by app.kubernetes.io/name.
+    metadata: {labels: {app: buildkit-controller, app.kubernetes.io/name: buildkit-controller}}
+    spec:
+      serviceAccountName: buildkit-controller
+      # PodSecurity "restricted". The controller writes nothing to its root fs.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: controller
+          image: buildkit-controller:dev
+          imagePullPolicy: Never
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: [ALL]}
+          args: [--log-format=text]
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          ports:
+            - {name: edge, containerPort: 8444}
+            - {name: ops, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /readyz, port: ops}
+            periodSeconds: 2
+          volumeMounts:
+            - {name: config, mountPath: /etc/buildkit-controller}
+      volumes:
+        - name: config
+          configMap: {name: buildkit-controller}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: buildkit-controller, namespace: buildkit-system}
+spec:
+  selector: {app: buildkit-controller}
+  ports:
+    - {name: edge, port: 8444, targetPort: edge}
+    - {name: ops, port: 8080, targetPort: ops}
