@@ -554,6 +554,50 @@ fn read_secs(p: &Path) -> Result<u64> {
         .context("epoch seconds")
 }
 
+/// Copies busybox and the musl loader out of the worker image into `dir`.
+/// The files come out as a tar stream on stdout, not through a bind mount. The
+/// rootless image runs as uid 1000, which cannot write to a host directory the
+/// runner owns on Linux. Extracted on the host, the files belong to the caller.
+fn copy_busybox(dir: &Path) -> Result<()> {
+    let mut docker = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--entrypoint",
+            "sh",
+            WORKER_IMAGE,
+            "-c",
+            "cd / && tar -chf - bin/busybox lib/ld-musl-*.so.1 lib/libc.musl-*.so.1",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("starting docker run for busybox")?;
+    let stream = docker.stdout.take().context("docker stdout")?;
+    let untar = Command::new("tar")
+        .arg("-xf")
+        .arg("-")
+        .arg("-C")
+        .arg(dir)
+        .stdin(stream)
+        .status()
+        .context("running tar")?;
+    let copied = docker.wait().context("waiting for docker run")?;
+    ensure!(
+        copied.success(),
+        "copying busybox out of {WORKER_IMAGE} failed: {copied}"
+    );
+    ensure!(
+        untar.success(),
+        "extracting busybox into {} failed: {untar}",
+        dir.display()
+    );
+    ensure!(
+        dir.join("bin/busybox").is_file(),
+        "busybox missing after the copy"
+    );
+    Ok(())
+}
+
 /// Build contexts. One is RUN-based (busybox copied out of the worker image,
 /// because nothing can be pulled inside kind) and one is COPY-only.
 fn prepare(work: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -563,12 +607,7 @@ fn prepare(work: &Path) -> Result<(PathBuf, PathBuf)> {
         let _ = std::fs::remove_dir_all(d);
         std::fs::create_dir_all(d)?;
     }
-    let mount = format!("{}:/out", ctx.display());
-    status(Command::new("docker").args([
-        "run", "--rm", "--entrypoint", "sh", "-v", &mount, WORKER_IMAGE,
-        "-c",
-        "mkdir -p /out/bin /out/lib && cp /bin/busybox /out/bin/ && cp -L /lib/ld-musl-*.so.1 /lib/libc.musl-*.so.1 /out/lib/",
-    ]).stdout(Stdio::null()))?;
+    copy_busybox(&ctx)?;
     write(
         &ctx.join("Dockerfile"),
         "FROM scratch\nCOPY lib/ /lib/\nCOPY bin/ /bin/\nRUN [\"/bin/busybox\", \"sh\", \"-c\", \"/bin/busybox echo built-through-edge > /ok; /bin/busybox cat /ok\"]\n",
