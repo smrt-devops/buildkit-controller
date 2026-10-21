@@ -14,11 +14,11 @@ Under Settings, Branches, add a rule for `main` that requires a pull request wit
 
 ### Tag ruleset for releases
 
-Under Settings, Rules, Rulesets, add a tag ruleset that targets `v*`, with enforcement active. Turn on "Restrict creations", "Restrict updates" and "Restrict deletions", and put only the release maintainers and the GitHub Actions app in the bypass list. The `action-tag` job force-moves the `vN` tags, so the Actions app needs the bypass for updates. The release workflow also checks that the tagged commit is on main and has green `Rust` checks, but only the ruleset stops a stray tag from being created in the first place.
+Under Settings, Rules, Rulesets, add a tag ruleset that targets `v*.*.*`, with enforcement active. Turn on "Restrict creations", "Restrict updates", "Restrict deletions" and "Block force pushes", and put the Repository admin role in the bypass list. The pattern covers release tags such as `v0.1.0` and `v0.1.0-rc1`, and leaves the major tags (`v0`, `v1`) out, because the `action-tag` job force-moves them with the workflow token. GitHub accepts the GitHub Actions app as a bypass actor only on organization repositories, so on a personal account the major tags have to stay outside the ruleset. The release workflow also checks that the tagged commit is on main and has a green `Rust` run, but only the ruleset stops a stray release tag from being created.
 
 ### Package visibility
 
-The release workflow pushes `ghcr.io/smrt-devops/buildkit-controller`. After the first release, set the package visibility to public and link it to the repository under the package's settings, so users can pull without credentials.
+The release workflow pushes `ghcr.io/smrt-devops/buildkit-controller`. The package takes the repository's visibility when the workflow creates it, so on a public repository users can pull without credentials. If the first release ran while the repository was private, set the package to public under the package's settings.
 
 ## Optional
 
