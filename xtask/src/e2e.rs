@@ -120,29 +120,6 @@ fn work_dir() -> PathBuf {
     root().join("target").join(name)
 }
 
-/// [`SOCAT_IMAGE`] present locally as that digest: pulled by digest and tagged,
-/// unless the local tag already is the digest.
-fn ensure_socat() -> Result<()> {
-    let repo = SOCAT_IMAGE.rsplit_once(':').map_or(SOCAT_IMAGE, |(r, _)| r);
-    let pinned = format!("{repo}@{SOCAT_DIGEST}");
-    let local = Command::new("docker")
-        .args([
-            "image",
-            "inspect",
-            "--format",
-            "{{json .RepoDigests}}",
-            SOCAT_IMAGE,
-        ])
-        .output()
-        .context("docker image inspect")?;
-    let short = format!("{}@{SOCAT_DIGEST}", repo.trim_start_matches("docker.io/"));
-    if local.status.success() && String::from_utf8_lossy(&local.stdout).contains(&short) {
-        return Ok(());
-    }
-    status(Command::new("docker").args(["pull", &pinned]))?;
-    status(Command::new("docker").args(["tag", &pinned, SOCAT_IMAGE]))
-}
-
 struct Cleanup(Env);
 
 impl Drop for Cleanup {
@@ -299,7 +276,7 @@ fn install(env: &Env, work: &Path, mode: &Mode) -> Result<PathBuf> {
     if matches!(mode, Mode::Mock(_)) {
         crate::image::ensure(REGISTRY_IMAGE)?;
         images.push(REGISTRY_IMAGE);
-        ensure_socat()?;
+        crate::gateway::ensure_image(SOCAT_IMAGE, SOCAT_DIGEST)?;
         images.push(SOCAT_IMAGE);
     }
     for image in images {

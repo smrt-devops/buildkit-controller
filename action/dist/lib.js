@@ -220,7 +220,18 @@ function apiError(what, res) {
   return new Error(`${what} failed: HTTP ${res.status}${msg ? ` ${String(msg).slice(0, 200)}` : ''}`);
 }
 
-/** Bound on the whole retry loop: the request's queue timeout (server default 1 h if unset) + 60 s. */
+/**
+ * The queue timeout a request to `pool` (a GET /v1/pools entry) runs under: the caller's value if
+ * set, else the pool default the server reports. Undefined when neither is known (a server that
+ * predates `queueTimeoutSeconds` in the pool list).
+ */
+function effectiveQueueTimeout(queueTimeoutSeconds, pool) {
+  if (queueTimeoutSeconds !== undefined) return queueTimeoutSeconds;
+  const d = pool && pool.queueTimeoutSeconds;
+  return Number.isInteger(d) && d >= 0 ? d : undefined;
+}
+
+/** Bound on the whole retry loop: the request's queue timeout (1 h, the largest allowed, if unknown) + 60 s. */
 function retryBudgetMs(queueTimeoutSeconds) {
   const q = queueTimeoutSeconds === undefined ? 3600 : queueTimeoutSeconds;
   return (q + 60) * 1000;
@@ -229,7 +240,8 @@ function retryBudgetMs(queueTimeoutSeconds) {
 /**
  * Queue timeout for an attempt that starts with `remainingMs` of the retry budget left: the requested
  * value, cut so that a full queue wait still ends inside the budget (budget minus 60 s of slack).
- * Undefined stays undefined: the pool default is unknown, so it is not overridden.
+ * Undefined stays undefined: the pool default is unknown, so it is not overridden. Pass the
+ * `effectiveQueueTimeout` result so that an unset input still gets a bound from the pool default.
  */
 function queueTimeoutFor(queueTimeoutSeconds, remainingMs) {
   if (queueTimeoutSeconds === undefined) return undefined;
@@ -313,5 +325,5 @@ async function fetchOidcToken(audience, setSecret) {
 module.exports = {
   parseList, parsePool, postTimeoutMs, parseDuration, generateKey, allocationBody,
   validatePools, buildxCommands, parseCacheInputs, cacheFlags, checkAllocationId, createBuilder, writeMaterial, request, apiError,
-  retryBudgetMs, queueTimeoutFor, retryAfterMs, isPreSendError, requestWithRetry, fetchOidcToken,
+  effectiveQueueTimeout, retryBudgetMs, queueTimeoutFor, retryAfterMs, isPreSendError, requestWithRetry, fetchOidcToken,
 };

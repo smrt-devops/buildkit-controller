@@ -48,15 +48,18 @@ async function run() {
   const results = await Promise.allSettled(pools.map(async (p, i) => {
     // Only a 503 with Retry-After or a failure before the request was sent is retried: anything
     // else may have claimed a worker whose id we would never learn.
-    // A retry queues only for what is left of the budget, so the total stays near queue-timeout + 60 s.
+    // A retry queues only for what is left of the budget, so the total stays near the queue timeout
+    // + 60 s. Without queue-timeout, the pool default from GET /v1/pools sets the budget.
+    const pqt = L.effectiveQueueTimeout(qt, found[i]);
     const attemptOpts = ({ remainingMs }) => {
-      const q = L.queueTimeoutFor(qt, remainingMs);
+      const q = L.queueTimeoutFor(pqt, remainingMs);
       return {
         method: 'POST', ca, timeoutMs: L.postTimeoutMs(q), headers: { 'Content-Type': 'application/json' },
         body: L.allocationBody(p, keys[i].publicKey, ttl, q, cache),
       };
     };
-    const res = await L.requestWithRetry(`${api}/v1/allocations`, attemptOpts, { what: `allocate ${p.namespace}/${p.pool}`, getToken, budgetMs, log: gha.info });
+    const res = await L.requestWithRetry(`${api}/v1/allocations`, attemptOpts,
+      { what: `allocate ${p.namespace}/${p.pool}`, getToken, budgetMs: L.retryBudgetMs(pqt), log: gha.info });
     if (res.status !== 201) throw L.apiError(`allocate ${p.namespace}/${p.pool}`, res);
     const a = JSON.parse(res.body);
     L.checkAllocationId(a.id);

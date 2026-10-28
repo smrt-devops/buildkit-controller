@@ -1066,7 +1066,10 @@ async fn reconcile_verify() {
         let req = http
             .post(format!("https://{}/v1/allocations", replica.api))
             .bearer_auth(&token)
-            .json(&json!({"namespace": NS, "pool": "r", "ttlSeconds": 3600, "queueTimeoutSeconds": 0}));
+            .json(
+                &json!({"namespace": NS, "pool": "r", "ttlSeconds": 3600, "queueTimeoutSeconds": 0,
+                "publicKey": rcgen::KeyPair::generate().unwrap().public_key_pem()}),
+            );
         tokio::spawn(req.send())
     };
     let r_secrets = || async {

@@ -27,6 +27,9 @@ use tracing::{info, warn};
 const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// `Retry-After` on a 503 from authentication (`TokenReview` busy, throttled or timed out).
 const AUTH_RETRY_AFTER_SECS: u64 = 2;
+/// Message of the 400 for a `POST /v1/allocations` without `publicKey`.
+pub const PUBLIC_KEY_REQUIRED: &str =
+    "publicKey is required: generate an ECDSA P-256 key pair and send the PEM SPKI public key";
 
 use super::body::CommitBody;
 use super::listener::Stopping;
@@ -426,6 +429,16 @@ async fn create<A: Allocator>(State(s): State<Arc<ApiState<A>>>, req: Request) -
         Ok::<_, ApiError>((who, read_body(&parts.headers, body).await?))
     }
     .await;
+    // The private key never leaves the client: a request without its public
+    // half is refused, so the server-generated key of the in-cluster
+    // BuildKitClaim path cannot be reached from here.
+    let pre = pre.and_then(|(who, body)| match body.public_key {
+        Some(_) => Ok((who, body)),
+        None => Err(ApiError::new(
+            ErrorCode::InvalidRequest,
+            PUBLIC_KEY_REQUIRED,
+        )),
+    });
     let (who, body) = match pre {
         Ok(v) => v,
         Err(e) => {
@@ -472,6 +485,9 @@ async fn release<A: Allocator>(
 
 fn summary(p: &BuildKitPool, edge: &EdgeInfo) -> Option<PoolSummary> {
     let st = p.status.clone().unwrap_or_default();
+    let a = &p.spec.allocation;
+    // A duration the CRD would reject is left out rather than guessed.
+    let secs = |d: &buildkit_controller_api::v1alpha1::Duration| d.seconds().ok();
     Some(PoolSummary {
         namespace: p.metadata.namespace.clone()?,
         name: p.metadata.name.clone()?,
@@ -488,6 +504,10 @@ fn summary(p: &BuildKitPool, edge: &EdgeInfo) -> Option<PoolSummary> {
         platforms: st.platforms,
         endpoint: edge.endpoint.clone(),
         server_name: edge.server_name.clone(),
+        queue_timeout_seconds: secs(&a.queue_timeout),
+        max_queue_timeout_seconds: secs(&a.max_queue_timeout),
+        default_ttl_seconds: secs(&a.default_ttl),
+        max_ttl_seconds: secs(&a.max_ttl),
     })
 }
 
