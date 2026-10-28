@@ -4,27 +4,14 @@ const { spawnSync } = require('node:child_process');
 const gha = require('./gha');
 const L = require('./lib');
 
-async function oidcToken(audience) {
-  const base = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
-  const bearer = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
-  if (!base || !bearer) throw new Error('OIDC unavailable: add `permissions: id-token: write` to the job');
-  gha.setSecret(bearer);
-  const url = `${base}${base.includes('?') ? '&' : '?'}audience=${encodeURIComponent(audience)}`;
-  const res = await L.request(url, { headers: { Authorization: `Bearer ${bearer}` }, timeoutMs: 30000 });
-  if (res.status !== 200) throw L.apiError('OIDC token request', res);
-  const token = JSON.parse(res.body).value;
-  if (!token) throw new Error('OIDC token response had no value');
-  gha.setSecret(token);
-  return token;
-}
-
 function docker(args) {
   const r = spawnSync('docker', args, { encoding: 'utf8' });
   if (r.status !== 0) throw new Error(`docker ${args.slice(0, 2).join(' ')} failed: ${(r.stderr || r.error || '').toString().trim()}`);
 }
 
-async function release(api, ca, token, id) {
-  const res = await L.request(`${api}/v1/allocations/${id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` }, ca, timeoutMs: 60000 });
+async function release(api, ca, getToken, budgetMs, id) {
+  const res = await L.requestWithRetry(`${api}/v1/allocations/${id}`, { method: 'DELETE', ca, timeoutMs: 60000 },
+    { what: `release ${id}`, getToken, budgetMs, log: gha.info });
   if (res.status !== 204 && res.status !== 404) throw L.apiError(`release ${id}`, res);
 }
 
@@ -40,8 +27,10 @@ async function run() {
     cache: gha.getInput('cache'), cacheKey: gha.getInput('cache-key'),
     cacheMode: gha.getInput('cache-mode'), cacheFrom: gha.getInput('cache-from'),
   });
-  const token = await oidcToken(gha.getInput('audience') || 'buildkit-controller');
-  const auth = { Authorization: `Bearer ${token}` };
+  const aud = gha.getInput('audience') || 'buildkit-controller';
+  const getToken = () => L.fetchOidcToken(aud, gha.setSecret);
+  const budgetMs = L.retryBudgetMs(qt);
+  const auth = { Authorization: `Bearer ${await getToken()}` };
 
   const lr = await L.request(`${api}/v1/pools`, { headers: auth, ca, timeoutMs: 30000 });
   if (lr.status !== 200) throw L.apiError('list pools', lr);
@@ -50,17 +39,19 @@ async function run() {
   const keys = pools.map(() => L.generateKey());
   keys.forEach((k) => gha.setSecret(k.privateKey));
   // Persist state before any POST so a cancel mid-way still releases what succeeded.
-  const aud = gha.getInput('audience') || 'buildkit-controller';
   gha.saveState('api', api);
   gha.saveState('audience', aud);
   gha.saveState('ca', ca || '');
+  gha.saveState('queue-timeout', qt === undefined ? '' : String(qt));
   const root = process.env.RUNNER_TEMP || require('node:os').tmpdir();
   const okIds = [];
   const results = await Promise.allSettled(pools.map(async (p, i) => {
-    const res = await L.request(`${api}/v1/allocations`, {
-      method: 'POST', ca, timeoutMs: L.postTimeoutMs(qt), headers: { ...auth, 'Content-Type': 'application/json' },
+    // Only a 503 with Retry-After or a failure before the request was sent is retried: anything
+    // else may have claimed a worker whose id we would never learn.
+    const res = await L.requestWithRetry(`${api}/v1/allocations`, {
+      method: 'POST', ca, timeoutMs: L.postTimeoutMs(qt), headers: { 'Content-Type': 'application/json' },
       body: L.allocationBody(p, keys[i].publicKey, ttl, qt, cache),
-    });
+    }, { what: `allocate ${p.namespace}/${p.pool}`, getToken, budgetMs, log: gha.info });
     if (res.status !== 201) throw L.apiError(`allocate ${p.namespace}/${p.pool}`, res);
     const a = JSON.parse(res.body);
     L.checkAllocationId(a.id);
@@ -72,7 +63,7 @@ async function run() {
   const allocs = results.map((r) => (r.status === 'fulfilled' ? r.value : undefined));
   const failed = results.find((r) => r.status === 'rejected');
   if (failed) {
-    for (const a of allocs) if (a) await release(api, ca, token, a.id).catch((e) => gha.warning(e.message));
+    for (const a of allocs) if (a) await release(api, ca, getToken, budgetMs, a.id).catch((e) => gha.warning(e.message));
     throw failed.reason;
   }
 

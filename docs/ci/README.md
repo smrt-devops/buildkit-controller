@@ -19,6 +19,21 @@ See `action/`. The job needs `permissions: id-token: write`.
 
 The post step removes the builder and releases every allocation, even when the job fails.
 
+### Retries
+
+The controller answers `503` with a `Retry-After` header only before it has claimed a worker (CA
+unavailable, token review busy, a replica shutting down). The Action retries `POST /v1/allocations` on
+exactly that, and on connection errors raised before the request was sent (connection refused, DNS
+failure). It waits the `Retry-After` seconds (at least 1, at most 30), logs each retry, and fetches a
+fresh OIDC token for every attempt. Retries stop after `queue-timeout` plus 60 seconds (the controller's
+default queue timeout, 1 hour, if unset) and the step then fails with the last error.
+
+Nothing else is retried: other statuses, a 503 without `Retry-After`, a connection reset after the request
+was sent and a timeout waiting for the response all fail the step, because the controller may have
+claimed a worker whose id the client never saw. With several pools, each pool retries on its own; if one
+pool still fails, the allocations that succeeded are released. Releases (`DELETE`) retry a 503 with
+`Retry-After` under the same limits, since a repeated release is safe.
+
 ### Build cache
 
 Workers are single-use, so a build gets cache only from the pool's cache layers
@@ -81,7 +96,10 @@ sh docs/ci/buildkit-allocate.sh sh -c 'docker buildx build --builder "$BUILDER" 
 ```
 
 Optional variables are `TTL` and `QUEUE_TIMEOUT` (seconds), `API_CA` (PEM file for the API listener),
-`CACHE_KEY` and `CACHE` (the Action's `cache-key` and `cache` inputs). The script prints the registry cache
+`CACHE_KEY` and `CACHE` (the Action's `cache-key` and `cache` inputs). The script retries the allocation
+under the same rules and limits as the Action (see Retries above): a 503 with `Retry-After`, or a curl
+failure to resolve or connect, for at most `QUEUE_TIMEOUT` plus 60 seconds. It reuses `TOKEN` for every
+attempt, so give it a token that outlives that window. The script prints the registry cache
 flags to stderr and exports them to the command as `$CACHE_ARGS`:
 
 ```sh
