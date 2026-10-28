@@ -265,6 +265,7 @@ fullnameOverride: buildkit-controller
 image: {{repository: buildkit-controller, tag: dev, pullPolicy: Never}}
 replicaCount: 1
 podDisruptionBudget: {{enabled: false}}
+watchNamespaces: [{POOL_NS}]
 logFormat: text
 service:
   type: NodePort

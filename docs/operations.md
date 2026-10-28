@@ -140,7 +140,9 @@ chart fails without it. Secret `get`, `create` and `delete` are granted by a
 Role in each listed namespace only, and a claim from any other namespace fails
 with `NamespaceNotServed`. With `watchNamespaces` set, the claim read and status rights are
 Roles in the listed namespaces as well, and a claim in any other namespace is
-ignored rather than failed.
+ignored: it gets no status, not `NamespaceNotServed`. This also applies to the
+deprecated `watchNamespace`, so an install that set it and relied on
+`NamespaceNotServed` no longer sees that status.
 
 A pool admits claims only through an access rule naming their namespaces:
 

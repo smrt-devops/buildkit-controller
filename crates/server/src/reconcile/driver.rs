@@ -12,7 +12,6 @@ use buildkit_controller_api::v1alpha1::BuildKitPool;
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::{Stream, stream};
 use k8s_openapi::jiff::{SignedDuration, Timestamp};
-use kube::api::Api;
 use kube::runtime::reflector::{self, Store};
 use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Client, ResourceExt};
@@ -30,7 +29,7 @@ use crate::render::LABEL_POOL;
 use crate::runtime::AppContext;
 use crate::runtime::hooks::LeaderWork;
 use crate::runtime::leader::BoxFut;
-use crate::runtime::stores::PodEvent;
+use crate::runtime::stores::{PodEvent, scoped_watch};
 
 /// `(namespace, name)` of a pool.
 pub type PoolKey = (String, String);
@@ -170,19 +169,19 @@ async fn run_term(ctx: AppContext, metrics: ReconcileMetrics) {
     info!("reconciler started");
     let _gauges = TermGauges(metrics.clone());
     let client: Client = ctx.client();
-    let ns = &ctx.config().watch_namespace;
-    let api: Api<BuildKitPool> = if ns.is_empty() {
-        Api::all(client.clone())
-    } else {
-        Api::namespaced(client.clone(), ns)
-    };
     // The leader's own Pool watch. A pass reads the pool from it.
     let (pools, writer) = reflector::store();
     let pool_triggers = {
         let ctx = ctx.clone();
         reflector::reflector(
             writer,
-            watcher(api, watcher::Config::default()).default_backoff(),
+            scoped_watch(
+                client.clone(),
+                ctx.config().watched_namespaces(),
+                &watcher::Config::default(),
+                pools.clone(),
+            )
+            .default_backoff(),
         )
         .filter_map(move |ev| {
             let t = match ev {
