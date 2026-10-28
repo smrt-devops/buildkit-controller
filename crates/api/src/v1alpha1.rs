@@ -785,7 +785,7 @@ pub struct Network {
 pub struct Egress {
     /// Whether workers may reach the internet.
     pub internet: Internet,
-    /// CIDR ranges re-opened through the egress deny list (for example a private registry or proxy), so they apply to every pool, not just under `Deny`. The controller refuses (`Ready=False/InvalidSpec`) an entry of `0.0.0.0/0` or `::/0`, or one that overlaps link-local (`169.254.0.0/16`, `fe80::/10`), `168.63.129.16/32`, loopback, the cluster's own ranges or the operator's `workerNetwork.extraDeniedCIDRs`, unless the operator lists a range holding it in `workerNetwork.permittedCIDRs`.
+    /// CIDR ranges re-opened through the egress deny list (for example a private registry or proxy), so they apply to every pool, not just under `Deny`. The controller refuses (`Ready=False/InvalidSpec`) an entry of `0.0.0.0/0` or `::/0`, or one that overlaps link-local (`169.254.0.0/16`, `fe80::/10`), `168.63.129.16/32`, loopback, the cluster's own ranges or the operator's `workerNetwork.extraDeniedCIDRs`, unless the operator lists a range holding it in `workerNetwork.permittedCIDRs`. A refused entry is left out of the pool's network policy.
     #[serde(rename = "allowCIDRs")]
     #[schemars(
         length(max = 32),

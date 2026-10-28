@@ -512,14 +512,20 @@ impl<'a> Planner<'_, 'a> {
                 format!("unknown time zone `{}`", spec.scaling.time_zone),
             )),
             (_, TemplateCheck::Conflict { message }) => Some(("TemplateConflict", message.clone())),
-            _ => egress_refused(spec, o.network).map(|m| ("InvalidSpec", m)),
+            _ => None,
         };
+        let egress = egress_refused(spec, o.network);
+        // Refused entries still apply the sandbox: render leaves them out, which
+        // narrows a policy an older spec or config opened wider. Pods that run
+        // under it lose the range at once.
+        let apply_sandbox = spec_block.is_none() || egress.is_some();
+        let spec_block = spec_block.or_else(|| egress.map(|m| ("InvalidSpec", m)));
         // Step 2.
         let ca = self.plan_ca();
         let waiting = self.plan_waiters_deadlines();
         // Steps 4 and 9 and the `P internal-ca` rule need a valid CA. Steps 5 to 8 always run.
         let fp = ca.map(|c| c.internal_ca().fingerprint_hex());
-        if fp.is_some() && spec_block.is_none() {
+        if fp.is_some() && apply_sandbox {
             self.plan_applies();
         }
         let counts = Some(self.plan_pods(fp.as_deref(), spec_block.is_none(), waiting));

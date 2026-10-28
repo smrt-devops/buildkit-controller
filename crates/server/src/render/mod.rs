@@ -104,10 +104,6 @@ pub enum RenderError {
     /// (`Ready=False/TemplateConflict`).
     #[error("template conflict: {}", .0.iter().map(|c| format!("{} ({})", c.field, c.reason)).collect::<Vec<_>>().join("; "))]
     TemplateConflict(Vec<TemplateConflictField>),
-    /// A `spec.network.egress.allowCIDRs` entry would reopen a range the sandbox
-    /// must keep closed (`Ready=False/InvalidSpec`); see [`refused_allow_cidr`].
-    #[error("egress refused: {}", .0.iter().map(|c| format!("{} ({})", c.field, c.reason)).collect::<Vec<_>>().join("; "))]
-    EgressRefused(Vec<TemplateConflictField>),
     /// The pool object lacks a field only the API server sets.
     #[error("pool is missing metadata.{0}")]
     MissingMetadata(&'static str),
@@ -127,9 +123,7 @@ impl RenderError {
     #[must_use]
     pub fn conflict_fields(&self) -> Vec<&str> {
         match self {
-            Self::TemplateConflict(c) | Self::EgressRefused(c) => {
-                c.iter().map(|c| c.field.as_str()).collect()
-            }
+            Self::TemplateConflict(c) => c.iter().map(|c| c.field.as_str()).collect(),
             _ => Vec::new(),
         }
     }

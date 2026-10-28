@@ -198,6 +198,7 @@ spec:
                           that overlaps link-local (`169.254.0.0/16`, `fe80::/10`), `168.63.129.16/32`,
                           loopback, the cluster's own ranges or the operator's `workerNetwork.extraDeniedCIDRs`,
                           unless the operator lists a range holding it in `workerNetwork.permittedCIDRs`.
+                          A refused entry is left out of the pool's network policy.
                         items:
                           maxLength: 64
                           type: string

@@ -694,22 +694,50 @@ async fn reconcile_verify() {
     // Give the controller passes that could have applied a widened policy.
     tokio::time::sleep(Duration::from_secs(5)).await;
     let after = nps.get(&np_name).await.unwrap();
+    assert_eq!(blocks(&after), blocks(&before), "NetworkPolicy widened");
+
+    // A policy an older spec or a withdrawn permit left wider is narrowed: put
+    // the metadata rule into the applied policy, as the controller would have
+    // rendered it while the entry was permitted, then start a new generation.
+    let mut egress = serde_json::to_value(&after).unwrap()["spec"]["egress"].clone();
+    egress
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"to": [{"ipBlock": {"cidr": "169.254.169.254/32"}}]}));
+    nps.patch(
+        &np_name,
+        &PatchParams::default(),
+        &Patch::Merge(json!({"spec": {"egress": egress}})),
+    )
+    .await
+    .unwrap();
+    let widened = blocks(&nps.get(&np_name).await.unwrap());
     assert!(
-        !blocks(&after)
-            .iter()
-            .any(|c| c.starts_with("169.254.") || c.starts_with("203.0.113.")),
-        "NetworkPolicy widened: {:?}",
-        blocks(&after)
+        widened.contains(&"169.254.169.254/32".to_owned()),
+        "{widened:?}"
     );
+    h.pools
+        .patch(
+            "m",
+            &PatchParams::default(),
+            &Patch::Merge(json!({"spec": {"network": {"egress": {
+                "allowCIDRs": ["192.0.2.0/24", "169.254.169.254/32"]}}}})),
+        )
+        .await
+        .unwrap();
+    until("m NetworkPolicy narrowed", 60, || async {
+        blocks(&nps.get(&np_name).await.unwrap()) == blocks(&before)
+    })
+    .await;
     assert_eq!(
-        after.metadata.resource_version, before.metadata.resource_version,
-        "NetworkPolicy changed"
+        cond(&h.pool("m").await, "Ready"),
+        Some(("False".into(), "InvalidSpec".into()))
     );
     assert!(h.list("m").await.is_empty(), "no pods of m");
     h.pools.delete("m", &DeleteParams::default()).await.unwrap();
     summary.push(format!(
-        "S13 PASS: allowCIDRs 169.254.169.254/32 and 203.0.113.128/25 (extraDeniedCIDRs) -> Ready=False/InvalidSpec ({message}); NetworkPolicy unchanged {:?}",
-        blocks(&after)
+        "S13 PASS: allowCIDRs 169.254.169.254/32 and 203.0.113.128/25 (extraDeniedCIDRs) -> Ready=False/InvalidSpec ({message}); NetworkPolicy not widened {:?}; a policy widened to {widened:?} was narrowed back on the next generation",
+        blocks(&before)
     ));
 
     // 2. A demand burst never exceeds max.

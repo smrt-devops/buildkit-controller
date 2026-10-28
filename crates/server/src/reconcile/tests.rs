@@ -819,8 +819,49 @@ fn template_conflict_and_invalid_spec_stop_creates_but_retire() {
     }
 }
 
-/// An `allowCIDRs` entry that reopens a protected range blocks the pool like any
-/// invalid spec: no sandbox apply, no creates, `Ready=False/InvalidSpec` naming it.
+/// A refused entry narrows the policy even when another spec error blocks the pool,
+/// and a pool already running warm pods under a wider policy (a new term, so no
+/// sandbox apply recorded) gets the narrowed one too, while its pods keep running.
+#[test]
+fn refused_allow_cidr_narrows_the_policy_under_any_block() {
+    let mut f = fx().scale(2, 10);
+    f.sandbox_gen = None;
+    f.pods = vec![pod(0), allocated(1)];
+    f.network.extra_denied_cidrs = vec!["203.0.113.0/24".into()];
+    f.pool.spec.network.egress.allow_cidrs = vec!["203.0.113.7/32".into()];
+    let p = f.plan();
+    assert!(
+        p.actions
+            .iter()
+            .any(|a| matches!(a, Action::ApplyNetworkPolicy))
+    );
+    assert!(retires(&p).is_empty() && creates(&p).is_empty());
+    assert_eq!(cond(&p, "Ready").reason, "InvalidSpec");
+
+    f.template = TemplateCheck::Conflict {
+        message: "sets metadata.name".into(),
+    };
+    let p = f.plan();
+    assert!(
+        p.actions
+            .iter()
+            .any(|a| matches!(a, Action::ApplyNetworkPolicy))
+    );
+    assert_eq!(cond(&p, "Ready").reason, "TemplateConflict");
+
+    // Without a refused entry a template conflict still applies nothing.
+    f.pool.spec.network.egress.allow_cidrs.clear();
+    let p = f.plan();
+    assert!(
+        !p.actions
+            .iter()
+            .any(|a| matches!(a, Action::ApplyNetworkPolicy))
+    );
+}
+
+/// An `allowCIDRs` entry that reopens a protected range blocks the pool:
+/// no creates, `Ready=False/InvalidSpec` naming it. The sandbox is still applied,
+/// because render leaves the entry out and so narrows an older, wider policy.
 #[test]
 fn refused_allow_cidr_is_invalid_spec() {
     let mut f = fx().scale(2, 10);
@@ -830,9 +871,10 @@ fn refused_allow_cidr_is_invalid_spec() {
     let p = f.plan();
     assert!(creates(&p).is_empty());
     assert!(
-        !p.actions
+        p.actions
             .iter()
-            .any(|a| matches!(a, Action::ApplySa | Action::ApplyNetworkPolicy))
+            .any(|a| matches!(a, Action::ApplyNetworkPolicy)),
+        "the narrowed policy is applied"
     );
     let c = cond(&p, "Ready");
     assert_eq!(

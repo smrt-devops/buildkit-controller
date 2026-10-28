@@ -984,52 +984,40 @@ fn permitted_cidrs_reopen_only_ranges_they_hold() {
 }
 
 #[test]
-fn network_policy_refuses_instead_of_widening() {
+fn network_policy_leaves_out_refused_entries() {
     let p = pool(
         "p",
         json!({"network": {"egress": {"internet": "Deny",
             "allowCIDRs": ["192.0.2.10/32", "169.254.169.254/32", "10.244.0.0/24"]}}}),
     );
+    let opened = |cfg: &RenderConfig| -> Vec<String> {
+        network_policy(&p, cfg)
+            .unwrap()
+            .spec
+            .and_then(|s| s.egress)
+            .into_iter()
+            .flatten()
+            .flat_map(|r| r.to.into_iter().flatten())
+            .filter_map(|p| p.ip_block.map(|b| b.cidr))
+            .collect()
+    };
     let mut cfg = default_config();
     cfg.worker_network = cluster_net();
-    let err = network_policy(&p, &cfg).unwrap_err();
-    assert!(matches!(err, RenderError::EgressRefused(_)), "{err}");
-    assert_eq!(
-        conflict_names(&err),
-        vec![
-            "spec.network.egress.allowCIDRs[1]",
-            "spec.network.egress.allowCIDRs[2]"
-        ]
-    );
-    let msg = err.to_string();
-    assert!(
-        msg.contains("`169.254.169.254/32` overlaps") && msg.contains("`10.244.0.0/24` overlaps"),
-        "{msg}"
-    );
-
-    // Permitting the cluster entry still leaves the metadata one refused.
+    assert_eq!(opened(&cfg), vec!["192.0.2.10/32"]);
+    // Permitting the cluster entry still leaves the metadata one out.
     cfg.worker_network.permitted_cidrs = vec!["10.244.0.0/24".into()];
-    assert_eq!(
-        conflict_names(&network_policy(&p, &cfg).unwrap_err()),
-        vec!["spec.network.egress.allowCIDRs[1]"]
-    );
+    assert_eq!(opened(&cfg), vec!["192.0.2.10/32", "10.244.0.0/24"]);
     // Permitting both renders every entry as its own rule.
     cfg.worker_network
         .permitted_cidrs
         .push("169.254.169.254/32".into());
-    let np = network_policy(&p, &cfg).unwrap();
-    let opened: Vec<String> = np
-        .spec
-        .and_then(|s| s.egress)
-        .into_iter()
-        .flatten()
-        .flat_map(|r| r.to.into_iter().flatten())
-        .filter_map(|p| p.ip_block.map(|b| b.cidr))
-        .collect();
     assert_eq!(
-        opened,
+        opened(&cfg),
         vec!["192.0.2.10/32", "169.254.169.254/32", "10.244.0.0/24"]
     );
+    // Withdrawing the permit narrows the policy again.
+    cfg.worker_network.permitted_cidrs.clear();
+    assert_eq!(opened(&cfg), vec!["192.0.2.10/32"]);
 }
 
 #[test]

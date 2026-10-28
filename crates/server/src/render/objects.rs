@@ -135,15 +135,16 @@ fn dns_rule(net: &WorkerNetwork) -> Option<NetworkPolicyEgressRule> {
 
 /// `NetworkPolicy` `<pool>-buildkit-worker`.
 ///
-/// Refuses with [`RenderError::EgressRefused`] rather than render an `allowCIDRs`
-/// rule that would reopen a link-local, metadata, loopback or cluster range.
+/// Leaves out every `allowCIDRs` entry [`super::refused_allow_cidr`] refuses, so the
+/// policy never reopens a link-local, metadata, loopback, cluster or extra denied
+/// range. Applied while the pool is `InvalidSpec`, it narrows the policy of
+/// pods that run under an older, wider one.
 pub fn network_policy(
     pool: &BuildKitPool,
     cfg: &RenderConfig,
 ) -> Result<NetworkPolicy, RenderError> {
     let (name, _, _) = pool_identity(pool)?;
     let net = &cfg.worker_network;
-    super::validate::check_egress(&pool.spec, net)?;
     let mut egress = Vec::new();
     egress.extend(dns_rule(net));
     let spec = &pool.spec.network.egress;
@@ -164,6 +165,7 @@ pub fn network_policy(
     egress.extend(
         spec.allow_cidrs
             .iter()
+            .filter(|c| super::refused_allow_cidr(c, net).is_none())
             .map(|c| to(vec![block(c, None)], None)),
     );
 

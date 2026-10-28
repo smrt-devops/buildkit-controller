@@ -353,16 +353,3 @@ pub fn refused_allow_cidrs(spec: &BuildKitPoolSpec, net: &WorkerNetwork) -> Vec<
         })
         .collect()
 }
-
-/// `Ok` when every `allowCIDRs` entry may be rendered.
-pub(super) fn check_egress(
-    spec: &BuildKitPoolSpec,
-    net: &WorkerNetwork,
-) -> Result<(), RenderError> {
-    let c = refused_allow_cidrs(spec, net);
-    if c.is_empty() {
-        Ok(())
-    } else {
-        Err(RenderError::EgressRefused(c))
-    }
-}
