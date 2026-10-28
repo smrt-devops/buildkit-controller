@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: sa-bad-name, namespace: default}
+spec:
+  access: {rules: [{serviceAccount: {name: "-bad"}}]}

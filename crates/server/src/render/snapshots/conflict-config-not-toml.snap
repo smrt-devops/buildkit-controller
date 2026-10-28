@@ -1,0 +1,6 @@
+---
+source: crates/server/src/render/tests.rs
+assertion_line: 284
+expression: err.to_string()
+---
+template conflict: spec.workers.buildkitdConfig (is not valid TOML: unclosed table, expected `]`)

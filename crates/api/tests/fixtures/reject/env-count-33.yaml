@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: env-count-33, namespace: default}
+spec:
+  template: {spec: {containers: [{name: buildkitd, env: [{name: E1, value: x}, {name: E2, value: x}, {name: E3, value: x}, {name: E4, value: x}, {name: E5, value: x}, {name: E6, value: x}, {name: E7, value: x}, {name: E8, value: x}, {name: E9, value: x}, {name: E10, value: x}, {name: E11, value: x}, {name: E12, value: x}, {name: E13, value: x}, {name: E14, value: x}, {name: E15, value: x}, {name: E16, value: x}, {name: E17, value: x}, {name: E18, value: x}, {name: E19, value: x}, {name: E20, value: x}, {name: E21, value: x}, {name: E22, value: x}, {name: E23, value: x}, {name: E24, value: x}, {name: E25, value: x}, {name: E26, value: x}, {name: E27, value: x}, {name: E28, value: x}, {name: E29, value: x}, {name: E30, value: x}, {name: E31, value: x}, {name: E32, value: x}, {name: E33, value: x}]}]}}
