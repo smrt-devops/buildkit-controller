@@ -1448,3 +1448,125 @@ async fn refused_review_does_not_mark_a_subject_seen() {
         .collect();
     assert!(accepting.review_slots.acquire("ci/builder", now).is_some());
 }
+
+// ---------- owner ----------
+
+const GH: &str = "https://token.actions.githubusercontent.com";
+const GH_SUB: &str = "repo:smrt-devops/app:pull_request";
+
+fn oidc(sub: &str, claims: Value) -> Identity {
+    let Value::Object(claims) = claims else {
+        panic!("object")
+    };
+    Identity::Oidc {
+        issuer: GH.into(),
+        subject: sub.into(),
+        claims,
+    }
+}
+
+fn gh_run(run_id: &str, attempt: &str) -> Value {
+    json!({"sub": GH_SUB, "run_id": run_id, "run_attempt": attempt,
+           "job_workflow_ref": "smrt-devops/app/.github/workflows/ci.yml@refs/pull/7/merge"})
+}
+
+#[test]
+fn github_owner_is_bound_to_the_run() {
+    assert_eq!(
+        oidc(GH_SUB, gh_run("42", "1")).owner(),
+        format!(
+            "oidc:{GH}#{GH_SUB}#run_id=42#run_attempt=1\
+             #job_workflow_ref=smrt-devops/app/.github/workflows/ci.yml@refs/pull/7/merge"
+        )
+    );
+    // Same repo and same `sub`, but another run or another attempt: another owner.
+    let a = oidc(GH_SUB, gh_run("42", "1")).owner();
+    assert_ne!(a, oidc(GH_SUB, gh_run("43", "1")).owner());
+    assert_ne!(a, oidc(GH_SUB, gh_run("42", "2")).owner());
+    let mut other_wf = gh_run("42", "1");
+    other_wf["job_workflow_ref"] = json!("smrt-devops/app/.github/workflows/x.yml@refs/heads/main");
+    assert_ne!(a, oidc(GH_SUB, other_wf).owner());
+    // A fresh token of the same run (the post step) keeps the owner.
+    assert_eq!(a, oidc(GH_SUB, gh_run("42", "1")).owner());
+}
+
+#[test]
+fn owner_without_run_claims_is_iss_and_sub() {
+    let plain = format!("oidc:{GH}#{GH_SUB}");
+    assert_eq!(oidc(GH_SUB, json!({"sub": GH_SUB})).owner(), plain);
+    // Empty or non-scalar values are not run claims.
+    assert_eq!(
+        oidc(
+            GH_SUB,
+            json!({"run_id": "", "run_attempt": null, "job_workflow_ref": {"a": 1}})
+        )
+        .owner(),
+        plain
+    );
+    // A subject with `#` keeps its legacy form when no run claim is present.
+    assert_eq!(oidc("a#b", json!({})).owner(), format!("oidc:{GH}#a#b"));
+}
+
+#[test]
+fn partial_and_numeric_run_claims() {
+    assert_eq!(
+        oidc("s", json!({"run_id": 7, "run_attempt": 2})).owner(),
+        format!("oidc:{GH}#s#run_id=7#run_attempt=2")
+    );
+    assert_eq!(
+        oidc("s", json!({"job_workflow_ref": "o/r/w.yml@x"})).owner(),
+        format!("oidc:{GH}#s#job_workflow_ref=o/r/w.yml@x")
+    );
+}
+
+/// A `#` in `sub` or a claim cannot forge another run's owner string.
+#[test]
+fn run_bound_owner_is_unambiguous() {
+    let forged = oidc("s#run_id=1", json!({"run_attempt": "2"})).owner();
+    let real = oidc("s", json!({"run_id": "1", "run_attempt": "2"})).owner();
+    assert_eq!(real, format!("oidc:{GH}#s#run_id=1#run_attempt=2"));
+    assert_eq!(forged, format!("oidc:{GH}#s%23run_id=1#run_attempt=2"));
+    assert_ne!(forged, real);
+    let a = oidc("s", json!({"run_id": "1#run_attempt=2"})).owner();
+    assert_ne!(a, real);
+    let pct = oidc("s%23x", json!({"run_id": "1"})).owner();
+    assert_ne!(pct, oidc("s#x", json!({"run_id": "1"})).owner());
+}
+
+#[test]
+fn service_account_and_claim_owners_are_unchanged() {
+    let sa = Identity::ServiceAccount {
+        namespace: "ci".into(),
+        name: "builder".into(),
+        uid: "u".into(),
+    };
+    assert_eq!(sa.owner(), "sa:ci/builder");
+    let claim = Identity::Claim {
+        namespace: "ci".into(),
+        name: "c".into(),
+        uid: "u".into(),
+    };
+    assert_eq!(claim.owner(), "claim:ci/c#u");
+}
+
+/// End to end through signature verification: the run claims of a real token
+/// reach the owner.
+#[tokio::test]
+async fn verified_token_owner_carries_run_claims() {
+    let es = Signer::es256("k1");
+    let iss = TestIssuer::start(&[&es]).await;
+    let auth = iss.auth(None);
+    let mut c = claims(&iss.url);
+    c["run_id"] = json!("9001");
+    c["run_attempt"] = json!("3");
+    c["job_workflow_ref"] = json!("smrt-devops/app/.github/workflows/ci.yml@refs/heads/main");
+    let id = auth.authenticate(&es.token(&c)).await.unwrap();
+    assert_eq!(
+        id.owner(),
+        format!(
+            "oidc:{}#repo:smrt-devops/app:ref:refs/heads/main#run_id=9001#run_attempt=3\
+             #job_workflow_ref=smrt-devops/app/.github/workflows/ci.yml@refs/heads/main",
+            iss.url
+        )
+    );
+}

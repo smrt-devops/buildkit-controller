@@ -53,6 +53,10 @@ The CA Secret holds two CAs. The client CA signs allocation certificates and the
 
 Each worker pod has its own serving certificate, issued by the internal CA. Its only name is `<nonce>.<pod>.<pool>.<namespace>.worker.buildkit.internal`, where `<pod>` is the slot name `<pool>-<slot>` and `<nonce>` is 16 random hex characters picked before the pod is created and stored on the pod. Slot names are reused, so the nonce is what tells two pods of one slot apart. The edge dials the worker using the name of the pod it looked up for the allocation. A different pod, or an earlier pod of the same slot, holds a certificate for another name, so the handshake fails and a connection can never be steered to the wrong worker. A pod is never renewed. The reconciler retires a free pod whose certificate has under 25 hours left, and a pod created on demand gets a certificate that lasts until its allocation expires plus 5 minutes.
 
+## Allocation owner
+
+Every allocation records its caller as the owner, and only the same owner can release it early. A service account is `sa:<namespace>/<name>` and a claim is `claim:<namespace>/<name>#<uid>`. An OIDC caller is `oidc:<iss>#<sub>`, plus the run claims `run_id`, `run_attempt` and `job_workflow_ref` when the token carries them, as `#run_id=<value>` and so on, with `%` and `#` in `sub` and in each value percent-encoded. GitHub Actions tokens carry all three. Their `sub` alone is the same for every run of a repository and ref, and for every `pull_request` run, so without the run claims one run could release another's worker. A token from the same job, such as the one the Action fetches in its post step, gives the same owner. A re-run attempt is a different owner and cannot release the earlier attempt's worker, which ends at its expiry.
+
 ## Build cache
 
 Workers are single-use, so a build never lands on a daemon that has already built. Cache comes from the pool's two layers, set under `spec.workers.cache`. Both are off by default.
