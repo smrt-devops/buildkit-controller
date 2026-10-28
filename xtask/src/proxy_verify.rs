@@ -42,7 +42,12 @@ const NS: &str = "bk-system";
 const POOL_NS: &str = "ci";
 const CLIENT_NS: &str = "bk-clients";
 const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
-const SOCAT_IMAGE: &str = "alpine/socat:latest";
+/// socat 1.8.1.3 for the client pods, pulled by index digest and tagged.
+const SOCAT: (&str, &str) = (
+    "docker.io/alpine/socat:1.8.1.3",
+    "sha256:603174b77eebaba25ba8f8ebb15e1234d6600409554e95d6fb203fd106150287",
+);
+const SOCAT_IMAGE: &str = SOCAT.0;
 const SERVER_NAME: &str = "bk.proxy.test";
 /// SNI of the extra passthrough `TLSRoute` to the API (scenario e).
 const PASSTHROUGH_HOST: &str = "pt.proxy.test";
@@ -351,7 +356,7 @@ fn run(env: &Env, work: &Path) -> Result<()> {
     )?;
     crate::image::image(CONTROLLER_IMAGE, Some(CLUSTER.as_str()))?;
     crate::image::ensure_worker()?;
-    crate::image::ensure(SOCAT_IMAGE)?;
+    crate::gateway::ensure_image(SOCAT.0, SOCAT.1)?;
     for image in [WORKER_IMAGE, SOCAT_IMAGE] {
         output(&mut crate::kube::kind_load(image, CLUSTER.as_str()))?;
     }

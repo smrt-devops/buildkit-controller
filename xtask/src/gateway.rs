@@ -89,7 +89,7 @@ fn verify(path: &Path, sha256: &str) -> Result<()> {
 }
 
 /// The pinned image as `tag`, pulled by digest unless the local `tag` already is that digest.
-fn ensure_image(tag: &str, digest: &str) -> Result<()> {
+pub(crate) fn ensure_image(tag: &str, digest: &str) -> Result<()> {
     let repo = tag.rsplit_once(':').map_or(tag, |(r, _)| r);
     let by_digest = format!("{repo}@{digest}");
     let local = Command::new("docker")
