@@ -1164,6 +1164,9 @@ fn cloud_metadata_endpoints_are_protected() {
         ("fd00:ec2::/32", "fd00:ec2::254/128"),
         ("fd20:ce::254/128", "fd20:ce::254/128"),
         ("fd00:a9fe:a9fe::1/128", "fd00:a9fe:a9fe::1/128"),
+        // Oracle Cloud and Scaleway metadata over IPv6.
+        ("fd00:c1::a9fe:a9fe/128", "fd00:c1::a9fe:a9fe/128"),
+        ("fd00:42::42/128", "fd00:42::42/128"),
         // Alibaba Cloud.
         ("100.100.100.200/32", "100.100.100.200/32"),
         ("100.64.0.0/10", "100.100.100.200/32"),
@@ -1249,4 +1252,25 @@ fn startup_is_probed_fast_and_readiness_slowly() {
     assert!(budget > 30 * 60, "{budget}");
     assert_eq!(ready.period_seconds, Some(10));
     assert_eq!(c.image_pull_policy.as_deref(), Some("IfNotPresent"));
+}
+
+#[test]
+fn history_is_off_even_when_the_gc_bound_cannot_be_read() {
+    let mut p = cached_pool(2, 5);
+    p.spec.workers.cache.local.as_mut().unwrap().size =
+        k8s_openapi::apimachinery::pkg::api::resource::Quantity("25e9".into());
+    p.spec.workers.buildkitd_config = "debug = true\n".into();
+    let d: toml_edit::DocumentMut = buildkitd_config(&p).parse().unwrap();
+    assert_eq!(d["history"]["maxEntries"].as_integer(), Some(0));
+    assert!(
+        d.get("worker")
+            .is_none_or(|w| w.get("oci").is_none_or(|o| o.get("maxUsedSpace").is_none()))
+    );
+    // The config check runs all the same.
+    p.spec.workers.buildkitd_config = "worker = 1\n".into();
+    assert!(
+        validate_template(&p.spec)
+            .iter()
+            .any(|c| c.field == "spec.workers.buildkitdConfig")
+    );
 }

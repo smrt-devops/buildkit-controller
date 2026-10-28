@@ -451,3 +451,22 @@ fn pull_policy_strings_are_the_wire_values() {
         assert_eq!(serde_json::to_value(p).unwrap(), p.as_str());
     }
 }
+
+#[test]
+fn list_and_time_bounds_are_in_the_schema() {
+    // crd-verify checks these against an API server; this pins them in the schema.
+    let v = serde_json::to_value(crd()).unwrap();
+    let spec =
+        &v["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"];
+    let schedule = &spec["scaling"]["properties"]["schedule"];
+    assert_eq!(schedule["maxItems"], 32);
+    let win = &schedule["items"]["properties"];
+    for f in ["start", "end"] {
+        assert_eq!(win[f]["pattern"], "^([01][0-9]|2[0-3]):[0-5][0-9]$", "{f}");
+    }
+    assert_eq!(
+        spec["network"]["properties"]["egress"]["properties"]["allowCIDRs"]["maxItems"],
+        32
+    );
+    assert_eq!(spec["access"]["properties"]["rules"]["maxItems"], 64);
+}

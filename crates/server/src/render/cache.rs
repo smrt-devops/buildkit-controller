@@ -349,7 +349,8 @@ pub fn gc_keep_bytes(lc: &LocalCache) -> Option<u64> {
 
 /// The pool's `buildkitd.toml`. With `cache.local` it gains
 /// `[worker.oci] maxUsedSpace` and `gc = true` (unless the pool's config
-/// already sets `maxUsedSpace`), and `[history] maxEntries = 0`, which turns
+/// already sets `maxUsedSpace`, or the bound's quantity is not one
+/// [`quantity_bytes`] reads), and `[history] maxEntries = 0`, which turns
 /// build history off: a volume outlives the allocation, and build records
 /// (logs, build arguments) must not reach a later one. The rest of the config
 /// keeps its formatting.
@@ -364,22 +365,23 @@ pub fn buildkitd_config(pool: &BuildKitPool) -> String {
         .cache
         .local
         .as_ref()
-        .and_then(gc_keep_bytes)
-        .and_then(|bytes| with_cache_settings(cfg, bytes).ok())
+        .and_then(|lc| with_cache_settings(cfg, gc_keep_bytes(lc)).ok())
         .unwrap_or_else(|| cfg.clone())
 }
 
-/// `cfg` with the `cache.local` settings of [`buildkitd_config`] and a GC
-/// bound of `bytes`, or why `cfg` cannot take them: it is not TOML, or
+/// `cfg` with the `cache.local` settings of [`buildkitd_config`], the GC
+/// bound only when `bytes` is known, or why `cfg` cannot take them: it is not TOML, or
 /// `worker`, `worker.oci` or `history` is not a table.
-pub(super) fn with_cache_settings(cfg: &str, bytes: u64) -> Result<String, String> {
+pub(super) fn with_cache_settings(cfg: &str, bytes: Option<u64>) -> Result<String, String> {
     let mut doc: DocumentMut = cfg
         .parse()
         .map_err(|e: TomlError| format!("is not valid TOML: {}", e.message()))?;
     let not_table = |key: &str| format!("sets `{key}` to something other than a table");
     let worker = child(doc.as_item_mut(), "worker").ok_or_else(|| not_table("worker"))?;
     let oci = child(worker, "oci").ok_or_else(|| not_table("worker.oci"))?;
-    if oci.get("maxUsedSpace").is_none() {
+    if let Some(bytes) = bytes
+        && oci.get("maxUsedSpace").is_none()
+    {
         set(oci, "maxUsedSpace", bytes.to_string().into());
         set(oci, "gc", true.into());
     }

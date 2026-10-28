@@ -106,8 +106,7 @@ fn local_cache(spec: &BuildKitPoolSpec, out: &mut Vec<Conflict>) {
     if spec.workers.cache.local.is_none() {
         return;
     }
-    // The bound's value does not change whether the config can take it.
-    if let Err(why) = with_cache_settings(&spec.workers.buildkitd_config, 0) {
+    if let Err(why) = with_cache_settings(&spec.workers.buildkitd_config, None) {
         conflict(out, "spec.workers.buildkitdConfig".into(), &why);
     }
 }
@@ -285,7 +284,7 @@ pub(super) fn check(spec: &BuildKitPoolSpec) -> Result<(), RenderError> {
 /// Ranges no `allowCIDRs` entry may overlap unless the operator permits it:
 /// link-local and loopback, the cloud metadata endpoints outside link-local,
 /// and the NAT64 local-use prefix.
-pub const PROTECTED_CIDRS: [&str; 10] = [
+pub const PROTECTED_CIDRS: [&str; 12] = [
     "169.254.0.0/16",
     "fe80::/10",
     "127.0.0.0/8",
@@ -300,6 +299,10 @@ pub const PROTECTED_CIDRS: [&str; 10] = [
     "fd20:ce::254/128",
     // Akamai (Linode) metadata over IPv6.
     "fd00:a9fe:a9fe::1/128",
+    // Oracle Cloud metadata over IPv6.
+    "fd00:c1::a9fe:a9fe/128",
+    // Scaleway metadata over IPv6.
+    "fd00:42::42/128",
     // RFC 8215 local-use NAT64: the operator picks where the IPv4 address
     // sits inside it, so its entries cannot be checked as IPv4.
     "64:ff9b:1::/48",

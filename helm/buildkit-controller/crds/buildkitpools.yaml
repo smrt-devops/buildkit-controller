@@ -197,12 +197,12 @@ spec:
                           refuses (`Ready=False/InvalidSpec`) an entry of `0.0.0.0/0`, `::/0` or
                           `64:ff9b::/96` (all of IPv4 through NAT64), or one that overlaps link-local
                           (`169.254.0.0/16`, `fe80::/10`), loopback, a cloud metadata endpoint (`168.63.129.16`,
-                          `100.100.100.200`, `fd00:ec2::254`, `fd20:ce::254`, `fd00:a9fe:a9fe::1`), the NAT64
-                          local-use prefix `64:ff9b:1::/48`, the cluster's own ranges or the operator's
-                          `workerNetwork.extraDeniedCIDRs`, unless the operator lists a range holding it in
-                          `workerNetwork.permittedCIDRs`. An entry inside `::ffff:0:0/96` or `64:ff9b::/96` is
-                          checked as the IPv4 range it reaches. A refused entry is left out of the pool's
-                          network policy.
+                          `100.100.100.200`, `fd00:ec2::254`, `fd20:ce::254`, `fd00:a9fe:a9fe::1`,
+                          `fd00:c1::a9fe:a9fe`, `fd00:42::42`), the NAT64 local-use prefix `64:ff9b:1::/48`, the cluster's
+                          own ranges or the operator's `workerNetwork.extraDeniedCIDRs`, unless the
+                          operator lists a range holding it in `workerNetwork.permittedCIDRs`. An entry inside
+                          `::ffff:0:0/96` or `64:ff9b::/96` is checked as the IPv4 range it reaches. A refused
+                          entry is left out of the pool's network policy.
                         items:
                           maxLength: 64
                           type: string
