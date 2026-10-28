@@ -109,7 +109,19 @@ Suggested alerts, with thresholds to tune:
 | Allocation failures | `sum(rate(buildkit_allocations_total{result!="ok"}[5m])) / sum(rate(buildkit_allocations_total[5m])) > 0.05` | 10m |
 | JWKS fetch failing | `increase(buildkit_jwks_fetch_total{result="error"}[10m]) > 5` | 10m |
 
-Health probes are `/healthz` (process alive) and `/readyz` (config loaded, caches synced, CA loaded, serving certificate loaded, listeners bound). Leadership is not part of readiness.
+Health probes are `/healthz` (process alive) and `/readyz` (config loaded, Pool and Pod caches listed and not stale, CA loaded, serving certificate loaded, listeners bound). Leadership is not part of readiness. See [Kubernetes API outages](#kubernetes-api-outages) for when a cache counts as stale.
+
+## Kubernetes API outages
+
+Each replica keeps in-memory caches of pools and pods, fed by watches. When a watch fails, for example while the API server restarts, the replica keeps its last list and starts a new watch after 1, 2, 4, 8, 16 and then every 30 s. Each new watch lists everything again. An API server blip reaches every replica at once, so the replicas ride it out instead of all leaving the Service together.
+
+- For 60 s after the first watch error the replica stays Ready and the edge keeps admitting new connections from the cache. Five retries fit in that window, so an outage of up to about 30 s shows only in `buildkit_watch_errors_total`.
+- If no new list completes within 60 s, `/readyz` fails naming `pool_store` or `pod_store`, and the edge refuses new connections with `store_stale`. By then the cache may have missed too many changes to vouch for an allocation.
+- The first completed list makes the replica Ready again and the edge admits again.
+- Builds already connected keep their connections throughout. A release or pod deletion during the outage closes its connection once the cache catches up.
+- At startup there is no grace: a replica is not Ready until both caches have listed once.
+
+Inside the 60 s the cache can miss a release or a deletion. Workers are single-use, so that can only admit the client that already held the worker. Expiry is checked against the clock, so an expired allocation is refused anyway. If a deleted pod's IP now belongs to another pod, the connection fails at the upstream handshake, because each worker's serving certificate names its own pod and nonce.
 
 ## Troubleshooting
 

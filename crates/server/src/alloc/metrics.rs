@@ -128,7 +128,7 @@ impl AllocMetrics {
             .set(i64::try_from(n).unwrap_or(i64::MAX));
     }
 
-    /// `result` = `ok`, `timeout`, `cancelled`, `full`.
+    /// `result` = `ok`, `timeout`, `cancelled`, `full`, `shutting_down`.
     pub fn queue_wait(&self, ns: &str, p: &str, result: &str, secs: f64) {
         self.queue_wait
             .get_or_create(&with(pool(ns, p), "result", result))
