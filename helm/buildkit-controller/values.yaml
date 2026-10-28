@@ -102,6 +102,11 @@ shutdown:
   # 5m allocation cert margin. The termination grace period follows this value.
   drainTimeout: ""
 
+# kube.requestTimeout is a controller config key, not a chart value: the chart renders no
+# `kube` section, so the controller uses its default of 5s. Must be below 90s: the
+# controller's Kubernetes client ends any request that receives nothing for 90 s, and the
+# controller refuses a config with a larger value.
+
 service:
   # ClusterIP behind a Gateway (the default). LoadBalancer exposes the API and edge
   # ports directly instead and makes gateway.parentRefs optional.

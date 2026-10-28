@@ -1,6 +1,6 @@
 # Quickstart
 
-This page installs the controller, creates a pool and runs one build with the GitHub Action and with plain curl. You need `kubectl`, `helm` 3, and a cluster on Kubernetes 1.30 or later. Check out this repository first, because the chart is installed from `helm/buildkit-controller`.
+This page installs the controller, creates a pool and runs one build with the GitHub Action and with plain curl. You need `kubectl`, `helm` 3, and a cluster on Kubernetes 1.30 or later. The commands install the chart from a checkout of this repository (`helm/buildkit-controller`); the next section shows how to install it from a release instead.
 
 ## Requirements
 
@@ -10,6 +10,15 @@ This page installs the controller, creates a pool and runs one build with the Gi
 - On an IPv6 or dual-stack cluster, list the IPv6 pod, service and node ranges in `workerNetwork.clusterCIDRs`, plus any IPv4 pod or node ranges outside RFC 1918 and 100.64.0.0/10. Until it holds an IPv6 range, workers get no IPv6 egress, and on an IPv6-only cluster every image pull fails while the pool reports Ready.
 
 ## 1. Install
+
+The chart is also a release asset. Wherever a command below says `helm install bk helm/buildkit-controller`, you can install the packaged chart instead, without a checkout:
+
+```sh
+helm install bk https://github.com/smrt-devops/buildkit-controller/releases/download/v0.1.0/buildkit-controller-0.1.0.tgz \
+  -n buildkit-system --create-namespace   # plus the same --set flags as below
+```
+
+That release predates some features and fixes in this repository. A setting or behavior these docs describe may need a newer release, so use the chart from a checkout of the matching tag or commit when a `--set` flag is rejected.
 
 ### On a real cluster
 
@@ -71,7 +80,7 @@ YAML
 kubectl get bkp -n ci
 ```
 
-`READY` turns `True` when the pool's sandbox objects and certificates exist. With the default `scaling.min: 0` the pool starts no pods until the first request, so the first build waits for one pod start (up to `workers.startTimeout`, 2 minutes by default). Set `scaling.min: 1` to keep one warm.
+`READY` turns `True` when the spec is valid, the controller has a CA and the pool's sandbox objects (ServiceAccount and NetworkPolicy) are applied. With the default `scaling.min: 0` the pool starts no pods until the first request, so the first build waits for one pod start (up to `workers.startTimeout`, 2 minutes by default). Set `scaling.min: 1` to keep one warm.
 
 A caller that matches no rule gets 404 `pool_not_found`.
 
@@ -93,7 +102,23 @@ steps:
   - run: docker buildx build .
 ```
 
-Inputs are `url`, `pools` (one `namespace/pool` per entry), `ttl`, `queue-timeout`, `audience` (default `buildkit-controller`), `builder-name` and `ca-cert`. The outputs are `builder`, `platforms` and `allocation-ids`. The post step removes the builder and releases every allocation even when the job fails.
+The inputs are:
+
+| Input | Meaning |
+|---|---|
+| `url` | Controller API base URL. Required. |
+| `pools` | Pools to allocate, one `namespace/pool` per entry. Required. |
+| `ttl` | Allocation TTL, for example `3600`, `90m` or `1h`. Defaults to the pool's. |
+| `queue-timeout` | How long to wait in the queue, for example `300` or `5m`. Defaults to the pool's. It also bounds the retries (see [Retries](ci/README.md#retries)). |
+| `audience` | OIDC token audience. Default `buildkit-controller`. |
+| `builder-name` | Name of the buildx builder. Default `bk-<first allocation id>`. |
+| `ca-cert` | PEM CA to trust for the API listener. Default the system roots. |
+| `cache` | `auto` (default, every layer the pool enables), `registry`, `local` or `none`. |
+| `cache-key` | Cache key for both layers. Defaults to the pool's registry `defaultKey`, else the pool name. |
+| `cache-mode` | `max` or `min`, replaces the pool's mode in `cache-to`. |
+| `cache-from` | Extra `--cache-from` values, one per line. |
+
+The outputs are `builder`, `platforms` (the union of the pools' platforms), `allocation-ids`, `cache-to` and `cache-from` (one value per line, for `docker/build-push-action`) and `cache-args` (the same values as flags for `docker buildx build`). The cache inputs and outputs are explained in [Using it from CI](ci/README.md#build-cache). The post step removes the builder and releases every allocation even when the job fails.
 
 Behind the Gateway, the API presents the Gateway's certificate. When that certificate is publicly trusted, the Action needs no `ca-cert`. The edge always passes through to the controller, and the Action trusts the CA that comes with each allocation.
 
@@ -105,6 +130,13 @@ kubectl -n buildkit-system get configmap buildkit-controller-ca-bundle -o 'jsonp
 ```
 
 To skip this step, give the controller a certificate from a public CA through `edge.tls.secretName`. If the Gateway's own certificate comes from a private CA, store that CA in `BK_CA` instead.
+
+### Choosing access rules
+
+The GitHub OIDC rule in `examples/pool-github-oidc.yaml` decides which workflows can use the pool. Match on ids, not names:
+
+- Prefer `repository_id` and `repository_owner_id` over `repository` and `repository_owner`. A name can be re-registered after a rename or deletion by someone else, but an id cannot.
+- A `ref` rule also matches `pull_request_target` runs. For that event GitHub sets `ref` to the base branch, for example `refs/heads/main`, even though the workflow can check out and run code from the pull request. Add `event_name` (for example `push`) or `job_workflow_ref` to the same rule to exclude it.
 
 ## 4. First build with curl
 

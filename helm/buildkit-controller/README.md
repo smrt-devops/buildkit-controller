@@ -26,6 +26,15 @@ keeps the install in-cluster. `gateway.envoy.enabled` adds Envoy Gateway policie
 listeners, timeouts and supported implementations are in
 [helm/README.md](../README.md#exposure).
 
+## Requirements
+
+The build sandbox depends on these cluster settings. Without an enforcing CNI or the IPv6 cluster ranges, pools still report Ready while builds are not isolated or have no IPv6 egress. A Pod Security refusal shows as `Degraded` with reason `PodCreateFailed`.
+
+- The cluster's CNI must enforce NetworkPolicy. The worker sandbox is a NetworkPolicy. kindnet and the default EKS VPC CNI ignore it, and on them a build reaches every pod and the cloud metadata endpoint.
+- Each pool namespace must admit privileged pods under Pod Security Admission. Label it `pod-security.kubernetes.io/enforce=privileged`. Rootless BuildKit needs unconfined seccomp and AppArmor, which `baseline` and `restricted` refuse.
+- Give each pool its own namespace, with no other workloads or NetworkPolicies, and never the release namespace, which holds the CA Secret. NetworkPolicies add up, so another policy that selects the worker pods widens the sandbox.
+- On an IPv6 or dual-stack cluster, list the IPv6 pod, service and node ranges in `workerNetwork.clusterCIDRs`, plus any IPv4 pod or node ranges outside RFC 1918 and 100.64.0.0/10. Until it holds an IPv6 range, workers get no IPv6 egress, so on an IPv6-only cluster image pulls fail.
+
 ## Pools
 
 Each `pools` item is `{name, namespace, spec, cache}`. The chart copies `spec`
