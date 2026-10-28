@@ -1,0 +1,9 @@
+# The alternative: the Service is the load balancer and no route is rendered.
+edge:
+  endpoint: tcp://bk.example.com:8444
+  serverName: bk.example.com
+service:
+  type: LoadBalancer
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-8443: tcp.idle_timeout.seconds=900
+    service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-8444: tcp.idle_timeout.seconds=900

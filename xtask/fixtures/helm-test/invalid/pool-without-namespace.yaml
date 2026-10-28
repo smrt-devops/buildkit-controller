@@ -1,2 +1,4 @@
+# expect: pools[nons]: set namespace to a dedicated pool namespace
 edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
 pools: [{name: nons, spec: {}}]
+gateway: {enabled: false}

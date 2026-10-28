@@ -1,0 +1,6 @@
+# expect: set caCertificateRefs or wellKnownCACertificates, not both
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+gateway:
+  parentRefs: [{name: shared, namespace: gateway-system}]
+  api:
+    backendTLS: {caCertificateRefs: [{name: my-ca}], wellKnownCACertificates: System}

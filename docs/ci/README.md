@@ -9,8 +9,8 @@ See `action/`. The job needs `permissions: id-token: write`.
 ```yaml
 - uses: smrt-devops/buildkit-controller/action@v0
   with:
-    url: https://bk.example.com:8443
-    ca-cert: ${{ vars.BK_CA }}   # omit with a public-CA edge certificate
+    url: https://bk.example.com
+    # ca-cert: ${{ vars.BK_CA }}   # see "Trusting the API" below
     pools: |
       ci/amd64
       ci/arm64        # more than one pool needs edge.allocationDomain and distinct pool platforms
@@ -18,6 +18,15 @@ See `action/`. The job needs `permissions: id-token: write`.
 ```
 
 The post step removes the builder and releases every allocation, even when the job fails.
+
+### Trusting the API
+
+`ca-cert` is the CA the Action trusts for the API listener; without it, the system roots. Which certificate the API presents depends on how the chart exposes it:
+
+- Behind a Gateway with `gateway.api.mode: terminate` (the chart's default), the Gateway's own certificate. With a publicly trusted one, leave `ca-cert` out. With a private CA, pass that CA.
+- With `service.type: LoadBalancer` or `gateway.api.mode: passthrough`, the controller's serving certificate. Pass the controller's CA from the `buildkit-controller-ca-bundle` ConfigMap (key `ca.crt`), unless `edge.tls.secretName` holds a publicly trusted certificate.
+
+The edge needs no input: each allocation response carries the CA for the edge, and the Action uses it.
 
 ### Retries
 
@@ -65,8 +74,7 @@ With `docker/build-push-action`:
 - id: bk
   uses: smrt-devops/buildkit-controller/action@v0
   with:
-    url: https://bk.example.com:8443
-    ca-cert: ${{ vars.BK_CA }}   # omit with a public-CA edge certificate
+    url: https://bk.example.com
     pools: ci/amd64
     cache-key: ${{ github.event.repository.name }}
 - uses: docker/build-push-action@v6
@@ -95,13 +103,13 @@ sends only the public key, creates a remote builder, runs your command with `$BU
 the allocation on exit, including after a failure or a signal.
 
 ```sh
-export API=https://bk.example.com:8443 POOL=ci/amd64
+export API=https://bk.example.com POOL=ci/amd64
 export TOKEN=...   # OIDC token or service-account token with the controller audience, e.g.
                    # kubectl create token builder --audience buildkit-controller
 sh docs/ci/buildkit-allocate.sh sh -c 'docker buildx build --builder "$BUILDER" .'
 ```
 
-Optional variables are `TTL` and `QUEUE_TIMEOUT` (seconds), `API_CA` (PEM file for the API listener),
+Optional variables are `TTL` and `QUEUE_TIMEOUT` (seconds), `API_CA` (PEM file for the API listener, needed under the same conditions as the Action's `ca-cert`),
 `CACHE_KEY` and `CACHE` (the Action's `cache-key` and `cache` inputs). The script retries the allocation
 under the same rules and limits as the Action (see Retries above): a 503 with `Retry-After`, or a curl
 failure to resolve or connect, for at most the queue timeout plus 60 seconds, shrinking the queue timeout it sends on each retry.

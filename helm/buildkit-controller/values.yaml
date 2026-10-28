@@ -1,4 +1,5 @@
-# buildkit-controller. edge.endpoint and edge.serverName are required.
+# buildkit-controller. edge.endpoint and edge.serverName are required, and gateway.parentRefs
+# unless service.type is LoadBalancer or gateway.enabled is false.
 
 image:
   repository: ghcr.io/smrt-devops/buildkit-controller
@@ -85,14 +86,79 @@ shutdown:
   drainTimeout: ""
 
 service:
-  type: LoadBalancer  # ClusterIP | NodePort | LoadBalancer
+  # ClusterIP behind a Gateway (the default). LoadBalancer exposes the API and edge
+  # ports directly instead and makes gateway.parentRefs optional.
+  type: ClusterIP  # ClusterIP | NodePort | LoadBalancer
   annotations: {}
   loadBalancerClass: ""
-  externalTrafficPolicy: Local   # keeps client source IPs, which the per-address caps count; "" = Cluster (SNAT)
+  externalTrafficPolicy: Local   # NodePort/LoadBalancer only; keeps client source IPs, which the per-address caps count; "" = Cluster (SNAT)
   ports:
     api: 8443
     edge: 8444
   nodePorts: {api: null, edge: null}
+
+# Exposure through Gateway API (gateway.networking.k8s.io/v1), the default. The chart
+# renders upstream kinds only, and only those the cluster serves (NOTES.txt names any
+# that are missing): HTTPRoute (Gateway API v1.0+), BackendTLSPolicy (v1.4+) and
+# TLSRoute (v1.5+), all in the standard channel. You bring the Gateway and its listeners.
+#
+# Behind a gateway the controller sees the gateway's addresses, not the clients', so
+# every client shares edge.maxHandshakesPerIp (32), api.maxConnectionsPerIp (128) and
+# auth.serviceAccount.maxReviewsPerIp (4). Raise them, or set them to 0, to match the
+# number of CI jobs that can start at once.
+gateway:
+  # true: render routes for gateway.parentRefs. Without parentRefs the chart fails to
+  # render unless service.type is LoadBalancer. false: no routes, e.g. an in-cluster-only
+  # install reached through the Service or a port-forward.
+  enabled: true
+  # Default listeners for both routes. The API and the edge need different listeners
+  # (HTTPS and TLS passthrough), so set api.parentRefs and edge.parentRefs instead, each
+  # with a sectionName. A ref without sectionName attaches the API HTTPRoute to every
+  # HTTP and HTTPS listener that admits it, plain HTTP included (NOTES.txt warns).
+  parentRefs: []
+  annotations: {}
+  labels: {}
+  api:
+    # terminate: an HTTPRoute; the gateway terminates TLS with its own certificate and
+    #   re-encrypts to the controller (BackendTLSPolicy). Clients need no CA when the
+    #   gateway's certificate is publicly trusted. Needs an HTTPS listener.
+    # passthrough: a TLSRoute; clients see the controller's serving certificate. Needs a
+    #   TLS listener in Passthrough mode.
+    mode: terminate
+    parentRefs: []         # e.g. [{name: shared, namespace: gateway-system, sectionName: https}]
+    hostnames: []          # [] = [edge.serverName]
+    # HTTPRoute timeouts (terminate mode). A queued allocation request is silent until a
+    # worker is free: up to the pool's maxQueueTimeout + workers.startTimeout + 10s, which
+    # is 12m10s with default pool settings. Keep both above that.
+    timeouts:
+      request: 15m
+      backendRequest: 15m
+    # How the gateway verifies the controller (terminate mode).
+    backendTLS:
+      hostname: ""                 # name checked in the controller's certificate; "" = edge.serverName
+      # [] = the controller's CA bundle ConfigMap <fullname>-ca-bundle (key ca.crt), which
+      # trusts the self-issued serving certificate. Set your own with edge.tls.secretName.
+      caCertificateRefs: []        # e.g. [{group: "", kind: ConfigMap, name: my-ca}]
+      wellKnownCACertificates: ""  # "System" for a publicly trusted edge.tls.secretName; exclusive with caCertificateRefs
+  edge:
+    # TLS passthrough only: the controller checks the client certificate itself, so the
+    # gateway must never terminate this TLS. Needs a TLS listener in Passthrough mode. The
+    # TLSRoute matches the SNI edge.serverName, plus *.<edge.allocationDomain> when set.
+    # e.g. parentRefs: [{name: shared, namespace: gateway-system, sectionName: bk-edge}]
+    parentRefs: []
+  # Envoy Gateway extras, off by default: a BackendTrafficPolicy per route with TCP
+  # keepalive, a connect timeout and, on the HTTPRoute, a stream idle timeout equal to
+  # api.timeouts.request, which holds even when a ClientTrafficPolicy on the Gateway sets
+  # a shorter one. Needs the gateway.envoyproxy.io/v1alpha1 CRDs.
+  envoy:
+    enabled: false
+    connectTimeout: 10s
+    tcpKeepalive: {idleTime: 30s, interval: 10s, probes: 3}
+    # proxyProtocol: reserved. The controller does not read PROXY protocol yet, so the
+    # chart never asks Envoy to send it.
+  # Extra objects for other implementations (policies, ReferenceGrants). Each item is an
+  # object or a string; both go through tpl, so {{ include "bkc.fullname" . }} works.
+  extraManifests: []
 
 metrics:
   port: 8080          # ops port: /healthz /readyz /metrics (own ClusterIP Service)

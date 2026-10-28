@@ -185,7 +185,9 @@ impl Default for Api {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct Kube {
-    /// Timeout of every non-watch API call.
+    /// Timeout of every non-watch API call. Must be below the client read
+    /// timeout (90 s, [`READ_TIMEOUT`](crate::runtime::READ_TIMEOUT)), which
+    /// would otherwise cut a silent call first.
     pub request_timeout: CrdDuration,
 }
 
@@ -652,6 +654,12 @@ impl Config {
         }
         if rt.is_zero() {
             p.push("kube.requestTimeout must be positive".into());
+        }
+        let read = crate::runtime::READ_TIMEOUT;
+        if rt >= read {
+            p.push(format!(
+                "kube.requestTimeout ({rt:?}) must be below the client read timeout ({read:?}), which ends any API request that receives nothing for that long"
+            ));
         }
         if ri.is_zero() {
             p.push("leaderElection.renewInterval must be positive".into());

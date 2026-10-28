@@ -1,0 +1,104 @@
+{{- /* Gateway API routes. Upstream kinds only; Envoy Gateway extras are opt-in below. */ -}}
+{{- $fn := include "bkc.fullname" . -}}
+{{- $gw := .Values.gateway -}}
+{{- $plan := include "bkc.gateway" . | fromJson -}}
+{{- $terminate := eq $gw.api.mode "terminate" -}}
+{{- with $plan.apiRefs }}
+{{- if $terminate }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $fn }}-api
+  namespace: {{ $.Release.Namespace }}
+  {{- include "bkc.gateway.meta" $ | nindent 2 }}
+spec:
+  parentRefs: {{- toYaml . | nindent 4 }}
+  hostnames: {{- toYaml $plan.apiHostnames | nindent 4 }}
+  rules:
+    - backendRefs:
+        - {name: {{ $fn }}, port: {{ $.Values.service.ports.api }}}
+      {{- with $gw.api.timeouts }}
+      timeouts: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+# The gateway re-encrypts to the controller's API port and checks its serving certificate.
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: {{ $fn }}-api
+  namespace: {{ $.Release.Namespace }}
+  {{- include "bkc.gateway.meta" $ | nindent 2 }}
+spec:
+  targetRefs:
+    - {group: "", kind: Service, name: {{ $fn }}, sectionName: api}
+  validation:
+    hostname: {{ default $.Values.edge.serverName $gw.api.backendTLS.hostname }}
+    {{- if $gw.api.backendTLS.wellKnownCACertificates }}
+    wellKnownCACertificates: {{ $gw.api.backendTLS.wellKnownCACertificates }}
+    {{- else }}
+    caCertificateRefs: {{- toYaml (default (list (dict "group" "" "kind" "ConfigMap" "name" (printf "%s-ca-bundle" $fn))) $gw.api.backendTLS.caCertificateRefs) | nindent 6 }}
+    {{- end }}
+---
+{{- else }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata:
+  name: {{ $fn }}-api
+  namespace: {{ $.Release.Namespace }}
+  {{- include "bkc.gateway.meta" $ | nindent 2 }}
+spec:
+  parentRefs: {{- toYaml . | nindent 4 }}
+  hostnames: {{- toYaml $plan.apiHostnames | nindent 4 }}
+  rules:
+    - backendRefs:
+        - {name: {{ $fn }}, port: {{ $.Values.service.ports.api }}}
+---
+{{- end }}
+{{- end }}
+{{- with $plan.edgeRefs }}
+# The edge is TLS passthrough only: the controller authenticates the client certificate.
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata:
+  name: {{ $fn }}-edge
+  namespace: {{ $.Release.Namespace }}
+  {{- include "bkc.gateway.meta" $ | nindent 2 }}
+spec:
+  parentRefs: {{- toYaml . | nindent 4 }}
+  hostnames: {{- toYaml $plan.edgeHostnames | nindent 4 }}
+  rules:
+    - backendRefs:
+        - {name: {{ $fn }}, port: {{ $.Values.service.ports.edge }}}
+---
+{{- end }}
+{{- if and $gw.envoy.enabled (not $plan.envoyMissing) }}
+{{- $e := $gw.envoy }}
+{{- range $route := list "api" "edge" }}
+{{- if get $plan (printf "%sRefs" $route) }}
+{{- $http := and (eq $route "api") $terminate }}
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: {{ $fn }}-{{ $route }}
+  namespace: {{ $.Release.Namespace }}
+  {{- include "bkc.gateway.meta" $ | nindent 2 }}
+spec:
+  targetRefs:
+    - {group: gateway.networking.k8s.io, kind: {{ ternary "HTTPRoute" "TLSRoute" $http }}, name: {{ $fn }}-{{ $route }}}
+  tcpKeepalive: {{- toYaml $e.tcpKeepalive | nindent 4 }}
+  timeout:
+    tcp: {connectTimeout: {{ $e.connectTimeout }}}
+    {{- if $http }}
+    http: {streamIdleTimeout: {{ $gw.api.timeouts.request | default "15m" }}}
+    {{- end }}
+  {{- /* PROXY protocol (proxyProtocol: {version: V2}) belongs here once the controller reads it. */}}
+---
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if $gw.enabled }}
+{{- range $gw.extraManifests }}
+{{ tpl (ternary . (toYaml .) (kindIs "string" .)) $ }}
+---
+{{- end }}
+{{- end }}

@@ -5,9 +5,12 @@
 //! runs in this process (trusted through the issuer's `caBundleConfigMap`) and
 //! a `registry:2` runs in the cluster. The clients are the real recipe
 //! `docs/ci/buildkit-allocate.sh` and real `docker buildx` on the host. They go
-//! through the real API and mTLS edge, which kind publishes on 127.0.0.1:18443
-//! and :18444 (`NodePorts`). `*.localhost` resolves to loopback, which makes
-//! per-allocation endpoints (`<id>.localhost:18444`) reachable.
+//! through the real API and mTLS edge behind Envoy Gateway (see `gateway.rs`),
+//! installed with the chart's default Gateway API exposure: an `HTTPRoute` with a
+//! `BackendTLSPolicy` for the API and a `TLSRoute` for the edge. kind publishes the
+//! Gateway's listeners on 127.0.0.1:18443 and :18444 (`NodePorts`). `*.localhost`
+//! resolves to loopback, which makes per-allocation endpoints
+//! (`<id>.localhost:18444`) reachable.
 //!
 //! Every kind, kubectl and helm call gets the private kubeconfig under
 //! `target/e2e`. The task never touches `~/.kube/config`, and `e2e` deletes the
@@ -194,6 +197,7 @@ fn install(env: &Env, work: &Path, mode: &Mode) -> Result<PathBuf> {
     for image in images {
         status(&mut crate::kube::kind_load(image, CLUSTER.as_str()))?;
     }
+    let gateway_ca = crate::gateway::install(env, CLUSTER.as_str(), work)?;
 
     for ns in [NS, POOL_NS] {
         env.kubectl(&["create", "namespace", ns])?;
@@ -267,9 +271,12 @@ replicaCount: 1
 podDisruptionBudget: {{enabled: false}}
 watchNamespaces: [{POOL_NS}]
 logFormat: text
-service:
-  type: NodePort
-  nodePorts: {{api: 30443, edge: 30444}}
+gateway:
+  api:
+    parentRefs: [{{name: {gw}, namespace: {gw_ns}, sectionName: api}}]
+    hostnames: [localhost]
+  edge:
+    parentRefs: [{{name: {gw}, namespace: {gw_ns}, sectionName: edge}}]
 shutdown: {{delay: 0s, drainTimeout: 30s}}
 edge:
   endpoint: tcp://localhost:18444
@@ -280,7 +287,9 @@ auth:
   oidc:
     - url: \"{issuer_url}\"
       audiences: [{AUD}]
-{oidc_ca}"
+{oidc_ca}",
+        gw = crate::gateway::NAME,
+        gw_ns = crate::gateway::NS,
     );
     let values_file = write(&work.join("values.yaml"), &values)?;
     let chart = root
@@ -350,21 +359,12 @@ auth:
     }
     println!("pools Ready: {ready:?}");
 
-    let ca = env.kubectl(&[
-        "get",
-        "secret",
-        "buildkit-controller-ca",
-        "-n",
-        NS,
-        "-o",
-        "jsonpath={.data.client-ca\\.crt}",
-    ])?;
-    let decoded =
-        output(Command::new("sh").args(["-c", &format!("printf %s '{ca}' | base64 -d")]))?;
+    // API clients trust the Gateway's certificate, not the controller's.
     let path = work.join("api-ca.pem");
-    write(&path, &decoded)?;
+    std::fs::copy(&gateway_ca, &path)?;
     until("API listener", Duration::from_mins(2), || {
-        // A TLS-verified 401 shows the API listener is serving.
+        // A TLS-verified 401 through the Gateway shows the HTTPRoute and the
+        // BackendTLSPolicy work: the gateway answers 503 when it cannot re-encrypt.
         let probe = Command::new("curl")
             .args(["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--cacert"])
             .arg(&path)
@@ -374,6 +374,17 @@ auth:
             .starts_with("401")
             .then_some(()))
     })?;
+    for (kind, name) in [
+        ("httproute", "buildkit-controller-api"),
+        ("backendtlspolicy", "buildkit-controller-api"),
+        ("tlsroute", "buildkit-controller-edge"),
+    ] {
+        ensure!(
+            crate::gateway::accepted(env, kind, name, NS)?,
+            "{kind}/{name} is not Accepted"
+        );
+    }
+    println!("PASS routes Accepted: HTTPRoute and BackendTLSPolicy (API), TLSRoute (edge)");
     Ok(path)
 }
 
@@ -414,6 +425,7 @@ pub(crate) fn e2e() -> Result<()> {
                 eprintln!("--- kubectl {args:?}\n{o}");
             }
         }
+        crate::gateway::dump(env);
     }
     result
 }
@@ -610,6 +622,12 @@ fn run(env: &Env, work: &Path) -> Result<()> {
         work: work.to_path_buf(),
     };
     let oidc = issuer.token(AUD, "e2e")?;
+    let foreign = if host == "arm64" { "amd64" } else { "arm64" };
+
+    // l. A long poll through the Gateway, beside scenarios a to h. X holds the only
+    // worker of the foreign pool for 330 s, and Y queues behind it. The API sends
+    // nothing while Y waits, past Envoy's default 5-minute stream idle timeout.
+    let long = LongPoll::start(&c, &format!("{POOL_NS}/{foreign}"), &issuer)?;
 
     // a. A build with a RUN step succeeds through the edge (OIDC token).
     let out = c.build(&pool, &oidc, "")?;
@@ -819,8 +837,9 @@ fn run(env: &Env, work: &Path) -> Result<()> {
         "PASS h: two overlapping e2e-spill builds both succeed; A local hit on {holder}, B local spill on {other}"
     );
 
+    long.finish()?;
+
     // e. Multi-platform. Two pools and a two-node builder, built the way the Action builds it.
-    let foreign = if host == "arm64" { "amd64" } else { "arm64" };
     let out = output(
         Command::new("bash")
             .arg(root().join("xtask/fixtures/e2e/multiplatform.sh"))
@@ -866,6 +885,169 @@ fn run(env: &Env, work: &Path) -> Result<()> {
         "PASS e: two nodes running (native pool + emulated-arch pool declaring two platforms); linux/arm64,linux/amd64 build and each platform build alone succeed; multiplatform path: {path}"
     );
 
+    gateway_options(env, &c, &pool, &issuer)?;
     println!("e2e: all scenarios passed");
+    Ok(())
+}
+
+/// Scenario l: an allocation request that stays queued, and silent, for over
+/// five minutes behind the Gateway.
+struct LongPoll {
+    holder: std::process::Child,
+    waiter: std::process::Child,
+    launched: u64,
+    outd: PathBuf,
+}
+
+/// How long X holds the worker, so Y waits past Envoy's default 5-minute stream idle timeout.
+const LONG_HOLD_SECS: u64 = 330;
+
+impl LongPoll {
+    fn start(c: &Client, pool: &str, issuer: &Issuer) -> Result<Self> {
+        let outd = c.work.clone();
+        for stale in ["l.x", "l.y"] {
+            let _ = std::fs::remove_file(outd.join(stale));
+        }
+        let holder = c
+            .recipe(
+                pool,
+                &issuer.token(AUD, "e2e")?,
+                &format!(r#"date +%s > "$OUTD/l.x"; sleep {LONG_HOLD_SECS}"#),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        until("X holds the foreign worker", Duration::from_mins(3), || {
+            Ok(outd.join("l.x").exists().then_some(()))
+        })?;
+        let launched = now()?;
+        let waiter = c
+            .recipe(
+                pool,
+                &issuer.token(AUD, "e2e")?,
+                r#"date +%s > "$OUTD/l.y""#,
+            )
+            .env("QUEUE_TIMEOUT", "600")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        Ok(Self {
+            holder,
+            waiter,
+            launched,
+            outd,
+        })
+    }
+
+    fn finish(mut self) -> Result<()> {
+        ensure!(self.holder.wait()?.success(), "long-poll holder X failed");
+        let y = self.waiter.wait_with_output()?;
+        ensure!(
+            y.status.success(),
+            "long-poll Y failed:\n{}{}",
+            String::from_utf8_lossy(&y.stdout),
+            String::from_utf8_lossy(&y.stderr)
+        );
+        let started = read_secs(&self.outd.join("l.y"))?;
+        let waited = started.saturating_sub(self.launched);
+        ensure!(
+            waited >= 300,
+            "Y waited {waited}s, not past the 5-minute idle bound the scenario tests"
+        );
+        println!(
+            "PASS l: an allocation request queued silently for {waited}s through the Gateway and got the worker"
+        );
+        Ok(())
+    }
+}
+
+/// `helm upgrade --reuse-values` of the e2e release with `sets`.
+fn upgrade(env: &Env, sets: &[&str]) -> Result<()> {
+    let chart = root().join("helm/buildkit-controller");
+    let chart = chart.to_string_lossy();
+    let mut args = vec!["upgrade", "bk", &chart, "-n", NS, "--reuse-values"];
+    for s in sets {
+        args.extend(["--set", s]);
+    }
+    env.tool("helm", &args)?;
+    Ok(())
+}
+
+/// Scenarios i and j: the chart's other Gateway options on the same Gateway.
+fn gateway_options(env: &Env, c: &Client, pool: &str, issuer: &Issuer) -> Result<()> {
+    // i. Envoy Gateway extras. Both BackendTrafficPolicies are Accepted and a build
+    // with a RUN step still goes through the API route and the edge.
+    upgrade(env, &["gateway.envoy.enabled=true"])?;
+    for route in ["api", "edge"] {
+        let name = format!("buildkit-controller-{route}");
+        until(
+            &format!("backendtrafficpolicy/{name} Accepted"),
+            Duration::from_mins(2),
+            || Ok(crate::gateway::accepted(env, "backendtrafficpolicy", &name, NS)?.then_some(())),
+        )?;
+    }
+    let out = c.build(pool, &issuer.token(AUD, "e2e")?, "")?;
+    ensure!(
+        out.contains("built-through-edge"),
+        "build with the Envoy extras:\n{out}"
+    );
+    println!(
+        "PASS i: gateway.envoy.enabled: both BackendTrafficPolicies Accepted; a build succeeds"
+    );
+
+    // j. The API by TLS passthrough. The TLSRoute on the Gateway's passthrough
+    // listener reaches the controller, which serves its own certificate.
+    upgrade(
+        env,
+        &[
+            "gateway.api.mode=passthrough",
+            &format!(
+                "gateway.api.parentRefs[0].sectionName=api-passthrough,gateway.api.parentRefs[0].name={},gateway.api.parentRefs[0].namespace={}",
+                crate::gateway::NAME,
+                crate::gateway::NS
+            ),
+        ],
+    )?;
+    until(
+        "tlsroute/buildkit-controller-api Accepted",
+        Duration::from_mins(2),
+        || {
+            Ok(
+                crate::gateway::accepted(env, "tlsroute", "buildkit-controller-api", NS)?
+                    .then_some(()),
+            )
+        },
+    )?;
+    let ca = env.kubectl(&[
+        "get",
+        "configmap",
+        "buildkit-controller-ca-bundle",
+        "-n",
+        NS,
+        "-o",
+        "jsonpath={.data.ca\\.crt}",
+    ])?;
+    let ca_file = write(&c.work.join("controller-ca.pem"), &ca)?;
+    // kubectl port-forward exits when the pod refuses a connection, which it does
+    // until Envoy has the listener, so each attempt opens its own.
+    let code = until("API by passthrough", Duration::from_mins(2), || {
+        let port = crate::gateway::PortForward::envoy(env, 9443)?;
+        let url = format!("https://localhost:{}/v1/pools", port.local);
+        let probe = Command::new("curl")
+            .args(["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--cacert"])
+            .arg(&ca_file)
+            .arg(&url)
+            .output()?;
+        let code = String::from_utf8_lossy(&probe.stdout).into_owned();
+        ensure!(
+            code.starts_with("401"),
+            "{url}: HTTP {code} {}",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        Ok(Some(code))
+    })?;
+    println!(
+        "PASS j: gateway.api.mode=passthrough: TLSRoute Accepted; the API answers {code} with the controller's own certificate"
+    );
     Ok(())
 }

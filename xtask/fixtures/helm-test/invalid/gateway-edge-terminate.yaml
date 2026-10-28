@@ -1,0 +1,6 @@
+# expect: at '/gateway/edge': additional properties 'mode' not allowed
+# The edge is TLS passthrough only; there is no way to ask for a terminating route.
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+gateway:
+  parentRefs: [{name: shared, namespace: gateway-system}]
+  edge: {mode: terminate}

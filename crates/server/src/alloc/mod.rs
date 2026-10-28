@@ -185,9 +185,9 @@ fn key_of(p: &k8s_openapi::api::core::v1::Pod) -> Option<PoolKey> {
 /// ages out.
 ///
 /// `stop` is checked only between ticks. A tick that has started runs to the
-/// end, each apply bounded by `kube.requestTimeout`: cut short, its PATCH may
-/// still land while the writer never records the entry, so `clear` would skip
-/// it.
+/// end, each apply bounded by `kube.requestTimeout`. The writer records an
+/// entry before its non-zero apply is sent, so `clear` also zeroes one whose
+/// apply timed out and may still have landed.
 async fn write_waiters(
     mut writer: WaitersWriter,
     queues: Arc<Queues>,
@@ -268,9 +268,10 @@ mod waiters_tests {
     use crate::render::fixtures;
 
     /// Records each `status.waiters` count when the apply is sent; the apply
-    /// then takes 2 s. Nothing else is called.
+    /// then takes 2 s and fails with `timeout` while its flag is set. Nothing
+    /// else is called.
     #[derive(Default)]
-    struct SlowWaiters(Mutex<Vec<i32>>);
+    struct SlowWaiters(Mutex<Vec<i32>>, std::sync::atomic::AtomicBool);
 
     fn unused<T: Send + 'static>(out: T) -> BoxFuture<'static, T> {
         Box::pin(async move { out })
@@ -301,9 +302,10 @@ mod waiters_tests {
             _: &str,
         ) -> BoxFuture<'static, Result<(), String>> {
             self.0.lock().unwrap().push(count);
-            Box::pin(async {
+            let fail = self.1.load(std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                Ok(())
+                if fail { Err("timeout".into()) } else { Ok(()) }
             })
         }
         fn get_pvc(
@@ -372,6 +374,34 @@ mod waiters_tests {
         assert_eq!(*backend.0.lock().unwrap(), [1]);
         stop.cancel();
         writer.await.unwrap();
+        assert_eq!(*backend.0.lock().unwrap(), [1, 0]);
+    }
+
+    /// A non-zero apply that times out may still land, so `clear` must zero
+    /// its entry too.
+    #[tokio::test(start_paused = true)]
+    async fn clear_zeroes_an_entry_whose_apply_timed_out() {
+        let spec = json!({
+            "template": {"spec": {"containers": [{"name": "buildkitd", "image": "moby/buildkit:v0.26.3"}]}},
+            "scaling": {"min": 0, "max": 1},
+            "access": {"rules": [{"serviceAccount": {}}]},
+        });
+        let mut pools = Writer::<BuildKitPool>::default();
+        pools.apply_watcher_event(&watcher::Event::Apply(fixtures::pool("p", spec).unwrap()));
+        let queues = Queues::new(MAX_WAITERS, AllocMetrics::default());
+        let queues = Arc::new(queues);
+        let _queued = queues
+            .enqueue(&(fixtures::POOL_NAMESPACE.into(), "p".into()))
+            .unwrap();
+        let backend = SlowWaiters::default();
+        backend.1.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut writer = WaitersWriter::new("r1".into(), pools.as_reader());
+        writer.tick(&queues, &backend).await;
+        backend.1.store(false, std::sync::atomic::Ordering::SeqCst);
+        writer.clear(&backend).await;
+        assert_eq!(*backend.0.lock().unwrap(), [1, 0]);
+        // Settled: a second clear sends nothing.
+        writer.clear(&backend).await;
         assert_eq!(*backend.0.lock().unwrap(), [1, 0]);
     }
 }

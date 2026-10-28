@@ -12,6 +12,8 @@ The `buildkit-controller` binary (`crates/server`) runs as one Deployment with t
 | Edge | 8444 (mTLS) | Proxies a build connection to its worker | every replica |
 | Reconciler | none | Keeps warm pods, retires expired ones, manages CAs and worker certificates, writes status | the Lease holder only |
 
+Clients reach the API and edge ports through a Gateway by default: the API through an HTTPRoute, where the gateway terminates TLS and re-encrypts to the controller, and the edge through a TLS passthrough TLSRoute, so that the edge itself checks the client certificate. A LoadBalancer Service is the alternative. See [Exposure](operations.md#exposure).
+
 A separate ops port (8080, plain HTTP, on its own ClusterIP Service) serves `/healthz`, `/readyz` and `/metrics`. All replicas share in-memory watch caches of pools and pods, so the API and edge read pools and pods from memory. On the request path the API calls the Kubernetes API only for TokenReview (ServiceAccount tokens), to create pre-claimed pods, and to patch pods when it claims or retires them.
 
 ## One CRD

@@ -118,6 +118,11 @@ pub const STALE_AFTER: Duration = Duration::from_mins(1);
 ///   relist do not restart that clock.
 /// - The next `InitDone` sets it again.
 ///
+/// A watch that hangs without an error becomes one: the kube client fails a
+/// request that receives nothing for [`READ_TIMEOUT`](super::READ_TIMEOUT), so
+/// a stall clears `ready` at most `READ_TIMEOUT + STALE_AFTER` after the API
+/// server last sent anything.
+///
 /// Returns when a stream ends (only test streams do).
 pub async fn drive<K, S>(
     mut writer: reflector::store::Writer<K>,
