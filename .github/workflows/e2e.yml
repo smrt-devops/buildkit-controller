@@ -50,6 +50,7 @@ jobs:
       - name: Install the controller on kind
         run: |
           cargo xtask e2e-up "$GITHUB_REPOSITORY"
+          echo "BK_URL=$(cat target/e2e/api-url)" >> "$GITHUB_ENV"
           {
             echo 'BK_CA<<BK_CA_EOF'
             cat target/e2e/api-ca.pem
@@ -62,7 +63,7 @@ jobs:
         id: bk
         uses: ./action
         with:
-          url: https://localhost:18443
+          url: ${{ env.BK_URL }}
           pools: ci/amd64
           ca-cert: ${{ env.BK_CA }}
       - name: Build through the builder the Action created

@@ -1,4 +1,3 @@
-//! `cargo xtask e2e`: the end-to-end suite on a kind cluster `bk-e2e`.
 //! `cargo xtask e2e` runs the end-to-end suite on a kind cluster `bk-e2e`.
 //!
 //! The task installs the controller from the Helm chart. A mock OIDC issuer
@@ -8,14 +7,16 @@
 //! through the real API and mTLS edge behind Envoy Gateway (see `gateway.rs`),
 //! installed with the chart's default Gateway API exposure: an `HTTPRoute` with a
 //! `BackendTLSPolicy` for the API and a `TLSRoute` for the edge. kind publishes the
-//! Gateway's listeners on 127.0.0.1:18443 and :18444 (`NodePorts`). `*.localhost`
-//! resolves to loopback, which makes per-allocation endpoints
-//! (`<id>.localhost:18444`) reachable.
+//! Gateway's listeners (`NodePorts`) on two loopback host ports, 18443 and 18444
+//! by default (see [`HostPorts`]). `*.localhost` resolves to loopback, which makes
+//! per-allocation endpoints (`<id>.localhost:<edge port>`) reachable.
 //!
 //! Every kind, kubectl and helm call gets the private kubeconfig under
-//! `target/e2e`. The task never touches `~/.kube/config`, and `e2e` deletes the
-//! cluster on every exit path. `e2e-up` installs the same cluster trusting
-//! GitHub's OIDC issuer and leaves it running, for the Action job in CI.
+//! `target/e2e` (`target/e2e-<suffix>` with `BK_KIND_SUFFIX`). The task never
+//! touches `~/.kube/config`, and `e2e` deletes the cluster on every exit path.
+//! `e2e-up` installs the same cluster trusting GitHub's OIDC issuer and leaves
+//! it running, for the Action job in CI. It writes the API URL to `api-url` in
+//! the work directory.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -33,8 +34,13 @@ static CLUSTER: std::sync::LazyLock<String> =
 const NS: &str = "bk-system";
 const POOL_NS: &str = "ci";
 const OIDC_HOST: &str = "mock-oidc.bk-oidc.svc";
-const SOCAT_IMAGE: &str = "alpine/socat:latest";
-const API: &str = "https://localhost:18443";
+/// The mock issuer's server, pulled by digest (the multi-arch index) and tagged locally.
+const SOCAT_IMAGE: &str = "docker.io/alpine/socat:1.8.1.3";
+const SOCAT_DIGEST: &str =
+    "sha256:603174b77eebaba25ba8f8ebb15e1234d6600409554e95d6fb203fd106150287";
+/// The API URL clients use, through the Gateway.
+static API: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("https://localhost:{}", HostPorts::get().api));
 const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const REGISTRY_IMAGE: &str = "registry:2";
 const REG: &str = "registry.e2e-reg.svc.cluster.local:5000";
@@ -47,6 +53,94 @@ enum Mode<'a> {
     Mock(&'a Issuer),
     /// GitHub's, for the repository `owner/name`.
     Github(&'a str),
+}
+
+/// Kind's pod and service ranges, set in `xtask/fixtures/e2e/kind.yaml`. The
+/// controller lists them as cluster ranges, and the pools open them (the
+/// in-cluster registry) through `workerNetwork.permittedCIDRs`.
+const KIND_CIDRS: &str = "10.244.0.0/16, 10.96.0.0/16";
+
+/// The loopback host ports kind publishes the Gateway's API and edge listeners on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HostPorts {
+    api: u16,
+    edge: u16,
+}
+
+impl HostPorts {
+    /// Without a suffix (CI), the fixed 18443 and 18444.
+    const DEFAULT: Self = Self {
+        api: 18443,
+        edge: 18444,
+    };
+    /// Suffixed runs get a port pair in `[FIRST, FIRST + 2 * PAIRS)`.
+    const FIRST: u16 = 20000;
+    const PAIRS: u32 = 1000;
+
+    /// The ports for `BK_KIND_SUFFIX`.
+    fn get() -> Self {
+        Self::for_suffix(std::env::var("BK_KIND_SUFFIX").ok().as_deref())
+    }
+
+    /// A stable pair per suffix, so two checkouts with different suffixes run at
+    /// once and `e2e-up` gives the same URL every time. FNV-1a, which needs no
+    /// dependency and does not change between Rust releases.
+    fn for_suffix(suffix: Option<&str>) -> Self {
+        let Some(s) = suffix.filter(|s| !s.is_empty()) else {
+            return Self::DEFAULT;
+        };
+        let hash = s.bytes().fold(0x811c_9dc5_u32, |h, b| {
+            (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+        });
+        // hash % PAIRS < 1000, so the pair fits under 22000.
+        let pair = u16::try_from(hash % Self::PAIRS).unwrap_or(0);
+        let api = Self::FIRST + 2 * pair;
+        Self { api, edge: api + 1 }
+    }
+
+    /// Fails when another process holds one of the ports, naming it, instead of
+    /// letting kind fail later with "port is already allocated".
+    fn check_free(self) -> Result<()> {
+        for port in [self.api, self.edge] {
+            std::net::TcpListener::bind(("127.0.0.1", port)).with_context(|| {
+                format!(
+                    "host port {port} for {} is taken; delete that cluster or pick another BK_KIND_SUFFIX",
+                    CLUSTER.as_str()
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// The work directory: `target/e2e`, or `target/e2e-<suffix>`, so two runs from
+/// one checkout keep their kubeconfigs and files apart.
+fn work_dir() -> PathBuf {
+    let name = super::kind_cluster("e2e");
+    root().join("target").join(name)
+}
+
+/// [`SOCAT_IMAGE`] present locally as that digest: pulled by digest and tagged,
+/// unless the local tag already is the digest.
+fn ensure_socat() -> Result<()> {
+    let repo = SOCAT_IMAGE.rsplit_once(':').map_or(SOCAT_IMAGE, |(r, _)| r);
+    let pinned = format!("{repo}@{SOCAT_DIGEST}");
+    let local = Command::new("docker")
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            "{{json .RepoDigests}}",
+            SOCAT_IMAGE,
+        ])
+        .output()
+        .context("docker image inspect")?;
+    let short = format!("{}@{SOCAT_DIGEST}", repo.trim_start_matches("docker.io/"));
+    if local.status.success() && String::from_utf8_lossy(&local.stdout).contains(&short) {
+        return Ok(());
+    }
+    status(Command::new("docker").args(["pull", &pinned]))?;
+    status(Command::new("docker").args(["tag", &pinned, SOCAT_IMAGE]))
 }
 
 struct Cleanup(Env);
@@ -104,7 +198,7 @@ fn pool_yaml(name: &str, platforms: &str, rules: &str) -> String {
       platforms: [{platforms}]
       scaling: {{min: 1, max: 1}}
       network:
-        egress: {{allowCIDRs: [10.0.0.0/8]}}
+        egress: {{allowCIDRs: [{KIND_CIDRS}]}}
       workers:
         buildkitdConfig: |
           [registry.\"{REG}\"]
@@ -170,7 +264,16 @@ fn cache_pool_yaml(name: &str, platform: &str, rules: &str, scaling: &str, cache
 fn install(env: &Env, work: &Path, mode: &Mode) -> Result<PathBuf> {
     let root = root();
     let _ = env.tool("kind", &["delete", "cluster", "--name", CLUSTER.as_str()]);
-    let kind_cfg = root.join("xtask/fixtures/e2e/kind.yaml");
+    let ports = HostPorts::get();
+    ports.check_free()?;
+    let kind_template = std::fs::read_to_string(root.join("xtask/fixtures/e2e/kind.yaml"))?;
+    let kind_cfg = work.join("kind.yaml");
+    write(
+        &kind_cfg,
+        &kind_template
+            .replace("API_PORT", &ports.api.to_string())
+            .replace("EDGE_PORT", &ports.edge.to_string()),
+    )?;
     env.tool(
         "kind",
         &[
@@ -185,19 +288,25 @@ fn install(env: &Env, work: &Path, mode: &Mode) -> Result<PathBuf> {
         ],
     )?;
 
+    // The image build (target/image and its cargo volume), the image pulls and
+    // the gateway download (target/gateway) are shared by every run from this
+    // checkout, so a parallel run waits here. The lock ends with the process at worst.
+    let lock = std::fs::File::create(root.join("target/e2e-host.lock"))?;
+    lock.lock().context("locking target/e2e-host.lock")?;
     crate::image::image(CONTROLLER_IMAGE, Some(CLUSTER.as_str()))?;
     crate::image::ensure_worker()?;
     let mut images = vec![WORKER_IMAGE];
     if matches!(mode, Mode::Mock(_)) {
         crate::image::ensure(REGISTRY_IMAGE)?;
         images.push(REGISTRY_IMAGE);
-        crate::image::ensure(SOCAT_IMAGE)?;
+        ensure_socat()?;
         images.push(SOCAT_IMAGE);
     }
     for image in images {
         status(&mut crate::kube::kind_load(image, CLUSTER.as_str()))?;
     }
     let gateway_ca = crate::gateway::install(env, CLUSTER.as_str(), work)?;
+    drop(lock);
 
     for ns in [NS, POOL_NS] {
         env.kubectl(&["create", "namespace", ns])?;
@@ -279,15 +388,19 @@ gateway:
     parentRefs: [{{name: {gw}, namespace: {gw_ns}, sectionName: edge}}]
 shutdown: {{delay: 0s, drainTimeout: 30s}}
 edge:
-  endpoint: tcp://localhost:18444
+  endpoint: tcp://localhost:{edge_port}
   serverName: bk.e2e.test
   allocationDomain: localhost
   extraNames: [localhost, 127.0.0.1]
+workerNetwork:
+  clusterCIDRs: [{KIND_CIDRS}]
+  permittedCIDRs: [{KIND_CIDRS}]
 auth:
   oidc:
     - url: \"{issuer_url}\"
       audiences: [{AUD}]
 {oidc_ca}",
+        edge_port = ports.edge,
         gw = crate::gateway::NAME,
         gw_ns = crate::gateway::NS,
     );
@@ -368,7 +481,7 @@ auth:
         let probe = Command::new("curl")
             .args(["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--cacert"])
             .arg(&path)
-            .arg(format!("{API}/v1/pools"))
+            .arg(format!("{}/v1/pools", *API))
             .output()?;
         Ok(String::from_utf8_lossy(&probe.stdout)
             .starts_with("401")
@@ -390,18 +503,20 @@ auth:
 
 /// Install a cluster for the GitHub Action job and leave it running.
 pub(crate) fn e2e_up(repo: &str) -> Result<()> {
-    let work = root().join("target/e2e");
+    let work = work_dir();
     std::fs::create_dir_all(&work)?;
     let env = Env {
         kubeconfig: work.join("kubeconfig"),
     };
     let ca = install(&env, &work, &Mode::Github(repo))?;
-    println!("e2e-up: API {API}, CA {}", ca.display());
+    // The CI job reads the URL from this file, not from a fixed port.
+    write(&work.join("api-url"), &format!("{}\n", *API))?;
+    println!("e2e-up: API {}, CA {}", *API, ca.display());
     Ok(())
 }
 
 pub(crate) fn e2e() -> Result<()> {
-    let work = root().join("target/e2e");
+    let work = work_dir();
     std::fs::create_dir_all(&work)?;
     let cleanup = Cleanup(Env {
         kubeconfig: work.join("kubeconfig"),
@@ -444,7 +559,7 @@ impl Client<'_> {
         c.arg(root().join("docs/ci/buildkit-allocate.sh"))
             .args(["sh", "-c", script])
             .current_dir(&self.ctx)
-            .env("API", API)
+            .env("API", API.as_str())
             .env("API_CA", &self.ca)
             .env("POOL", pool)
             .env("TOKEN", token)
@@ -950,7 +1065,7 @@ fn run(env: &Env, work: &Path) -> Result<()> {
     let out = output(
         Command::new("bash")
             .arg(root().join("xtask/fixtures/e2e/multiplatform.sh"))
-            .env("API", API)
+            .env("API", API.as_str())
             .env("API_CA", &ca)
             .env("TOKEN", &oidc)
             .env(
@@ -1157,4 +1272,26 @@ fn gateway_options(env: &Env, c: &Client, pool: &str, issuer: &Issuer) -> Result
         "PASS j: gateway.api.mode=passthrough: TLSRoute Accepted; the API answers {code} with the controller's own certificate"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HostPorts;
+
+    #[test]
+    fn host_ports_are_fixed_without_a_suffix_and_stable_per_suffix() {
+        assert_eq!(HostPorts::for_suffix(None), HostPorts::DEFAULT);
+        assert_eq!(HostPorts::for_suffix(Some("")), HostPorts::DEFAULT);
+        let a = HostPorts::for_suffix(Some("cidrs1"));
+        let b = HostPorts::for_suffix(Some("cidrs2"));
+        assert_eq!(a, HostPorts::for_suffix(Some("cidrs1")));
+        assert_ne!(a, b);
+        for p in [a, b] {
+            assert!(
+                p.api >= HostPorts::FIRST && p.edge == p.api + 1 && p.edge < 22000,
+                "{p:?}"
+            );
+            assert!(p.api % 2 == 0, "pairs never overlap: {p:?}");
+        }
+    }
 }
