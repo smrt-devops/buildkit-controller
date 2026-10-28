@@ -30,6 +30,7 @@ mod idle;
 
 pub mod hooks;
 pub mod leader;
+pub mod listen;
 pub mod metrics;
 pub mod readiness;
 pub mod shutdown;

@@ -27,6 +27,7 @@ use axum::http::{HeaderValue, header};
 use super::api::Peer;
 use crate::edge::{PerPeer, tune_socket};
 use crate::net::ProxyProtocol;
+use crate::runtime::listen::canonical;
 
 /// Request extension that fires when the replica starts shutting down.
 #[derive(Clone, Debug)]
@@ -156,7 +157,7 @@ pub async fn serve_with_proxy(
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
             accepted = listener.accept() => {
                 let (tcp, peer) = match accepted {
-                    Ok(a) => a,
+                    Ok((tcp, peer)) => (tcp, canonical(peer)),
                     Err(e) => {
                         debug!(error = %e, "accept");
                         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -421,7 +422,7 @@ mod tests {
             .serve_connection(TokioIo::new(server), svc);
         let peer: SocketAddr = ([127, 0, 0, 1], 1).into();
         let stop = CancellationToken::new();
-        let served = tokio::spawn({
+        let driven = tokio::spawn({
             let (flight, stop) = (Arc::clone(&flight), stop.clone());
             async move { drive(conn, peer, &flight, limits, stop, true).await }
         });
@@ -439,7 +440,7 @@ mod tests {
         assert_eq!(resp.status(), hyper::StatusCode::OK);
 
         stop.cancel();
-        tokio::time::timeout(idle * 20, served)
+        tokio::time::timeout(idle * 20, driven)
             .await
             .expect("the connection outlived shutdown")
             .unwrap();
