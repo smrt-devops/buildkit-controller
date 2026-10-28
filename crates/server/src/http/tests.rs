@@ -276,25 +276,36 @@ fn pools() -> Store<BuildKitPool> {
     store
 }
 
+/// API state whose OIDC issuer is [`ISSUER`], which never resolves.
 fn state<A: Allocator>(alloc: A, metrics: &Metrics) -> Arc<ApiState<A>> {
+    state_with(alloc, metrics, ISSUER, rustls::RootCertStore::empty())
+}
+
+/// API state trusting the OIDC issuer at `issuer`, reached with `roots`.
+fn state_with<A: Allocator>(
+    alloc: A,
+    metrics: &Metrics,
+    issuer: &str,
+    roots: rustls::RootCertStore,
+) -> Arc<ApiState<A>> {
     let auth = Authenticator::new(
         AuthConfig {
             oidc: vec![OidcIssuer {
-                url: ISSUER.into(),
+                url: issuer.into(),
                 audiences: vec!["buildkit-controller".into()],
                 jwks_url: None,
                 ca_certs: Vec::new(),
             }],
             service_account_audiences: Some(vec!["buildkit-controller".into()]),
         },
-        https_client(rustls::RootCertStore::empty()).unwrap(),
+        https_client(roots).unwrap(),
         Reviewer,
     )
     .unwrap();
     Arc::new(ApiState {
         alloc,
         auth: Arc::new(SaJwt(auth)),
-        oidc_issuers: HashSet::from([ISSUER.to_owned()]),
+        oidc_issuers: HashSet::from([issuer.to_owned()]),
         service_accounts: true,
         pools: pools(),
         edge: EdgeInfo {
@@ -366,21 +377,38 @@ fn b64(v: &Value) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
 }
 
+/// The issuer's keys load, so each token fails on its signature or `alg`.
 #[tokio::test]
 async fn forged_or_unsigned_jwt_is_401() {
+    use crate::auth::tests::{Signer, TestIssuer, claims};
+    let key = Signer::rsa("k", "RS256");
+    let iss = TestIssuer::start(&[&key]).await;
     let fake = Fake::new(Next::Grant);
     let grant = Arc::clone(&fake.grant);
-    let app = router(state(fake, &Metrics::new()));
-    let claims = b64(
-        &json!({"iss": ISSUER, "sub": "x", "aud": "buildkit-controller", "exp": 4_102_444_800_u64}),
-    );
-    let unsigned = format!("{}.{claims}.", b64(&json!({"alg": "none", "typ": "JWT"})));
-    let forged = format!(
-        "{}.{claims}.c2lnbmF0dXJl",
+    let app = router(state_with(
+        fake,
+        &Metrics::new(),
+        &iss.url,
+        iss.roots.clone(),
+    ));
+    let valid = key.token(&claims(&iss.url));
+    let body = valid.split('.').nth(1).unwrap().to_owned();
+    let unsigned = format!("{}.{body}.", b64(&json!({"alg": "none", "typ": "JWT"})));
+    let garbage = format!(
+        "{}.{body}.c2lnbmF0dXJl",
         b64(&json!({"alg": "RS256", "kid": "k"}))
     );
-    let hs = format!("{}.{claims}.c2lnbmF0dXJl", b64(&json!({"alg": "HS256"})));
-    for t in [unsigned, forged, hs] {
+    // A real signature over other claims.
+    let mut other = claims(&iss.url);
+    other["sub"] = json!("repo:smrt-devops/other:ref:refs/heads/main");
+    let mut swapped: Vec<String> = valid.split('.').map(str::to_owned).collect();
+    swapped[1] = key.token(&other).split('.').nth(1).unwrap().to_owned();
+    let swapped = swapped.join(".");
+    let hs = format!(
+        "{}.{body}.c2lnbmF0dXJl",
+        b64(&json!({"alg": "HS256", "kid": "k"}))
+    );
+    for t in [unsigned, garbage, swapped, hs] {
         let (st, h, _) = call(&app, post(Some(&t), "application/json", OK_BODY)).await;
         assert_eq!(st, StatusCode::UNAUTHORIZED);
         assert_eq!(h[header::WWW_AUTHENTICATE], "Bearer");
@@ -390,6 +418,40 @@ async fn forged_or_unsigned_jwt_is_401() {
         PENDING,
         "allocator never reached"
     );
+    // The same issuer's validly signed token gets through, so the keys loaded.
+    let (st, _, text) = call(&app, post(Some(&valid), "application/json", OK_BODY)).await;
+    assert_ne!(st, StatusCode::UNAUTHORIZED, "{text}");
+    assert_ne!(grant.load(Ordering::SeqCst), PENDING);
+}
+
+/// An issuer whose keys cannot be fetched is a retryable 503, not a 401 that
+/// reads as a bad token. `Retry-After` covers the refetch backoff, since an
+/// earlier retry cannot change the answer.
+#[tokio::test]
+async fn unreachable_issuer_is_503_with_retry_after() {
+    let fake = Fake::new(Next::Grant);
+    let grant = Arc::clone(&fake.grant);
+    let app = router(state(fake, &Metrics::new()));
+    let claims = b64(
+        &json!({"iss": ISSUER, "sub": "x", "aud": "buildkit-controller", "exp": 4_102_444_800_u64}),
+    );
+    let t = format!(
+        "{}.{claims}.c2lnbmF0dXJl",
+        b64(&json!({"alg": "RS256", "kid": "k"}))
+    );
+    for _ in 0..2 {
+        let (st, h, text) = call(&app, post(Some(&t), "application/json", OK_BODY)).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+        assert_eq!(
+            h[header::RETRY_AFTER],
+            crate::auth::REFETCH_INTERVAL.as_secs().to_string()
+        );
+        assert!(h.get(header::WWW_AUTHENTICATE).is_none());
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["error"]["code"], "upstream_error", "{text}");
+        assert_eq!(v["error"]["message"], "token issuer keys unavailable");
+    }
+    assert_eq!(grant.load(Ordering::SeqCst), PENDING);
 }
 
 struct NoBackend;

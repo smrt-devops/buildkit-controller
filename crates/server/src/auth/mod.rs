@@ -8,7 +8,7 @@ mod oidc;
 mod token_review;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,11 +17,14 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 
 pub use access::{AccessRule, AccessRules, RuleError};
-pub use oidc::{OidcIssuer, https_client, public_roots};
+pub use oidc::{OidcIssuer, REFETCH_INTERVAL, https_client, public_roots};
 pub use token_review::{
     DEFAULT_MAX_CONCURRENT_REVIEWS, DEFAULT_MAX_REVIEWS_PER_IP, DEFAULT_RECENT_SUBJECT_TTL,
     DEFAULT_RESERVED_REVIEWS, KubeTokenReviewer, REVIEW_CACHE_TTL, ReviewError, TokenReviewer,
 };
+
+/// `Retry-After` seconds of a 503 from a busy, throttled or timed-out `TokenReview`.
+pub const REVIEW_RETRY_AFTER_SECS: u64 = 2;
 
 /// Largest accepted bearer token.
 pub const MAX_TOKEN_BYTES: usize = 16 * 1024;
@@ -148,6 +151,30 @@ impl AuthError {
             401 => "unauthenticated",
             503 => "upstream_error",
             _ => "internal",
+        }
+    }
+
+    /// Why the token was refused, for the log: the fixed reason of
+    /// [`Self::Invalid`] ("expired", "audience mismatch", "unknown kid", ...),
+    /// otherwise [`Self::metric_result`]. It never holds token or claim data.
+    #[must_use]
+    pub fn detail(&self) -> &'static str {
+        match self {
+            Self::Invalid(reason) => reason,
+            _ => self.metric_result(),
+        }
+    }
+
+    /// `Retry-After` seconds of a 503: a `TokenReview` slot or an API server
+    /// answer can come back within seconds, but after a failed JWKS fetch the
+    /// issuer is not asked again for [`REFETCH_INTERVAL`], so an earlier retry
+    /// gets the same answer.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<u64> {
+        match self {
+            Self::Upstream(_) => Some(REVIEW_RETRY_AFTER_SECS),
+            Self::KeysUnavailable => Some(REFETCH_INTERVAL.as_secs()),
+            Self::Invalid(_) | Self::UnknownIssuer | Self::Internal(_) => None,
         }
     }
 
