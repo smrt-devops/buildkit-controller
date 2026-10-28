@@ -622,7 +622,7 @@ fn history_records(out: &str) -> Result<usize> {
         .count())
 }
 
-/// Scenario i: cache scopes and build history on `cache-local` (one slot).
+/// Scenario k: cache scopes and build history on `cache-local` (one slot).
 fn scopes(c: &Client, host_pool: &str, oidc: &str) -> Result<()> {
     let sa = &c.sa_token()?;
     let local_pool = format!("{POOL_NS}/cache-local");
@@ -705,7 +705,7 @@ fn scopes(c: &Client, host_pool: &str, oidc: &str) -> Result<()> {
         "the OIDC caller got the ServiceAccount's cache:\n{back}"
     );
     println!(
-        "PASS i: another identity gets an empty volume (local {result}, 0 CACHED, 0 build records; {n} on {host_pool}); the same identity then hits ({hits} CACHED); the first identity starts empty again"
+        "PASS k: another identity gets an empty volume (local {result}, 0 CACHED, 0 build records; {n} on {host_pool}); the same identity then hits ({hits} CACHED); the first identity starts empty again"
     );
     Ok(())
 }
@@ -939,7 +939,7 @@ fn run(env: &Env, work: &Path) -> Result<()> {
         "PASS h: two overlapping e2e-spill builds both succeed; A local hit on {holder}, B local spill on {other}"
     );
 
-    // i. Cache scopes. After g, the only volume of cache-local belongs to the OIDC
+    // k. Cache scopes. After g, the only volume of cache-local belongs to the OIDC
     // caller. A caller of another identity (the ServiceAccount) neither gets its
     // cache nor reads any build history through the edge, then hits its own cache.
     scopes(&c, &pool, &oidc)?;
