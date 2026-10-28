@@ -22,6 +22,10 @@ A separate ops port (8080, plain HTTP, on its own ClusterIP Service) serves `/he
 
 There is no worker CRD and no gateway. The reconciler creates plain pods named `<pool>-<slot>` and owns them by label. A pod is `free`, `allocated` or `draining`. Claiming a free pod is one JSON patch with a test on its labels, so two replicas cannot claim the same pod. If no pod is free, the API creates a pre-claimed pod while the pool is under `scaling.max`, and otherwise queues the request. Retiring a pod is also a patch, followed by deletion. The pod template is yours, but the controller owns the security context, TLS mounts, command and labels. The API server rejects a template that sets those.
 
+A claim first holds the pod only briefly. Its `expires-at` is 60 seconds past the moment the pod can be ready: the claim itself for a free pod, the end of `workers.startTimeout` for a created one. Just before the API answers, it moves `expires-at` to the allocation's real expiry with a patch that tests the short value. If that patch fails, the request fails and the pod is retired. A replica killed between the claim and the answer therefore holds the pod for at most `startTimeout` plus 60 seconds, after which the reconciler retires it as expired. The claim always ends before the real expiry, so every commit changes `expires-at`. The reconciler's expiry and start-timeout retires of an allocated pod test the `expires-at` they judged, so neither can reap an allocation that committed in the meantime.
+
+A new pod is created before its worker Secret, and the Secret is created with the pod as its owner, so the garbage collector deletes it with the pod and no other object ever owns a worker's private key. A pod whose Secret was never created cannot mount it, never becomes ready, and is retired at `startTimeout`. When the answer to a pod create is lost, the controller reads the pod back and creates the Secret only if the pod exists.
+
 ## Data path
 
 ```mermaid

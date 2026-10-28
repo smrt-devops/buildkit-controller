@@ -46,8 +46,8 @@ fn pool_meta(pool: &BuildKitPool) -> Result<ObjectMeta, RenderError> {
 
 /// The per-pod Secret `<pod>-<nonce>` of the pod [`super::worker_pod`] renders
 /// from the same `inputs`: `tls.crt`, `tls.key`, `ca.crt`, `buildkitd.toml`.
-/// It is owned by the pool until the pod exists; the creator then moves the
-/// ownerReference to the pod.
+/// It carries the pool's ownerReference as rendered; [`crate::reconcile::spawn`]
+/// replaces it with the pod's before the Secret is created.
 pub fn worker_secret(
     pool: &BuildKitPool,
     inputs: &PodInputs,

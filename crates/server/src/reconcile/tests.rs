@@ -108,6 +108,7 @@ pub(super) fn pod(slot: u32) -> WorkerPod {
         grace_seconds: 5,
         template_hash: Some("h".into()),
         expires_at: None,
+        expires_at_raw: None,
         worker_cert_not_after: Some(later(30 * 86_400)),
         internal_ca: Some(fp()[..16].to_owned()),
         evicted: false,
@@ -342,20 +343,59 @@ fn expiry_retires_allocated_with_expected_id() {
     let mut f = fx();
     f.pods = vec![WorkerPod {
         expires_at: Some(*NOW),
+        expires_at_raw: Some("2026-01-01T00:00:00Z".into()),
         ..allocated(0)
     }];
     let p = f.plan();
+    // The retire tests the value it judged expired, so it loses to a commit
+    // that moved `expires-at` from a claim's short value in the meantime.
     assert!(p.actions.contains(&Action::RetireAllocated {
         pod: "p-0".into(),
         uid: "uid-0".into(),
         alloc_id: ALLOC_ID.into(),
+        expires_at: Some("2026-01-01T00:00:00Z".into()),
         reason: RetireReason::Expired,
     }));
+
+    // Other reasons hold whatever `expires-at` says, so they do not test it.
+    f.pods = vec![WorkerPod {
+        phase: Phase::Succeeded,
+        expires_at_raw: Some("2099-01-01T00:00:00Z".into()),
+        ..allocated(0)
+    }];
+    assert!(f.plan().actions.iter().any(|a| matches!(
+        a,
+        Action::RetireAllocated {
+            reason: RetireReason::PodFinished,
+            expires_at: None,
+            ..
+        }
+    )));
 
     f.pods = vec![allocated(0)];
     let p = f.plan();
     assert!(retires(&p).is_empty());
     assert_eq!(p.requeue_at, Some(later(3600)));
+}
+
+/// A cold pod judged not started may commit (and move `expires-at`) before
+/// the retire lands. The retire tests the value it saw, so it loses then.
+#[test]
+fn start_timeout_retire_of_an_allocated_pod_tests_the_expires_at_it_saw() {
+    let mut f = fx();
+    f.pods = vec![WorkerPod {
+        phase: Phase::Pending,
+        created: Some(ago(121)),
+        expires_at_raw: Some("2026-01-01T00:03:00Z".into()),
+        ..allocated(0)
+    }];
+    assert!(f.plan().actions.contains(&Action::RetireAllocated {
+        pod: "p-0".into(),
+        uid: "uid-0".into(),
+        alloc_id: ALLOC_ID.into(),
+        expires_at: Some("2026-01-01T00:03:00Z".into()),
+        reason: RetireReason::StartTimeout,
+    }));
 }
 
 #[test]

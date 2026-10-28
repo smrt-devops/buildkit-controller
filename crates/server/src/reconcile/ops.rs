@@ -16,11 +16,10 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use futures::future::BoxFuture;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 
 use super::plan::WaiterRef;
 use super::spawn::{WorkerSecrets, bounded};
-use crate::render::{ANN_ALLOC, CONTROLLER, LABEL_STATE};
+use crate::render::{ANN_ALLOC, ANN_EXPIRES_AT, CONTROLLER, LABEL_STATE};
 
 /// Field manager of every server-side apply.
 pub const FIELD_MANAGER: &str = "buildkit-controller";
@@ -103,14 +102,16 @@ pub trait KubeOps: WorkerSecrets + Send + Sync {
     fn apply<K: Applied>(&self, obj: &K) -> impl Future<Output = OpResult> + Send;
     /// POST a pod; returns the created pod.
     fn create_pod(&self, ns: &str, pod: &Pod) -> impl Future<Output = OpResult<Pod>> + Send;
-    /// `[test uid, test P alloc == expected, replace P alloc/state draining]`;
-    /// returns the patched pod's resourceVersion.
+    /// `[test uid, test P alloc == expected, (test P expires-at == expires_at),
+    /// replace P alloc/state draining]`; returns the patched pod's
+    /// resourceVersion.
     fn retire(
         &self,
         ns: &str,
         pod: &str,
         uid: &str,
         expected: &str,
+        expires_at: Option<&str>,
     ) -> impl Future<Output = OpResult<Option<String>>> + Send;
     /// DELETE a pod with a uid (and optionally resourceVersion) precondition.
     fn delete_pod(
@@ -182,15 +183,24 @@ fn escape(seg: &str) -> String {
     seg.replace('~', "~0").replace('/', "~1")
 }
 
-/// The retire patch.
+/// The retire patch. `expires_at` is the `P expires-at` an expiry retire saw:
+/// an allocation committed since then has moved it, and the retire loses.
 #[must_use]
-pub fn retire_patch(uid: &str, expected: &str) -> serde_json::Value {
-    json!([
-        {"op": "test", "path": "/metadata/uid", "value": uid},
-        {"op": "test", "path": format!("/metadata/annotations/{}", escape(ANN_ALLOC)), "value": expected},
-        {"op": "replace", "path": format!("/metadata/annotations/{}", escape(ANN_ALLOC)), "value": "draining"},
-        {"op": "replace", "path": format!("/metadata/labels/{}", escape(LABEL_STATE)), "value": "draining"},
-    ])
+pub fn retire_patch(uid: &str, expected: &str, expires_at: Option<&str>) -> serde_json::Value {
+    let alloc = format!("/metadata/annotations/{}", escape(ANN_ALLOC));
+    let mut ops = vec![
+        json!({"op": "test", "path": "/metadata/uid", "value": uid}),
+        json!({"op": "test", "path": alloc, "value": expected}),
+    ];
+    if let Some(e) = expires_at {
+        let path = format!("/metadata/annotations/{}", escape(ANN_EXPIRES_AT));
+        ops.push(json!({"op": "test", "path": path, "value": e}));
+    }
+    ops.extend([
+        json!({"op": "replace", "path": alloc, "value": "draining"}),
+        json!({"op": "replace", "path": format!("/metadata/labels/{}", escape(LABEL_STATE)), "value": "draining"}),
+    ]);
+    serde_json::Value::Array(ops)
 }
 
 /// The waiter prune patch.
@@ -231,8 +241,9 @@ impl KubeOps for KubeClient {
         pod: &str,
         uid: &str,
         expected: &str,
+        expires_at: Option<&str>,
     ) -> OpResult<Option<String>> {
-        let patch = json_patch(retire_patch(uid, expected))?;
+        let patch = json_patch(retire_patch(uid, expected, expires_at))?;
         let pp = PatchParams {
             field_manager: Some(FIELD_MANAGER.into()),
             ..PatchParams::default()
@@ -404,9 +415,13 @@ impl<O: KubeOps> KubeOps for Timed<O> {
         pod: &str,
         uid: &str,
         expected: &str,
+        expires_at: Option<&str>,
     ) -> OpResult<Option<String>> {
-        self.run("retire", self.inner.retire(ns, pod, uid, expected))
-            .await
+        self.run(
+            "retire",
+            self.inner.retire(ns, pod, uid, expected, expires_at),
+        )
+        .await
     }
 
     async fn delete_pod(
@@ -474,17 +489,12 @@ impl WorkerSecrets for KubeClient {
         self.0.create_worker_secret(secret)
     }
 
-    fn reown_worker_secret(
+    fn get_worker_pod(
         &self,
         ns: &str,
         name: &str,
-        owner: OwnerReference,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        self.0.reown_worker_secret(ns, name, owner)
-    }
-
-    fn delete_worker_secret(&self, ns: &str, name: &str) -> BoxFuture<'static, Result<(), String>> {
-        self.0.delete_worker_secret(ns, name)
+    ) -> BoxFuture<'static, Result<Option<Pod>, String>> {
+        self.0.get_worker_pod(ns, name)
     }
 }
 
@@ -493,19 +503,16 @@ impl<O: KubeOps> WorkerSecrets for Timed<O> {
         bounded(self.timeout, self.inner.create_worker_secret(secret))
     }
 
-    fn reown_worker_secret(
+    fn get_worker_pod(
         &self,
         ns: &str,
         name: &str,
-        owner: OwnerReference,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        bounded(
-            self.timeout,
-            self.inner.reown_worker_secret(ns, name, owner),
-        )
-    }
-
-    fn delete_worker_secret(&self, ns: &str, name: &str) -> BoxFuture<'static, Result<(), String>> {
-        bounded(self.timeout, self.inner.delete_worker_secret(ns, name))
+    ) -> BoxFuture<'static, Result<Option<Pod>, String>> {
+        let (f, t) = (self.inner.get_worker_pod(ns, name), self.timeout);
+        Box::pin(async move {
+            tokio::time::timeout(t, f)
+                .await
+                .unwrap_or_else(|_| Err(format!("no answer within {t:?}")))
+        })
     }
 }

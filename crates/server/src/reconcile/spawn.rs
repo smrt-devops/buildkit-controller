@@ -1,13 +1,14 @@
-//! Creating one worker, shared by the reconciler and the
-//! API's cold path: issue the pod's serving cert into its own Secret, create
-//! the pod, then hand the Secret to the pod.
+//! Creating one worker, shared by the reconciler and the API's cold path:
+//! issue the pod's serving cert, create the pod, then create the pod's Secret
+//! owned by the pod.
 //!
-//! The Secret is created owned by the pool, so it never outlives the pool.
-//! Once the pod exists its ownerReferences are replaced by the pod alone, and
-//! the garbage collector removes it with the pod. A pod create that certainly
-//! failed deletes the Secret by name. A crash between the two steps, or a
-//! create whose outcome is unknown, leaves the Secret owned by the pool until
-//! the pool is deleted; the controller never lists Secrets in pool namespaces.
+//! The Secret is born owned by the pod, so the garbage collector removes it
+//! with the pod and no other owner ever holds a worker's private key. Until
+//! the Secret exists the kubelet cannot mount it, so the pod does not start.
+//! A pod whose Secret never arrives (the create failed, the creator crashed)
+//! stays unready and is retired at `workers.startTimeout`, taking nothing with
+//! it. A pod create whose outcome is unknown is confirmed with a read of the
+//! pod before any Secret is created.
 
 use std::future::Future;
 
@@ -15,29 +16,27 @@ use buildkit_controller_api::v1alpha1::BuildKitPool;
 use futures::future::BoxFuture;
 use k8s_openapi::api::core::v1::{Pod, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
+use kube::api::{Api, PostParams};
 use kube::{Client, ResourceExt};
-use serde_json::json;
 use time::{Duration, OffsetDateTime};
-use tracing::warn;
 
 use crate::pki::{CaBundle, Namespace, PoolName, WorkerIdentity};
-use crate::render::{self, CONTROLLER, Claim, PodInputs, WorkerTlsPem, worker_pod_name};
+use crate::render::{
+    self, ANN_WORKER_NONCE, CONTROLLER, Claim, PodInputs, WorkerTlsPem, worker_pod_name,
+};
 
-/// The writes [`spawn`] needs beyond the pod create: create, re-own and
-/// delete one Secret by name. No reads, so RBAC grants no get/list/watch.
+/// The calls [`spawn`] needs beyond the pod create: create the pod's Secret
+/// and read the pod back after a create whose outcome is unknown. RBAC grants
+/// no read of Secrets.
 pub trait WorkerSecrets: Send + Sync {
     /// POST the per-pod Secret.
     fn create_worker_secret(&self, secret: &Secret) -> BoxFuture<'static, Result<(), String>>;
-    /// Merge-patch `metadata.ownerReferences` to `[owner]` (no read first).
-    fn reown_worker_secret(
+    /// GET a pod; `Ok(None)` on 404.
+    fn get_worker_pod(
         &self,
         ns: &str,
         name: &str,
-        owner: OwnerReference,
-    ) -> BoxFuture<'static, Result<(), String>>;
-    /// DELETE the Secret by name; a 404 counts as done.
-    fn delete_worker_secret(&self, ns: &str, name: &str) -> BoxFuture<'static, Result<(), String>>;
+    ) -> BoxFuture<'static, Result<Option<Pod>, String>>;
 }
 
 /// What a pod create did, as far as the Secret is concerned.
@@ -45,9 +44,10 @@ pub trait WorkerSecrets: Send + Sync {
 pub enum PodCreated {
     /// The pod exists with this name and uid.
     Yes { name: String, uid: String },
-    /// The API server refused it (409, quota, admission): delete the Secret.
+    /// The API server refused it (409, quota, admission), or the read back
+    /// found no pod of this create.
     No,
-    /// Timeout or 5xx: the pod may exist and mount the Secret, so keep it.
+    /// Timeout or 5xx: the pod may exist.
     Unknown,
 }
 
@@ -62,7 +62,7 @@ pub trait PodOutcome {
 pub struct Worker {
     /// The pod, named `<pool>-<slot>`, mounting `secret`.
     pub pod: Pod,
-    /// `<pod>-<nonce>`, owned by the pool.
+    /// `<pod>-<nonce>`; [`spawn`] makes the pod its owner.
     pub secret: Secret,
     /// The serving cert's notAfter.
     pub not_after: OffsetDateTime,
@@ -104,40 +104,77 @@ pub fn prepare(
     })
 }
 
-/// Creates the Secret, runs `create` on the pod, then re-owns or deletes the
-/// Secret. `Err` means the Secret create failed and `create` never ran.
-pub async fn spawn<S, F, Fut>(secrets: &S, worker: Worker, create: F) -> Result<Fut::Output, String>
+/// What [`spawn`] did.
+#[derive(Debug)]
+pub struct Spawned<T> {
+    /// The pod create's own result.
+    pub out: T,
+    /// The pod as resolved: an unknown create outcome is confirmed by a read
+    /// of the pod (and its nonce), so `Unknown` here means the read failed too.
+    pub pod: PodCreated,
+    /// `Err` when the pod exists but its Secret was not created. That pod
+    /// never starts and is retired at `workers.startTimeout`.
+    pub secret: Result<(), String>,
+}
+
+/// Creates the pod with `create`, then, once the pod is known to exist, its
+/// Secret owned by the pod. No Secret is created for a pod that was refused
+/// or whose existence cannot be confirmed.
+pub async fn spawn<S, F, Fut>(secrets: &S, worker: Worker, create: F) -> Spawned<Fut::Output>
 where
     S: WorkerSecrets + ?Sized,
     F: FnOnce(Pod) -> Fut,
     Fut: Future,
     Fut::Output: PodOutcome,
 {
-    let Worker { pod, secret, .. } = worker;
+    let Worker {
+        pod, mut secret, ..
+    } = worker;
     let ns = secret.namespace().unwrap_or_default();
-    let name = secret.name_any();
-    secrets
-        .create_worker_secret(&secret)
-        .await
-        .map_err(|e| format!("create Secret {name}: {e}"))?;
+    let name = pod.name_any();
+    let nonce = pod.annotations().get(ANN_WORKER_NONCE).cloned();
     let out = create(pod).await;
-    match out.pod_created() {
-        PodCreated::Yes { name: pod, uid } => {
-            if let Err(error) = secrets
-                .reown_worker_secret(&ns, &name, pod_owner(&pod, &uid))
+    let pod = match out.pod_created() {
+        PodCreated::Unknown => confirm(secrets, &ns, &name, nonce.as_deref()).await,
+        known => known,
+    };
+    let secret = match &pod {
+        PodCreated::Yes { name, uid } => {
+            secret.metadata.owner_references = Some(vec![pod_owner(name, uid)]);
+            secrets
+                .create_worker_secret(&secret)
                 .await
-            {
-                warn!(namespace = %ns, secret = %name, %error, "re-owning the worker Secret; it stays with the pool");
+                .map_err(|e| format!("create Secret {}: {e}", secret.name_any()))
+        }
+        PodCreated::No | PodCreated::Unknown => Ok(()),
+    };
+    Spawned { out, pod, secret }
+}
+
+/// Reads the pod back after a create whose answer was lost. It is ours when
+/// it carries the nonce this create chose.
+async fn confirm<S: WorkerSecrets + ?Sized>(
+    secrets: &S,
+    ns: &str,
+    name: &str,
+    nonce: Option<&str>,
+) -> PodCreated {
+    match secrets.get_worker_pod(ns, name).await {
+        Ok(Some(p)) if p.annotations().get(ANN_WORKER_NONCE).map(String::as_str) == nonce => {
+            match p.metadata.uid {
+                Some(uid) => PodCreated::Yes {
+                    name: name.to_owned(),
+                    uid,
+                },
+                None => PodCreated::Unknown,
             }
         }
-        PodCreated::No => {
-            if let Err(error) = secrets.delete_worker_secret(&ns, &name).await {
-                warn!(namespace = %ns, secret = %name, %error, "deleting the worker Secret; it stays with the pool");
-            }
+        Ok(_) => PodCreated::No,
+        Err(error) => {
+            tracing::warn!(namespace = %ns, pod = %name, %error, "reading back a pod whose create outcome is unknown");
+            PodCreated::Unknown
         }
-        PodCreated::Unknown => {}
     }
-    Ok(out)
 }
 
 /// ownerReference to the pod (`controller: true`).
@@ -185,31 +222,12 @@ impl WorkerSecrets for Client {
         })
     }
 
-    fn reown_worker_secret(
+    fn get_worker_pod(
         &self,
         ns: &str,
         name: &str,
-        owner: OwnerReference,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        let (api, name) = (secrets(self, ns), name.to_owned());
-        Box::pin(async move {
-            // A JSON merge patch replaces the whole list, so no read is needed.
-            let patch = json!({"metadata": {"ownerReferences": [owner]}});
-            api.patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
-                .await
-                .map(drop)
-                .map_err(|e| e.to_string())
-        })
-    }
-
-    fn delete_worker_secret(&self, ns: &str, name: &str) -> BoxFuture<'static, Result<(), String>> {
-        let (api, name) = (secrets(self, ns), name.to_owned());
-        Box::pin(async move {
-            match api.delete(&name, &DeleteParams::default()).await {
-                Ok(_) => Ok(()),
-                Err(kube::Error::Api(s)) if s.code == 404 => Ok(()),
-                Err(e) => Err(e.to_string()),
-            }
-        })
+    ) -> BoxFuture<'static, Result<Option<Pod>, String>> {
+        let (api, name) = (Api::<Pod>::namespaced(self.clone(), ns), name.to_owned());
+        Box::pin(async move { api.get_opt(&name).await.map_err(|e| e.to_string()) })
     }
 }

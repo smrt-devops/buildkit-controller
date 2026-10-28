@@ -298,6 +298,10 @@ pub enum Action {
         uid: String,
         /// Tested `P alloc`.
         alloc_id: String,
+        /// Tested `P expires-at`, for expiry and start-timeout retires only, so
+        /// they lose to a commit that moved it from the claim value after
+        /// the state they judged.
+        expires_at: Option<String>,
         /// Why.
         reason: RetireReason,
     },
@@ -927,6 +931,9 @@ impl<'a> Planner<'_, 'a> {
             pod: p.name.clone(),
             uid: p.uid.clone(),
             alloc_id: id.to_owned(),
+            expires_at: matches!(reason, RetireReason::Expired | RetireReason::StartTimeout)
+                .then(|| p.expires_at_raw.clone())
+                .flatten(),
             reason,
         });
     }
