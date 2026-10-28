@@ -94,6 +94,12 @@ impl Queues {
         })
     }
 
+    /// Whether anyone waits in the queue of `key`.
+    #[must_use]
+    pub fn is_waiting(&self, key: &PoolKey) -> bool {
+        self.lock().get(key).is_some_and(|q| !q.order.is_empty())
+    }
+
     /// Let the head of `key` retry.
     pub fn wake(&self, key: &PoolKey) {
         if let Some(q) = self.lock().get(key) {

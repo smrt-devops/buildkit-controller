@@ -596,7 +596,11 @@ impl Engine {
         ))
     }
 
-    /// Warm, cold, then the queue.
+    /// Warm, cold, then the queue. The queue is FIFO per pool on this replica:
+    /// a request that finds others waiting for the pool makes no attempt of
+    /// its own and goes behind them. Its arrival wakes the head, which makes
+    /// the attempt in its place, so a newcomer never takes a pod a waiter could
+    /// have had. Across replicas the order is best effort.
     async fn acquire(&self, r: &Req<'_>, qt: Duration) -> Result<Won, AllocError> {
         // Shutdown is checked only before an attempt, so a request is never
         // refused after its claim was sent.
@@ -604,8 +608,15 @@ impl Engine {
         if self.stopping.is_cancelled() {
             return Err(AllocError::ShuttingDown);
         }
-        if let Some(w) = self.attempt(r).await? {
-            return Ok(w);
+        // The wake version of the last attempt; `None` until this request made one.
+        let mut tried = None;
+        if self.queues.is_waiting(&r.key) {
+            self.queues.wake(&r.key);
+        } else {
+            if let Some(w) = self.attempt(r).await? {
+                return Ok(w);
+            }
+            tried = Some(snapshot);
         }
         let exhausted = || AllocError::PoolExhausted(format!("{}/{}", r.key.0, r.key.1));
         if qt.is_zero() {
@@ -622,15 +633,14 @@ impl Engine {
             result: "cancelled",
         };
         let deadline = rec.since + qt;
-        let mut tried = snapshot;
         loop {
             if self.stopping.is_cancelled() {
                 rec.result = "shutting_down";
                 return Err(AllocError::ShuttingDown);
             }
             let v = ticket.seen();
-            if v != tried && ticket.is_head() {
-                tried = v;
+            if tried != Some(v) && ticket.is_head() {
+                tried = Some(v);
                 if let Some(w) = self.attempt(r).await? {
                     rec.result = "ok";
                     return Ok(w);

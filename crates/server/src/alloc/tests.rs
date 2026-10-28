@@ -798,6 +798,106 @@ async fn queue_is_fifo_and_woken_by_pod_events() {
     }
 }
 
+/// A request that finds a waiter goes behind it, so a pod freed while
+/// someone is queued goes to the waiter even when the newcomer runs first.
+#[tokio::test(start_paused = true)]
+async fn a_newcomer_never_takes_a_pod_from_a_queued_request() {
+    let e = env_with(4, false, 10);
+    let _stop = e.spawn_drive();
+    let engine = Arc::clone(&e.engine);
+    let first = tokio::spawn(async move {
+        engine
+            .allocate(&sa("first"), &req(60))
+            .await
+            .map(super::Allocation::commit)
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let key = (NS.to_owned(), POOL.to_owned());
+    assert_eq!(e.engine.queues.lengths(), vec![(key, 1)]);
+    // The newcomer runs before the pod event wakes the queue head.
+    let p0 = e.warm(0);
+    let t = tokio::time::Instant::now();
+    assert!(matches!(
+        e.engine.allocate(&sa("late"), &req(0)).await,
+        Err(AllocError::PoolExhausted(_))
+    ));
+    assert_eq!(t.elapsed(), Duration::ZERO);
+    let engine = Arc::clone(&e.engine);
+    let second = tokio::spawn(async move {
+        engine
+            .allocate(&sa("second"), &req(60))
+            .await
+            .map(super::Allocation::commit)
+    });
+    let p1 = e.warm(1);
+    assert_eq!(
+        first.await.unwrap().unwrap().owner,
+        format!("sa:{NS}/first")
+    );
+    assert_eq!(
+        second.await.unwrap().unwrap().owner,
+        format!("sa:{NS}/second")
+    );
+    for (pod, who) in [(p0, "first"), (p1, "second")] {
+        let owner = ann(&e.fake.get(&pod).unwrap(), ANN_OWNER).map(str::to_owned);
+        assert_eq!(owner, Some(format!("sa:{NS}/{who}")));
+    }
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(128))]
+
+    /// FIFO on one replica: whatever the interleaving of arrivals and freed
+    /// pods, the requests that got a pod are exactly the earliest arrivals.
+    #[test]
+    fn requests_are_served_in_arrival_order(
+        events in proptest::collection::vec((proptest::bool::ANY, 0..4_usize), 1..20),
+    ) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let (served, want) = rt.block_on(async {
+            let e = env_with(64, false, 64);
+            let _stop = e.spawn_drive();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            let (mut handles, mut freed) = (Vec::new(), 0_u32);
+            for (arrive, yields) in events {
+                if arrive {
+                    let engine = Arc::clone(&e.engine);
+                    let who = sa(&format!("a{}", handles.len()));
+                    handles.push(tokio::spawn(async move {
+                        engine
+                            .allocate(&who, &req(600))
+                            .await
+                            .map(super::Allocation::commit)
+                    }));
+                } else {
+                    e.warm(freed);
+                    freed += 1;
+                }
+                for _ in 0..yields {
+                    tokio::task::yield_now().await;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let want: Vec<usize> = (0..handles.len().min(freed as usize)).collect();
+            let mut served = Vec::new();
+            for (i, h) in handles.iter().enumerate() {
+                if h.is_finished() {
+                    served.push(i);
+                }
+            }
+            for h in handles.into_iter().filter(tokio::task::JoinHandle::is_finished) {
+                assert!(h.await.unwrap().is_ok());
+            }
+            (served, want)
+        });
+        proptest::prop_assert_eq!(served, want);
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn release_is_owner_only() {
     let e = env_with(4, false, 10);
