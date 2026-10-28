@@ -7,14 +7,16 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::gauge::Gauge;
 use rustls::ClientConfig;
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{oneshot, watch};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use x509_parser::prelude::{FromDer, X509Certificate};
@@ -22,7 +24,7 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 use super::handler::{Accepted, ConnectionHandler, Refusal};
 use super::metrics::{Direction, EdgeMetrics, Revocation};
 use super::pods::PodView;
-use super::revoke::Registry;
+use super::revoke::{MAX_CONNECTIONS_PER_ALLOCATION, Registry};
 use super::tls::EdgeTls;
 use super::upstream::{dial, worker_name};
 use crate::pki::AllocationId;
@@ -72,7 +74,7 @@ impl ProxyHandler {
                 tls,
                 metrics,
                 options,
-                live: Arc::new(Registry::default()),
+                live: Arc::new(Registry::new(MAX_CONNECTIONS_PER_ALLOCATION)),
             }),
         }
     }
@@ -114,15 +116,27 @@ impl Inner {
 
     async fn serve(self: Arc<Self>, conn: Accepted) {
         let Accepted { stream, id, .. } = conn;
-        let mut client = stream;
         // The deadline is absolute and fixed at accept, so dial time cannot stretch the session.
-        let not_after = leaf_not_after(&client);
+        let not_after = leaf_not_after(&stream);
+        self.forward(stream, &id, not_after).await;
+    }
+
+    /// Everything after the client handshake, over any client stream.
+    async fn forward<C>(&self, mut client: C, id: &AllocationId, not_after: Option<Instant>)
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+    {
         // Index first, so a revocation racing the re-resolve below still lands.
-        let (_reg, revoked) = self.live.register(&id);
-        let target = match self.view.resolve(&id, OffsetDateTime::now_utc()) {
+        let Some((_reg, revoked)) = self.live.register(id) else {
+            self.metrics.outcome(Some(id), "allocation_limit");
+            warn!("edge per-allocation connection limit reached; closing");
+            let _ = tokio::time::timeout(CLOSE_GRACE, client.shutdown()).await;
+            return;
+        };
+        let target = match self.view.resolve(id, OffsetDateTime::now_utc()) {
             Ok(t) => t,
             Err(r) => {
-                self.metrics.outcome(Some(&id), r.result_label());
+                self.metrics.outcome(Some(id), r.result_label());
                 debug!(result = r.result_label(), "forwarding refused");
                 let _ = tokio::time::timeout(CLOSE_GRACE, client.shutdown()).await;
                 return;
@@ -143,43 +157,57 @@ impl Inner {
         let mut upstream = match dialed {
             Ok(s) => s,
             Err(error) => {
-                self.metrics.outcome(Some(&id), "upstream_error");
+                self.metrics.outcome(Some(id), "upstream_error");
                 warn!(%addr, %error, "upstream connect failed");
                 let _ = tokio::time::timeout(CLOSE_GRACE, client.shutdown()).await;
                 return;
             }
         };
-        self.metrics.outcome(Some(&id), "ok");
+        self.metrics.outcome(Some(id), "ok");
         self.metrics
             .upstream_connected(start.elapsed().as_secs_f64());
         info!(%addr, "edge connection proxied");
-
-        let active = self.metrics.active(&id);
-        active.inc();
-        let guard = DrainGuard(Some(self.metrics.clone()));
-        let end = pump(
+        relay(
+            &self.metrics,
+            id,
             &mut client,
             &mut upstream,
-            &self.metrics,
             not_after,
             revoked,
         )
         .await;
-        guard.disarm();
-        active.dec();
-        match end {
-            End::Closed(Ok((up, down))) => debug!(up, down, "edge connection closed"),
-            End::Closed(Err(e)) => debug!(error = %e, "edge connection ended"),
-            End::Revoked(r) => {
-                self.metrics.revoked(r);
-                info!(reason = r.label(), "edge connection revoked");
-            }
-        }
         let _ = tokio::time::timeout(CLOSE_GRACE, async {
             let _ = client.shutdown().await;
             let _ = upstream.shutdown().await;
         })
         .await;
+    }
+}
+
+/// [`pump`] with its accounting: the active gauge while it runs, the
+/// revocation counter when it is cut, and `drain` when the future is dropped
+/// mid-copy (the drain deadline aborting the edge).
+async fn relay<C, U>(
+    metrics: &EdgeMetrics,
+    id: &AllocationId,
+    client: &mut C,
+    upstream: &mut U,
+    not_after: Option<Instant>,
+    revoked: oneshot::Receiver<Revocation>,
+) where
+    C: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    U: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    let active = Active::start(metrics, id);
+    let end = pump(client, upstream, metrics, not_after, revoked).await;
+    active.end();
+    match end {
+        End::Closed(Ok((up, down))) => debug!(up, down, "edge connection closed"),
+        End::Closed(Err(e)) => debug!(error = %e, "edge connection ended"),
+        End::Revoked(r) => {
+            metrics.revoked(r);
+            info!(reason = r.label(), "edge connection revoked");
+        }
     }
 }
 
@@ -199,7 +227,7 @@ pub async fn pump<C, U>(
     client: &mut C,
     upstream: &mut U,
     metrics: &EdgeMetrics,
-    not_after: Option<tokio::time::Instant>,
+    not_after: Option<Instant>,
     revoked: oneshot::Receiver<Revocation>,
 ) -> End
 where
@@ -230,27 +258,42 @@ where
 
 /// The verified client leaf's notAfter as a tokio instant, computed now
 /// (at accept); `None` if unreadable. A past notAfter maps to now.
-fn leaf_not_after<S>(s: &tokio_rustls::server::TlsStream<S>) -> Option<tokio::time::Instant> {
+fn leaf_not_after<S>(s: &tokio_rustls::server::TlsStream<S>) -> Option<Instant> {
     let leaf = s.get_ref().1.peer_certificates()?.first()?;
     let (_, cert) = X509Certificate::from_der(leaf).ok()?;
     let at = cert.validity().not_after.timestamp();
     let left = at.saturating_sub(OffsetDateTime::now_utc().unix_timestamp());
     let left = Duration::from_secs(u64::try_from(left).unwrap_or(0));
-    Some(tokio::time::Instant::now() + left)
+    Some(Instant::now() + left)
 }
 
-/// Counts a connection aborted at the drain deadline (dropped mid-copy).
-struct DrainGuard(Option<EdgeMetrics>);
+/// One connection in `edge_active_connections`, taken out again on drop. Dropped
+/// without [`Active::end`], the connection was aborted mid-copy by the drain
+/// deadline and is counted as a `drain` revocation.
+struct Active {
+    gauge: Gauge,
+    drained: Option<EdgeMetrics>,
+}
 
-impl DrainGuard {
-    fn disarm(mut self) {
-        self.0 = None;
+impl Active {
+    fn start(metrics: &EdgeMetrics, id: &AllocationId) -> Self {
+        let gauge = metrics.active(id);
+        gauge.inc();
+        Self {
+            gauge,
+            drained: Some(metrics.clone()),
+        }
+    }
+
+    fn end(mut self) {
+        self.drained = None;
     }
 }
 
-impl Drop for DrainGuard {
+impl Drop for Active {
     fn drop(&mut self) {
-        if let Some(m) = self.0.take() {
+        self.gauge.dec();
+        if let Some(m) = self.drained.take() {
             m.revoked(Revocation::Drain);
         }
     }
