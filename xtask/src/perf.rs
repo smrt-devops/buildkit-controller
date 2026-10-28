@@ -423,12 +423,7 @@ fn setup(p: &Perf, work: &std::path::Path) -> Result<CaBundle> {
     }
     let crd = root().join(CRD_PATH).to_string_lossy().into_owned();
     p.k(&["apply", "--server-side", "-f", &crd])?;
-    p.k(&[
-        "wait",
-        "--for=condition=established",
-        "--timeout=60s",
-        "crd/buildkitpools.buildkit.smrt-devops.net",
-    ])?;
+    crate::kube::wait_crd_established(&p.env.kubeconfig)?;
     p.k(&["create", "namespace", SYSTEM_NS])?;
     p.k(&[
         "label",

@@ -316,12 +316,7 @@ pub(crate) fn edge_verify() -> Result<()> {
 
     let crd = root.join(CRD_PATH).to_string_lossy().into_owned();
     env.kubectl(&["apply", "--server-side", "-f", &crd])?;
-    env.kubectl(&[
-        "wait",
-        "--for=condition=established",
-        "--timeout=60s",
-        "crd/buildkitpools.buildkit.smrt-devops.net",
-    ])?;
+    crate::kube::wait_crd_established(&env.kubeconfig)?;
     env.kubectl(&["create", "namespace", SYSTEM_NS])?;
     // The controller pod must pass PodSecurity "restricted".
     env.kubectl(&[

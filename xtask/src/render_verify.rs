@@ -114,16 +114,7 @@ impl Kube {
         }
         let crd = root.join(CRD_PATH).to_string_lossy().into_owned();
         self.ok("CRD apply", &["apply", "--server-side", "-f", &crd], None)?;
-        self.ok(
-            "CRD not established",
-            &[
-                "wait",
-                "--for=condition=established",
-                "--timeout=60s",
-                "crd/buildkitpools.buildkit.smrt-devops.net",
-            ],
-            None,
-        )?;
+        crate::kube::wait_crd_established(&self.kubeconfig)?;
         for ns in [POOL_NAMESPACE, CONTROLLER_NAMESPACE] {
             self.ok("create namespace", &["create", "namespace", ns], None)?;
         }
