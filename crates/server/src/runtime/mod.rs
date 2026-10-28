@@ -34,6 +34,7 @@ pub mod listen;
 pub mod metrics;
 pub mod readiness;
 pub mod shutdown;
+pub mod stop;
 pub mod stores;
 
 use std::sync::Arc;
