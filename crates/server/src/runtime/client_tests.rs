@@ -1,9 +1,12 @@
-//! The read timeout turns a stalled API connection into a watcher error.
+//! The per-request silence limit turns a stalled API request into a watcher
+//! error, and does not cut a healthy request on a reused connection.
 //!
 //! These run on the real clock against a fake API server on loopback: the
 //! paused clock auto-advances whenever the runtime waits on socket I/O, which
 //! would fire the timeout before the server could answer.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -30,6 +33,8 @@ enum Watch {
 struct Server {
     /// Lists answer; otherwise they get no response at all.
     list: bool,
+    /// How long a list waits before it answers.
+    list_delay: Duration,
     watch: Watch,
 }
 
@@ -61,6 +66,7 @@ async fn serve(mut sock: TcpStream, server: Server) {
             if !server.list {
                 std::future::pending::<()>().await;
             }
+            tokio::time::sleep(server.list_delay).await;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{LIST}",
                 LIST.len()
@@ -82,20 +88,29 @@ async fn serve(mut sock: TcpStream, server: Server) {
     }
 }
 
-/// A pod watcher against a fake API server that answers as `server` says.
-async fn pod_watch(
-    server: Server,
-) -> impl futures::Stream<Item = watcher::Result<Event<Pod>>> + Send {
+/// A client of a fake API server that answers as `server` says, and the count
+/// of connections the server accepted.
+async fn fake(server: Server) -> (kube::Client, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&accepted);
     tokio::spawn(async move {
         loop {
             let (sock, _) = listener.accept().await.unwrap();
+            count.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(serve(sock, server));
         }
     });
     let config = kube::Config::new(format!("http://{addr}").parse().unwrap());
-    let client = client_from(config, TIMEOUT).unwrap();
+    (client_from(config, TIMEOUT).unwrap(), accepted)
+}
+
+/// A pod watcher against a fake API server that answers as `server` says.
+async fn pod_watch(
+    server: Server,
+) -> impl futures::Stream<Item = watcher::Result<Event<Pod>>> + Send {
+    let (client, _) = fake(server).await;
     watcher::watcher(
         Api::<Pod>::namespaced(client, "ns"),
         watcher::Config::default(),
@@ -133,6 +148,7 @@ where
 async fn a_watch_that_stalls_after_its_headers_fails_after_the_read_timeout() {
     let mut events = pod_watch(Server {
         list: true,
+        list_delay: Duration::ZERO,
         watch: Watch::Stall,
     })
     .await;
@@ -150,6 +166,7 @@ async fn a_watch_that_stalls_after_its_headers_fails_after_the_read_timeout() {
 async fn a_list_that_gets_no_response_fails_after_the_read_timeout() {
     let mut events = pod_watch(Server {
         list: false,
+        list_delay: Duration::ZERO,
         watch: Watch::Stall,
     })
     .await;
@@ -169,6 +186,7 @@ async fn a_list_that_gets_no_response_fails_after_the_read_timeout() {
 async fn bookmarks_keep_a_quiet_watch_alive() {
     let mut events = pod_watch(Server {
         list: true,
+        list_delay: Duration::ZERO,
         watch: Watch::Bookmarks,
     })
     .await;
@@ -176,4 +194,27 @@ async fn bookmarks_keep_a_quiet_watch_alive() {
     // Five read timeouts without a change: bookmarks only, so no item at all.
     let item = next_within(&mut events, TIMEOUT * 5).await;
     assert!(item.is_none(), "{item:?}");
+}
+
+/// A connection that sat idle in the pool for most of the limit, then carries
+/// a request the server answers just inside it. A timer on the connection
+/// would have counted the idle time too and cut the request.
+#[tokio::test]
+async fn a_request_on_a_long_idle_connection_gets_the_full_limit() {
+    let (client, accepted) = fake(Server {
+        list: true,
+        list_delay: TIMEOUT * 2 / 3,
+        watch: Watch::Stall,
+    })
+    .await;
+    let pods = Api::<Pod>::namespaced(client, "ns");
+    let lp = kube::api::ListParams::default();
+    pods.list(&lp).await.unwrap();
+    tokio::time::sleep(TIMEOUT * 2 / 3).await;
+    pods.list(&lp).await.unwrap();
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "the second list reused the idle connection"
+    );
 }

@@ -23,6 +23,8 @@
 //! (reconcile; it starts per leadership term, after `wait_synced`, dropped when
 //! leadership ends). Replace the stubs in [`hooks::Hooks`].
 
+mod idle;
+
 pub mod hooks;
 pub mod leader;
 pub mod metrics;
@@ -47,8 +49,11 @@ use metrics::Metrics;
 use readiness::Readiness;
 use stores::{PodSubscription, SecretState, StoreFreshness, StoreSpec, Stores};
 
-/// Longest a request to the API server may go without receiving a byte
-/// before it fails: the read timeout of the controller's kube client.
+/// Longest a request to the API server may go without receiving anything
+/// before it fails: from sending the request to its response headers, and
+/// then between frames of the response body. The timers belong to each
+/// request, so one sent on a pooled connection that sat idle still gets the
+/// full limit.
 ///
 /// Without it a connection that stalls without an error (an API server that
 /// hangs, a load balancer that silently drops the flow) leaves a watch, a list
@@ -70,17 +75,20 @@ use stores::{PodSubscription, SecretState, StoreFreshness, StoreSpec, Stores};
 ///
 /// The timeout counts silence, not the length of a request, so a long but
 /// flowing list is unaffected. A request is cut only if the API server sends
-/// nothing for 90 s. That is far beyond `kube.requestTimeout` (5 s by default),
-/// which already bounds the allocation, reconcile, token review and Lease
-/// calls; calls without their own bound, such as the claim controller's, gain
-/// this one. It is also beyond how long the API server takes to start
+/// nothing for 90 s. Calls bounded by `kube.requestTimeout` (5 s by default;
+/// the allocation, reconcile, token review and Lease calls) keep that bound,
+/// which config validation holds below this one so that it is the one that
+/// applies. Calls without their own bound, such as the claim controller's,
+/// gain this one. It is also beyond how long the API server takes to start
 /// answering a list, even a paged one served from etcd. The
 /// controller makes no exec, attach or log requests, the long-lived calls that
 /// a read timeout would break.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// The controller's kube client: the inferred config (in-cluster, or the
-/// kubeconfig) with [`READ_TIMEOUT`]. Every watch, list and write shares it.
+/// The controller's kube client: [`Client::try_default`] (the inferred
+/// config, in-cluster or the kubeconfig, with kube's TLS, auth refresh,
+/// retries and headers unchanged), wrapped so that each request fails after
+/// [`READ_TIMEOUT`] of silence. Every watch, list and write shares it.
 ///
 /// # Errors
 ///
@@ -92,10 +100,11 @@ pub async fn kube_client() -> Result<Client, kube::Error> {
     client_from(config, READ_TIMEOUT)
 }
 
-/// A client for `config` whose requests fail after `read_timeout` without a byte.
-fn client_from(mut config: kube::Config, read_timeout: Duration) -> Result<Client, kube::Error> {
-    config.read_timeout = Some(read_timeout);
-    Client::try_from(config)
+/// A client for `config` whose requests fail after `after` of silence.
+fn client_from(config: kube::Config, after: Duration) -> Result<Client, kube::Error> {
+    let namespace = config.default_namespace.clone();
+    let inner = Client::try_from(config)?;
+    Ok(Client::new(idle::IdleTimeout { inner, after }, namespace))
 }
 
 /// Shared handle to the runtime; cheap to clone.
