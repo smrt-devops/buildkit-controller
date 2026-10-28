@@ -85,6 +85,51 @@ fn bad_duration_is_reported() {
 }
 
 #[test]
+fn drain_timeout_is_unset_by_default_and_bounded_by_the_connection_lifetime() {
+    let c = Config::from_yaml(MIN).unwrap();
+    assert_eq!(c.shutdown_delay(), Duration::from_secs(5));
+    assert_eq!(c.drain_timeout(), None);
+    assert_eq!(c.drain_budget(), MAX_CONNECTION_LIFETIME);
+    assert_eq!(MAX_CONNECTION_LIFETIME, Duration::from_mins(1445));
+}
+
+#[test]
+fn drain_timeout_when_set_is_a_hard_cap() {
+    let c = Config::from_yaml(&format!("{MIN}shutdown:\n  drainTimeout: 90s\n")).unwrap();
+    assert_eq!(c.drain_timeout(), Some(Duration::from_secs(90)));
+    assert_eq!(c.drain_budget(), Duration::from_secs(90));
+    let v = errs(&format!("{MIN}shutdown:\n  drainTimeout: later\n"));
+    assert!(
+        v.iter().any(|m| m.contains("shutdown.drainTimeout")),
+        "{v:?}"
+    );
+}
+
+/// The drain bound follows the longest connection the edge lets live: the CRD's
+/// `maxTTL` cap plus the cert margin past the allocation's expiry.
+#[test]
+fn max_connection_lifetime_matches_the_ttl_cap_and_cert_margin() {
+    use buildkit_controller_api::v1alpha1::BuildKitPoolSpec;
+    let spec = |ttl: &str| {
+        let mut s: BuildKitPoolSpec = serde_json::from_value(serde_json::json!(
+            {"access": {"rules": [{"serviceAccount": {"name": "builder"}}]}}
+        ))
+        .unwrap();
+        s.allocation.max_ttl = CrdDuration::new(ttl);
+        s.validate()
+    };
+    assert!(spec("24h").is_ok());
+    assert!(
+        spec("24h0m1s").is_err(),
+        "the CRD cap moved; update MAX_CONNECTION_LIFETIME"
+    );
+    let margin = Duration::from_secs(
+        u64::try_from(crate::alloc::pods::CERT_MARGIN.whole_seconds()).unwrap(),
+    );
+    assert_eq!(MAX_CONNECTION_LIFETIME, Duration::from_hours(24) + margin);
+}
+
+#[test]
 fn settings_require_pod_env() {
     let dir = std::env::temp_dir().join(format!("bkc-cfg-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

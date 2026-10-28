@@ -29,6 +29,7 @@ const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const AUTH_RETRY_AFTER_SECS: u64 = 2;
 
 use super::body::CommitBody;
+use super::listener::Stopping;
 use super::metrics::HttpMetrics;
 use crate::alloc::engine::access_rules;
 use crate::alloc::{AllocError, AllocService, Allocation, Engine};
@@ -408,6 +409,15 @@ async fn read_body(headers: &HeaderMap, body: Body) -> Result<CreateAllocationRe
 }
 
 async fn create<A: Allocator>(State(s): State<Arc<ApiState<A>>>, req: Request) -> Response {
+    // A stopping replica takes no new allocation; the engine refuses queued ones.
+    if req
+        .extensions()
+        .get::<Stopping>()
+        .is_some_and(|s| s.0.is_cancelled())
+    {
+        s.alloc.rejected(ErrorCode::ShuttingDown);
+        return ApiError::from(AllocError::ShuttingDown).into_response();
+    }
     let addr = peer_addr(&req);
     let peer = peer(&req);
     let (parts, body) = req.into_parts();

@@ -151,16 +151,19 @@ impl Component for AllocService {
                 .map(Duration::from_secs)
                 .map_err(|e| anyhow::anyhow!("kube.requestTimeout: {e}"))?;
             let sub_ctx = ctx.clone();
-            let engine = Arc::new(Engine::new(
-                Arc::new(KubeBackend::new(ctx.client(), timeout)),
-                ctx.pools(),
-                ctx.pods(),
-                Box::new(move || sub_ctx.pod_events()),
-                Arc::new(MaterialSource::new(material)),
-                cfg,
-                metrics.clone(),
-                Arc::new(Queues::new(MAX_WAITERS, metrics)),
-            ));
+            let engine = Arc::new(
+                Engine::new(
+                    Arc::new(KubeBackend::new(ctx.client(), timeout)),
+                    ctx.pools(),
+                    ctx.pods(),
+                    Box::new(move || sub_ctx.pod_events()),
+                    Arc::new(MaterialSource::new(material)),
+                    cfg,
+                    metrics.clone(),
+                    Arc::new(Queues::new(MAX_WAITERS, metrics)),
+                )
+                .with_stopping(shutdown.clone()),
+            );
             ctx.wait_synced().await;
             let _ = cell.set(Arc::clone(&engine));
             info!(component = "alloc", "allocation service running");

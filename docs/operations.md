@@ -34,11 +34,30 @@ Check the state with `kubectl get bkp -A`. The Warm, Allocated and Waiting colum
 
 ## Upgrades
 
-- Upgrade with `helm upgrade`. The Deployment rolls one replica at a time and the PodDisruptionBudget keeps one replica up. A leaving replica keeps accepting for `shutdown.delay` (5 s), closes its listeners, and lets open edge connections run for up to `shutdown.drainTimeout` (300 s). Running builds on other replicas are unaffected, and a build on a draining replica has up to that long to finish.
+- Upgrade with `helm upgrade`. The Deployment rolls one replica at a time and the PodDisruptionBudget keeps one replica up. Running builds survive it: see [Stopping a replica](#stopping-a-replica).
 - Helm installs the CRD on first install only and never upgrades it. When a release changes `crds/`, apply it yourself first with `kubectl apply --server-side -f helm/buildkit-controller/crds/`.
 - A change to a pool's template changes its pod template hash. The reconciler retires free pods with the old hash and starts new ones. Allocated pods run to the end of their allocation.
 - Since the run-bound owner change, an OIDC allocation's owner includes the token's run claims (see [Allocation owner](architecture.md#allocation-owner)). An allocation a GitHub Actions run made before the upgrade has the old owner `oidc:<iss>#<sub>`, so a release from that run after the upgrade is refused with 403 (the Action's post step logs a warning and the job still passes) and the worker is freed at the allocation's expiry instead. Accepting the old form would let every run with the same `sub` release those workers, which is the hole the change closes. To avoid holding workers, upgrade while few builds are running.
 - A config change restarts the controller. No pool state is lost, because state lives in pods and pool status.
+
+## Stopping a replica
+
+A replica that gets SIGTERM, from a rollout, an HPA scale-in, a node drain or a pod delete, does not cut a running build:
+
+1. `/readyz` fails, so the replica leaves the Service endpoints.
+2. If it leads, it stops the reconciler and releases the Lease at once. Another replica leads within a few seconds, whatever the drain takes.
+3. After `shutdown.delay` (5 s) the API stops accepting connections. Requests already in flight finish. Allocation requests still queued on this replica, and new ones sent on a connection that was already open, get 503 `shutting_down` with `Retry-After: 1` before any worker is claimed for them, so a retry reaches another replica. The Action and the curl recipe retry it.
+4. The edge stops accepting connections and keeps the open ones until each ends on its own: the build finishes and the client releases the allocation, the allocation expires, the worker pod goes away, or the client certificate's `notAfter` passes. The Pod watch, revocation and certificate timers keep running until the last connection closes. Then the process exits.
+
+With `shutdown.drainTimeout` unset (the default), the drain has no fixed budget. It is bounded by the longest a connection can live: the 24h `maxTTL` cap plus the 5-minute certificate margin, 24h5m. The chart sets `terminationGracePeriodSeconds` to `shutdown.delay` + 86700 s + 10 s, so Kubernetes does not kill a draining replica early. Set `shutdown.drainTimeout` to cap the drain instead; connections still open at the cap are cut and counted as `buildkit_edge_revocations_total{reason="drain"}`, and the grace period becomes `shutdown.delay` + `shutdown.drainTimeout` + 10 s. A draining replica logs `edge draining` with its open connection count every minute.
+
+A Deployment rollout does not wait for old replicas to finish draining: new replicas take traffic as soon as they are Ready, and the old ones exit when their last build ends. The same holds for HPA scale-in, so `autoscaling` is safe to enable. A terminating replica is not Ready, so the PodDisruptionBudget counts it as down and lets the next eviction wait for its replacement.
+
+Node drains are bounded by whatever evicts the pod:
+
+- `kubectl drain` waits for evicted pods to exit. Its `--timeout` (none by default) caps the wait, and on expiry it stops and leaves the node cordoned; the pod keeps draining.
+- cluster-autoscaler caps the grace period of pods it evicts on scale-down at `--max-graceful-termination-sec`, 600 s by default. A build that runs longer through a replica on that node is cut. Raise the flag, or keep the controller on nodes it does not scale down (annotate the pods `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` with `podAnnotations`).
+- Karpenter honours the pod's `terminationGracePeriodSeconds` when it drains a node, up to the NodePool's `terminationGracePeriod` when that is set.
 
 ## CA rotation
 
@@ -122,6 +141,7 @@ Errors the API returns to clients, and the usual cause:
 - 404 `pool_not_found`. The pool does not exist, or no access rule matches the caller. The API never answers 403 for this, so pools cannot be probed.
 - 503 `pool_exhausted`. The pool is at `scaling.max` and the queue wait ran out. Raise `max`, or `queueTimeout`.
 - 503 `ca_unavailable`. The CA is being replaced. Retry shortly.
+- 503 `shutting_down` with `Retry-After: 1`. The replica that held the request is stopping (rollout, scale-in, node drain) and claimed nothing for it. Retry; the request reaches another replica.
 
 A client that cannot connect to the edge usually has a certificate problem. Check `buildkit_edge_connections_total` for `tls_error`, `bad_san` and `expired`, and set `--set logLevel=debug` on the chart to see handshake failures. The curl recipe can use `API_CA` to trust a self-issued certificate.
 

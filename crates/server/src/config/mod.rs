@@ -460,21 +460,29 @@ impl Default for Dns {
     }
 }
 
+/// The longest an edge connection can live: the CRD caps `maxTTL` at 24h, and
+/// the allocation cert, whose `notAfter` closes the connection, outlives the
+/// allocation by [`CERT_MARGIN`](crate::alloc::pods::CERT_MARGIN) (5 minutes).
+/// The edge allows no skew past `notAfter`. With `shutdown.drainTimeout` unset
+/// this bounds the drain, and the chart sizes the termination grace period from it.
+pub const MAX_CONNECTION_LIFETIME: Duration = Duration::from_mins(24 * 60 + 5);
+
 /// `shutdown`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct Shutdown {
     /// Pause between going unready and closing listeners.
     pub delay: CrdDuration,
-    /// Drain budget.
-    pub drain_timeout: CrdDuration,
+    /// Hard cap on the drain. Unset: the drain waits for every edge connection
+    /// to end on its own, which takes at most [`MAX_CONNECTION_LIFETIME`].
+    pub drain_timeout: Option<CrdDuration>,
 }
 
 impl Default for Shutdown {
     fn default() -> Self {
         Self {
             delay: CrdDuration::new("5s"),
-            drain_timeout: CrdDuration::new("300s"),
+            drain_timeout: None,
         }
     }
 }
@@ -588,10 +596,20 @@ impl Config {
         Duration::from_secs(self.shutdown.delay.seconds().unwrap_or(0))
     }
 
-    /// `shutdown.drainTimeout`; call only on a validated config.
+    /// `shutdown.drainTimeout`, `None` when unset; call only on a validated config.
     #[must_use]
-    pub fn drain_timeout(&self) -> Duration {
-        Duration::from_secs(self.shutdown.drain_timeout.seconds().unwrap_or(0))
+    pub fn drain_timeout(&self) -> Option<Duration> {
+        self.shutdown
+            .drain_timeout
+            .as_ref()
+            .map(|d| Duration::from_secs(d.seconds().unwrap_or(0)))
+    }
+
+    /// The longest the drain may take: `shutdown.drainTimeout`, else
+    /// [`MAX_CONNECTION_LIFETIME`].
+    #[must_use]
+    pub fn drain_budget(&self) -> Duration {
+        self.drain_timeout().unwrap_or(MAX_CONNECTION_LIFETIME)
     }
 
     /// Check every config rule, returning all failures.
@@ -626,9 +644,11 @@ impl Config {
                 "edge.upstreamConnectTimeout",
             ),
             (&self.shutdown.delay, "shutdown.delay"),
-            (&self.shutdown.drain_timeout, "shutdown.drainTimeout"),
         ] {
             secs(d, f, &mut p);
+        }
+        if let Some(d) = &self.shutdown.drain_timeout {
+            secs(d, "shutdown.drainTimeout", &mut p);
         }
         if rt.is_zero() {
             p.push("kube.requestTimeout must be positive".into());

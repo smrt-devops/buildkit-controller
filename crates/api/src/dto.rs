@@ -211,6 +211,9 @@ pub enum ErrorCode {
     CaUnavailable,
     /// HTTP 503 when a Kubernetes API call times out or returns 5xx and the outcome is unknown.
     UpstreamError,
+    /// HTTP 503 when the replica is shutting down and took no pod for the request. Retry
+    /// at once: the replica has already left the Service endpoints.
+    ShuttingDown,
 }
 
 impl ErrorCode {
@@ -230,15 +233,17 @@ impl ErrorCode {
             | Self::PodLost
             | Self::NotReady
             | Self::CaUnavailable
-            | Self::UpstreamError => 503,
+            | Self::UpstreamError
+            | Self::ShuttingDown => 503,
         }
     }
 
-    /// Whether the response carries `Retry-After: 5`.
+    /// The `Retry-After` the response carries, in seconds.
     #[must_use]
     pub const fn retry_after_seconds(self) -> Option<u64> {
         match self {
             Self::PoolExhausted | Self::StartTimeout => Some(5),
+            Self::ShuttingDown => Some(1),
             _ => None,
         }
     }
@@ -275,7 +280,7 @@ impl ErrorBody {
 
 impl ErrorCode {
     /// Every code, in the order of the API error table.
-    pub const ALL: [ErrorCode; 14] = [
+    pub const ALL: [ErrorCode; 15] = [
         Self::InvalidRequest,
         Self::Unauthenticated,
         Self::Forbidden,
@@ -290,6 +295,7 @@ impl ErrorCode {
         Self::NotReady,
         Self::CaUnavailable,
         Self::UpstreamError,
+        Self::ShuttingDown,
     ];
 
     /// The stable wire string. It is also the metrics `result` label value.
@@ -310,6 +316,7 @@ impl ErrorCode {
             Self::NotReady => "not_ready",
             Self::CaUnavailable => "ca_unavailable",
             Self::UpstreamError => "upstream_error",
+            Self::ShuttingDown => "shutting_down",
         }
     }
 }

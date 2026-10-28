@@ -56,7 +56,7 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
     "maxConnectionsPerIp" (int .Values.api.maxConnectionsPerIp))
   "auth" (dict "oidc" $issuers "serviceAccount" .Values.auth.serviceAccount)
   "workerNetwork" .Values.workerNetwork
-  "shutdown" .Values.shutdown
+  "shutdown" (ternary .Values.shutdown (omit .Values.shutdown "drainTimeout") (not (empty .Values.shutdown.drainTimeout)))
   "claims" (dict "enabled" .Values.claims.enabled "namespaces" .Values.claims.namespaces) -}}
 {{- /* Scoped: the list. Cluster-wide: the old empty key, so existing configs (and their checksum) stay the same. */ -}}
 {{- with include "bkc.watchNamespaces" . | fromJsonArray -}}
@@ -87,5 +87,15 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- list .Values.watchNamespace | toJson -}}
 {{- else -}}
 {{- default (list) .Values.watchNamespaces | toJson -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Seconds the controller may drain: shutdown.drainTimeout, or when unset the
+longest edge connection lifetime (24h maxTTL cap + 5m cert margin = 86700 s). */}}
+{{- define "bkc.drainSeconds" -}}
+{{- if .Values.shutdown.drainTimeout -}}
+{{- include "bkc.seconds" .Values.shutdown.drainTimeout -}}
+{{- else -}}
+86700
 {{- end -}}
 {{- end -}}

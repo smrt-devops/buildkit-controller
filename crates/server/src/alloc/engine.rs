@@ -10,6 +10,7 @@ use kube::runtime::reflector::{ObjectRef, Store};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use super::backend::{Backend, CreateOutcome, PatchOutcome};
@@ -61,6 +62,9 @@ pub struct Engine {
     pub queues: Arc<Queues>,
     /// Permits of [`RELEASE_WAITERS`].
     pub release_waiters: Arc<tokio::sync::Semaphore>,
+    /// Fires when the replica starts shutting down. From then on a request that
+    /// has not claimed a pod gets [`AllocError::ShuttingDown`].
+    pub stopping: CancellationToken,
 }
 
 /// A successful allocation. The orphan guard still owns the pod. Call
@@ -308,7 +312,15 @@ impl Engine {
             metrics,
             queues,
             release_waiters: Arc::new(tokio::sync::Semaphore::new(RELEASE_WAITERS)),
+            stopping: CancellationToken::new(),
         }
+    }
+
+    /// Refuse new and queued requests with [`AllocError::ShuttingDown`] once `stopping` fires.
+    #[must_use]
+    pub fn with_stopping(mut self, stopping: CancellationToken) -> Self {
+        self.stopping = stopping;
+        self
     }
 
     /// POST /v1/allocations after authentication.
@@ -539,7 +551,12 @@ impl Engine {
 
     /// Warm, cold, then the queue.
     async fn acquire(&self, r: &Req<'_>, qt: Duration) -> Result<Won, AllocError> {
+        // Shutdown is checked only before an attempt, so a request is never
+        // refused after its claim was sent.
         let snapshot = self.queues.version(&r.key);
+        if self.stopping.is_cancelled() {
+            return Err(AllocError::ShuttingDown);
+        }
         if let Some(w) = self.attempt(r).await? {
             return Ok(w);
         }
@@ -560,6 +577,10 @@ impl Engine {
         let deadline = rec.since + qt;
         let mut tried = snapshot;
         loop {
+            if self.stopping.is_cancelled() {
+                rec.result = "shutting_down";
+                return Err(AllocError::ShuttingDown);
+            }
             let v = ticket.seen();
             if v != tried && ticket.is_head() {
                 tried = v;
@@ -569,12 +590,12 @@ impl Engine {
                 }
                 continue;
             }
-            if tokio::time::timeout_at(deadline, ticket.changed())
-                .await
-                .is_err()
-            {
-                rec.result = "timeout";
-                return Err(exhausted());
+            tokio::select! {
+                r = tokio::time::timeout_at(deadline, ticket.changed()) => if r.is_err() {
+                    rec.result = "timeout";
+                    return Err(exhausted());
+                },
+                () = self.stopping.cancelled() => {}
             }
         }
     }

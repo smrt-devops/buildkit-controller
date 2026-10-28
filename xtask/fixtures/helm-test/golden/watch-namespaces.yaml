@@ -86,7 +86,6 @@ data:
       caSecretName: buildkit-controller-ca
     shutdown:
       delay: 5s
-      drainTimeout: 300s
     watchNamespaces:
     - ci-a
     - ci-b
@@ -722,10 +721,10 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: buildkit-controller-0.1.0
       annotations:
-        checksum/config: 3a9089b706f24820af069fe1179b959d21c29206b7004c0d94156259585387fe
+        checksum/config: c785d138eaff1295cf4c0fd9a6dd08dc00d5549101878868abcd3202364d7efd
     spec:
       serviceAccountName: buildkit-controller
-      terminationGracePeriodSeconds: 315
+      terminationGracePeriodSeconds: 86715
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

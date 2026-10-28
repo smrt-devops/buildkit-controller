@@ -27,6 +27,7 @@ pub mod hooks;
 pub mod leader;
 pub mod metrics;
 pub mod readiness;
+pub mod shutdown;
 pub mod stores;
 
 use std::sync::Arc;
