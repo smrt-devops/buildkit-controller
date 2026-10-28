@@ -260,8 +260,10 @@ fn pool(name: &str, ns: &str, rule: Value) -> BuildKitPool {
 
 fn pools() -> Store<BuildKitPool> {
     let (store, mut writer) = reflector::store();
+    let mut b = pool("b", NS, json!({"serviceAccount": {}}));
+    b.spec.allocation.queue_timeout = serde_json::from_value(json!("5m")).unwrap();
     for p in [
-        pool("b", NS, json!({"serviceAccount": {}})),
+        b,
         pool("a", NS, json!({"serviceAccount": {}})),
         pool(
             "c",
@@ -744,7 +746,13 @@ async fn pools_lists_accessible_pools_sorted() {
         v["pools"][0],
         json!({"namespace": NS, "name": "a", "ready": true, "warm": 2, "starting": 0, "allocated": 1,
             "waiting": 0, "min": 1, "max": 4, "platforms": ["linux/amd64"],
-            "endpoint": "tcp://bk.example.com:8444", "serverName": "bk.example.com"})
+            "endpoint": "tcp://bk.example.com:8444", "serverName": "bk.example.com",
+            "queueTimeoutSeconds": 120, "maxQueueTimeoutSeconds": 600,
+            "defaultTtlSeconds": 3600, "maxTtlSeconds": 86400})
+    );
+    assert_eq!(
+        v["pools"][1]["queueTimeoutSeconds"], 300,
+        "from the pool spec"
     );
     let (_, _, body) = call(&app, get("/v1/pools", "sa.other.bob")).await;
     assert!(

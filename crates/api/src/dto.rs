@@ -166,6 +166,19 @@ pub struct PoolSummary {
     pub endpoint: String,
     /// TLS server name.
     pub server_name: String,
+    /// `allocation.queueTimeout` in seconds: the queue wait of a request that
+    /// sends no `queueTimeoutSeconds`. Absent from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_timeout_seconds: Option<u64>,
+    /// `allocation.maxQueueTimeout` in seconds. Absent from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_queue_timeout_seconds: Option<u64>,
+    /// `allocation.defaultTTL` in seconds. Absent from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_ttl_seconds: Option<u64>,
+    /// `allocation.maxTTL` in seconds. Absent from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ttl_seconds: Option<u64>,
 }
 
 /// `GET /v1/pools` response.

@@ -472,6 +472,9 @@ async fn release<A: Allocator>(
 
 fn summary(p: &BuildKitPool, edge: &EdgeInfo) -> Option<PoolSummary> {
     let st = p.status.clone().unwrap_or_default();
+    let a = &p.spec.allocation;
+    // A duration the CRD would reject is left out rather than guessed.
+    let secs = |d: &buildkit_controller_api::v1alpha1::Duration| d.seconds().ok();
     Some(PoolSummary {
         namespace: p.metadata.namespace.clone()?,
         name: p.metadata.name.clone()?,
@@ -488,6 +491,10 @@ fn summary(p: &BuildKitPool, edge: &EdgeInfo) -> Option<PoolSummary> {
         platforms: st.platforms,
         endpoint: edge.endpoint.clone(),
         server_name: edge.server_name.clone(),
+        queue_timeout_seconds: secs(&a.queue_timeout),
+        max_queue_timeout_seconds: secs(&a.max_queue_timeout),
+        default_ttl_seconds: secs(&a.default_ttl),
+        max_ttl_seconds: secs(&a.max_ttl),
     })
 }
 
