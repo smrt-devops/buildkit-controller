@@ -134,6 +134,7 @@ fn signal_group(pgid: u32, sig: Option<Signal>) -> bool {
 /// visible to `kill(-pgid, 0)`, so the leader is checked with `waitid` without
 /// reaping it, and the other members with `ps`, which marks zombies `Z`.
 fn group_done(pgid: u32) -> bool {
+    use std::os::unix::process::CommandExt as _;
     if !signal_group(pgid, None) {
         return true;
     }
@@ -144,18 +145,27 @@ fn group_done(pgid: u32) -> bool {
     if !matches!(waitid(WaitId::Pid(leader), opts), Ok(Some(_))) {
         return false;
     }
+    // Own process group, so a terminal Ctrl-C cannot kill `ps` mid-check.
     let Ok(ps) = Command::new("ps")
         .args(["-A", "-o", "pgid=,stat="])
         .stdin(Stdio::null())
+        .process_group(0)
         .output()
     else {
         return false;
     };
-    !String::from_utf8_lossy(&ps.stdout).lines().any(|l| {
-        let mut f = l.split_whitespace();
-        f.next().and_then(|g| g.parse::<u32>().ok()) == Some(pgid)
-            && f.next().is_some_and(|s| !s.starts_with('Z'))
-    })
+    !ps_has_live_member(&ps, pgid)
+}
+
+/// Whether `ps` output lists a non-zombie member of group `pgid`. A `ps` that
+/// failed says nothing, so it counts as a live member and the wait goes on.
+fn ps_has_live_member(ps: &Output, pgid: u32) -> bool {
+    !ps.status.success()
+        || String::from_utf8_lossy(&ps.stdout).lines().any(|l| {
+            let mut f = l.split_whitespace();
+            f.next().and_then(|g| g.parse::<u32>().ok()) == Some(pgid)
+                && f.next().is_some_and(|s| !s.starts_with('Z'))
+        })
 }
 
 /// SIGTERM to every group in `pgids`, then SIGKILL to any still alive after 5 s,
@@ -429,6 +439,23 @@ mod tests {
             "{:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn ps_output_decides_live_members() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let out = |code, text: &str| Output {
+            status: ExitStatus::from_raw(code),
+            stdout: text.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        };
+        let table = " 42 S\n 42 Z\n 7 R+\n";
+        assert!(ps_has_live_member(&out(0, table), 42));
+        assert!(!ps_has_live_member(&out(0, " 42 Z\n 7 R+\n"), 42));
+        assert!(!ps_has_live_member(&out(0, ""), 42));
+        // A failed ps (nonzero exit, or killed) must not read as "no members".
+        assert!(ps_has_live_member(&out(1 << 8, ""), 42));
+        assert!(ps_has_live_member(&out(2, ""), 42));
     }
 
     /// A grandchild holding the pipe open does not keep `run` waiting.
