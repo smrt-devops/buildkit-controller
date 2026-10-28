@@ -1,2 +1,4 @@
+# expect: at '/pools/0': missing property 'name'
 edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
 pools: [{namespace: ci}]
+gateway: {enabled: false}

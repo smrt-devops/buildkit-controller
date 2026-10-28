@@ -3,15 +3,6 @@ buildkit-controller {{ .Chart.AppVersion }} installed in {{ .Release.Namespace }
 {{- $gw := .Values.gateway }}
 {{- $plan := include "bkc.gateway" . | fromJson }}
 {{- $ca := printf "kubectl -n %s get configmap %s-ca-bundle -o 'jsonpath={.data.ca\\.crt}' > bk-ca.pem" .Release.Namespace $fn }}
-{{- if $plan.missing }}
-
-WARNING: this cluster does not serve gateway.networking.k8s.io/v1 {{ join ", " $plan.missing }},
-so the chart rendered no route that needs it and the controller is not reachable through
-the Gateway. HTTPRoute is in Gateway API v1.0+, BackendTLSPolicy in v1.4+ and TLSRoute in
-v1.5+, all in the standard channel. Install the Gateway API CRDs your implementation
-supports, then run helm upgrade. With helm template, pass them with --api-versions, e.g.
---api-versions gateway.networking.k8s.io/v1/TLSRoute.
-{{- end }}
 {{- if $plan.apiUnpinned }}
 
 WARNING: a gateway.api.parentRefs entry (or gateway.parentRefs) names no sectionName or
@@ -133,6 +124,15 @@ List the pool namespaces instead:
 {{- else }}
 
 Watching pools in: {{ join ", " $watch }}. A pool in any other namespace is ignored.
+{{- end }}
+{{- if not .Values.workerNetwork.clusterCIDRs }}
+
+WARNING: workerNetwork.clusterCIDRs is empty, so the controller cannot tell this cluster's
+pod, service and node addresses from outside ones. A pool allowCIDRs entry that overlaps
+them (10.0.0.0/16, say) can open the whole cluster to builds, and IPv6 egress stays closed.
+List this cluster's pod, service and node ranges:
+  helm upgrade {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} --reuse-values \
+    --set 'workerNetwork.clusterCIDRs={10.244.0.0/16,10.96.0.0/12}'
 {{- end }}
 {{- if .Values.watchNamespace }}
 

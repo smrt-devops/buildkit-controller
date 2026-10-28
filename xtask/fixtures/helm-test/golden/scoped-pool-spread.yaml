@@ -149,7 +149,7 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: buildkit-controller-workload
+  name: buildkit-controller-buildkit-system-workload
   namespace: ci
   labels:
     app.kubernetes.io/name: buildkit-controller
@@ -189,8 +189,6 @@ rules:
     - secrets
     verbs:
     - create
-    - patch
-    - delete
   - apiGroups:
     - ""
     resources:
@@ -260,7 +258,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: buildkit-controller-workload
+  name: buildkit-controller-buildkit-system-workload
   namespace: ci
   labels:
     app.kubernetes.io/name: buildkit-controller
@@ -268,7 +266,7 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: buildkit-controller-0.1.0
-roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: buildkit-controller-workload}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: buildkit-controller-buildkit-system-workload}
 subjects:
   - kind: ServiceAccount
     name: buildkit-controller
@@ -410,7 +408,7 @@ spec:
             periodSeconds: 5
           resources:
             limits:
-              memory: 512Mi
+              memory: 2560Mi
             requests:
               cpu: 100m
               memory: 128Mi

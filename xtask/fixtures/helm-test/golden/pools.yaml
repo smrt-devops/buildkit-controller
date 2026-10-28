@@ -169,8 +169,6 @@ rules:
     - secrets
     verbs:
     - create
-    - patch
-    - delete
   - apiGroups:
     - ""
     resources:
@@ -407,7 +405,7 @@ spec:
             periodSeconds: 5
           resources:
             limits:
-              memory: 512Mi
+              memory: 2560Mi
             requests:
               cpu: 100m
               memory: 128Mi

@@ -31,6 +31,7 @@ auth:
       caBundleConfigMap: {name: other-ca, key: root.pem}
   serviceAccount: {enabled: true, audiences: [bkc], maxConcurrentReviews: 8, maxReviewsPerIp: 2}
 workerNetwork:
+  clusterCIDRs: [10.244.0.0/16, 10.96.0.0/12, "fd00::/48"]
   extraDeniedCIDRs: [203.0.113.0/24]
   permittedCIDRs: [169.254.20.10/32]
   dns: {namespace: kube-system, podLabels: {k8s-app: kube-dns}, cidrs: [169.254.20.10/32]}

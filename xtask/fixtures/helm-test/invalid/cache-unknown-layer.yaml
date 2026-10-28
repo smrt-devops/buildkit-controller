@@ -1,5 +1,7 @@
+# expect: at '/pools/0/cache': additional properties 'disk' not allowed
 edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
 pools:
   - name: a
     namespace: ci
     cache: {registry: {repository: r/x}, disk: {}}
+gateway: {enabled: false}
