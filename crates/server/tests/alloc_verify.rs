@@ -1,5 +1,5 @@
 //! Allocation scenarios on a real API server. Run by `cargo xtask alloc-verify`
-//! (which provides a kind cluster through `KUBECONFIG`); ignored otherwise.
+//! (which provides a kind cluster through `BK_TEST_KUBECONFIG`); ignored otherwise.
 //!
 //! The harness stands in for the reconciler. It creates warm pause pods with
 //! the labels, annotations and ownerReference the reconciler would render.
@@ -12,6 +12,9 @@
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
+
+#[path = "support/kind.rs"]
+mod harness;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -33,8 +36,8 @@ use buildkit_controller_api::v1alpha1::BuildKitPool;
 use clap::Parser;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::{Namespace, Pod, Secret};
+use kube::ResourceExt;
 use kube::api::{Api, ListParams, Patch, PatchParams, PostParams};
-use kube::{Client, ResourceExt};
 use serde_json::json;
 use time::OffsetDateTime;
 use tokio::sync::watch;
@@ -172,7 +175,7 @@ async fn wait(what: &str, limit: Duration, mut f: impl FnMut() -> bool) {
 }
 
 async fn setup() -> (H, AllocService, CancellationToken, Arc<Metrics>) {
-    let client = Client::try_default().await.unwrap();
+    let client = harness::client().await;
     let image = std::env::var("ALLOC_VERIFY_PAUSE_IMAGE").unwrap();
     let work = std::path::PathBuf::from(std::env::var("ALLOC_VERIFY_WORK").unwrap());
     Api::<Namespace>::all(client.clone())

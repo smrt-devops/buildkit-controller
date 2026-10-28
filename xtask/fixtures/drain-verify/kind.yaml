@@ -1,9 +1,10 @@
-# Host ports 28443 and 28444 reach the chart's NodePorts 30443 and 30444 (API and edge).
-# They differ from e2e's 18443/18444, so both suites can run on one host.
+# The host ports API_PORT and EDGE_PORT (filled in by `cargo xtask drain-verify`)
+# reach the chart's NodePorts 30443 and 30444 (API and edge). By default they are
+# 28443 and 28444, apart from e2e's, so both suites can run on one host.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
   - role: control-plane
     extraPortMappings:
-      - {containerPort: 30443, hostPort: 28443, listenAddress: "127.0.0.1"}
-      - {containerPort: 30444, hostPort: 28444, listenAddress: "127.0.0.1"}
+      - {containerPort: 30443, hostPort: API_PORT, listenAddress: "127.0.0.1"}
+      - {containerPort: 30444, hostPort: EDGE_PORT, listenAddress: "127.0.0.1"}

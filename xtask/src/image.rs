@@ -1,4 +1,3 @@
-//! `cargo xtask image`: build a Linux container image of `buildkit-controller`
 //! `cargo xtask image` builds a Linux container image of `buildkit-controller`
 //! for the host architecture. It needs no network access beyond the host's
 //! cached crates and local base images.
@@ -9,9 +8,9 @@
 //! COPY-only `docker/Dockerfile` then packages the binary.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::root;
 
@@ -19,6 +18,19 @@ use crate::root;
 const TARGET_VOLUME: &str = "buildkit-controller-image-target";
 /// Binary name produced by the server crate.
 const BINARY: &str = "buildkit-controller";
+
+/// Holds `target/xtask-host.lock` until dropped. The image build (`target/image`
+/// and the cargo volume), the worker image and the gateway download
+/// (`target/gateway`) are shared by every task run from this checkout, so a
+/// parallel run waits here. The lock ends with the process at worst.
+pub(crate) fn host_lock() -> Result<std::fs::File> {
+    let path = root().join("target/xtask-host.lock");
+    std::fs::create_dir_all(root().join("target"))?;
+    let lock = std::fs::File::create(&path)?;
+    lock.lock()
+        .with_context(|| format!("locking {}", path.display()))?;
+    Ok(lock)
+}
 
 /// Run a command and fail with its status if it does not succeed.
 fn run(cmd: &mut Command) -> Result<()> {
@@ -82,10 +94,8 @@ fn vendor(root: &Path, work: &Path) -> Result<()> {
 /// volume per checkout path avoids that, and also avoids concurrent builds
 /// sharing a volume.
 fn target_volume(root: &Path) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    root.hash(&mut h);
-    format!("{TARGET_VOLUME}-{:016x}", h.finish())
+    let hash = crate::kube::fnv1a(root.as_os_str().as_encoded_bytes());
+    format!("{TARGET_VOLUME}-{hash:08x}")
 }
 
 /// Label on each per-checkout target volume: the checkout's absolute path.
@@ -210,6 +220,7 @@ fn compile(root: &Path, work: &Path, image: &str, out: &Path) -> Result<()> {
 
 /// Build the image, tag it, and optionally load it into a kind cluster.
 pub(crate) fn image(tag: &str, load_kind: Option<&str>) -> Result<()> {
+    let _lock = host_lock()?;
     let root = root();
     let work = root.join("target/image");
     let ctx = work.join("ctx");
@@ -260,6 +271,7 @@ pub(crate) fn ensure(image: &str) -> Result<()> {
 /// Make [`WORKER_IMAGE`] present locally: the pinned tag if Docker has it, else
 /// [`LOCAL_BUILDKIT`] retagged, else a pull. A fresh CI runner has neither.
 pub(crate) fn ensure_worker() -> Result<()> {
+    let _lock = host_lock()?;
     if have(WORKER_IMAGE) {
         return Ok(());
     }
@@ -267,6 +279,50 @@ pub(crate) fn ensure_worker() -> Result<()> {
         return run(Command::new("docker").args(["tag", LOCAL_BUILDKIT, WORKER_IMAGE]));
     }
     ensure(WORKER_IMAGE)
+}
+
+/// Copies busybox and the musl loader out of the worker image into `dir`.
+/// The files come out as a tar stream on stdout, not through a bind mount. The
+/// rootless image runs as uid 1000, which cannot write to a host directory the
+/// runner owns on Linux. Extracted on the host, the files belong to the caller.
+pub(crate) fn copy_busybox(dir: &Path) -> Result<()> {
+    let mut docker = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--entrypoint",
+            "sh",
+            WORKER_IMAGE,
+            "-c",
+            "cd / && tar -chf - bin/busybox lib/ld-musl-*.so.1 lib/libc.musl-*.so.1",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("starting docker run for busybox")?;
+    let stream = docker.stdout.take().context("docker stdout")?;
+    let untar = Command::new("tar")
+        .arg("-xf")
+        .arg("-")
+        .arg("-C")
+        .arg(dir)
+        .stdin(stream)
+        .status()
+        .context("running tar")?;
+    let copied = docker.wait().context("waiting for docker run")?;
+    ensure!(
+        copied.success(),
+        "copying busybox out of {WORKER_IMAGE} failed: {copied}"
+    );
+    ensure!(
+        untar.success(),
+        "extracting busybox into {} failed: {untar}",
+        dir.display()
+    );
+    ensure!(
+        dir.join("bin/busybox").is_file(),
+        "busybox missing after the copy"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 //! Public HTTPS API scenarios on a real API server. Run by `cargo xtask
-//! api-verify` (which provides a kind cluster through `KUBECONFIG` and
-//! `API_VERIFY_KUBECONFIG`); ignored otherwise.
+//! api-verify` (which provides a kind cluster through `BK_TEST_KUBECONFIG`);
+//! ignored otherwise.
 //!
 //! The controller runs on the host, with the certs, alloc and http components over
 //! the kind API server, with OIDC discovery and JWKS served by an in-harness
@@ -19,8 +19,10 @@
     clippy::many_single_char_names
 )]
 
+#[path = "support/kind.rs"]
+mod harness;
+
 use std::net::SocketAddr;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,8 +45,8 @@ use buildkit_controller_api::v1alpha1::BuildKitPool;
 use clap::Parser;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::{Namespace, Pod, Secret};
+use kube::ResourceExt;
 use kube::api::{Api, Patch, PatchParams, PostParams};
-use kube::{Client, ResourceExt};
 use reqwest::StatusCode;
 use ring::rand::SystemRandom;
 use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
@@ -71,13 +73,7 @@ async fn wait(what: &str, limit: Duration, mut f: impl FnMut() -> bool) {
 }
 
 fn kubectl(args: &[&str]) -> String {
-    let kc = std::env::var("API_VERIFY_KUBECONFIG").unwrap();
-    let out = Command::new("kubectl")
-        .arg("--kubeconfig")
-        .arg(kc)
-        .args(args)
-        .output()
-        .unwrap();
+    let out = harness::kubectl().args(args).output().unwrap();
     assert!(
         out.status.success(),
         "kubectl {args:?}: {}",
@@ -288,7 +284,7 @@ fn pool_json(name: &str, rules: &Value) -> BuildKitPool {
 }
 
 async fn setup(issuer: &Issuer, stop: &CancellationToken) -> (H, SocketAddr, Arc<Metrics>) {
-    let client = Client::try_default().await.unwrap();
+    let client = harness::client().await;
     let image = std::env::var("API_VERIFY_PAUSE_IMAGE").unwrap();
     let work = std::path::PathBuf::from(std::env::var("API_VERIFY_WORK").unwrap());
     Api::<Namespace>::all(client.clone())

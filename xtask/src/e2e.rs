@@ -8,7 +8,7 @@
 //! installed with the chart's default Gateway API exposure: an `HTTPRoute` with a
 //! `BackendTLSPolicy` for the API and a `TLSRoute` for the edge. kind publishes the
 //! Gateway's listeners (`NodePorts`) on two loopback host ports, 18443 and 18444
-//! by default (see [`HostPorts`]). `*.localhost` resolves to loopback, which makes
+//! by default (see [`PORTS`]). `*.localhost` resolves to loopback, which makes
 //! per-allocation endpoints (`<id>.localhost:<edge port>`) reachable.
 //!
 //! Every kind, kubectl and helm call gets the private kubeconfig under
@@ -22,25 +22,31 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 
 use crate::e2e_issuer::Issuer;
-use crate::helm_verify::{Env, until};
-use crate::image::WORKER_IMAGE;
+use crate::image::{WORKER_IMAGE, copy_busybox};
+use crate::kube::{Cluster, HostPorts};
+use crate::proc::{Spawned, host_platform, output, status, until, write};
 use crate::root;
 
-static CLUSTER: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| super::kind_cluster("bk-e2e"));
 const NS: &str = "bk-system";
 const POOL_NS: &str = "ci";
 const OIDC_HOST: &str = "mock-oidc.bk-oidc.svc";
-/// The mock issuer's server, pulled by digest (the multi-arch index) and tagged locally.
-const SOCAT_IMAGE: &str = "docker.io/alpine/socat:1.8.1.3";
-const SOCAT_DIGEST: &str =
-    "sha256:603174b77eebaba25ba8f8ebb15e1234d6600409554e95d6fb203fd106150287";
 /// The API URL clients use, through the Gateway.
+/// The loopback host ports kind publishes the Gateway's API and edge listeners
+/// on: 18443 and 18444 without `BK_KIND_SUFFIX` (CI), else a pair in 20000-21999.
+static PORTS: std::sync::LazyLock<HostPorts> = std::sync::LazyLock::new(|| {
+    HostPorts::get(
+        HostPorts {
+            api: 18443,
+            edge: 18444,
+        },
+        20000,
+    )
+});
 static API: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| format!("https://localhost:{}", HostPorts::get().api));
+    std::sync::LazyLock::new(|| format!("https://localhost:{}", PORTS.api));
 const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const REGISTRY_IMAGE: &str = "registry:2";
 const REG: &str = "registry.e2e-reg.svc.cluster.local:5000";
@@ -60,59 +66,6 @@ enum Mode<'a> {
 /// in-cluster registry) through `workerNetwork.permittedCIDRs`.
 const KIND_CIDRS: &str = "10.244.0.0/16, 10.96.0.0/16";
 
-/// The loopback host ports kind publishes the Gateway's API and edge listeners on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct HostPorts {
-    api: u16,
-    edge: u16,
-}
-
-impl HostPorts {
-    /// Without a suffix (CI), the fixed 18443 and 18444.
-    const DEFAULT: Self = Self {
-        api: 18443,
-        edge: 18444,
-    };
-    /// Suffixed runs get a port pair in `[FIRST, FIRST + 2 * PAIRS)`.
-    const FIRST: u16 = 20000;
-    const PAIRS: u32 = 1000;
-
-    /// The ports for `BK_KIND_SUFFIX`.
-    fn get() -> Self {
-        Self::for_suffix(std::env::var("BK_KIND_SUFFIX").ok().as_deref())
-    }
-
-    /// A stable pair per suffix, so two checkouts with different suffixes run at
-    /// once and `e2e-up` gives the same URL every time. FNV-1a, which needs no
-    /// dependency and does not change between Rust releases.
-    fn for_suffix(suffix: Option<&str>) -> Self {
-        let Some(s) = suffix.filter(|s| !s.is_empty()) else {
-            return Self::DEFAULT;
-        };
-        let hash = s.bytes().fold(0x811c_9dc5_u32, |h, b| {
-            (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
-        });
-        // hash % PAIRS < 1000, so the pair fits under 22000.
-        let pair = u16::try_from(hash % Self::PAIRS).unwrap_or(0);
-        let api = Self::FIRST + 2 * pair;
-        Self { api, edge: api + 1 }
-    }
-
-    /// Fails when another process holds one of the ports, naming it, instead of
-    /// letting kind fail later with "port is already allocated".
-    fn check_free(self) -> Result<()> {
-        for port in [self.api, self.edge] {
-            std::net::TcpListener::bind(("127.0.0.1", port)).with_context(|| {
-                format!(
-                    "host port {port} for {} is taken; delete that cluster or pick another BK_KIND_SUFFIX",
-                    CLUSTER.as_str()
-                )
-            })?;
-        }
-        Ok(())
-    }
-}
-
 /// The work directory: `target/e2e`, or `target/e2e-<suffix>`, so two runs from
 /// one checkout keep their kubeconfigs and files apart.
 fn work_dir() -> PathBuf {
@@ -120,51 +73,9 @@ fn work_dir() -> PathBuf {
     root().join("target").join(name)
 }
 
-struct Cleanup(Env);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        if std::env::var_os("E2E_KEEP").is_some() {
-            return;
-        }
-        let _ = self
-            .0
-            .tool("kind", &["delete", "cluster", "--name", CLUSTER.as_str()]);
-    }
-}
-
-fn status(c: &mut Command) -> Result<()> {
-    ensure!(
-        c.status().with_context(|| format!("{c:?}"))?.success(),
-        "{c:?} failed"
-    );
-    Ok(())
-}
-
-/// Returns stdout and stderr of a command, and fails with both when it exits non-zero.
-fn output(c: &mut Command) -> Result<String> {
-    let o = c.output().with_context(|| format!("{c:?}"))?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&o.stdout),
-        String::from_utf8_lossy(&o.stderr)
-    );
-    ensure!(o.status.success(), "{c:?} failed:\n{text}");
-    Ok(text)
-}
-
-/// The pool platform of this host.
-fn host_platform() -> Result<&'static str> {
-    match std::env::consts::ARCH {
-        "aarch64" => Ok("arm64"),
-        "x86_64" => Ok("amd64"),
-        a => bail!("unsupported host architecture {a}"),
-    }
-}
-
-fn write(path: &Path, text: &str) -> Result<String> {
-    std::fs::write(path, text).with_context(|| path.display().to_string())?;
-    Ok(path.to_string_lossy().into_owned())
+/// The e2e cluster: `bk-e2e`, plus `-$BK_KIND_SUFFIX` when that is set.
+fn cluster(work: &Path) -> Cluster {
+    Cluster::new(&super::kind_cluster("bk-e2e"), work.join("kubeconfig"))
 }
 
 fn pool_yaml(name: &str, platforms: &str, rules: &str) -> String {
@@ -238,52 +149,35 @@ fn cache_pool_yaml(name: &str, platform: &str, rules: &str, scaling: &str, cache
 #[allow(clippy::too_many_lines, reason = "one linear install script")]
 /// Create the cluster and install the chart with its pools. Returns the API CA
 /// file (the client CA, which signs the API serving certificate).
-fn install(env: &Env, work: &Path, mode: &Mode) -> Result<PathBuf> {
+fn install(env: &Cluster, work: &Path, mode: &Mode) -> Result<PathBuf> {
     let root = root();
-    let _ = env.tool("kind", &["delete", "cluster", "--name", CLUSTER.as_str()]);
-    let ports = HostPorts::get();
-    ports.check_free()?;
-    let kind_template = std::fs::read_to_string(root.join("xtask/fixtures/e2e/kind.yaml"))?;
-    let kind_cfg = work.join("kind.yaml");
-    write(
-        &kind_cfg,
-        &kind_template
-            .replace("API_PORT", &ports.api.to_string())
-            .replace("EDGE_PORT", &ports.edge.to_string()),
-    )?;
-    env.tool(
-        "kind",
+    // A leftover cluster of this name holds the ports; delete it before checking them.
+    env.delete();
+    let ports = *PORTS;
+    ports.check_free(env.name())?;
+    let kind_cfg = crate::fixture(
+        "e2e/kind.yaml",
+        work,
         &[
-            "create",
-            "cluster",
-            "--name",
-            CLUSTER.as_str(),
-            "--config",
-            &kind_cfg.to_string_lossy(),
-            "--wait",
-            "120s",
+            ("API_PORT", ports.api.to_string()),
+            ("EDGE_PORT", ports.edge.to_string()),
         ],
     )?;
+    env.create(Some(&kind_cfg), "120s")?;
 
-    // The image build (target/image and its cargo volume), the image pulls and
-    // the gateway download (target/gateway) are shared by every run from this
-    // checkout, so a parallel run waits here. The lock ends with the process at worst.
-    let lock = std::fs::File::create(root.join("target/e2e-host.lock"))?;
-    lock.lock().context("locking target/e2e-host.lock")?;
-    crate::image::image(CONTROLLER_IMAGE, Some(CLUSTER.as_str()))?;
+    crate::image::image(CONTROLLER_IMAGE, Some(env.name()))?;
     crate::image::ensure_worker()?;
     let mut images = vec![WORKER_IMAGE];
     if matches!(mode, Mode::Mock(_)) {
         crate::image::ensure(REGISTRY_IMAGE)?;
         images.push(REGISTRY_IMAGE);
-        crate::gateway::ensure_image(SOCAT_IMAGE, SOCAT_DIGEST)?;
-        images.push(SOCAT_IMAGE);
+        crate::gateway::ensure_image(crate::gateway::SOCAT.0, crate::gateway::SOCAT.1)?;
+        images.push(crate::gateway::SOCAT.0);
     }
     for image in images {
-        status(&mut crate::kube::kind_load(image, CLUSTER.as_str()))?;
+        status(&mut crate::kube::kind_load(image, env.name()))?;
     }
-    let gateway_ca = crate::gateway::install(env, CLUSTER.as_str(), work)?;
-    drop(lock);
+    let gateway_ca = crate::gateway::install(env, work)?;
 
     for ns in [NS, POOL_NS] {
         env.kubectl(&["create", "namespace", ns])?;
@@ -320,9 +214,7 @@ fn install(env: &Env, work: &Path, mode: &Mode) -> Result<PathBuf> {
             env.kubectl(&[
                 "apply",
                 "-f",
-                &root
-                    .join("xtask/fixtures/e2e/mock-oidc.yaml")
-                    .to_string_lossy(),
+                &crate::fixture("e2e/mock-oidc.yaml", work, &[])?.to_string_lossy(),
             ])?;
             env.kubectl(&[
                 "apply",
@@ -414,21 +306,18 @@ auth:
         }
     }
     let pools_file = write(&work.join("pools.yaml"), &pools)?;
-    env.tool(
-        "helm",
-        &[
-            "upgrade",
-            "--install",
-            "bk",
-            &chart,
-            "-n",
-            NS,
-            "-f",
-            &values_file,
-            "-f",
-            &pools_file,
-        ],
-    )?;
+    env.helm(&[
+        "upgrade",
+        "--install",
+        "bk",
+        &chart,
+        "-n",
+        NS,
+        "-f",
+        &values_file,
+        "-f",
+        &pools_file,
+    ])?;
     env.kubectl(&[
         "rollout",
         "status",
@@ -438,8 +327,7 @@ auth:
         "--timeout=300s",
     ])?;
     for p in &ready {
-        crate::kube::wait_condition(
-            &env.kubeconfig,
+        env.wait_condition(
             &format!("buildkitpool/{p}"),
             Some(POOL_NS),
             "Ready",
@@ -481,9 +369,9 @@ auth:
 pub(crate) fn e2e_up(repo: &str) -> Result<()> {
     let work = work_dir();
     std::fs::create_dir_all(&work)?;
-    let env = Env {
-        kubeconfig: work.join("kubeconfig"),
-    };
+    let env = cluster(&work);
+    // Left running for the Action job, whether or not the install succeeds.
+    env.keep();
     let ca = install(&env, &work, &Mode::Github(repo))?;
     // The CI job reads the URL from this file, not from a fixed port.
     write(&work.join("api-url"), &format!("{}\n", *API))?;
@@ -494,10 +382,10 @@ pub(crate) fn e2e_up(repo: &str) -> Result<()> {
 pub(crate) fn e2e() -> Result<()> {
     let work = work_dir();
     std::fs::create_dir_all(&work)?;
-    let cleanup = Cleanup(Env {
-        kubeconfig: work.join("kubeconfig"),
-    });
-    let env = &cleanup.0;
+    let env = &cluster(&work);
+    if std::env::var_os("E2E_KEEP").is_some() {
+        env.keep();
+    }
     let result = run(env, &work);
     if result.is_err() {
         for args in [
@@ -523,7 +411,7 @@ pub(crate) fn e2e() -> Result<()> {
 
 /// A client of the API, implementing the curl recipe from `docs/ci`.
 struct Client<'a> {
-    env: &'a Env,
+    env: &'a Cluster,
     ca: PathBuf,
     ctx: PathBuf,
     work: PathBuf,
@@ -551,14 +439,12 @@ impl Client<'_> {
         output(&mut self.recipe(pool, token, &script))
     }
 
-    /// `kubectl exec -n ci <args[0]> -- <args[1..]>`. `--kubeconfig` goes before
-    /// `exec`, because [`Env::kubectl`] appends it, which would land after `--`.
+    /// `kubectl exec -n ci <args[0]> -- <args[1..]>`.
     fn exec(&self, args: &[&str]) -> Result<String> {
         let (pod, cmd) = args.split_first().context("exec needs a pod")?;
         output(
-            crate::kube::kubectl(&self.env.kubeconfig)
-                .arg("--kubeconfig")
-                .arg(&self.env.kubeconfig)
+            self.env
+                .kubectl_cmd()
                 .args(["exec", "-n", POOL_NS, pod, "--"])
                 .args(cmd),
         )
@@ -634,50 +520,6 @@ fn read_secs(p: &Path) -> Result<u64> {
         .trim()
         .parse()
         .context("epoch seconds")
-}
-
-/// Copies busybox and the musl loader out of the worker image into `dir`.
-/// The files come out as a tar stream on stdout, not through a bind mount. The
-/// rootless image runs as uid 1000, which cannot write to a host directory the
-/// runner owns on Linux. Extracted on the host, the files belong to the caller.
-fn copy_busybox(dir: &Path) -> Result<()> {
-    let mut docker = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "--entrypoint",
-            "sh",
-            WORKER_IMAGE,
-            "-c",
-            "cd / && tar -chf - bin/busybox lib/ld-musl-*.so.1 lib/libc.musl-*.so.1",
-        ])
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("starting docker run for busybox")?;
-    let stream = docker.stdout.take().context("docker stdout")?;
-    let untar = Command::new("tar")
-        .arg("-xf")
-        .arg("-")
-        .arg("-C")
-        .arg(dir)
-        .stdin(stream)
-        .status()
-        .context("running tar")?;
-    let copied = docker.wait().context("waiting for docker run")?;
-    ensure!(
-        copied.success(),
-        "copying busybox out of {WORKER_IMAGE} failed: {copied}"
-    );
-    ensure!(
-        untar.success(),
-        "extracting busybox into {} failed: {untar}",
-        dir.display()
-    );
-    ensure!(
-        dir.join("bin/busybox").is_file(),
-        "busybox missing after the copy"
-    );
-    Ok(())
 }
 
 /// Build contexts. One is RUN-based (busybox copied out of the worker image,
@@ -802,7 +644,7 @@ fn scopes(c: &Client, host_pool: &str, oidc: &str) -> Result<()> {
 }
 
 #[allow(clippy::too_many_lines, reason = "one linear scenario script")]
-fn run(env: &Env, work: &Path) -> Result<()> {
+fn run(env: &Cluster, work: &Path) -> Result<()> {
     let issuer = Issuer::new(OIDC_HOST)?;
     let ca = install(env, work, &Mode::Mock(&issuer))?;
     let (ctx, mp) = prepare(work)?;
@@ -836,9 +678,13 @@ fn run(env: &Env, work: &Path) -> Result<()> {
     let out = c.build(&pool, &sa, "")?;
     ensure!(out.contains("built-through-edge"), "SA build:\n{out}");
     let bad = c.recipe(&pool, "not-a-token", "true").output()?;
-    ensure!(!bad.status.success(), "bogus token was accepted");
+    let why = String::from_utf8_lossy(&bad.stderr);
+    ensure!(
+        !bad.status.success() && why.contains("allocation failed: HTTP 401"),
+        "bogus token not refused with 401:\n{why}"
+    );
     println!(
-        "PASS b: mock OIDC and ServiceAccount TokenReview allocate and build; a bogus token is refused"
+        "PASS b: mock OIDC and ServiceAccount TokenReview allocate and build; a bogus token is refused with 401"
     );
 
     // c. Registry cache. The second build, on a fresh worker, hits it.
@@ -862,20 +708,20 @@ fn run(env: &Env, work: &Path) -> Result<()> {
     }
     let a_script = r#"date +%s > "$OUTD/a.start"; sleep 20; date +%s > "$OUTD/a.end""#;
     let b_script = r#"date +%s > "$OUTD/b.start""#;
-    let mut a = c
-        .recipe(&pool, &oidc, a_script)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let mut a = Spawned::spawn(
+        c.recipe(&pool, &oidc, a_script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )?;
     until("A holds the worker", Duration::from_mins(3), || {
         Ok(work.join("a.start").exists().then_some(()))
     })?;
     let b_launched = now()?;
-    let mut b = c
-        .recipe(&pool, &oidc, b_script)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let mut b = Spawned::spawn(
+        c.recipe(&pool, &oidc, b_script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )?;
     ensure!(a.wait()?.success(), "allocation A failed");
     ensure!(b.wait()?.success(), "allocation B failed");
     let (a_end, b_start) = (
@@ -994,16 +840,16 @@ fn run(env: &Env, work: &Path) -> Result<()> {
     c.wait_warm(other, "")?;
     let _ = std::fs::remove_file(work.join("h.a"));
     let build = "docker buildx build --builder \"$BUILDER\" --progress=plain -o type=cacheonly $CACHE_ARGS .";
-    let a = c
-        .recipe(
+    let a = Spawned::spawn(
+        c.recipe(
             &spill_pool,
             &oidc,
             &format!("touch \"$OUTD/h.a\"; {build} && sleep 15"),
         )
         .env("CACHE_KEY", "e2e-spill")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped()),
+    )?;
     until("A holds the cached slot", Duration::from_mins(3), || {
         Ok(
             (work.join("h.a").exists() && c.pod_state(holder).is_some_and(|(free, _)| !free))
@@ -1091,8 +937,8 @@ fn run(env: &Env, work: &Path) -> Result<()> {
 /// Scenario l: an allocation request that stays queued, and silent, for over
 /// five minutes behind the Gateway.
 struct LongPoll {
-    holder: std::process::Child,
-    waiter: std::process::Child,
+    holder: Spawned,
+    waiter: Spawned,
     launched: u64,
     outd: PathBuf,
 }
@@ -1106,29 +952,29 @@ impl LongPoll {
         for stale in ["l.x", "l.y"] {
             let _ = std::fs::remove_file(outd.join(stale));
         }
-        let holder = c
-            .recipe(
+        let holder = Spawned::spawn(
+            c.recipe(
                 pool,
                 &issuer.token(AUD, "e2e")?,
                 &format!(r#"date +%s > "$OUTD/l.x"; sleep {LONG_HOLD_SECS}"#),
             )
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null()),
+        )?;
         until("X holds the foreign worker", Duration::from_mins(3), || {
             Ok(outd.join("l.x").exists().then_some(()))
         })?;
         let launched = now()?;
-        let waiter = c
-            .recipe(
+        let waiter = Spawned::spawn(
+            c.recipe(
                 pool,
                 &issuer.token(AUD, "e2e")?,
                 r#"date +%s > "$OUTD/l.y""#,
             )
             .env("QUEUE_TIMEOUT", "600")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped()),
+        )?;
         Ok(Self {
             holder,
             waiter,
@@ -1160,19 +1006,19 @@ impl LongPoll {
 }
 
 /// `helm upgrade --reuse-values` of the e2e release with `sets`.
-fn upgrade(env: &Env, sets: &[&str]) -> Result<()> {
+fn upgrade(env: &Cluster, sets: &[&str]) -> Result<()> {
     let chart = root().join("helm/buildkit-controller");
     let chart = chart.to_string_lossy();
     let mut args = vec!["upgrade", "bk", &chart, "-n", NS, "--reuse-values"];
     for s in sets {
         args.extend(["--set", s]);
     }
-    env.tool("helm", &args)?;
+    env.helm(&args)?;
     Ok(())
 }
 
 /// Scenarios i and j: the chart's other Gateway options on the same Gateway.
-fn gateway_options(env: &Env, c: &Client, pool: &str, issuer: &Issuer) -> Result<()> {
+fn gateway_options(env: &Cluster, c: &Client, pool: &str, issuer: &Issuer) -> Result<()> {
     // i. Envoy Gateway extras. Both BackendTrafficPolicies are Accepted and a build
     // with a RUN step still goes through the API route and the edge.
     upgrade(env, &["gateway.envoy.enabled=true"])?;
@@ -1248,26 +1094,4 @@ fn gateway_options(env: &Env, c: &Client, pool: &str, issuer: &Issuer) -> Result
         "PASS j: gateway.api.mode=passthrough: TLSRoute Accepted; the API answers {code} with the controller's own certificate"
     );
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::HostPorts;
-
-    #[test]
-    fn host_ports_are_fixed_without_a_suffix_and_stable_per_suffix() {
-        assert_eq!(HostPorts::for_suffix(None), HostPorts::DEFAULT);
-        assert_eq!(HostPorts::for_suffix(Some("")), HostPorts::DEFAULT);
-        let a = HostPorts::for_suffix(Some("cidrs1"));
-        let b = HostPorts::for_suffix(Some("cidrs2"));
-        assert_eq!(a, HostPorts::for_suffix(Some("cidrs1")));
-        assert_ne!(a, b);
-        for p in [a, b] {
-            assert!(
-                p.api >= HostPorts::FIRST && p.edge == p.api + 1 && p.edge < 22000,
-                "{p:?}"
-            );
-            assert!(p.api % 2 == 0, "pairs never overlap: {p:?}");
-        }
-    }
 }

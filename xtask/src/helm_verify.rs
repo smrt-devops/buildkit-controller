@@ -14,18 +14,15 @@
 //! `target/helm-verify`. The task never touches `~/.kube/config`, and it
 //! deletes the cluster on every exit path.
 
-use std::path::PathBuf;
-use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 
 use crate::image::WORKER_IMAGE;
+use crate::kube::{Cluster, shows_rbac_denial};
+use crate::proc::until;
 use crate::root;
 
-fn cluster() -> String {
-    super::kind_cluster("bk-helm-verify")
-}
 const NS: &str = "bk-helm";
 const POOL_NS: &str = "bk-helm-pool";
 /// The second watched pool namespace.
@@ -38,68 +35,13 @@ const CONTROLLER_SA: &str = "system:serviceaccount:bk-helm:buildkit-controller";
 const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const LEASE: &str = "buildkit-controller-leader";
 
-pub(crate) struct Env {
-    pub(crate) kubeconfig: PathBuf,
-}
-
-impl Env {
-    pub(crate) fn tool(&self, program: &str, args: &[&str]) -> Result<String> {
-        let out = crate::kube::by_name(program, &self.kubeconfig)
-            .args(args)
-            .arg("--kubeconfig")
-            .arg(&self.kubeconfig)
-            .output()
-            .with_context(|| format!("running {program}"))?;
-        ensure!(
-            out.status.success(),
-            "{program} {args:?}: {}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    }
-
-    pub(crate) fn kubectl(&self, args: &[&str]) -> Result<String> {
-        self.tool("kubectl", args)
-    }
-}
-
-/// Poll `f` until it returns `Some`, or fail after `timeout` and report `what`.
-pub(crate) fn until<T>(
-    what: &str,
-    timeout: Duration,
-    mut f: impl FnMut() -> Result<Option<T>>,
-) -> Result<T> {
-    let start = Instant::now();
-    loop {
-        match f() {
-            Ok(Some(v)) => return Ok(v),
-            Err(e) if start.elapsed() > timeout => bail!("{what}: {e:#}"),
-            Ok(None) | Err(_) => {}
-        }
-        ensure!(start.elapsed() <= timeout, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_secs(3));
-    }
-}
-
-/// Deletes the cluster when dropped, including on failure.
-struct Cleanup(Env);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = self
-            .0
-            .tool("kind", &["delete", "cluster", "--name", cluster().as_str()]);
-    }
-}
-
 pub(crate) fn helm_verify() -> Result<()> {
     let work = root().join("target/helm-verify");
     std::fs::create_dir_all(&work)?;
-    let cleanup = Cleanup(Env {
-        kubeconfig: work.join("kubeconfig"),
-    });
-    let env = &cleanup.0;
+    let env = &Cluster::new(
+        &super::kind_cluster("bk-helm-verify"),
+        work.join("kubeconfig"),
+    );
     let result = verify(env);
     if result.is_err() {
         for args in [
@@ -126,34 +68,12 @@ pub(crate) fn helm_verify() -> Result<()> {
 }
 
 #[allow(clippy::too_many_lines, reason = "one linear scenario script")]
-fn verify(env: &Env) -> Result<()> {
+fn verify(env: &Cluster) -> Result<()> {
     let root = root();
-    let _ = env.tool("kind", &["delete", "cluster", "--name", cluster().as_str()]);
-    env.tool(
-        "kind",
-        &[
-            "create",
-            "cluster",
-            "--name",
-            cluster().as_str(),
-            "--wait",
-            "120s",
-        ],
-    )?;
-
-    crate::image::image(CONTROLLER_IMAGE, Some(cluster().as_str()))?;
-    let ok = |c: &mut Command| -> Result<()> {
-        ensure!(
-            c.status().with_context(|| format!("{c:?}"))?.success(),
-            "{c:?} failed"
-        );
-        Ok(())
-    };
+    env.create(None, "120s")?;
+    crate::image::image(CONTROLLER_IMAGE, Some(env.name()))?;
     crate::image::ensure_worker()?;
-    ok(&mut crate::kube::kind_load(
-        WORKER_IMAGE,
-        cluster().as_str(),
-    ))?;
+    crate::proc::status(&mut crate::kube::kind_load(WORKER_IMAGE, env.name()))?;
 
     env.kubectl(&["create", "namespace", NS])?;
     env.kubectl(&[
@@ -174,20 +94,17 @@ fn verify(env: &Env) -> Result<()> {
         .join("xtask/fixtures/helm-verify/values.yaml")
         .to_string_lossy()
         .into_owned();
-    env.tool(
-        "helm",
-        &[
-            "install",
-            "bk",
-            &chart,
-            "-n",
-            NS,
-            "-f",
-            &values,
-            "--timeout",
-            "5m",
-        ],
-    )?;
+    env.helm(&[
+        "install",
+        "bk",
+        &chart,
+        "-n",
+        NS,
+        "-f",
+        &values,
+        "--timeout",
+        "5m",
+    ])?;
     println!("installed chart");
 
     // LoadBalancer exposure: the Service is the load balancer and no route is rendered.
@@ -204,7 +121,7 @@ fn verify(env: &Env) -> Result<()> {
         svc_type == "LoadBalancer",
         "Service type {svc_type}, want LoadBalancer"
     );
-    let manifest = env.tool("helm", &["get", "manifest", "bk", "-n", NS])?;
+    let manifest = env.helm(&["get", "manifest", "bk", "-n", NS])?;
     ensure!(
         !manifest.contains("gateway.networking.k8s.io"),
         "LoadBalancer mode rendered Gateway API objects:\n{manifest}"
@@ -252,27 +169,23 @@ fn verify(env: &Env) -> Result<()> {
     println!("PASS one leader (buildkit_leader=1 on one replica; lease holder {holder})");
 
     // Apply the pool only now that the controller is Ready, to rule out a startup race.
-    let pool_values = root
-        .join("xtask/fixtures/helm-verify/pool.yaml")
+    let work = root.join("target/helm-verify");
+    let pool_values = crate::fixture("helm-verify/pool.yaml", &work, &[])?
         .to_string_lossy()
         .into_owned();
-    env.tool(
-        "helm",
-        &[
-            "upgrade",
-            "bk",
-            &chart,
-            "-n",
-            NS,
-            "-f",
-            &values,
-            "-f",
-            &pool_values,
-        ],
-    )?;
+    env.helm(&[
+        "upgrade",
+        "bk",
+        &chart,
+        "-n",
+        NS,
+        "-f",
+        &values,
+        "-f",
+        &pool_values,
+    ])?;
     println!("applied pools after controller Ready");
-    let stray = root
-        .join("xtask/fixtures/helm-verify/stray-pool.yaml")
+    let stray = crate::fixture("helm-verify/stray-pool.yaml", &work, &[])?
         .to_string_lossy()
         .into_owned();
     env.kubectl(&["apply", "-f", &stray])?;
@@ -311,7 +224,6 @@ fn verify(env: &Env) -> Result<()> {
     }
 
     // An allocation from each pool, through a claim.
-    let work = root.join("target/helm-verify");
     for (claim, ns) in [("claim-a", POOL_NS), ("claim-b", POOL_NS_B)] {
         let path = work.join(format!("{claim}.yaml"));
         std::fs::write(
@@ -399,22 +311,22 @@ fn verify(env: &Env) -> Result<()> {
 }
 
 /// `kubectl auth can-i` as the controller's service account: "yes" or "no".
-fn can_i(env: &Env, verb: &str, resource: &str, ns: &str) -> Result<String> {
-    // can-i exits 1 for "no", so this does not go through `Env::kubectl`.
-    let out = crate::kube::kubectl(&env.kubeconfig)
-        .args([
-            "auth",
-            "can-i",
-            verb,
-            resource,
-            "-n",
-            ns,
-            "--as",
-            CONTROLLER_SA,
-        ])
-        .arg("--kubeconfig")
-        .arg(&env.kubeconfig)
-        .output()
+fn can_i(env: &Cluster, verb: &str, resource: &str, ns: &str) -> Result<String> {
+    // can-i exits 1 for "no", so this does not go through `Cluster::kubectl`.
+    let out = env
+        .kubectl_raw(
+            &[
+                "auth",
+                "can-i",
+                verb,
+                resource,
+                "-n",
+                ns,
+                "--as",
+                CONTROLLER_SA,
+            ],
+            None,
+        )
         .context("running kubectl auth can-i")?;
     let answer = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     ensure!(
@@ -423,33 +335,4 @@ fn can_i(env: &Env, verb: &str, resource: &str, ns: &str) -> Result<String> {
         String::from_utf8_lossy(&out.stderr)
     );
     Ok(answer)
-}
-
-/// Whether controller logs contain a Kubernetes API authorization denial.
-/// Matches the kube error text, not a bare "403", which also appears in
-/// microsecond timestamps, UIDs and resourceVersions.
-fn shows_rbac_denial(logs: &str) -> bool {
-    ["Forbidden", "is forbidden", "\"code\":403"]
-        .iter()
-        .any(|needle| logs.contains(needle))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::shows_rbac_denial;
-
-    #[test]
-    fn bare_403_in_timestamps_and_ids_is_not_a_denial() {
-        let logs = "2026-10-20T10:52:21.403512Z  INFO reconcile pool=p uid=4031-aa rv=\"94037\"";
-        assert!(!shows_rbac_denial(logs));
-    }
-
-    #[test]
-    fn kube_forbidden_errors_are_denials() {
-        assert!(shows_rbac_denial(
-            r#"pods "x" is forbidden: User "system:serviceaccount:ns:sa" cannot list"#
-        ));
-        assert!(shows_rbac_denial(r#"{"kind":"Status","code":403}"#));
-        assert!(shows_rbac_denial("ApiError: Forbidden (ErrorResponse)"));
-    }
 }

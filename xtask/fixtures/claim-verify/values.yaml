@@ -27,5 +27,5 @@ pools:
         spec:
           containers:
             - name: buildkitd
-              image: moby/buildkit:v0.34.0-rootless
+              image: WORKER_IMAGE
               imagePullPolicy: Never
