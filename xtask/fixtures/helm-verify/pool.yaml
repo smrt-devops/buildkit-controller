@@ -1,14 +1,19 @@
+# One pool in each watched namespace; each admits claims from bk-helm-apps.
 pools:
   - name: verify
     namespace: bk-helm-pool
-    spec:
+    spec: &spec
       scaling: {min: 1}
       access:
         rules:
           - serviceAccount: {name: builder}
+          - claims: {namespaces: [bk-helm-apps]}
       template:
         spec:
           containers:
             - name: buildkitd
               image: moby/buildkit:v0.34.0-rootless
               imagePullPolicy: Never
+  - name: verify
+    namespace: bk-helm-pool-b
+    spec: *spec

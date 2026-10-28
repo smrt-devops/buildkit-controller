@@ -4,6 +4,14 @@
 
 The chart renders one YAML file from `values.yaml` into a ConfigMap, and the controller reads it. Unknown keys and invalid values stop startup with exit code 2 and a list of every error. There is no live reload. Helm rolls the Deployment when the file changes. Every key is documented in [values.yaml](../helm/buildkit-controller/values.yaml) and checked by `values.schema.json`, the chart is described in the [Helm README](../helm/buildkit-controller/README.md), and the pool fields are in [architecture.md](architecture.md#one-crd).
 
+## Namespace scope
+
+Set `watchNamespaces` to the namespaces that hold pools, for example `watchNamespaces: [ci-builders, team-b-builders]`. The chart then renders a Role and RoleBinding in each listed namespace for the worker pods, Secrets, ServiceAccounts, PVCs and NetworkPolicies, and the controller watches pools and worker pods in those namespaces only. A pool in another namespace gets no status and no pods. The only cluster-wide grant left is TokenReview, and the release namespace keeps its own Role for the Lease, the CA Secret, Events and the CA bundle ConfigMap. To add a pool namespace, add it to the list and run `helm upgrade`; the controller restarts and picks it up.
+
+The default, `[]`, serves every namespace through a ClusterRole that can create and delete pods, Secrets and ServiceAccounts in any namespace, kube-system included. Anyone who takes over the controller then controls the cluster. `helm install` prints a warning in that mode.
+
+`watchNamespace` (one string) still works as a deprecated alias for a one-entry list. Setting both fails, in the chart and at controller startup.
+
 ## Sizing
 
 - Pool size. Set `scaling.max` to the number of builds you want to run at once. Each worker pod requests 500m CPU, 1Gi memory and 1Gi ephemeral storage by default, with limits of 4Gi memory and 20Gi ephemeral storage. Override these in `spec.template.spec.containers[0].resources`. Limits must include `memory` and `ephemeral-storage`.
@@ -131,7 +139,11 @@ controller on the leader and grant it `buildkitclaims` read and status write.
 Also set `claims.namespaces` to the namespaces whose claims it serves; the
 chart fails without it. Secret `get`, `create` and `delete` are granted by a
 Role in each listed namespace only, and a claim from any other namespace fails
-with `NamespaceNotServed`.
+with `NamespaceNotServed`. With `watchNamespaces` set, the claim read and status rights are
+Roles in the listed namespaces as well, and a claim in any other namespace is
+ignored: it gets no status, not `NamespaceNotServed`. This also applies to the
+deprecated `watchNamespace`, so an install that set it and relied on
+`NamespaceNotServed` no longer sees that status.
 
 A pool admits claims only through an access rule naming their namespaces:
 

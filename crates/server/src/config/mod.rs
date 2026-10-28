@@ -112,8 +112,12 @@ impl Settings {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct Config {
-    /// `""` = all namespaces.
+    /// Deprecated single-namespace form of `watchNamespaces`; `""` = unset.
+    /// Setting both is a validation error.
     pub watch_namespace: String,
+    /// Namespaces whose pools, pods and claims the controller watches; `[]` =
+    /// all namespaces. Read through [`Config::watched_namespaces`].
+    pub watch_namespaces: Vec<String>,
     /// Listen addresses.
     pub listen: Listen,
     /// API listener limits.
@@ -530,6 +534,15 @@ fn dur(d: &CrdDuration) -> time::Duration {
 /// Smallest `pki.testLeafLifetimes.edgeValidity` (see `validate_test_leaf`).
 const MIN_TEST_EDGE_VALIDITY: Duration = Duration::from_mins(3);
 
+/// A DNS-1123 label, the form of a namespace name.
+fn is_namespace_name(s: &str) -> bool {
+    (1..=63).contains(&s.len())
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 fn is_dns_name(s: &str) -> bool {
     let s = s.strip_suffix('.').unwrap_or(s);
     !s.is_empty()
@@ -636,6 +649,7 @@ impl Config {
                 "renewInterval + requestTimeout must be < leaseDuration - fenceMargin ({ri:?} + {rt:?} >= {ld:?} - {fm:?})"
             ));
         }
+        self.validate_watch(&mut p);
         self.validate_edge(&mut p);
         self.validate_auth(&mut p);
         self.validate_network(&mut p);
@@ -644,6 +658,33 @@ impl Config {
             Ok(())
         } else {
             Err(ConfigError::Invalid(p))
+        }
+    }
+
+    /// The namespaces to watch, `[]` = all. Call only on a validated config.
+    #[must_use]
+    pub fn watched_namespaces(&self) -> &[String] {
+        if self.watch_namespace.is_empty() {
+            &self.watch_namespaces
+        } else {
+            std::slice::from_ref(&self.watch_namespace)
+        }
+    }
+
+    fn validate_watch(&self, p: &mut Vec<String>) {
+        if !self.watch_namespace.is_empty() && !self.watch_namespaces.is_empty() {
+            p.push(
+                "watchNamespace and watchNamespaces are both set; use watchNamespaces only (watchNamespace is deprecated)"
+                    .into(),
+            );
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for ns in self.watched_namespaces() {
+            if !is_namespace_name(ns) {
+                p.push(format!("watchNamespaces: `{ns}` is not a namespace name"));
+            } else if !seen.insert(ns.as_str()) {
+                p.push(format!("watchNamespaces: `{ns}` is listed twice"));
+            }
         }
     }
 

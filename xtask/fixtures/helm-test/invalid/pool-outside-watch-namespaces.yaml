@@ -1,0 +1,3 @@
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+watchNamespaces: [ci-a, ci-b]
+pools: [{name: stray, namespace: other, spec: {}}]

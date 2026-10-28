@@ -51,11 +51,15 @@ spec:
     - {port: metrics, path: /metrics, interval: {{ .Values.metrics.serviceMonitor.interval }}}
 ---
 {{- end }}
+{{- $watch := include "bkc.watchNamespaces" . | fromJsonArray }}
 {{- range .Values.pools }}
 {{- /* Workers need a privileged-PSA namespace; keep them away from the CA Secret in the release namespace. */}}
-{{- $ns := .namespace | default $.Values.watchNamespace }}
+{{- $ns := .namespace | default (ternary (first $watch) "" (eq (len $watch) 1)) }}
 {{- if or (not $ns) (eq $ns $.Release.Namespace) }}
 {{- fail (printf "pools[%s]: set namespace to a dedicated pool namespace other than the release namespace %s" (toString .name) $.Release.Namespace) }}
+{{- end }}
+{{- if and $watch (not (has $ns $watch)) }}
+{{- fail (printf "pools[%s]: namespace %s is not in watchNamespaces" (toString .name) $ns) }}
 {{- end }}
 apiVersion: buildkit.smrt-devops.net/v1alpha1
 kind: BuildKitPool

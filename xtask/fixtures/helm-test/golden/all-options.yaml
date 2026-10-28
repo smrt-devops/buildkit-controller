@@ -106,7 +106,8 @@ data:
     shutdown:
       delay: 10s
       drainTimeout: 10m
-    watchNamespace: ci
+    watchNamespaces:
+    - ci
     workerNetwork:
       clusterCIDRs: []
       deniedCIDRs:
@@ -400,7 +401,7 @@ spec:
         helm.sh/chart: buildkit-controller-0.1.0
         team: ci
       annotations:
-        checksum/config: 58deff3b01ef223a2c75e87152ea852e437b5b68d432b37a0c16169bac907c00
+        checksum/config: 6d16c17f6e4c4c3d9fe16f67b6be7fb1577c1cd358131746517542aeda742ef5
         example.com/x: "1"
     spec:
       serviceAccountName: bkc

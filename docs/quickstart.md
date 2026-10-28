@@ -18,12 +18,13 @@ Pick a DNS name for the load balancer, install, then point the name at the Servi
 ```sh
 helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
   --set edge.endpoint=tcp://bk.example.com:8444 --set edge.serverName=bk.example.com \
+  --set 'watchNamespaces={ci}' \
   --set 'auth.oidc[0].url=https://token.actions.githubusercontent.com' \
   --set 'auth.oidc[0].audiences={buildkit-controller}'
 kubectl get svc -n buildkit-system
 ```
 
-The chart refuses to render without `edge.endpoint` and `edge.serverName`. The API listens on 8443 and the edge on 8444. Without `auth.oidc`, only ServiceAccount tokens authenticate. Some load balancers need a higher idle timeout. See [helm/README.md](../helm/README.md).
+`watchNamespaces` lists the namespaces that hold pools (`ci`, created in step 2). The chart grants the controller pod and Secret access in those namespaces only, and the controller ignores pools anywhere else. Leave it out and the controller serves every namespace through a ClusterRole that can create pods and Secrets anywhere, kube-system included. The chart refuses to render without `edge.endpoint` and `edge.serverName`. The API listens on 8443 and the edge on 8444. Without `auth.oidc`, only ServiceAccount tokens authenticate. Some load balancers need a higher idle timeout. See [helm/README.md](../helm/README.md).
 
 ### On kind
 
@@ -36,6 +37,7 @@ helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
   --set fullnameOverride=buildkit-controller \
   --set image.repository=buildkit-controller --set image.tag=dev \
   --set service.type=ClusterIP --set replicaCount=1 \
+  --set 'watchNamespaces={ci}' \
   --set edge.endpoint=tcp://localhost:8444 --set edge.serverName=localhost
 kubectl -n buildkit-system port-forward svc/buildkit-controller 8443:8443 8444:8444 &
 ```

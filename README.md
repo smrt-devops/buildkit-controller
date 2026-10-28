@@ -10,7 +10,7 @@ Long-lived BuildKit daemons share caches and CPU between unrelated jobs, and a c
 
 - Each build gets its own worker pod. No other build runs on it, and the controller deletes the pod when the allocation ends.
 - A pool keeps `scaling.min` warm pods (zero by default, or a time-of-day schedule) and grows to `scaling.max`. When the pool is full, requests queue up to the pool's `queueTimeout`.
-- One install serves any number of pools in any namespaces, so amd64, arm64 and per-team pools live side by side.
+- One install serves any number of pools in the namespaces you list in `watchNamespaces`, so amd64, arm64 and per-team pools live side by side. Outside them and its own namespace the controller can write nothing.
 - The GitHub Action allocates builders for one or more pools and releases them when the job finishes, even after a failure.
 - Build cache comes in two layers, both off by default. The registry layer gives each cache key a registry ref, and the controller returns the `--cache-from` and `--cache-to` values for it. Local volumes keep a worker's state directory on a PVC per warm slot ([details](docs/architecture.md#build-cache)).
 
@@ -32,6 +32,7 @@ You need a cluster that meets the requirements above, `helm`, and a GitHub repos
 # 1. Install the controller and its CRD.
 helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
   --set edge.endpoint=tcp://bk.example.com:8444 --set edge.serverName=bk.example.com \
+  --set 'watchNamespaces={ci}' \
   --set 'auth.oidc[0].url=https://token.actions.githubusercontent.com' \
   --set 'auth.oidc[0].audiences={buildkit-controller}'
 

@@ -6,16 +6,22 @@
 //! uses `store_shared`/`Writer::subscribe`. A receiver that lags is told to
 //! rescan with [`PodEvent::Resync`].
 
+use std::collections::{HashSet, VecDeque};
+use std::fmt::Debug;
 use std::future::Future;
+use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::stream::{self, BoxStream};
 use futures::{Stream, StreamExt};
 use k8s_openapi::api::core::v1::{Pod, Secret};
 use kube::api::Api;
+use kube::core::NamespaceResourceScope;
 use kube::runtime::reflector::{self, Store};
 use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Client, Resource, ResourceExt};
+use serde::de::DeserializeOwned;
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -210,8 +216,8 @@ pub struct Stores {
 pub struct StoreSpec<'a> {
     /// API client.
     pub client: Client,
-    /// `watchNamespace`, `""` = all.
-    pub watch_namespace: &'a str,
+    /// Watched namespaces, `[]` = all.
+    pub watch_namespaces: &'a [String],
     /// Controller namespace.
     pub namespace: &'a str,
     /// CA Secret name.
@@ -226,18 +232,191 @@ pub struct StoreSpec<'a> {
     pub pods_ready: ReadyFlag,
 }
 
-fn scoped<K>(client: Client, ns: &str) -> Api<K>
+/// A watch of `K` in `namespaces`, `[]` = all namespaces. More than one
+/// namespace runs one watcher per namespace, merged by [`merge_namespaces`];
+/// `store` is the reader of the store the events are applied to.
+#[must_use]
+pub fn scoped_watch<K>(
+    client: Client,
+    namespaces: &[String],
+    cfg: &watcher::Config,
+    store: Store<K>,
+) -> BoxStream<'static, watcher::Result<watcher::Event<K>>>
 where
-    K: Resource<Scope = kube::core::NamespaceResourceScope>,
-    K::DynamicType: Default,
+    K: Resource<Scope = NamespaceResourceScope>
+        + Clone
+        + DeserializeOwned
+        + Debug
+        + Send
+        + Sync
+        + 'static,
+    K::DynamicType: Default + Clone + Eq + Hash,
 {
-    if ns.is_empty() {
-        Api::all(client)
-    } else {
-        Api::namespaced(client, ns)
+    match namespaces {
+        [] => watcher(Api::all(client), cfg.clone()).boxed(),
+        [ns] => watcher(Api::namespaced(client, ns), cfg.clone()).boxed(),
+        many => {
+            let tagged = stream::select_all(many.iter().enumerate().map(|(i, ns)| {
+                watcher(Api::<K>::namespaced(client.clone(), ns), cfg.clone())
+                    .map(move |ev| (i, ev))
+                    .boxed()
+            }));
+            merge_namespaces(tagged.boxed(), many.to_vec(), store).boxed()
+        }
     }
 }
 
+/// Merge watch streams of single namespaces into one stream that a single
+/// reflector writer can apply. Each item is tagged with its index in
+/// `namespaces`.
+///
+/// The writer replaces its whole store at `InitDone`, so the merged stream
+/// sends one `Init`, `InitApply`.., `InitDone` once every namespace finished
+/// its first list, and holds earlier events until then. A later relist of one
+/// namespace becomes `Apply` for each listed object and `Delete` for each
+/// object `store` holds in that namespace that the list lacked. Errors pass
+/// through unchanged.
+pub fn merge_namespaces<K>(
+    tagged: BoxStream<'static, (usize, watcher::Result<watcher::Event<K>>)>,
+    namespaces: Vec<String>,
+    store: Store<K>,
+) -> impl Stream<Item = watcher::Result<watcher::Event<K>>> + Send + 'static
+where
+    K: Resource + Clone + Send + Sync + 'static,
+    K::DynamicType: Default + Clone + Eq + Hash,
+{
+    let merge = Merge {
+        listing: vec![None; namespaces.len()],
+        listed: vec![false; namespaces.len()],
+        initial: Some(Vec::new()),
+        namespaces,
+        store,
+        out: VecDeque::new(),
+    };
+    stream::unfold((tagged, merge), |(mut tagged, mut m)| async move {
+        loop {
+            if let Some(ev) = m.out.pop_front() {
+                return Some((ev, (tagged, m)));
+            }
+            let (i, item) = tagged.next().await?;
+            m.handle(i, item);
+        }
+    })
+}
+
+struct Merge<K>
+where
+    K: Resource + 'static,
+    K::DynamicType: Hash + Eq,
+{
+    namespaces: Vec<String>,
+    /// Per namespace: the objects of a list in progress.
+    listing: Vec<Option<Vec<K>>>,
+    /// Per namespace: its first list completed.
+    listed: Vec<bool>,
+    /// Objects held until every namespace listed; `None` afterwards.
+    initial: Option<Vec<K>>,
+    store: Store<K>,
+    out: VecDeque<watcher::Result<watcher::Event<K>>>,
+}
+
+fn same<K: Resource>(a: &K, b: &K) -> bool {
+    a.meta().name == b.meta().name && a.meta().namespace == b.meta().namespace
+}
+
+impl<K> Merge<K>
+where
+    K: Resource + Clone + 'static,
+    K::DynamicType: Default + Clone + Eq + Hash,
+{
+    fn handle(&mut self, i: usize, item: watcher::Result<watcher::Event<K>>) {
+        let ev = match item {
+            Ok(ev) => ev,
+            Err(e) => {
+                self.out.push_back(Err(e));
+                return;
+            }
+        };
+        match ev {
+            watcher::Event::Init => {
+                if let Some(l) = self.listing.get_mut(i) {
+                    *l = Some(Vec::new());
+                }
+            }
+            watcher::Event::InitApply(o) => match self.listing.get_mut(i) {
+                Some(Some(l)) => l.push(o),
+                _ => self.apply(o),
+            },
+            watcher::Event::InitDone => {
+                let objs = self
+                    .listing
+                    .get_mut(i)
+                    .and_then(Option::take)
+                    .unwrap_or_default();
+                self.list_done(i, objs);
+            }
+            watcher::Event::Apply(o) => self.apply(o),
+            watcher::Event::Delete(o) => self.delete(o),
+        }
+    }
+
+    fn apply(&mut self, o: K) {
+        match &mut self.initial {
+            Some(held) => {
+                held.retain(|x| !same(x, &o));
+                held.push(o);
+            }
+            None => self.out.push_back(Ok(watcher::Event::Apply(o))),
+        }
+    }
+
+    fn delete(&mut self, o: K) {
+        match &mut self.initial {
+            Some(held) => held.retain(|x| !same(x, &o)),
+            None => self.out.push_back(Ok(watcher::Event::Delete(o))),
+        }
+    }
+
+    fn list_done(&mut self, i: usize, objs: Vec<K>) {
+        let Some(ns) = self.namespaces.get(i) else {
+            return;
+        };
+        if let Some(held) = &mut self.initial {
+            held.retain(|x| x.meta().namespace.as_ref() != Some(ns));
+            held.extend(objs);
+            if let Some(l) = self.listed.get_mut(i) {
+                *l = true;
+            }
+            if self.listed.iter().all(|l| *l)
+                && let Some(all) = self.initial.take()
+            {
+                self.out.push_back(Ok(watcher::Event::Init));
+                self.out
+                    .extend(all.into_iter().map(|o| Ok(watcher::Event::InitApply(o))));
+                self.out.push_back(Ok(watcher::Event::InitDone));
+            }
+            return;
+        }
+        let names: HashSet<&str> = objs
+            .iter()
+            .filter_map(|o| o.meta().name.as_deref())
+            .collect();
+        let stale: Vec<K> = self
+            .store
+            .state()
+            .iter()
+            .filter(|s| {
+                s.meta().namespace.as_ref() == Some(ns)
+                    && !s.meta().name.as_deref().is_some_and(|n| names.contains(n))
+            })
+            .map(|s| K::clone(s))
+            .collect();
+        self.out
+            .extend(objs.into_iter().map(|o| Ok(watcher::Event::Apply(o))));
+        self.out
+            .extend(stale.into_iter().map(|o| Ok(watcher::Event::Delete(o))));
+    }
+}
 fn secret_watch(
     client: Client,
     ns: &str,
@@ -283,7 +462,7 @@ impl Stores {
     pub fn spawn(spec: StoreSpec<'_>, shutdown: &CancellationToken) -> Self {
         let StoreSpec {
             client,
-            watch_namespace,
+            watch_namespaces,
             namespace,
             ca_secret_name,
             serving_secret_name,
@@ -293,9 +472,15 @@ impl Stores {
         } = spec;
 
         let (pool_store, pool_writer) = reflector::store::<BuildKitPool>();
-        let pools: Api<BuildKitPool> = scoped(client.clone(), watch_namespace);
+        let (c, scope, s) = (
+            client.clone(),
+            watch_namespaces.to_vec(),
+            pool_store.clone(),
+        );
         let m = Arc::clone(&metrics);
-        let events = move || watcher(pools.clone(), watcher::Config::default()).modify(strip);
+        let events = move || {
+            scoped_watch(c.clone(), &scope, &watcher::Config::default(), s.clone()).modify(strip)
+        };
         spawn_until(
             shutdown.clone(),
             drive(
@@ -312,10 +497,10 @@ impl Stores {
 
         let (pod_store, pod_writer) = reflector::store::<Pod>();
         let (tx, _) = broadcast::channel(POD_EVENT_CAPACITY);
-        let pod_api: Api<Pod> = scoped(client.clone(), watch_namespace);
+        let (c, scope, s) = (client.clone(), watch_namespaces.to_vec(), pod_store.clone());
         let cfg = watcher::Config::default()
             .labels(&format!("{LABEL_MANAGED_BY}={CONTROLLER},{LABEL_POOL}"));
-        let events = move || watcher(pod_api.clone(), cfg.clone()).modify(strip);
+        let events = move || scoped_watch(c.clone(), &scope, &cfg, s.clone()).modify(strip);
         let m = Arc::clone(&metrics);
         let ptx = tx.clone();
         spawn_until(
