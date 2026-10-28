@@ -1,1 +1,3 @@
+# expect: at '/edge/endpoint'
 edge: {endpoint: "https://bk.example.com", serverName: bk.example.com}
+gateway: {enabled: false}

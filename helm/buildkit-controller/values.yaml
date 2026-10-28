@@ -19,6 +19,9 @@ podDisruptionBudget:
   enabled: true
   minAvailable: 1
 
+# Each proxied edge connection holds two 64 KiB copy buffers and two TLS sessions, about
+# 200 KiB, and an idle replica uses about 14 MiB, so 512Mi holds roughly 2300 connections.
+# edge.maxConnections (2000) is sized to this limit: raise one only with the other.
 resources:
   requests: {cpu: 100m, memory: 128Mi}
   limits: {memory: 512Mi}
@@ -44,7 +47,7 @@ edge:
   tls:
     secretName: ""   # "" = self-issued; else a kubernetes.io/tls Secret in the release namespace
   handshakeTimeout: 10s
-  maxConnections: 10000      # established connections per replica; taken after the handshake
+  maxConnections: 2000       # established connections per replica; taken after the handshake
   maxHandshakes: 1024        # connections still in the TLS handshake, per replica
   maxHandshakesPerIp: 32     # in-handshake connections from one client address (IPv4, or IPv6 /64); 0 = no cap
   # PROXY protocol v2 from a gateway or load balancer, off by default. When on, a
@@ -88,7 +91,11 @@ workerNetwork:
   deniedCIDRs: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, 127.0.0.0/8, 168.63.129.16/32, "fc00::/7", "fe80::/10", "64:ff9b::/96", "64:ff9b:1::/48"]
   extraDeniedCIDRs: []
   # Pod, service and node ranges of this cluster, both families. IPv6 egress stays
-  # closed until an IPv6 range is listed here.
+  # closed until an IPv6 range is listed here. Set this: while it is empty the controller
+  # cannot tell cluster addresses from outside ones, so a pool allowCIDRs entry that
+  # covers pod or service addresses (10.0.0.0/16, say) can open the whole cluster to
+  # builds. NOTES.txt warns while it is empty. The chart has no default because the
+  # ranges differ per cluster.
   clusterCIDRs: []
   # Ranges a pool's allowCIDRs may open although they overlap link-local, metadata,
   # loopback, clusterCIDRs or extraDeniedCIDRs. An allowCIDRs entry passes only
@@ -119,8 +126,8 @@ service:
   nodePorts: {api: null, edge: null}
 
 # Exposure through Gateway API (gateway.networking.k8s.io/v1), the default. The chart
-# renders upstream kinds only, and only those the cluster serves (NOTES.txt names any
-# that are missing): HTTPRoute (Gateway API v1.0+), BackendTLSPolicy (v1.4+) and
+# renders upstream kinds only, whether or not the cluster serves them yet (a missing
+# CRD fails the apply): HTTPRoute (Gateway API v1.0+), BackendTLSPolicy (v1.4+) and
 # TLSRoute (v1.5+), all in the standard channel. You bring the Gateway and its listeners.
 #
 # Behind a gateway the controller sees the gateway's addresses, not the clients', so

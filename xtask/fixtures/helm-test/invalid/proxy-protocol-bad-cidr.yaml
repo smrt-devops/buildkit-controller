@@ -3,3 +3,4 @@
 edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
 api:
   proxyProtocol: {enabled: true, trustedCIDRs: [envoy.envoy-gateway-system.svc]}
+gateway: {enabled: false}

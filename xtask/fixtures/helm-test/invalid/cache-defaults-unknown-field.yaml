@@ -1,2 +1,4 @@
+# expect: at '/cacheDefaults/registry': additional properties 'repo' not allowed
 edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
 cacheDefaults: {registry: {repo: r/x}}
+gateway: {enabled: false}

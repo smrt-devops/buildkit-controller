@@ -1,2 +1,4 @@
+# expect: at '/watchNamespaces/0'
 edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
 watchNamespaces: [CI_Builders]
+gateway: {enabled: false}

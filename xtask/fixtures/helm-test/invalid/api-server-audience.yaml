@@ -1,3 +1,5 @@
+# expect: at '/auth/serviceAccount/audiences/0'
 edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
 auth:
   serviceAccount: {audiences: ["https://kubernetes.default.svc.cluster.local"]}
+gateway: {enabled: false}
