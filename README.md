@@ -41,7 +41,7 @@ helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
 # 2. Create a namespace and a pool that accepts your GitHub organization.
 #    Edit the access rules in the example first: set repository_owner_id to your
 #    organization's id (gh api orgs/<org> --jq .id) and replace the sample repository. The
-#    first rule allows the main branch only; drop its `ref` claim to allow pull requests.
+#    first rule allows the main branch only; to allow pull requests, replace its `ref` and `event_name` claims with `event_name: pull_request`.
 kubectl create namespace ci
 kubectl label namespace ci pod-security.kubernetes.io/enforce=privileged
 kubectl apply -f examples/pool-github-oidc.yaml

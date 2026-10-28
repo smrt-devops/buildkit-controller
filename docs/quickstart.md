@@ -136,7 +136,7 @@ To skip this step, give the controller a certificate from a public CA through `e
 The GitHub OIDC rule in `examples/pool-github-oidc.yaml` decides which workflows can use the pool. Match on ids, not names:
 
 - Prefer `repository_id` and `repository_owner_id` over `repository` and `repository_owner`. A name can be re-registered after a rename or deletion by someone else, but an id cannot.
-- A `ref` rule also matches `pull_request_target` runs. For that event GitHub sets `ref` to the base branch, for example `refs/heads/main`, even though the workflow can check out and run code from the pull request. Add `event_name` (for example `push`) or `job_workflow_ref` to the same rule to exclude it.
+- A `ref` rule also matches `pull_request_target` runs. For that event GitHub sets `ref` to the base branch, for example `refs/heads/main`, even though the workflow can check out and run code from the pull request. Add `event_name` (for example `push`) to the same rule to exclude it. `job_workflow_ref` excludes the event only when the named workflow has no `pull_request_target` trigger, because a run of that workflow on the base branch carries the same value for every event.
 
 ## 4. First build with curl
 

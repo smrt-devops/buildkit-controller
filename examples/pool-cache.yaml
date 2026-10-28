@@ -35,4 +35,5 @@ spec:
       - oidc:
           issuer: https://token.actions.githubusercontent.com
           claims:
-            repository: example/app
+            repository_id: "87654321"   # gh api repos/example/app --jq .id; names can be re-registered
+            event_name: push

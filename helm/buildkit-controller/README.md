@@ -68,7 +68,7 @@ pools:
       scaling: {min: 2, max: 10}
       access:
         rules:
-          - oidc: {issuer: https://token.actions.githubusercontent.com, claims: {repository_owner: org}}
+          - oidc: {issuer: https://token.actions.githubusercontent.com, claims: {repository_owner_id: "12345678", event_name: push}}
 ```
 
 The controller holds no registry credentials. CI jobs log in to the cache
