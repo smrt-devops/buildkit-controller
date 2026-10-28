@@ -54,6 +54,11 @@ struct Rec {
     pods: Vec<(String, String, &'static str, String, jiff::Timestamp)>,
     /// (pool, type, status, reason), on change only.
     conds: Vec<(String, String, String, String)>,
+    /// Per pod uid: when the watch first saw it, and first saw it Ready.
+    seen_at: HashMap<String, jiff::Timestamp>,
+    ready_at: HashMap<String, jiff::Timestamp>,
+    /// Per worker Secret (pool-labelled): every owner kind it was seen with.
+    secret_owners: BTreeMap<String, BTreeSet<String>>,
 }
 
 type Shared = Arc<Mutex<Rec>>;
@@ -73,8 +78,35 @@ fn record_pod(rec: &Shared, p: &Pod, kind: &'static str) {
     let n = set.len();
     let peak = r.peak.entry(pool.clone()).or_default();
     *peak = (*peak).max(n);
-    r.pods
-        .push((pool, p.name_any(), kind, alloc, jiff::Timestamp::now()));
+    let now = jiff::Timestamp::now();
+    let uid = p.metadata.uid.clone().unwrap_or_default();
+    r.seen_at.entry(uid.clone()).or_insert(now);
+    if ready(p) {
+        r.ready_at.entry(uid).or_insert(now);
+    }
+    r.pods.push((pool, p.name_any(), kind, alloc, now));
+}
+
+fn record_secret(rec: &Shared, s: &Secret) {
+    if !s.labels().contains_key(LABEL_POOL) {
+        return;
+    }
+    let kinds = s
+        .metadata
+        .owner_references
+        .iter()
+        .flatten()
+        .map(|o| o.kind.clone());
+    let mut r = rec.lock().unwrap();
+    let seen = r.secret_owners.entry(s.name_any()).or_default();
+    seen.extend(kinds);
+    if s.metadata
+        .owner_references
+        .as_ref()
+        .is_none_or(Vec::is_empty)
+    {
+        seen.insert("<none>".into());
+    }
 }
 
 fn record_pool(rec: &Shared, p: &BuildKitPool) {
@@ -105,6 +137,16 @@ fn spawn_recorders(client: &Client, rec: &Shared) {
                 }
                 Ok(watcher::Event::Delete(p)) => record_pod(&r, &p, "delete"),
                 _ => {}
+            }
+        }
+    });
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), NS);
+    let r = Arc::clone(rec);
+    tokio::spawn(async move {
+        let mut s = std::pin::pin!(watcher(secrets, watcher::Config::default()));
+        while let Some(ev) = s.next().await {
+            if let Ok(watcher::Event::Apply(x) | watcher::Event::InitApply(x)) = ev {
+                record_secret(&r, &x);
             }
         }
     });
@@ -960,6 +1002,55 @@ async fn reconcile_verify() {
     };
     let claimed = |p: &Pod| !matches!(alloc(p), "" | "free" | "draining");
 
+    // 12. Cold-start latency, printed for comparison across changes: each of
+    // five allocations creates its pod. Pod times are watch receipt times.
+    let (mut answered, mut started) = (Vec::new(), Vec::new());
+    for _ in 0..5 {
+        let mark = h.mark();
+        let sent = Instant::now();
+        let resp = allocate().await.unwrap().unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+        answered.push(sent.elapsed().as_millis());
+        let body: Value = resp.json().await.unwrap();
+        let uid = h.pods.get("r-0").await.unwrap().metadata.uid.unwrap();
+        {
+            let log = rec.lock().unwrap();
+            let ms = log.ready_at[&uid]
+                .duration_since(log.seen_at[&uid])
+                .as_millis();
+            started.push(u128::try_from(ms).unwrap());
+        }
+        let released = http
+            .delete(format!(
+                "https://{}/v1/allocations/{}",
+                replica.api,
+                body["id"].as_str().unwrap()
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(released.status(), reqwest::StatusCode::NO_CONTENT);
+        until("r-0 released and gone", 60, || async {
+            h.deletes_since(mark, "r").contains(&"r-0".to_owned()) && h.list("r").await.is_empty()
+        })
+        .await;
+    }
+    let stats = |v: &mut Vec<u128>| {
+        v.sort_unstable();
+        format!(
+            "p50 {} ms, max {} ms, all {v:?}",
+            v[v.len() / 2],
+            v[v.len() - 1]
+        )
+    };
+    summary.push(format!(
+        "S12 latency (n=5): POST to 201 {}; pod seen to Ready {}",
+        stats(&mut answered),
+        stats(&mut started)
+    ));
+    println!("{}", summary.last().unwrap());
+
     // 10. A client that gives up mid cold start (a cancelled CI job) leaves
     // neither the pod nor its worker Secret behind.
     let mark = h.mark();
@@ -1084,6 +1175,20 @@ async fn reconcile_verify() {
     );
     summary.push(format!(
         "API: no status apply or Event rejected; all >=400 responses: {rejected:?}"
+    ));
+    // No worker Secret was ever owned by anything but its pod.
+    let owners = rec.lock().unwrap().secret_owners.clone();
+    let wrong: Vec<_> = owners
+        .iter()
+        .filter(|(_, kinds)| kinds.iter().any(|k| k != "Pod"))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "worker Secrets with other owners: {wrong:?}"
+    );
+    summary.push(format!(
+        "Secrets: {} worker Secrets seen, each owned only by its pod",
+        owners.len()
     ));
     let conds = rec.lock().unwrap().conds.clone();
     summary.push(format!("conditions seen: {conds:?}"));

@@ -255,9 +255,12 @@ struct Req<'a> {
 }
 
 /// The `expires-at` a claim is written with: [`COMMIT_WINDOW`] past now
-/// plus `start`, never past the allocation's own expiry.
+/// plus `start`, and always before the allocation's own expiry, so every
+/// commit moves it. The leader's retires test that value, which makes each
+/// of them lose to a commit made after the state it judged.
 fn claim_until(expires_at: OffsetDateTime, start: time::Duration) -> OffsetDateTime {
-    (whole_seconds(OffsetDateTime::now_utc()) + start + COMMIT_WINDOW).min(expires_at)
+    (whole_seconds(OffsetDateTime::now_utc()) + start + COMMIT_WINDOW)
+        .min(expires_at - time::Duration::SECOND)
 }
 
 fn grace_of(pod: &Pod) -> Option<u32> {
@@ -525,9 +528,6 @@ impl Engine {
     /// pod, so no client holds an allocation the leader is about to reap at
     /// the claim value.
     async fn extend(&self, won: &mut Won) -> Result<(), AllocError> {
-        if won.claimed_until >= won.expires_at {
-            return Ok(());
-        }
         let (ns, name) = (won.guard.ns.clone(), won.guard.name.clone());
         let patch = extend_patch(
             &won.uid,
@@ -821,12 +821,13 @@ impl Engine {
             let pname = worker.pod.metadata.name.clone().unwrap_or_default();
             // Subscribe before the create so no event about the new pod is missed.
             let sub = (self.subscribe)();
-            let (guard, created) = self.create_detached(r, worker, &pname).await?;
-            let created = created.map_err(|e| {
+            let (guard, s) = self.create_detached(r, worker, &pname).await?;
+            if let Err(e) = &s.secret {
+                // The pod cannot start without it; the guard retires it now.
                 error!(namespace = %ns, pool = %name, pod = %pname, error = %e, "creating the worker Secret");
-                AllocError::Internal
-            })?;
-            match created {
+                return Err(AllocError::Internal);
+            }
+            match s.out {
                 CreateOutcome::Created(p) => {
                     let Some(uid) = p.metadata.uid.clone() else {
                         return Err(AllocError::Internal);
@@ -854,18 +855,17 @@ impl Engine {
         Ok(None)
     }
 
-    /// Runs the create sequence of [`spawn::spawn`] (Secret, pod, Secret
-    /// re-own) in its own task, so a cancelled request cannot stop it halfway
-    /// and leave the worker Secret, with its private key, owned by the pool.
-    /// The task holds the orphan guard until the outcome is known and hands it
-    /// back; if the request is gone by then, the guard drops in the task and
-    /// retires the pod.
+    /// Runs [`spawn::spawn`] (pod, then its Secret) in its own task, so a
+    /// cancelled request cannot stop it between the two creates and leave a
+    /// pod that cannot start. The task holds the orphan guard until the
+    /// outcome is known and hands it back; if the request is gone by then,
+    /// the guard drops in the task and retires the pod.
     async fn create_detached(
         &self,
         r: &Req<'_>,
         worker: spawn::Worker,
         pname: &str,
-    ) -> Result<(OrphanGuard, Result<CreateOutcome, String>), AllocError> {
+    ) -> Result<(OrphanGuard, spawn::Spawned<CreateOutcome>), AllocError> {
         // Armed first, by name (no uid yet), because the create may land
         // although its answer is lost.
         let mut guard = self.guard(r, pname, None, None);
@@ -873,22 +873,21 @@ impl Engine {
         let ns = r.key.0.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let created = spawn::spawn(&*backend, worker, |pod| backend.create_pod(&ns, pod)).await;
-            match &created {
-                Ok(CreateOutcome::Created(p)) => {
-                    if let Some(uid) = &p.metadata.uid {
-                        guard.uid = Some(uid.clone());
-                        guard.grace = grace_of(p);
-                        guard.confirmed = true;
-                    }
-                }
+            let s = spawn::spawn(&*backend, worker, |pod| backend.create_pod(&ns, pod)).await;
+            if let spawn::PodCreated::Yes { uid, .. } = &s.pod {
+                guard.uid = Some(uid.clone());
+                guard.confirmed = true;
+            }
+            match &s.out {
+                CreateOutcome::Created(p) => guard.grace = grace_of(p),
                 // The pod may exist, so the undo stays armed.
-                Ok(CreateOutcome::Unknown) => {}
-                Ok(CreateOutcome::Exists | CreateOutcome::Quota | CreateOutcome::Failed(_))
-                | Err(_) => guard.armed = false,
+                CreateOutcome::Unknown => {}
+                CreateOutcome::Exists | CreateOutcome::Quota | CreateOutcome::Failed(_) => {
+                    guard.armed = false;
+                }
             }
             // A send to a dropped request returns the guard, which drops here.
-            drop(tx.send((guard, created)));
+            drop(tx.send((guard, s)));
         });
         rx.await.map_err(|_| {
             error!(pod = %pname, "the cold create task ended without an outcome");

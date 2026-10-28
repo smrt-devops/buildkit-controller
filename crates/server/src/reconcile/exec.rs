@@ -374,7 +374,7 @@ impl PodOutcome for OpResult<Pod> {
     }
 }
 
-/// Issues the pod's serving cert into its own Secret, then creates the pod
+/// Issues the pod's serving cert, creates the pod, then its Secret
 /// ([`spawn::spawn`]).
 async fn create_pod<O: KubeOps>(ops: &O, env: &Env<'_>, slot: u32, r: &mut Report) -> CreateResult {
     let failed = |message: String| CreateResult::Failed { message };
@@ -396,28 +396,28 @@ async fn create_pod<O: KubeOps>(ops: &O, env: &Env<'_>, slot: u32, r: &mut Repor
         return skip;
     }
     let ns = env.pool.namespace().unwrap_or_default();
-    let res = spawn::spawn(
-        ops,
-        worker,
-        |pod| async move { ops.create_pod(&ns, &pod).await },
-    )
+    // Boxed: the create and its read back would bloat every pass future.
+    let res = Box::pin(spawn::spawn(ops, worker, |pod| async move {
+        ops.create_pod(&ns, &pod).await
+    }))
     .await;
-    match res {
-        Err(e) => {
-            r.pod_ops.push(("create", "error"));
-            r.errors.push(format!("create slot {slot}: {e}"));
-            failed(e)
-        }
-        Ok(Ok(p)) => {
+    match res.out {
+        Ok(p) => {
             r.pod_ops.push(("create", "ok"));
             r.created.push(p);
+            // The pod cannot start without its Secret and is retired at
+            // startTimeout; the failure counts toward the create backoff.
+            if let Err(e) = res.secret {
+                r.errors.push(format!("create slot {slot}: {e}"));
+                return failed(e);
+            }
             CreateResult::Created
         }
-        Ok(Err(OpError::Conflict(_))) => {
+        Err(OpError::Conflict(_)) => {
             r.pod_ops.push(("create", "conflict"));
             CreateResult::SlotTaken
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             r.pod_ops.push(("create", "error"));
             r.errors.push(format!("create slot {slot}: {e}"));
             failed(e.to_string())

@@ -502,6 +502,14 @@ impl WorkerSecrets for KubeClient {
     fn delete_worker_secret(&self, ns: &str, name: &str) -> BoxFuture<'static, Result<(), String>> {
         self.0.delete_worker_secret(ns, name)
     }
+
+    fn get_worker_pod(
+        &self,
+        ns: &str,
+        name: &str,
+    ) -> BoxFuture<'static, Result<Option<Pod>, String>> {
+        self.0.get_worker_pod(ns, name)
+    }
 }
 
 impl<O: KubeOps> WorkerSecrets for Timed<O> {
@@ -523,5 +531,18 @@ impl<O: KubeOps> WorkerSecrets for Timed<O> {
 
     fn delete_worker_secret(&self, ns: &str, name: &str) -> BoxFuture<'static, Result<(), String>> {
         bounded(self.timeout, self.inner.delete_worker_secret(ns, name))
+    }
+
+    fn get_worker_pod(
+        &self,
+        ns: &str,
+        name: &str,
+    ) -> BoxFuture<'static, Result<Option<Pod>, String>> {
+        let (f, t) = (self.inner.get_worker_pod(ns, name), self.timeout);
+        Box::pin(async move {
+            tokio::time::timeout(t, f)
+                .await
+                .unwrap_or_else(|_| Err(format!("no answer within {t:?}")))
+        })
     }
 }

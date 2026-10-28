@@ -58,6 +58,10 @@ struct World {
     patches: Vec<Value>,
     /// Pod creates land at once but answer after this long.
     create_delay: Duration,
+    /// Pod creates answer `Unknown`; `true` lands them anyway.
+    lost_creates: Option<bool>,
+    /// Every worker Secret create fails with this.
+    secret_err: Option<String>,
 }
 
 struct Fake {
@@ -143,8 +147,11 @@ impl Backend for Fake {
     fn create_pod(&self, _: &str, mut pod: Pod) -> BoxFuture<'static, CreateOutcome> {
         let name = pod.metadata.name.clone().unwrap();
         self.w.lock().unwrap().calls.push(format!("create {name}"));
+        let lost = self.w.lock().unwrap().lost_creates;
         let out = if self.get(&name).is_some() {
             CreateOutcome::Exists
+        } else if lost == Some(false) {
+            CreateOutcome::Unknown
         } else if self.w.lock().unwrap().quota {
             CreateOutcome::Quota
         } else {
@@ -155,7 +162,11 @@ impl Backend for Fake {
             };
             pod.metadata.uid = Some(format!("00000000-0000-4000-8000-{n:012}"));
             self.put(pod.clone());
-            CreateOutcome::Created(Box::new(pod))
+            if lost.is_some() {
+                CreateOutcome::Unknown
+            } else {
+                CreateOutcome::Created(Box::new(pod))
+            }
         };
         let delay = self.w.lock().unwrap().create_delay;
         Box::pin(async move {
@@ -319,6 +330,8 @@ fn env_full(max: i32, cold: bool, queue_cap: usize, cache: bool) -> Env {
             extend: None,
             patches: Vec::new(),
             create_delay: Duration::ZERO,
+            lost_creates: None,
+            secret_err: None,
         }),
         tx: tx.clone(),
     });
@@ -636,15 +649,10 @@ async fn cancelled_cold_request_leaves_no_orphaned_claim() {
     );
     settle().await;
     let calls = e.fake.calls();
-    // The cold path issues the pod's own Secret first and re-owns it after.
-    assert!(calls[0].starts_with("secret create p-0-"), "{calls:?}");
-    assert_eq!(calls[1], "create p-0", "{calls:?}");
-    let secret = &calls[0]["secret create ".len()..];
-    assert_eq!(
-        calls[2],
-        format!("secret reown {secret} Pod/p-0"),
-        "{calls:?}"
-    );
+    // The cold path creates the pod, then its Secret owned by the pod.
+    assert_eq!(calls[0], "create p-0", "{calls:?}");
+    assert!(calls[1].starts_with("secret create p-0-"), "{calls:?}");
+    assert!(calls[1].ends_with(" Pod/p-0"), "{calls:?}");
     assert!(
         calls.contains(&"patch p-0 draining".to_owned()),
         "{calls:?}"
@@ -1228,12 +1236,23 @@ async fn release_waiters_are_bounded() {
 impl WorkerSecrets for Fake {
     fn create_worker_secret(&self, s: &Secret) -> BoxFuture<'static, Result<(), String>> {
         let name = s.metadata.name.clone().unwrap_or_default();
-        self.w
-            .lock()
-            .unwrap()
-            .calls
-            .push(format!("secret create {name}"));
-        Box::pin(async { Ok(()) })
+        let owners: Vec<String> = (s.metadata.owner_references.iter().flatten())
+            .map(|o| format!("{}/{}", o.kind, o.name))
+            .collect();
+        let mut w = self.w.lock().unwrap();
+        w.calls
+            .push(format!("secret create {name} {}", owners.join(",")));
+        let out = w.secret_err.clone().map_or(Ok(()), Err);
+        Box::pin(async move { out })
+    }
+    fn get_worker_pod(
+        &self,
+        _: &str,
+        name: &str,
+    ) -> BoxFuture<'static, Result<Option<Pod>, String>> {
+        self.w.lock().unwrap().calls.push(format!("get {name}"));
+        let pod = self.get(name);
+        Box::pin(async move { Ok(pod) })
     }
     fn reown_worker_secret(
         &self,
@@ -1635,7 +1654,7 @@ fn an_untested_expiry_retire_would_reap_a_committed_allocation() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_request_cancelled_mid_create_still_hands_the_secret_to_the_pod() {
+async fn a_request_cancelled_mid_create_still_finishes_the_create() {
     let e = env_with(1, true, 10);
     // The create lands at once, but its answer takes 5 s.
     e.fake.w.lock().unwrap().create_delay = Duration::from_secs(5);
@@ -1649,13 +1668,11 @@ async fn a_request_cancelled_mid_create_still_hands_the_secret_to_the_pod() {
     tokio::time::sleep(Duration::from_secs(10)).await;
     settle().await;
     let calls = e.fake.calls();
-    let secret = calls[0].strip_prefix("secret create ").unwrap();
-    assert_eq!(calls[1], "create p-0", "{calls:?}");
-    // The sequence ran to the end: the pod owns the Secret, so the garbage
+    assert_eq!(calls[0], "create p-0", "{calls:?}");
+    // The sequence ran to the end: the Secret is the pod's, so the garbage
     // collector deletes it with the pod the guard then retires.
-    assert_eq!(
-        calls[2],
-        format!("secret reown {secret} Pod/p-0"),
+    assert!(
+        calls[1].starts_with("secret create p-0-") && calls[1].ends_with(" Pod/p-0"),
         "{calls:?}"
     );
     assert!(
@@ -1664,4 +1681,61 @@ async fn a_request_cancelled_mid_create_still_hands_the_secret_to_the_pod() {
     );
     assert!(calls.contains(&"delete p-0".to_owned()), "{calls:?}");
     assert!(e.fake.get("p-0").is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_secret_fails_the_request_and_retires_the_pod_at_once() {
+    let e = env_with(1, true, 10);
+    e.fake.w.lock().unwrap().secret_err = Some("forbidden".into());
+    let got = e.engine.allocate(&sa("b"), &req(0)).await.err();
+    assert_eq!(got, Some(AllocError::Internal));
+    settle().await;
+    let calls = e.fake.calls();
+    // No wait for startTimeout: the guard knows the pod's uid and retires it.
+    assert!(
+        calls.contains(&"patch p-0 draining".to_owned()),
+        "{calls:?}"
+    );
+    assert!(e.fake.get("p-0").is_none(), "{calls:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lost_create_answer_is_read_back_before_any_secret() {
+    for landed in [true, false] {
+        let e = env_with(1, true, 10);
+        e.fake.w.lock().unwrap().lost_creates = Some(landed);
+        let got = e.engine.allocate(&sa("b"), &req(0)).await.err();
+        assert_eq!(got, Some(AllocError::UpstreamError), "landed {landed}");
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        settle().await;
+        let calls = e.fake.calls();
+        assert_eq!(calls[..2], ["create p-0", "get p-0"], "{calls:?}");
+        let secret = calls.iter().any(|c| c.starts_with("secret create"));
+        // A pod that landed gets its Secret (owned by it) and is retired;
+        // a pod that did not land gets no Secret at all.
+        assert_eq!(secret, landed, "{calls:?}");
+        assert!(e.fake.get("p-0").is_none(), "{calls:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_commit_moves_expires_at_even_for_the_shortest_ttl() {
+    // TTL 60 s is shorter than the commit window: the claim still ends a
+    // second early, so the commit always changes `expires-at` and every
+    // leader retire that tested the claim value loses to it.
+    let e = env_with(4, false, 10);
+    let name = e.warm(0);
+    let mut r = req(0);
+    r.ttl_seconds = Some(60);
+    let a = e.engine.allocate(&sa("b"), &r).await.unwrap();
+    let patches = e.fake.w.lock().unwrap().patches.clone();
+    assert_eq!(patches.len(), 2, "{patches:?}");
+    let claimed = parse_ts(&written_expiry(&patches[0])).unwrap();
+    let pod = e.fake.get(&name).unwrap();
+    assert_eq!(claimed - allocated_ann(&pod), time::Duration::seconds(59));
+    assert_eq!(
+        expires_ann(&pod) - allocated_ann(&pod),
+        time::Duration::seconds(60)
+    );
+    let _ = a.commit();
 }

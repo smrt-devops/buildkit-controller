@@ -360,4 +360,17 @@ impl WorkerSecrets for KubeBackend {
     fn delete_worker_secret(&self, ns: &str, name: &str) -> BoxFuture<'static, Result<(), String>> {
         bounded(self.timeout, self.client.delete_worker_secret(ns, name))
     }
+
+    fn get_worker_pod(
+        &self,
+        ns: &str,
+        name: &str,
+    ) -> BoxFuture<'static, Result<Option<Pod>, String>> {
+        let (f, t) = (self.client.get_worker_pod(ns, name), self.timeout);
+        Box::pin(async move {
+            tokio::time::timeout(t, f)
+                .await
+                .unwrap_or_else(|_| Err("timeout".to_owned()))
+        })
+    }
 }

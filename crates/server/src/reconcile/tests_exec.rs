@@ -292,9 +292,8 @@ async fn actions_run_in_plan_order() {
             "delete:p-2",
             "retire:p-3:a3:2026-01-01T00:00:00Z",
             "delete:p-3",
-            "secret_create:p-0-N",
             "create:p-0",
-            "secret_reown:p-0-N:Pod/uid-p-0",
+            "secret_create:p-0-N:Pod/uid-p-0",
             "status",
             "prune:1",
             "prune:0",
@@ -426,25 +425,43 @@ async fn create_outcomes_are_classified() {
     assert!(matches!(results[1], CreateResult::Failed { .. }));
     assert_eq!(results[2], CreateResult::Created);
     assert_eq!(r.created.len(), 1);
-    // The 409 deletes its own Secret by name; the unknown outcome keeps it (the
-    // pod may mount it); the created pod takes it over.
+    // A refused create gets no Secret. An unknown outcome is read back first,
+    // and no pod of this create means no Secret. The created pod owns its
+    // Secret from the start.
     assert_eq!(
         fake.calls_n(),
         [
-            "secret_create:p-0-N",
             "create:p-0",
-            "secret_delete:p-0-N",
-            "secret_create:p-1-N",
             "create:p-1",
-            "secret_create:p-2-N",
+            "get_pod:p-1",
             "create:p-2",
-            "secret_reown:p-2-N:Pod/uid-p-2",
+            "secret_create:p-2-N:Pod/uid-p-2",
         ]
     );
-    let calls = fake.calls();
+}
+
+#[tokio::test]
+async fn a_refused_secret_create_leaves_a_pod_that_cannot_start() {
+    let (p, ca) = (pool(), valid_ca());
+    let fake = Fake::failing(&[("secret_create", OpError::Other("forbidden".into()))]);
+    let create = vec![Action::CreatePod {
+        slot: 0,
+        name: "p-0".into(),
+    }];
+    let r = execute(
+        &fake,
+        &CaGuard::default(),
+        &env(&p, &ca, None, 0),
+        &plan(create),
+    )
+    .await;
+    // The pod exists (the planner retires it at startTimeout), and the
+    // failure counts toward the create backoff.
+    assert_eq!(r.created.len(), 1);
+    assert!(matches!(r.creates[0].result, CreateResult::Failed { .. }));
     assert_eq!(
-        calls[0]["secret_create:".len()..],
-        calls[2]["secret_delete:".len()..]
+        fake.calls_n(),
+        ["create:p-0", "secret_create:p-0-N:Pod/uid-p-0"]
     );
 }
 
@@ -1089,9 +1106,15 @@ fn all_trigger_reaches_remembered_pools_that_left_the_store() {
 }
 
 impl WorkerSecrets for Fake {
+    /// Records the owner; the key `secret_create` in `fail` fails every create.
     fn create_worker_secret(&self, s: &Secret) -> BoxFuture<'static, Result<(), String>> {
         let name = s.metadata.name.clone().unwrap_or_default();
-        let res = self.call(format!("secret_create:{name}"));
+        let owners: Vec<String> = (s.metadata.owner_references.iter().flatten())
+            .map(|o| format!("{}/{}", o.kind, o.uid))
+            .collect();
+        let res = self
+            .call(format!("secret_create:{name}:{}", owners.join(",")))
+            .and(self.fail.get("secret_create").cloned().map_or(Ok(()), Err));
         Box::pin(async move { res.map_err(|e| e.to_string()) })
     }
     fn reown_worker_secret(
@@ -1106,6 +1129,14 @@ impl WorkerSecrets for Fake {
     fn delete_worker_secret(&self, _: &str, name: &str) -> BoxFuture<'static, Result<(), String>> {
         let res = self.call(format!("secret_delete:{name}"));
         Box::pin(async move { res.map_err(|e| e.to_string()) })
+    }
+    fn get_worker_pod(
+        &self,
+        _: &str,
+        name: &str,
+    ) -> BoxFuture<'static, Result<Option<Pod>, String>> {
+        let res = self.call(format!("get_pod:{name}"));
+        Box::pin(async move { res.map(|()| None).map_err(|e| e.to_string()) })
     }
 }
 
@@ -1191,12 +1222,10 @@ async fn cached_slot_creates_its_volume_before_the_pod() {
         [
             "get_pvc:p-cache-1",
             "create_pvc:p-cache-1",
-            "secret_create:p-1-N",
             "create:p-1",
-            "secret_reown:p-1-N:Pod/uid-p-1",
-            "secret_create:p-2-N",
+            "secret_create:p-1-N:Pod/uid-p-1",
             "create:p-2",
-            "secret_reown:p-2-N:Pod/uid-p-2",
+            "secret_create:p-2-N:Pod/uid-p-2",
         ]
     );
     assert_eq!(state_claim(&r.created[0]).as_deref(), Some("p-cache-1"));
@@ -1248,9 +1277,8 @@ async fn current_volume_passes_its_cache_key_to_the_pod() {
         fake.calls_n(),
         [
             "get_pvc:p-cache-0",
-            "secret_create:p-0-N",
             "create:p-0",
-            "secret_reown:p-0-N:Pod/uid-p-0",
+            "secret_create:p-0-N:Pod/uid-p-0",
         ]
     );
     assert_eq!(

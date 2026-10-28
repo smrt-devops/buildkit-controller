@@ -378,6 +378,26 @@ fn expiry_retires_allocated_with_expected_id() {
     assert_eq!(p.requeue_at, Some(later(3600)));
 }
 
+/// A cold pod judged not started may commit (and move `expires-at`) before
+/// the retire lands. The retire tests the value it saw, so it loses then.
+#[test]
+fn start_timeout_retire_of_an_allocated_pod_tests_the_expires_at_it_saw() {
+    let mut f = fx();
+    f.pods = vec![WorkerPod {
+        phase: Phase::Pending,
+        created: Some(ago(121)),
+        expires_at_raw: Some("2026-01-01T00:03:00Z".into()),
+        ..allocated(0)
+    }];
+    assert!(f.plan().actions.contains(&Action::RetireAllocated {
+        pod: "p-0".into(),
+        uid: "uid-0".into(),
+        alloc_id: ALLOC_ID.into(),
+        expires_at: Some("2026-01-01T00:03:00Z".into()),
+        reason: RetireReason::StartTimeout,
+    }));
+}
+
 #[test]
 fn draining_deleted_every_pass_and_stuck_ones_forced() {
     let d = |s, del: Option<Timestamp>| WorkerPod {
