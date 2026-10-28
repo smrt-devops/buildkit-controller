@@ -1611,3 +1611,43 @@ async fn relist_of_one_namespace_triggers_its_deleted_pools() {
     left.sort();
     assert_eq!(left, ["a/p1", "b/y"]);
 }
+
+/// The leader's Pool watch is tolerant: with namespace `b` failing every list,
+/// the pools of `a` still get an `All` trigger once `b` is given up.
+#[tokio::test(start_paused = true)]
+async fn an_unlistable_namespace_does_not_hold_the_other_pools() {
+    use futures::StreamExt;
+    use kube::runtime::reflector;
+    use kube::runtime::watcher::{Error, Event};
+
+    use super::driver::pool_trigger;
+    use crate::runtime::stores::{GIVE_UP_AFTER, NamespaceReport, merge_tolerant};
+    let mut a1 = fixtures::pool("p1", json!({})).unwrap();
+    a1.metadata.namespace = Some("a".into());
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    for item in [
+        (0, Ok(Event::Init)),
+        (0, Ok(Event::InitApply(a1))),
+        (0, Ok(Event::InitDone)),
+        (1, Err(Error::NoResourceVersion)),
+    ] {
+        tx.unbounded_send(item).unwrap();
+    }
+    let (store, writer) = reflector::store::<BuildKitPool>();
+    let merged = merge_tolerant(
+        rx.boxed(),
+        vec!["a".into(), "b".into()],
+        store.clone(),
+        NamespaceReport::log("controller"),
+    );
+    let mut triggers = Box::pin(
+        reflector::reflector(writer, merged)
+            .filter_map(|ev| std::future::ready(ev.ok().as_ref().and_then(pool_trigger))),
+    );
+    let first = tokio::time::timeout(GIVE_UP_AFTER * 2, triggers.next())
+        .await
+        .expect("a trigger once b is given up");
+    assert_eq!(first, Some(Trigger::All));
+    assert_eq!(store.state().len(), 1);
+    drop(tx);
+}
