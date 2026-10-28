@@ -163,16 +163,17 @@ pub fn reconcile_verify() -> Result<()> {
     std::thread::sleep(std::time::Duration::from_secs(5));
     let early = controller.try_wait()?;
     ensure!(early.is_none(), "controller exited at startup: {early:?}");
-    let tests = c
-        .server_test("reconcile_verify")
+    let mut tests = c.server_test("reconcile_verify");
+    tests
         .env("RV_OPS", format!("127.0.0.1:{ops}"))
         .env("RV_NODE", format!("{}-control-plane", c.name()))
         .env("RV_NAMESPACE", NAMESPACE)
         .env("RV_CONFIG", &config)
         .env("RV_IMAGE", IMAGE)
         .env("RV_BIN", &bin)
-        .env("RV_CTRL_KUBECONFIG", &ctrl_kc)
-        .status()?;
+        .env("RV_CTRL_KUBECONFIG", &ctrl_kc);
+    // In its own group, so an interrupt stops cargo test and the replicas it starts.
+    let tests = Spawned::spawn(&mut tests)?.wait()?;
     ensure!(
         tests.success(),
         "reconcile_verify scenarios failed (controller log: {})",

@@ -355,7 +355,7 @@ pub fn runtime_verify() -> Result<()> {
         .position(|r| r.name == holder)
         .context("leader index")?;
     let survivor = &replicas[1 - li];
-    children[li].child()?.kill()?;
+    children[li].kill_leader()?;
     let killed = Instant::now();
     let took = wait_for("failover", FAILOVER_BOUND, || {
         is_leader(survivor.ops) == Some(true)
@@ -371,7 +371,7 @@ pub fn runtime_verify() -> Result<()> {
     );
 
     // 6. SIGTERM the survivor. It releases the Lease and exits 0.
-    let pid = children[1 - li].child()?.id().to_string();
+    let pid = children[1 - li].id().to_string();
     ensure!(
         Command::new("kill")
             .args(["-TERM", &pid])

@@ -11,6 +11,8 @@ use std::cell::Cell;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+
+use crate::proc::Spawned;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -205,10 +207,8 @@ impl Cluster {
         if let Some(cfg) = config {
             c.arg("--config").arg(cfg);
         }
-        let out = c
-            .arg("--kubeconfig")
-            .arg(&self.kubeconfig)
-            .output()
+        // In its own group, so an interrupt stops it before the cluster is deleted.
+        let out = crate::proc::run(c.arg("--kubeconfig").arg(&self.kubeconfig))
             .context("running kind create cluster")?;
         ensure!(
             out.status.success(),
@@ -247,15 +247,15 @@ impl Cluster {
 
     /// Runs kubectl with `args` and `stdin` (empty when `None`), whatever its exit status.
     pub(crate) fn kubectl_raw(&self, args: &[&str], stdin: Option<&str>) -> Result<Output> {
-        let mut child = self
-            .kubectl_cmd()
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("spawning kubectl")?;
-        let mut pipe = child.stdin.take().context("kubectl stdin")?;
+        let mut child = Spawned::spawn(
+            self.kubectl_cmd()
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .context("spawning kubectl")?;
+        let mut pipe = child.take_stdin().context("kubectl stdin")?;
         pipe.write_all(stdin.unwrap_or_default().as_bytes())?;
         drop(pipe);
         child.wait_with_output().context("waiting for kubectl")
@@ -278,11 +278,7 @@ impl Cluster {
 
     /// helm's stdout; fails with its output when it exits non-zero.
     pub(crate) fn helm(&self, args: &[&str]) -> Result<String> {
-        let out = self
-            .helm_cmd()
-            .args(args)
-            .output()
-            .context("running helm")?;
+        let out = crate::proc::run(self.helm_cmd().args(args)).context("running helm")?;
         checked("helm", args, &out)
     }
 

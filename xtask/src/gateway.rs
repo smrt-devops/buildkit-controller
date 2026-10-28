@@ -300,11 +300,7 @@ impl PortForward {
                 .stderr(Stdio::null()),
         )
         .context("kubectl port-forward")?;
-        let stdout = child
-            .child()?
-            .stdout
-            .take()
-            .context("port-forward stdout")?;
+        let stdout = child.take_stdout().context("port-forward stdout")?;
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
         reader.read_line(&mut line)?;
