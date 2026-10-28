@@ -24,9 +24,12 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 pub use handler::{Accepted, CloseHandler, ConnectionHandler, Refusal};
-pub use listener::{ListenerOptions, PeerKey, PeerSlot, PerPeer, Serve, serve, tune_socket};
+pub use listener::{
+    ListenerOptions, PeerKey, PeerSlot, PerPeer, Serve, serve, serve_with_proxy, tune_socket,
+};
 pub use metrics::{Direction, EdgeMetrics, Revocation};
 pub use pods::{PodView, revocation};
 pub use proxy::{End, ProxyHandler, ProxyOptions, pump};
@@ -34,6 +37,7 @@ pub use tls::{EdgeTls, TlsBuilder};
 pub use upstream::client_config;
 
 use crate::certs::CertMaterial;
+use crate::net::ProxyProtocol;
 use crate::render::BUILDKIT_PORT;
 use crate::runtime::AppContext;
 use crate::runtime::hooks::{BoxResult, Component};
@@ -89,6 +93,11 @@ impl Component for EdgeComponent {
                 max_handshakes_per_ip: usize::try_from(edge.max_handshakes_per_ip)
                     .unwrap_or(usize::MAX),
             };
+            let proxy_protocol =
+                ProxyProtocol::from_config(&edge.proxy_protocol, ctx.metrics(), "edge")?;
+            if proxy_protocol.is_on() {
+                info!(trusted = ?proxy_protocol.trusted(), "edge reads PROXY protocol v2 from trusted sources");
+            }
             let addr = ctx.config().listen.edge;
             let listener = TcpListener::bind(addr).await?;
             let (tx, rx) = watch::channel(None);
@@ -127,7 +136,7 @@ impl Component for EdgeComponent {
                 options,
                 ready,
             };
-            serve(listener, s, shutdown).await;
+            serve_with_proxy(listener, s, proxy_protocol, shutdown).await;
             material_stop.cancel();
             let _ = material.await;
             revoke_stop.cancel();

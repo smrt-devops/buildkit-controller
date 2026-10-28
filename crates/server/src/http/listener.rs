@@ -26,6 +26,7 @@ use axum::http::{HeaderValue, header};
 
 use super::api::Peer;
 use crate::edge::{PerPeer, tune_socket};
+use crate::net::ProxyProtocol;
 
 /// Request extension that fires when the replica starts shutting down.
 #[derive(Clone, Debug)]
@@ -129,6 +130,22 @@ pub async fn serve(
     limits: Limits,
     shutdown: CancellationToken,
 ) {
+    serve_with_proxy(listener, app, certs, limits, ProxyProtocol::off(), shutdown).await;
+}
+
+/// [`serve`] behind a gateway: a connection from a source `proxy` trusts must
+/// open with a PROXY header, whose source address then stands for the client
+/// in `max_connections_per_ip`, the [`Peer`] extension (logs, the per-address
+/// review cap) and the debug logs here. The header read holds a connection
+/// slot and is bounded by the header timeout.
+pub async fn serve_with_proxy(
+    listener: TcpListener,
+    app: Router,
+    certs: ServingCerts,
+    limits: Limits,
+    proxy: ProxyProtocol,
+    shutdown: CancellationToken,
+) {
     let mut configs = Configs { certs, built: None };
     let permits = Arc::new(Semaphore::new(limits.max_connections.max(1)));
     let per_peer = PerPeer::new(limits.max_connections_per_ip);
@@ -147,19 +164,23 @@ pub async fn serve(
                     }
                 };
                 let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-                    debug!(peer = %peer, "API connection limit reached; closing");
-                    continue;
-                };
-                let Some(slot) = per_peer.try_take(peer.ip()) else {
-                    debug!(peer = %peer, "API per-address connection limit reached; closing");
+                    debug!(remote = %peer, "API connection limit reached; closing");
                     continue;
                 };
                 let Some(tls) = configs.current() else {
-                    debug!(peer = %peer, "no serving cert yet; closing");
+                    debug!(remote = %peer, "no serving cert yet; closing");
                     continue;
                 };
                 let (app, stop) = (app.clone(), shutdown.clone());
+                let (proxy, per_peer) = (proxy.clone(), per_peer.clone());
                 conns.spawn(async move {
+                    // From here on `peer` is the client: the PROXY source behind a
+                    // trusted gateway, else the socket's peer.
+                    let Some((tcp, peer)) = client(tcp, peer, &proxy).await else { return };
+                    let Some(slot) = per_peer.try_take(peer.ip()) else {
+                        debug!(peer = %peer, "API per-address connection limit reached; closing");
+                        return;
+                    };
                     connection(tcp, peer, tls, app, limits, stop).await;
                     drop((permit, slot));
                 });
@@ -169,6 +190,27 @@ pub async fn serve(
     // Close the socket now, so a new connection is refused rather than left in the backlog.
     drop(listener);
     while conns.join_next().await.is_some() {}
+}
+
+/// The connection and its client address, or `None` when a trusted source
+/// sent no valid PROXY header (the connection is then closed).
+async fn client(
+    mut tcp: TcpStream,
+    peer: SocketAddr,
+    proxy: &ProxyProtocol,
+) -> Option<(TcpStream, SocketAddr)> {
+    match proxy.client(&mut tcp, peer).await {
+        Ok(c) => {
+            if let Some(via) = c.origin.via() {
+                debug!(peer = %c.addr, via = %via, "API PROXY header accepted");
+            }
+            Some((tcp, c.addr))
+        }
+        Err(e) => {
+            debug!(via = %peer, reason = e.label(), error = %e, "API PROXY header refused; closing");
+            None
+        }
+    }
 }
 
 async fn connection(

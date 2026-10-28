@@ -170,6 +170,8 @@ pub struct Api {
     pub max_connections: u32,
     /// Open API connections from one client address; more are closed on accept. 0: no cap.
     pub max_connections_per_ip: u32,
+    /// PROXY protocol v2 from a gateway in front of the listener.
+    pub proxy_protocol: ProxyProtocol,
 }
 
 impl Default for Api {
@@ -177,6 +179,54 @@ impl Default for Api {
         Self {
             max_connections: 4096,
             max_connections_per_ip: 128,
+            proxy_protocol: ProxyProtocol::default(),
+        }
+    }
+}
+
+/// `api.proxyProtocol` and `edge.proxyProtocol`: PROXY protocol v2, read only
+/// from `trustedCIDRs` (see [`crate::net::ProxyProtocol`]).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct ProxyProtocol {
+    /// Off by default: every connection counts as its socket peer.
+    pub enabled: bool,
+    /// Sources that must send a header (the gateway's addresses). Required when enabled.
+    #[serde(rename = "trustedCIDRs")]
+    pub trusted_cidrs: Vec<String>,
+    /// Longest wait for the header after accept.
+    pub header_timeout: CrdDuration,
+}
+
+impl Default for ProxyProtocol {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trusted_cidrs: Vec::new(),
+            header_timeout: CrdDuration::new("5s"),
+        }
+    }
+}
+
+impl ProxyProtocol {
+    fn validate(&self, field: &str, p: &mut Vec<String>) {
+        if secs(&self.header_timeout, &format!("{field}.headerTimeout"), p).is_zero() {
+            p.push(format!("{field}.headerTimeout must be positive"));
+        }
+        if self.enabled && self.trusted_cidrs.is_empty() {
+            p.push(format!(
+                "{field}.trustedCIDRs must list the gateway's addresses when enabled"
+            ));
+        }
+        for c in &self.trusted_cidrs {
+            match c.parse::<crate::net::Cidr>() {
+                Err(e) => p.push(format!("{field}.trustedCIDRs: {e}")),
+                // Trusting every address lets any client choose its own address.
+                Ok(n) if n.prefix() == 0 => p.push(format!(
+                    "{field}.trustedCIDRs: `{c}` would trust every address"
+                )),
+                Ok(_) => {}
+            }
         }
     }
 }
@@ -283,6 +333,8 @@ pub struct Edge {
     pub max_handshakes: u32,
     /// In-handshake connections from one client address. 0: no cap.
     pub max_handshakes_per_ip: u32,
+    /// PROXY protocol v2 from a gateway in front of the listener.
+    pub proxy_protocol: ProxyProtocol,
 }
 
 impl Default for Edge {
@@ -299,6 +351,7 @@ impl Default for Edge {
             max_connections: 10_000,
             max_handshakes: 1024,
             max_handshakes_per_ip: 32,
+            proxy_protocol: ProxyProtocol::default(),
         }
     }
 }
@@ -673,6 +726,12 @@ impl Config {
         self.validate_edge(&mut p);
         self.validate_auth(&mut p);
         self.validate_network(&mut p);
+        self.api
+            .proxy_protocol
+            .validate("api.proxyProtocol", &mut p);
+        self.edge
+            .proxy_protocol
+            .validate("edge.proxyProtocol", &mut p);
         self.validate_test_leaf(&mut p);
         if p.is_empty() {
             Ok(())
