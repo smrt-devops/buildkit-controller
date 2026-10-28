@@ -91,7 +91,10 @@ spec:
     {{- if $http }}
     http: {streamIdleTimeout: {{ $gw.api.timeouts.request | default "15m" }}}
     {{- end }}
-  {{- /* PROXY protocol (proxyProtocol: {version: V2}) belongs here once the controller reads it. */}}
+  {{- if and $e.proxyProtocol (get $.Values $route).proxyProtocol.enabled }}
+  # The controller accepts it from {{ $route }}.proxyProtocol.trustedCIDRs.
+  proxyProtocol: {version: V2}
+  {{- end }}
 ---
 {{- end }}
 {{- end }}

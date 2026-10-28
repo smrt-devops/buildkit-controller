@@ -51,6 +51,8 @@ sequenceDiagram
 
 The allocation certificate's URI SAN names the pod, the allocation and the pool. The edge reads those fields and finds the pod in its watch cache, so it needs no database and no per-request call to Kubernetes. When the allocation is released, expires, or the pod disappears, the edge closes its connections.
 
+Behind a gateway, the API and edge connections come from the gateway. With PROXY protocol on for a listener, the gateway prefixes each connection with the client's address, the controller reads that header before TLS from trusted gateway addresses only, and the per-address caps and logs use the client's address. See [PROXY protocol](operations.md#proxy-protocol).
+
 ## Two CAs
 
 The CA Secret holds two CAs. The client CA signs allocation certificates and the self-issued edge and API serving certificate. The internal CA signs the worker serving certificates and the edge-to-worker client certificate. buildkitd trusts only the internal CA, so an allocation certificate cannot talk to a worker directly.

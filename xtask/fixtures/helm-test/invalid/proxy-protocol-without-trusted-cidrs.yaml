@@ -1,0 +1,6 @@
+# expect: trustedCIDRs
+# PROXY protocol on with no trusted source would close nothing and trust nothing.
+edge:
+  endpoint: "tcp://bk.example.com:8444"
+  serverName: bk.example.com
+  proxyProtocol: {enabled: true}

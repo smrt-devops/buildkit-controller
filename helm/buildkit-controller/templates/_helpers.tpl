@@ -58,6 +58,14 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
   "workerNetwork" .Values.workerNetwork
   "shutdown" (ternary .Values.shutdown (omit .Values.shutdown "drainTimeout") (not (empty .Values.shutdown.drainTimeout)))
   "claims" (dict "enabled" .Values.claims.enabled "namespaces" .Values.claims.namespaces) -}}
+{{- /* PROXY protocol only when on, so configs without it (and their checksum) stay the same. */ -}}
+{{- range $l := list "api" "edge" -}}
+  {{- $p := (get $.Values $l).proxyProtocol -}}
+  {{- if $p.enabled -}}
+    {{- if not $p.trustedCIDRs }}{{ fail (printf "%s.proxyProtocol.trustedCIDRs is required when %s.proxyProtocol.enabled is true: list the gateway's source addresses" $l $l) }}{{ end -}}
+    {{- $_ := set (get $cfg $l) "proxyProtocol" (dict "enabled" true "trustedCIDRs" $p.trustedCIDRs "headerTimeout" $p.headerTimeout) -}}
+  {{- end -}}
+{{- end -}}
 {{- /* Scoped: the list. Cluster-wide: the old empty key, so existing configs (and their checksum) stay the same. */ -}}
 {{- with include "bkc.watchNamespaces" . | fromJsonArray -}}
   {{- $_ := unset $cfg "watchNamespace" -}}

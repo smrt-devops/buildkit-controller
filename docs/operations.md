@@ -18,13 +18,41 @@ By default the chart exposes the controller through a Gateway API Gateway that y
 
 Timeouts on the path matter because a queued allocation request is silent for up to 12 minutes 10 seconds with default pool timeouts. The HTTPRoute's `timeouts.request` and `timeouts.backendRequest` default to 15 minutes (`gateway.api.timeouts`). Raise them, and any idle timeout of the gateway or of the load balancer in front of it, above the pool's `allocation.maxQueueTimeout` plus `workers.startTimeout` plus 10 seconds when a pool allows longer waits.
 
-Behind a gateway, the controller sees the gateway's addresses instead of the clients'. The per-address caps (32 TLS handshakes in progress per address on the edge, 128 API connections, 4 TokenReviews in flight) then apply to every client together. Raise `edge.maxHandshakesPerIp`, `api.maxConnectionsPerIp` and `auth.serviceAccount.maxReviewsPerIp` to the number of jobs that start at once, or set them to 0 and limit clients at the gateway. The controller does not read PROXY protocol yet.
+Behind a gateway, the controller sees the gateway's addresses instead of the clients'. The per-address caps (32 TLS handshakes in progress per address on the edge, 128 API connections, 4 TokenReviews in flight) then apply to every client together, and the logs show the gateway's pod addresses. Either turn on PROXY protocol (below), or raise `edge.maxHandshakesPerIp`, `api.maxConnectionsPerIp` and `auth.serviceAccount.maxReviewsPerIp` to the number of jobs that start at once, or set them to 0 and limit clients at the gateway.
+
+### PROXY protocol
+
+With PROXY protocol the gateway opens each backend connection with a short binary header that names the client's address. The controller reads version 2 (the binary form; v1 text headers are refused) on each listener where it is on, and uses the client's address for the per-address caps, the TokenReview cap and the `peer` log field. The gateway's own address is logged as `via`.
+
+Turn it on per listener, together with the gateway side:
+
+```yaml
+api:
+  proxyProtocol: {enabled: true, trustedCIDRs: [10.244.7.0/24]}
+edge:
+  proxyProtocol: {enabled: true, trustedCIDRs: [10.244.7.0/24]}
+gateway:
+  envoy: {enabled: true, proxyProtocol: true}   # Envoy Gateway: BackendTrafficPolicy proxyProtocol V2
+```
+
+`gateway.envoy.proxyProtocol` asks Envoy to send the header to each listener whose `proxyProtocol` is on. On another implementation, configure its PROXY protocol v2 option for the controller's Service, for example through `gateway.extraManifests`. `helm install` warns when the chart asks Envoy to send PROXY protocol to a listener that does not read it, or the reverse.
+
+The trust model:
+
+- Only connections from `trustedCIDRs` are parsed. List the gateway's source addresses: the Envoy pods' addresses, or a node or subnet range that only the gateway uses. Never a range that clients or other pods share, because any host in it could then claim any address. `0.0.0.0/0` and `::/0` are refused.
+- A connection from a trusted address must open with a valid header within `headerTimeout` (5 s), or it is closed. There is no fallback to the gateway's address. The header may be at most 1040 bytes (1024 of addresses and TLVs).
+- A connection from any other address is served as itself and never parsed. A client that sends its own header from outside the trusted range only breaks its own TLS handshake.
+- A `LOCAL` header (a gateway health check) is accepted and the connection counts as the gateway's address.
+
+Each header from a trusted source is counted in `buildkit_api_proxy_protocol_headers_total` or `buildkit_edge_proxy_protocol_headers_total` by `result`: `proxied`, `local`, or why the connection was closed (`timeout`, `truncated`, `bad_signature`, `bad_version`, `bad_command`, `oversized`, `short`, `unsupported_family`, `io_error`). A rising `bad_signature` or `timeout` count usually means the gateway does not send the header, or something else connects from a trusted range. The refused connections are logged at `debug`.
+
+Pod addresses change when the Envoy pods are rescheduled. Pin them to a node pool or subnet and trust that range, or keep the list in sync. Without PROXY protocol, or when the gateway does not send it, everything works as before, and the caps count the gateway's addresses.
 
 ## Sizing
 
 - Pool size. Set `scaling.max` to the number of builds you want to run at once. Each worker pod requests 500m CPU, 1Gi memory and 1Gi ephemeral storage by default, with limits of 4Gi memory and 20Gi ephemeral storage. Override these in `spec.template.spec.containers[0].resources`. Limits must include `memory` and `ephemeral-storage`.
 - Cache. Worker storage is an `emptyDir`, so the BuildKit cache disappears with the pod. Use registry cache (`--cache-to` and `--cache-from`) in your builds. The ephemeral-storage limit bounds the local cache, and `spec.workers.cache.sizeLimit` caps the `emptyDir`.
-- Controller. The chart defaults are 2 replicas, a 100m CPU and 128Mi memory request, and a 512Mi memory limit. The edge copies bytes for every build, so watch CPU on the replicas under heavy load and raise `replicaCount` or enable `autoscaling` (CPU-based HPA). Per replica, the edge allows 10000 established connections (`edge.maxConnections`) and 1024 connections in the TLS handshake (`edge.maxHandshakes`), 32 of them from one client address (`edge.maxHandshakesPerIp`). The API allows 4096 connections (`api.maxConnections`), 128 of them from one client address (`api.maxConnectionsPerIp`). An IPv6 client address is its /64. Connections over a cap are closed on accept and logged at `debug`. The per-address caps count the source address the controller sees, so they need source-IP preservation. With `service.type: LoadBalancer` the chart sets `service.externalTrafficPolicy: Local` for that. Behind a Gateway (see [Exposure](#exposure)), with `Cluster`, a load balancer that rewrites the source, a proxy, or runners behind one NAT address, many clients share one address: raise `api.maxConnectionsPerIp`, `edge.maxHandshakesPerIp` and `auth.serviceAccount.maxReviewsPerIp`, or set them to 0 to disable them.
+- Controller. The chart defaults are 2 replicas, a 100m CPU and 128Mi memory request, and a 512Mi memory limit. The edge copies bytes for every build, so watch CPU on the replicas under heavy load and raise `replicaCount` or enable `autoscaling` (CPU-based HPA). Per replica, the edge allows 10000 established connections (`edge.maxConnections`) and 1024 connections in the TLS handshake (`edge.maxHandshakes`), 32 of them from one client address (`edge.maxHandshakesPerIp`). The API allows 4096 connections (`api.maxConnections`), 128 of them from one client address (`api.maxConnectionsPerIp`). An IPv6 client address is its /64. Connections over a cap are closed on accept and logged at `debug`. The per-address caps count the source address the controller sees, so they need source-IP preservation. With `service.type: LoadBalancer` the chart sets `service.externalTrafficPolicy: Local` for that. Behind a Gateway without [PROXY protocol](#proxy-protocol), with `Cluster`, a load balancer that rewrites the source, a proxy, or runners behind one NAT address, many clients share one address: turn on PROXY protocol where the proxy supports it, or raise `api.maxConnectionsPerIp`, `edge.maxHandshakesPerIp` and `auth.serviceAccount.maxReviewsPerIp`, or set them to 0 to disable them.
 - Load balancer and gateway. A queued request is silent for up to 12 minutes 10 seconds with default pool timeouts. Raise the load balancer or gateway idle timeout above that, per [Exposure](#exposure) and the table in [../helm/README.md](../helm/README.md#load-balancer-idle-timeout).
 - Quotas. Pods count against the pool namespace's ResourceQuota. A refused create shows as `Degraded=True/PodCreateFailed`.
 

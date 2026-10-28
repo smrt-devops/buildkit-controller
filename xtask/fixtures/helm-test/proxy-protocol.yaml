@@ -1,0 +1,16 @@
+# PROXY protocol v2 on both listeners behind Envoy Gateway: the controller trusts the
+# Envoy pod range, and the Envoy extras ask Envoy to send the header to both backends.
+edge:
+  endpoint: tcp://bk.example.com:8444
+  serverName: bk.example.com
+  proxyProtocol: {enabled: true, trustedCIDRs: [10.244.0.0/16, "fd00:10:244::/64"], headerTimeout: 3s}
+api:
+  proxyProtocol: {enabled: true, trustedCIDRs: [10.244.0.0/16]}
+gateway:
+  api:
+    parentRefs: [{name: eg, namespace: envoy-gateway-system, sectionName: https}]
+  edge:
+    parentRefs: [{name: eg, namespace: envoy-gateway-system, sectionName: tls}]
+  envoy:
+    enabled: true
+    proxyProtocol: true

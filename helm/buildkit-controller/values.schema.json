@@ -28,14 +28,16 @@
         "handshakeTimeout": {"type": "string", "pattern": "^([0-9]+h)?([0-9]+m)?([0-9]+s)?$", "minLength": 2},
         "maxConnections": {"type": "integer", "minimum": 1},
         "maxHandshakes": {"type": "integer", "minimum": 1},
-        "maxHandshakesPerIp": {"type": "integer", "minimum": 0}
+        "maxHandshakesPerIp": {"type": "integer", "minimum": 0},
+        "proxyProtocol": {"$ref": "#/definitions/proxyProtocol"}
       }
     },
     "api": {
       "type": "object",
       "properties": {
         "maxConnections": {"type": "integer", "minimum": 1},
-        "maxConnectionsPerIp": {"type": "integer", "minimum": 0}
+        "maxConnectionsPerIp": {"type": "integer", "minimum": 0},
+        "proxyProtocol": {"$ref": "#/definitions/proxyProtocol"}
       }
     },
     "auth": {
@@ -147,6 +149,7 @@
           "properties": {
             "enabled": {"type": "boolean"},
             "connectTimeout": {"$ref": "#/definitions/gatewayDuration"},
+            "proxyProtocol": {"type": "boolean"},
             "tcpKeepalive": {
               "type": "object",
               "additionalProperties": false,
@@ -217,6 +220,17 @@
     }
   },
   "definitions": {
+    "proxyProtocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
+      "then": {"properties": {"trustedCIDRs": {"minItems": 1}}, "required": ["trustedCIDRs"]},
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "trustedCIDRs": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[0-9A-Fa-f:.]+/[0-9]{1,3}$"}},
+        "headerTimeout": {"type": "string", "pattern": "^([0-9]+h)?([0-9]+m)?([0-9]+s)?$", "minLength": 2}
+      }
+    },
     "parentRefs": {
       "type": "array",
       "items": {

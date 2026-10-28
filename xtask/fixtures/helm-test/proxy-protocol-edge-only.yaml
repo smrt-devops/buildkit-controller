@@ -1,0 +1,16 @@
+# Envoy proxyProtocol on, but only the edge reads it: the chart asks Envoy to send it
+# to the edge backend only (NOTES.txt warns about the API), in passthrough mode.
+edge:
+  endpoint: tcp://bk.example.com:8444
+  serverName: bk.example.com
+  proxyProtocol: {enabled: true, trustedCIDRs: [10.244.0.0/16]}
+gateway:
+  api:
+    mode: passthrough
+    parentRefs: [{name: eg, namespace: envoy-gateway-system, sectionName: api}]
+    hostnames: [api.bk.example.com]
+  edge:
+    parentRefs: [{name: eg, namespace: envoy-gateway-system, sectionName: tls}]
+  envoy:
+    enabled: true
+    proxyProtocol: true

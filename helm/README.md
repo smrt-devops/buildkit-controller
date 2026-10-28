@@ -144,18 +144,24 @@ The controller caps work per client address: `edge.maxHandshakesPerIp` (32 TLS
 handshakes in progress), `api.maxConnectionsPerIp` (128 open API connections) and
 `auth.serviceAccount.maxReviewsPerIp` (4 TokenReviews in flight). Behind a gateway
 the controller sees the gateway's pod addresses, not the clients', so all clients
-share each cap. Raise them to the number of jobs that can start at once, or set them
-to 0 to turn them off, and enforce per-client limits at the gateway instead. The
-controller does not accept PROXY protocol yet.
+share each cap. Turn on PROXY protocol so the controller reads the client address
+from the gateway: `api.proxyProtocol` and `edge.proxyProtocol` with `trustedCIDRs` set
+to the gateway's source addresses, plus `gateway.envoy.proxyProtocol: true` on Envoy
+Gateway. Only connections from `trustedCIDRs` are parsed, and each must carry a v2
+header. The trust model is in
+[docs/operations.md](../docs/operations.md#proxy-protocol). Without PROXY protocol,
+raise the caps to the number of jobs that can start at once, or set them to 0 to turn
+them off, and enforce per-client limits at the gateway instead.
 
 #### Implementation extras
 
 `gateway.envoy.enabled` renders an Envoy Gateway `BackendTrafficPolicy` for each
 route: TCP keepalive and a connect timeout, and on the HTTPRoute a `streamIdleTimeout`
-equal to `gateway.api.timeouts.request`. It needs the `gateway.envoyproxy.io/v1alpha1`
-CRDs. For other implementations, put their policy objects in
-`gateway.extraManifests`. Each entry is an object or a string, and both go through
-`tpl`.
+equal to `gateway.api.timeouts.request`. With `gateway.envoy.proxyProtocol: true` it
+also sets `proxyProtocol: {version: V2}` on the route of each listener whose
+`proxyProtocol` is enabled. It needs the `gateway.envoyproxy.io/v1alpha1` CRDs.
+For other implementations, put their policy objects in `gateway.extraManifests`.
+Each entry is an object or a string, and both go through `tpl`.
 
 ### LoadBalancer
 
@@ -200,8 +206,8 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 | `podDisruptionBudget.*` | rendered only when replicas exceed `minAvailable` |
 | `watchNamespaces` | namespaces whose pools the controller serves; recommended. The chart renders a Role and RoleBinding in each for pods, Secrets, ServiceAccounts, PVCs and NetworkPolicies, and only TokenReview stays cluster-wide. Pools elsewhere are ignored. `[]` (the default) = every namespace through a ClusterRole that can create pods and Secrets in any namespace, kube-system included; NOTES.txt warns about it |
 | `watchNamespace` | deprecated single-namespace form of `watchNamespaces`; setting both fails to render |
-| `edge.*` | `endpoint`, `serverName`, `allocationDomain`, `extraNames`, `tls.secretName` (user serving cert, a `kubernetes.io/tls` Secret in the release namespace), `handshakeTimeout` (10s), `maxConnections` (10000 established), `maxHandshakes` (1024), `maxHandshakesPerIp` (32; 0 = no cap) |
-| `api.*` | `maxConnections` (4096), `maxConnectionsPerIp` (128; 0 = no cap) |
+| `edge.*` | `endpoint`, `serverName`, `allocationDomain`, `extraNames`, `tls.secretName` (user serving cert, a `kubernetes.io/tls` Secret in the release namespace), `handshakeTimeout` (10s), `maxConnections` (10000 established), `maxHandshakes` (1024), `maxHandshakesPerIp` (32; 0 = no cap), `proxyProtocol.enabled` (false), `.trustedCIDRs` (required when enabled), `.headerTimeout` (5s) |
+| `api.*` | `maxConnections` (4096), `maxConnectionsPerIp` (128; 0 = no cap), `proxyProtocol` (as `edge.proxyProtocol`) |
 | `auth.oidc[]` | `url`, `audiences`, `jwksUrl`, and at most one of `caBundle` (inline PEM), `caBundleFile` (path), `caBundleConfigMap: {name, key}` (mounted, sets the file) |
 | `auth.serviceAccount` | `enabled`, `audiences` (never the API server audience), `maxConcurrentReviews` (32), `maxReviewsPerIp` (4; 0 = no cap), `reservedReviews` (8; slots held for recently seen service accounts), `recentSubjectTtl` (10m) |
 | `workerNetwork.*`, `shutdown.*` | the chart copies them into the config. `shutdown.drainTimeout` is unset by default, so a stopping replica waits for its open builds to end (at most 24h5m). The termination grace period is `shutdown.delay` + (`shutdown.drainTimeout`, or 86700 s when unset) + 10 s |
@@ -210,7 +216,7 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 | `gateway.api.*` | `mode` (`terminate`: HTTPRoute and BackendTLSPolicy; `passthrough`: TLSRoute), `parentRefs`, `hostnames` (default `[edge.serverName]`), `timeouts.request` and `.backendRequest` (15m), `backendTLS.hostname` (default `edge.serverName`), `backendTLS.caCertificateRefs` (default the `<fullname>-ca-bundle` ConfigMap) or `backendTLS.wellKnownCACertificates: System` |
 | `gateway.edge.parentRefs` | listeners of the edge TLSRoute (TLS passthrough only) |
 | `gateway.annotations`, `gateway.labels` | added to every Gateway API object |
-| `gateway.envoy.*` | `enabled` (false), `connectTimeout`, `tcpKeepalive`: Envoy Gateway BackendTrafficPolicies |
+| `gateway.envoy.*` | `enabled` (false), `connectTimeout`, `tcpKeepalive`, `proxyProtocol` (false; PROXY protocol v2 to the listeners that read it): Envoy Gateway BackendTrafficPolicies |
 | `gateway.extraManifests` | extra objects (or `tpl` strings) for other implementations |
 | `metrics.port`, `metrics.serviceMonitor.enabled` | ops port (`/healthz`, `/readyz`, `/metrics`) on its own Service; ServiceMonitor `true`, `false` or `auto` (only when the CRD exists) |
 | `pools` | list of `{name, namespace, spec}`, one BuildKitPool each; `namespace` is required unless `watchNamespaces` has one entry, must be in `watchNamespaces` when that is set, and must not be the release namespace (the chart fails to render otherwise); namespaces are not created |
