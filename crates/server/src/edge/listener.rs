@@ -41,7 +41,8 @@ impl Default for ListenerOptions {
     fn default() -> Self {
         Self {
             handshake_timeout: Duration::from_secs(10),
-            max_connections: 10_000,
+            max_connections: usize::try_from(crate::config::EDGE_MAX_CONNECTIONS)
+                .unwrap_or(usize::MAX),
             max_handshakes: 1024,
             max_handshakes_per_ip: 32,
         }

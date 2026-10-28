@@ -329,7 +329,7 @@ pub struct Edge {
     pub handshake_timeout: CrdDuration,
     /// Upstream connect timeout.
     pub upstream_connect_timeout: CrdDuration,
-    /// Established connection cap.
+    /// Established connection cap ([`EDGE_MAX_CONNECTIONS`] by default).
     pub max_connections: u32,
     /// In-handshake connection cap.
     pub max_handshakes: u32,
@@ -350,13 +350,19 @@ impl Default for Edge {
             tls: EdgeTls::default(),
             handshake_timeout: CrdDuration::new("10s"),
             upstream_connect_timeout: CrdDuration::new("5s"),
-            max_connections: 10_000,
+            max_connections: EDGE_MAX_CONNECTIONS,
             max_handshakes: 1024,
             max_handshakes_per_ip: 32,
             proxy_protocol: ProxyProtocol::default(),
         }
     }
 }
+
+/// Default `edge.maxConnections`, the same as the chart. Sized to the chart's
+/// 512Mi memory limit: an established edge connection holds about 200 KiB and
+/// an idle replica about 14 MiB, so 2000 connections stay near 400 MiB.
+/// Raise it together with the memory limit.
+pub const EDGE_MAX_CONNECTIONS: u32 = 2000;
 
 /// `edge.tls`.
 #[derive(Clone, Debug, Default, Deserialize)]

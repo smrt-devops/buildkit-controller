@@ -608,3 +608,14 @@ fn empty_cluster_cidrs_warn_at_startup() {
     .unwrap();
     assert!(!c.warn_unchecked_cluster_ranges());
 }
+
+#[test]
+fn edge_max_connections_defaults_to_the_chart_value_everywhere() {
+    let c = Config::from_yaml(MIN).unwrap();
+    assert_eq!(c.edge.max_connections, 2000);
+    assert_eq!(
+        crate::edge::ListenerOptions::default().max_connections,
+        2000,
+        "the edge listener's own default follows the config one"
+    );
+}
