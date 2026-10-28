@@ -106,10 +106,31 @@ pub(crate) fn until<T>(
 /// Process groups of live [`Spawned`] children, killed on SIGINT or SIGTERM.
 static GROUPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
+fn signal_group(pid: u32, signal: &str) -> bool {
+    Command::new("kill")
+        .args(["-s", signal, &format!("-{pid}")])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 fn kill_group(pid: u32) {
-    let _ = Command::new("kill")
-        .args(["-s", "TERM", &format!("-{pid}")])
-        .output();
+    signal_group(pid, "TERM");
+}
+
+/// SIGTERM to every group in `pids`, then SIGKILL to any still alive after 5 s,
+/// so no child outlives the task. A controller replica drains on SIGTERM and
+/// could otherwise keep running after its cluster is gone.
+fn stop_groups(pids: &[u32]) {
+    for pid in pids {
+        kill_group(*pid);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while pids.iter().any(|p| signal_group(*p, "0")) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for pid in pids {
+        signal_group(*pid, "KILL");
+    }
 }
 
 /// A child process in its own process group. Dropping it kills the group, so
@@ -196,9 +217,7 @@ pub(crate) fn on_signal() {
             });
             let Some(sig) = got else { return };
             eprintln!("{sig}: cleaning up");
-            for pid in GROUPS.lock().map(|g| g.clone()).unwrap_or_default() {
-                kill_group(pid);
-            }
+            stop_groups(&GROUPS.lock().map(|g| g.clone()).unwrap_or_default());
             crate::kube::delete_live_clusters();
             std::process::exit(130);
         });
