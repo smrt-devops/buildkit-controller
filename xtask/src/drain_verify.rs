@@ -656,10 +656,111 @@ fn queued_request_gets_503(c: &Client<'_>) -> Result<()> {
         "PASS c: request queued on {replica} answered 503 shutting_down, Retry-After {retry_after}, {}ms after SIGTERM",
         answered.as_millis()
     );
-    c.release(&held)?;
-    wait_pool_warm(env)?;
-    let retried = c.allocate_ok("b2", 120)?;
+    retry_is_counted_once(c, &replica, t0, &held)
+}
+
+/// c, continued: the retry of the refused request queues on a live replica and is
+/// counted once, and it gets 201 once the held worker is released.
+fn retry_is_counted_once(c: &Client<'_>, replica: &str, t0: Instant, held: &str) -> Result<()> {
+    let env = c.env;
+    // The client retries at once, while the worker is still held, so it queues
+    // on a live replica. The stopping replica's entry must already read 0, or
+    // the leader counts the request twice and plans surplus workers.
+    let mut retry = c.allocate("b2", 120)?.spawn()?;
+    let cleared = until(
+        "the stopping replica's waiters entry to clear and the retry to queue",
+        Duration::from_secs(30),
+        || {
+            if let Some(s) = retry.try_wait()? {
+                bail!(
+                    "the retry ended before it queued: {s} {}",
+                    c.read("b2", "code")
+                );
+            }
+            let w = waiters(env)?;
+            let old = w.get(replica).copied().unwrap_or(0);
+            let queued_elsewhere = w.iter().any(|(r, n)| r != replica && *n > 0);
+            Ok((old == 0 && queued_elsewhere).then_some(w))
+        },
+    )?;
+    let cleared_after = t0.elapsed();
+    let (max_waiting, max_pods) = watch_for_surplus(env)?;
+    ensure!(
+        max_waiting <= 1,
+        "status.waiting reached {max_waiting} with one queued request"
+    );
+    ensure!(max_pods <= 1, "{max_pods} worker pods with scaling.max 1");
+    println!(
+        "PASS c: {replica}'s status.waiters entry read 0 {}ms after SIGTERM ({cleared:?}); over 20s with the retry queued, status.waiting max {max_waiting}, worker pods max {max_pods}",
+        cleared_after.as_millis()
+    );
+    c.release(held)?;
+    let started = Instant::now();
+    loop {
+        if let Some(s) = retry.try_wait()? {
+            ensure!(s.success(), "the retry failed: {s}");
+            break;
+        }
+        ensure!(
+            started.elapsed() < Duration::from_mins(3),
+            "the retry was not served after the release"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let (code, body) = (c.read("b2", "code"), c.read("b2", "body"));
+    ensure!(code == "201", "retry: HTTP {code} {body}");
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let retried = v["id"].as_str().context("allocation id")?.to_owned();
     c.release(&retried)?;
-    println!("PASS c: retry after the release got 201 ({retried})");
+    println!("PASS c: the queued retry got 201 after the release ({retried})");
     Ok(())
+}
+
+/// `status.waiters` of the pool, by replica.
+fn waiters(env: &Env) -> Result<BTreeMap<String, i32>> {
+    let w = env.kubectl(&[
+        "get",
+        "buildkitpool",
+        POOL,
+        "-n",
+        POOL_NS,
+        "-o",
+        "jsonpath={range .status.waiters[*]}{.replica} {.count}{\"\\n\"}{end}",
+    ])?;
+    Ok(w.lines()
+        .filter_map(|l| {
+            let (r, n) = l.split_once(' ')?;
+            Some((r.to_owned(), n.trim().parse().ok()?))
+        })
+        .collect())
+}
+
+/// Highest `status.waiting` and live worker pod count seen over 20 s.
+fn watch_for_surplus(env: &Env) -> Result<(i32, usize)> {
+    let mut max_waiting = 0;
+    let mut max_pods = 0;
+    let watch = Instant::now();
+    while watch.elapsed() < Duration::from_secs(20) {
+        let waiting = env.kubectl(&[
+            "get",
+            "buildkitpool",
+            POOL,
+            "-n",
+            POOL_NS,
+            "-o",
+            "jsonpath={.status.waiting}",
+        ])?;
+        max_waiting = max_waiting.max(waiting.trim().parse::<i32>().unwrap_or(0));
+        let pods = env.kubectl(&[
+            "get", "pods", "-n", POOL_NS, "-o",
+            "jsonpath={range .items[*]}{.metadata.name} {.metadata.deletionTimestamp}{\"\\n\"}{end}",
+        ])?;
+        let live = pods
+            .lines()
+            .filter(|l| l.split_whitespace().count() == 1)
+            .count();
+        max_pods = max_pods.max(live);
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    Ok((max_waiting, max_pods))
 }
