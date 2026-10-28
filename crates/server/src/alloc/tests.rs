@@ -838,10 +838,16 @@ async fn a_newcomer_never_takes_a_pod_from_a_queued_request() {
         second.await.unwrap().unwrap().owner,
         format!("sa:{NS}/second")
     );
-    for (pod, who) in [(p0, "first"), (p1, "second")] {
-        let owner = ann(&e.fake.get(&pod).unwrap(), ANN_OWNER).map(str::to_owned);
-        assert_eq!(owner, Some(format!("sa:{NS}/{who}")));
-    }
+    // Either waiter may claim either pod; the newcomer got neither.
+    let mut owners: Vec<String> = [p0, p1]
+        .iter()
+        .map(|p| ann(&e.fake.get(p).unwrap(), ANN_OWNER).unwrap().to_owned())
+        .collect();
+    owners.sort();
+    assert_eq!(
+        owners,
+        [format!("sa:{NS}/first"), format!("sa:{NS}/second")]
+    );
 }
 
 proptest::proptest! {
