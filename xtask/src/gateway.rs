@@ -240,6 +240,54 @@ pub(crate) fn dump(env: &Env) {
     }
 }
 
+/// Label selector of the Gateway's Envoy Service and pods.
+fn envoy_selector() -> String {
+    format!(
+        "gateway.envoyproxy.io/owning-gateway-name={NAME},gateway.envoyproxy.io/owning-gateway-namespace={NS}"
+    )
+}
+
+/// The name of the Gateway's Envoy Service in `envoy-gateway-system`.
+pub(crate) fn envoy_service(env: &Env) -> Result<String> {
+    let svc = env.kubectl(&[
+        "get",
+        "svc",
+        "-n",
+        EG_NS,
+        "-l",
+        &envoy_selector(),
+        "-o",
+        "jsonpath={.items[0].metadata.name}",
+    ])?;
+    let svc = svc.trim();
+    ensure!(!svc.is_empty(), "no Envoy Service for {NS}/{NAME}");
+    Ok(svc.to_owned())
+}
+
+/// In-cluster DNS name of the Gateway's Envoy Service.
+pub(crate) fn envoy_host(env: &Env) -> Result<String> {
+    Ok(format!("{}.{EG_NS}.svc", envoy_service(env)?))
+}
+
+/// Pod IPs of the Gateway's Envoy pods: the source addresses of every
+/// connection Envoy opens to a backend.
+pub(crate) fn envoy_pod_ips(env: &Env) -> Result<Vec<String>> {
+    let ips = env.kubectl(&[
+        "get",
+        "pods",
+        "-n",
+        EG_NS,
+        "-l",
+        &envoy_selector(),
+        "--field-selector=status.phase=Running",
+        "-o",
+        "jsonpath={.items[*].status.podIP}",
+    ])?;
+    let ips: Vec<String> = ips.split_whitespace().map(str::to_owned).collect();
+    ensure!(!ips.is_empty(), "no running Envoy pod for {NS}/{NAME}");
+    Ok(ips)
+}
+
 /// `kubectl port-forward` to a port of the Gateway's Envoy Service, on a free
 /// local port. Stopped when dropped.
 pub(crate) struct PortForward {
@@ -249,24 +297,12 @@ pub(crate) struct PortForward {
 
 impl PortForward {
     pub(crate) fn envoy(env: &Env, port: u16) -> Result<Self> {
-        let svc = env.kubectl(&[
-            "get",
-            "svc",
-            "-n",
-            EG_NS,
-            "-l",
-            &format!(
-                "gateway.envoyproxy.io/owning-gateway-name={NAME},gateway.envoyproxy.io/owning-gateway-namespace={NS}"
-            ),
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ])?;
-        ensure!(!svc.trim().is_empty(), "no Envoy Service for {NS}/{NAME}");
+        let svc = envoy_service(env)?;
         let mut child = crate::kube::kubectl(&env.kubeconfig)
             .arg("--kubeconfig")
             .arg(&env.kubeconfig)
             .args(["port-forward", "-n", EG_NS])
-            .arg(format!("svc/{}", svc.trim()))
+            .arg(format!("svc/{svc}"))
             .arg(format!(":{port}"))
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

@@ -297,8 +297,8 @@ async fn admit(
         }
     };
     let via = client.origin.via();
-    if via.is_some() {
-        debug!(peer = %client.addr, via = ?via, "edge PROXY header accepted");
+    if let Some(v) = via {
+        debug!(peer = %client.addr, via = %v, "edge PROXY header accepted");
     }
     let Some(slot) = shared.per_peer.try_take(client.addr.ip()) else {
         debug!(peer = %client.addr, via = ?via, "edge per-address handshake limit reached; closing");
