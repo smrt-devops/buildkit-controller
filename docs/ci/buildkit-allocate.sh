@@ -22,6 +22,8 @@ NS=${POOL%%/*}; NAME=${POOL#*/}
 case $POOL in */*) ;; *) echo "POOL must be <namespace>/<pool>" >&2; exit 2 ;; esac
 case $API in https://*) ;; *) echo "API must be https://" >&2; exit 2 ;; esac
 case ${CACHE:-auto} in auto|registry|local|none) ;; *) echo "CACHE must be auto, registry, local or none" >&2; exit 2 ;; esac
+case ${TTL:-} in *[!0-9]*) echo "TTL must be whole seconds, e.g. 3600" >&2; exit 2 ;; esac
+case ${QUEUE_TIMEOUT:-} in *[!0-9]*) echo "QUEUE_TIMEOUT must be whole seconds, e.g. 300" >&2; exit 2 ;; esac
 
 D=$(mktemp -d)
 chmod 700 "$D"
@@ -30,11 +32,38 @@ chmod 700 "$D"
 ( umask 077; printf "Authorization: Bearer %s\n" "$TOKEN" > "$D/auth" )
 ID=
 BUILDER=
+CMD=
 CA_OPT=
 [ -z "${API_CA:-}" ] || CA_OPT=$API_CA
 
 curl_api() { # curl_api args... ; honours API_CA
   if [ -n "$CA_OPT" ]; then curl -sS --proto =https --cacert "$CA_OPT" "$@"; else curl -sS --proto =https "$@"; fi
+}
+
+# idem WHAT BUDGET_SECONDS curl-args... : an idempotent request (GET, DELETE) with auth, a 30 s limit and
+# retries of HTTP 503 with Retry-After and of curl failing to resolve or connect (exit 6 or 7), until the
+# next wait would pass BUDGET_SECONDS. Leaves the status in $code (000 on a curl failure), the body in $D/io.
+idem() {
+  _what=$1; _budget=$2; shift 2
+  _start=$(date +%s)
+  _backoff=1
+  while :; do
+    _rc=0
+    code=$(curl_api --max-time 30 -H @"$D/auth" -D "$D/ih" -o "$D/io" -w '%{http_code}' "$@") || _rc=$?
+    [ -n "$code" ] || code=000
+    _wait=
+    if [ "$code" = 503 ]; then
+      _wait=$(retry_wait "$D/ih")
+    elif [ "$_rc" = 6 ] || [ "$_rc" = 7 ]; then
+      _wait=$_backoff
+      _backoff=$(( _backoff * 2 ))
+      [ "$_backoff" -le 30 ] || _backoff=30
+    fi
+    [ -n "$_wait" ] || break
+    [ $(( $(date +%s) - _start + _wait )) -le "$_budget" ] || break
+    echo "$_what: HTTP $code (curl $_rc), retrying in ${_wait}s" >&2
+    sleep "$_wait"
+  done
 }
 
 # retry_wait HEADERS_FILE -> seconds to wait on stdout: the Retry-After value (integer seconds)
@@ -50,20 +79,11 @@ retry_wait() {
 release() {
   rc=$?
   trap - EXIT
+  [ -z "$CMD" ] || kill "$CMD" 2>/dev/null || :
   [ -z "$BUILDER" ] || docker buildx rm --force "$BUILDER" >/dev/null 2>&1 || true
   if [ -n "$ID" ]; then
-    # DELETE is idempotent, so a 503 with Retry-After is retried within the same time bound.
-    start=$(date +%s)
-    while :; do
-      code=$(curl_api -D "$D/del.hdr" -o /dev/null -w '%{http_code}' -X DELETE \
-        -H @"$D/auth" "$API/v1/allocations/$ID" || echo 000)
-      [ "$code" = 503 ] || break
-      wait=$(retry_wait "$D/del.hdr")
-      [ -n "$wait" ] || break
-      [ $(( $(date +%s) - start + wait )) -le "$RETRY_BUDGET" ] || break
-      echo "release $ID: HTTP 503, retrying in ${wait}s" >&2
-      sleep "$wait"
-    done
+    # The release has its own short budget: a down API must not hold the job for the queue timeout.
+    idem "release $ID" 60 -X DELETE "$API/v1/allocations/$ID"
     case $code in 204|404) ;; *) echo "warning: release of $ID returned $code; it drains at expiresAt" >&2 ;; esac
   fi
   rm -rf "$D"
@@ -76,9 +96,12 @@ trap 'exit 143' TERM
 # Without QUEUE_TIMEOUT, the pool default from GET /v1/pools takes its place, so the retries below
 # stay inside the default + 60 s. A server that does not report it leaves QUEUE_TIMEOUT unset.
 if [ -z "${QUEUE_TIMEOUT:-}" ]; then
-  QUEUE_TIMEOUT=$(curl_api --max-time 30 -H @"$D/auth" "$API/v1/pools" 2>/dev/null |
-    jq -r --arg ns "$NS" --arg name "$NAME" \
-      '.pools[]? | select(.namespace == $ns and .name == $name) | .queueTimeoutSeconds // empty' 2>/dev/null || :)
+  QUEUE_TIMEOUT=
+idem "list pools" 60 "$API/v1/pools"
+  if [ "$code" = 200 ]; then
+    QUEUE_TIMEOUT=$(jq -r --arg ns "$NS" --arg name "$NAME" \
+      '.pools[]? | select(.namespace == $ns and .name == $name) | .queueTimeoutSeconds // empty' "$D/io" 2>/dev/null || :)
+  fi
   case $QUEUE_TIMEOUT in *[!0-9]*) QUEUE_TIMEOUT= ;; esac
 fi
 # Total time for retries: queue timeout (1 h, the largest allowed, if unknown) + 60 s.
@@ -118,12 +141,20 @@ while :; do
   write_body "$qt"
   MAX_TIME=$(( ${qt:-3600} + 1800 + 10 ))
   rc=0
+  # In the background, so a TERM runs the release trap at once instead of after the request.
   curl_api --max-time "$MAX_TIME" -H @"$D/auth" -D "$D/hdr" -o "$D/alloc.json" -w '%{http_code}' \
-    -H 'Content-Type: application/json' --data-binary @"$D/req.json" "$API/v1/allocations" > "$D/status" || rc=$?
+    -H 'Content-Type: application/json' --data-binary @"$D/req.json" "$API/v1/allocations" > "$D/status" &
+  CMD=$!
+  wait "$CMD" || rc=$?
+  CMD=
   code=$(cat "$D/status" 2>/dev/null || :)
   wait=
   if [ "$code" = 503 ]; then
-    wait=$(retry_wait "$D/hdr")
+    # Only the codes the controller sends with Retry-After before it claims a worker; an intermediary
+    # that adds Retry-After to its own 503 may have forwarded the request.
+    case $(jq -r '.error.code // empty' "$D/alloc.json" 2>/dev/null || :) in
+      pool_exhausted|start_timeout|shutting_down|upstream_error) wait=$(retry_wait "$D/hdr") ;;
+    esac
     why="HTTP 503"
   elif [ "$rc" = 6 ] || [ "$rc" = 7 ]; then
     wait=$backoff
@@ -144,6 +175,10 @@ if [ "$code" != 201 ]; then
 fi
 
 ID=$(jq -r .id "$D/alloc.json")
+case $ID in
+  ''|*[!a-z0-9]*) ID=; echo "controller returned an invalid allocation id" >&2; exit 1 ;;
+esac
+[ "${#ID}" -le 63 ] || { ID=; echo "controller returned an invalid allocation id" >&2; exit 1; }
 BUILDER="bk-$ID"
 jq -r .clientCert "$D/alloc.json" > "$D/cert.pem"
 jq -r '.caCert // empty' "$D/alloc.json" > "$D/ca.pem"
@@ -159,4 +194,9 @@ CACHE_LOCAL=$(jq -r '.cache.local.result // empty' "$D/alloc.json")
 [ -z "$CACHE_LOCAL" ] || echo "cache: key $(jq -r .cache.key "$D/alloc.json"), local $CACHE_LOCAL" >&2
 [ -z "$CACHE_ARGS" ] || echo "cache flags: $CACHE_ARGS" >&2
 export BUILDER CACHE_ARGS
-"$@"
+# The command runs in the background with the original stdin, so a TERM reaches the release trap
+# at once, which stops the command and releases the worker.
+exec 3<&0
+"$@" <&3 3<&- &
+CMD=$!
+wait "$CMD"

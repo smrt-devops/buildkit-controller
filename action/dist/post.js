@@ -16,15 +16,9 @@ async function run() {
     if (ids.length) {
       const aud = gha.getState('audience');
       const getToken = () => L.fetchOidcToken(aud, gha.setSecret);
-      const qtState = gha.getState('queue-timeout');
-      const budgetMs = L.retryBudgetMs(qtState === '' ? undefined : Number(qtState));
-      for (const id of ids) {
-        try {
-          const res = await L.requestWithRetry(`${api}/v1/allocations/${id}`, { method: 'DELETE', ca, timeoutMs: 60000 },
-            { what: `release ${id}`, getToken, budgetMs, log: gha.info });
-          if (res.status !== 204 && res.status !== 404) throw L.apiError(`release ${id}`, res);
-        } catch (e) { failed = true; gha.warning(e.message); }
-      }
+      // In parallel, each under its own short retry budget, so the step ends within a minute or two.
+      await Promise.all(ids.map((id) => L.releaseAllocation({ api, ca, getToken, id, log: gha.info })
+        .catch((e) => { failed = true; gha.warning(e.message); })));
     }
   } catch (e) {
     failed = true;
