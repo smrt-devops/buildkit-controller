@@ -38,7 +38,7 @@ renders no Envoy policy and Envoy sends no PROXY header.
 WARNING: gateway.envoy.proxyProtocol is true but {{ $l }}.proxyProtocol.enabled is false, so the
 chart does not ask Envoy to send PROXY protocol to the {{ $l }} listener, and the controller
 counts every {{ $l }} client as an Envoy pod address. Enable {{ $l }}.proxyProtocol with
-trustedCIDRs set to the Envoy pods' addresses.
+trustedCIDRs set to the Envoy pods' addresses (/32s, never the pod CIDR).
 {{- else if and $e.enabled $p.enabled $routed (or (not $e.proxyProtocol) $plan.envoyMissing) }}
 
 WARNING: {{ $l }}.proxyProtocol.enabled is true, but the chart does not ask Envoy to send PROXY

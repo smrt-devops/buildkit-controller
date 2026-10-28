@@ -54,7 +54,11 @@ edge:
   # themselves. See docs/operations.md (PROXY protocol).
   proxyProtocol:
     enabled: false
-    trustedCIDRs: []         # required when enabled, e.g. [10.244.0.0/16]
+    # Required when enabled: the gateway pods' addresses as /32s (or a subnet or node
+    # range only the gateway uses), e.g. [10.244.3.17/32]. Never the whole pod CIDR:
+    # any pod in it could send its own header and pick its address, and pods in it
+    # that dial the Service directly are refused. Trust model: docs/operations.md.
+    trustedCIDRs: []
     headerTimeout: 5s        # longest wait for the header after accept
 
 api:
@@ -171,8 +175,8 @@ gateway:
     tcpKeepalive: {idleTime: 30s, interval: 10s, probes: 3}
     # true: Envoy sends PROXY protocol v2 to each listener whose api.proxyProtocol or
     # edge.proxyProtocol is enabled, so the controller sees client addresses. Set the
-    # trustedCIDRs there to the Envoy pods' addresses. NOTES.txt warns when one side is
-    # on without the other.
+    # trustedCIDRs there to the Envoy pods' addresses (/32s, not the pod CIDR).
+    # NOTES.txt warns when one side is on without the other.
     proxyProtocol: false
   # Extra objects for other implementations (policies, ReferenceGrants). Each item is an
   # object or a string; both go through tpl, so {{ include "bkc.fullname" . }} works.

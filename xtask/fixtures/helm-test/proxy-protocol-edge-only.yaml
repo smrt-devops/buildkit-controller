@@ -3,7 +3,7 @@
 edge:
   endpoint: tcp://bk.example.com:8444
   serverName: bk.example.com
-  proxyProtocol: {enabled: true, trustedCIDRs: [10.244.0.0/16]}
+  proxyProtocol: {enabled: true, trustedCIDRs: [10.244.3.17/32, 10.244.5.9/32]}
 gateway:
   api:
     mode: passthrough

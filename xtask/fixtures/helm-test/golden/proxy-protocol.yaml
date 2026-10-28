@@ -54,7 +54,8 @@ data:
         enabled: true
         headerTimeout: 5s
         trustedCIDRs:
-        - 10.244.0.0/16
+        - 10.244.3.17/32
+        - 10.244.5.9/32
     auth:
       oidc: []
       serviceAccount:
@@ -80,8 +81,9 @@ data:
         enabled: true
         headerTimeout: 3s
         trustedCIDRs:
-        - 10.244.0.0/16
-        - fd00:10:244::/64
+        - 10.244.3.17/32
+        - 10.244.5.9/32
+        - fd00:10:244::3:11/128
       serverName: bk.example.com
       serviceName: buildkit-controller
       tls:
@@ -376,7 +378,7 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: buildkit-controller-0.1.0
       annotations:
-        checksum/config: f218112ed3bec19a023552a74c49bd8cf12dd99a59c7b7d7f4817abe5b6b15f9
+        checksum/config: bb74edee537b843e9ce7395312c331c91c5df5e93f2667064cc83d059e6c3a06
     spec:
       serviceAccountName: buildkit-controller
       terminationGracePeriodSeconds: 86715

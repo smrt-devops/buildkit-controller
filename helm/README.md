@@ -146,7 +146,8 @@ handshakes in progress), `api.maxConnectionsPerIp` (128 open API connections) an
 the controller sees the gateway's pod addresses, not the clients', so all clients
 share each cap. Turn on PROXY protocol so the controller reads the client address
 from the gateway: `api.proxyProtocol` and `edge.proxyProtocol` with `trustedCIDRs` set
-to the gateway's source addresses, plus `gateway.envoy.proxyProtocol: true` on Envoy
+to the gateway's source addresses (the gateway pods as /32s, or a range only the
+gateway uses, never the pod CIDR), plus `gateway.envoy.proxyProtocol: true` on Envoy
 Gateway. Only connections from `trustedCIDRs` are parsed, and each must carry a v2
 header. The trust model is in
 [docs/operations.md](../docs/operations.md#proxy-protocol). Without PROXY protocol,

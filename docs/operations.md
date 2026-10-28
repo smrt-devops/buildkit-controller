@@ -28,9 +28,9 @@ Turn it on per listener, together with the gateway side:
 
 ```yaml
 api:
-  proxyProtocol: {enabled: true, trustedCIDRs: [10.244.7.0/24]}
+  proxyProtocol: {enabled: true, trustedCIDRs: [10.244.3.17/32, 10.244.5.9/32]}   # the Envoy pods
 edge:
-  proxyProtocol: {enabled: true, trustedCIDRs: [10.244.7.0/24]}
+  proxyProtocol: {enabled: true, trustedCIDRs: [10.244.3.17/32, 10.244.5.9/32]}   # the Envoy pods
 gateway:
   envoy: {enabled: true, proxyProtocol: true}   # Envoy Gateway: BackendTrafficPolicy proxyProtocol V2
 ```
@@ -39,7 +39,7 @@ gateway:
 
 The trust model:
 
-- Only connections from `trustedCIDRs` are parsed. List the gateway's source addresses: the Envoy pods' addresses, or a node or subnet range that only the gateway uses. Never a range that clients or other pods share, because any host in it could then claim any address. `0.0.0.0/0` and `::/0` are refused.
+- Only connections from `trustedCIDRs` are parsed. List the gateway's source addresses: the Envoy pods' addresses, or a node or subnet range that only the gateway uses. Never a range that clients or other pods share, because any host in it could then claim any address. Pods in a trusted range that dial the Service directly, without a header, are refused. `0.0.0.0/0` and `::/0` are refused.
 - A connection from a trusted address must open with a valid header within `headerTimeout` (5 s), or it is closed. There is no fallback to the gateway's address. The header may be at most 1040 bytes (1024 of addresses and TLVs).
 - A connection from any other address is served as itself and never parsed. A client that sends its own header from outside the trusted range only breaks its own TLS handshake.
 - A `LOCAL` header (a gateway health check) is accepted and the connection counts as the gateway's address.
