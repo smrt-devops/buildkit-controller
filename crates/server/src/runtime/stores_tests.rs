@@ -455,3 +455,49 @@ async fn one_namespace_failing_keeps_the_merged_store_ready_until_the_bound() {
     assert!(readiness.failing().is_empty(), "every namespace relisted");
     assert_eq!(keys(&store), ["a/p1", "b/q2"]);
 }
+
+/// What the client's read timeout does to a watch: when `events` yields
+/// nothing for [`READ_TIMEOUT`](crate::runtime::READ_TIMEOUT), it yields an
+/// error and ends.
+fn read_timeout(events: BoxStream<'static, Item>) -> BoxStream<'static, Item> {
+    stream::unfold(Some(events), |events| async move {
+        let mut events = events?;
+        match tokio::time::timeout(crate::runtime::READ_TIMEOUT, events.next()).await {
+            Ok(item) => item.map(|item| (item, Some(events))),
+            Err(_) => Some((failed(), None)),
+        }
+    })
+    .boxed()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_watch_turns_stale_within_the_read_timeout_plus_the_bound_and_recovers() {
+    let read = crate::runtime::READ_TIMEOUT;
+    let (store, writer) = reflector::store::<Pod>();
+    let (txs, mut watch) = fed(3);
+    let readiness = spawn_pods(writer, move || read_timeout(watch()));
+    send(&txs[0], listed(&[pod("a")]));
+    settle().await;
+    let t0 = tokio::time::Instant::now();
+    // The watch stalls: no event, no error. Within the read timeout that is
+    // indistinguishable from a quiet watch.
+    at(t0, read.checked_sub(SEC).unwrap()).await;
+    assert!(readiness.failing().is_empty());
+    // The read timeout fails it, and the relist that follows stalls too. The
+    // bound runs from that first error.
+    at(t0, (read + STALE_AFTER).checked_sub(SEC).unwrap()).await;
+    assert!(readiness.failing().is_empty(), "inside the bound");
+    at(t0, read + STALE_AFTER + SEC).await;
+    assert_eq!(readiness.failing(), ["pod_store"], "stale past the bound");
+    assert_eq!(names(&store), ["a"]);
+
+    // The stalled relist fails at 2 x read, and the next watch lists.
+    at(t0, 2 * read + 3 * SEC).await;
+    send(&txs[2], listed(&[pod("b")]));
+    settle().await;
+    assert!(
+        readiness.failing().is_empty(),
+        "a completed relist recovers"
+    );
+    assert_eq!(names(&store), ["b"]);
+}
