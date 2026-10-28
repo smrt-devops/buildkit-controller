@@ -442,3 +442,26 @@ fn watch_namespaces_must_be_unique_namespace_names() {
     let v = errs(&format!("{MIN}watchNamespace: Bad\n"));
     assert!(v.iter().any(|m| m.contains("`Bad` is not")), "{v:?}");
 }
+
+#[test]
+fn request_timeout_must_be_below_the_read_timeout() {
+    let v = errs(&format!("{MIN}kube:\n  requestTimeout: 90s\n"));
+    assert!(
+        v.iter()
+            .any(|m| m.contains("kube.requestTimeout (90s)")
+                && m.contains("client read timeout (90s)")),
+        "{v:?}"
+    );
+    let ok = format!(
+        "{MIN}kube:\n  requestTimeout: 89s\nleaderElection:\n  fenceMargin: 89s\n  leaseDuration: 600s\n"
+    );
+    let errors = match Config::from_yaml(&ok) {
+        Ok(_) => Vec::new(),
+        Err(ConfigError::Invalid(v)) => v,
+        Err(e) => panic!("{e}"),
+    };
+    assert!(
+        !errors.iter().any(|m| m.contains("read timeout")),
+        "{errors:?}"
+    );
+}

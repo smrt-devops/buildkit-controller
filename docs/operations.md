@@ -129,7 +129,7 @@ A watch can also hang without failing, for example when the API server freezes o
 
 - A healthy watch is never silent for 90 s. The API server sends a bookmark on every watch about once a minute, and 90 s leaves 30 s of margin.
 - If the API server runs with the watch cache disabled (`--watch-cache=false`), there are no bookmarks. A watch that sees no change then fails after 90 s and starts again; for the Pool and Pod caches that means a full list, so expect one extra list of each every 90 s on each replica. The replica stays Ready through these relists, but `buildkit_watch_errors_total` counts each one.
-- The timeout covers every request on the client: the Pool, Pod, Secret, Lease and claim watches, each namespace's watch when `watchNamespaces` lists several, and every write. It counts silence, not duration, so a large list that keeps streaming is not cut. Allocation, reconcile, TokenReview and Lease calls already give up after `kube.requestTimeout`, so in practice the 90 s limit ends only stalled watches and lists, and calls that have no timeout of their own.
+- The timeout covers every request on the client: the Pool, Pod, Secret, Lease and claim watches, each namespace's watch when `watchNamespaces` lists several, and every write. It counts silence, not duration, so a large list that keeps streaming is not cut. Allocation, reconcile, TokenReview and Lease calls already give up after `kube.requestTimeout`, which the controller requires to be below 90 s, so in practice the 90 s limit ends only stalled watches and lists, and calls that have no timeout of their own.
 
 ## Troubleshooting
 
