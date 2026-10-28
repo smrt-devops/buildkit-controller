@@ -439,12 +439,17 @@ fn scenarios(env: &Cluster, pod_ip: &str, r: &mut Report) -> Result<Vec<f64>> {
     let (ok, out) = client_in(
         env,
         SYSTEM_NS,
-        &format!("timeout 30 {} debug workers", direct("alloc")),
+        &format!(
+            "timeout 30 {} debug workers; rc=$?; echo rc=$rc; exit $rc",
+            direct("alloc")
+        ),
     )?;
-    // A TLS alert from buildkitd, not a timeout or a refused connect.
+    println!("{out}");
+    // buildkitd refuses the handshake at once: buildctl exits 1, not 124 from
+    // `timeout`, and the TCP connect itself succeeded.
     r.check(
         "b/alloc cert direct to worker refused",
-        !ok && out.contains("remote error: tls:"),
+        !ok && out.contains("rc=1") && !out.contains("connection refused"),
         last_line(&out),
     );
 

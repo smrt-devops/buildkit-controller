@@ -163,11 +163,11 @@ fn verify(env: &Cluster) -> Result<()> {
     })?;
     println!("installed chart with claims.enabled; pool Ready");
 
-    // 7. A cacheKey that is not a lowercase label is rejected at admission.
+    // 7. A cacheKey that starts with a hyphen is rejected at admission.
     let path = work.join("cache-key.yaml");
     std::fs::write(
         &path,
-        claim_yaml(OK_NS, "keyed", "10m", "  cacheKey: Bad_Key\n"),
+        claim_yaml(OK_NS, "keyed", "10m", "  cacheKey: \"-bad\"\n"),
     )?;
     let out = env.kubectl_raw(&["apply", "-f", &path.to_string_lossy()], None)?;
     let err = String::from_utf8_lossy(&out.stderr);
