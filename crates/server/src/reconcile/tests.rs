@@ -58,6 +58,7 @@ pub(super) struct Fx {
     pub ca: &'static LoadOutcome,
     pub tz: Option<TimeZone>,
     pub template: TemplateCheck,
+    pub network: crate::render::WorkerNetwork,
     pub sandbox_gen: Option<i64>,
     pub prev_fail: bool,
     pub creates: Vec<CreateOutcome>,
@@ -82,6 +83,7 @@ pub(super) fn fx() -> Fx {
         ca: &CA,
         tz: Some(TimeZone::UTC),
         template: TemplateCheck::Current { hash: "h".into() },
+        network: crate::render::WorkerNetwork::default(),
         sandbox_gen: Some(1),
         prev_fail: false,
         creates: Vec::new(),
@@ -133,6 +135,7 @@ impl Fx {
             pool: &self.pool,
             time_zone: self.tz.clone(),
             template: self.template.clone(),
+            network: &self.network,
             config_hash: "cfg".into(),
             platforms: Vec::new(),
             ca: self.ca,
@@ -814,6 +817,58 @@ fn template_conflict_and_invalid_spec_stop_creates_but_retire() {
         };
         assert_eq!(cond(&p, "Ready").reason, want);
     }
+}
+
+/// An `allowCIDRs` entry that reopens a protected range blocks the pool like any
+/// invalid spec: no sandbox apply, no creates, `Ready=False/InvalidSpec` naming it.
+#[test]
+fn refused_allow_cidr_is_invalid_spec() {
+    let mut f = fx().scale(2, 10);
+    f.sandbox_gen = None;
+    f.pool.spec.network.egress.allow_cidrs =
+        vec!["192.0.2.0/24".into(), "169.254.169.254/32".into()];
+    let p = f.plan();
+    assert!(creates(&p).is_empty());
+    assert!(
+        !p.actions
+            .iter()
+            .any(|a| matches!(a, Action::ApplySa | Action::ApplyNetworkPolicy))
+    );
+    let c = cond(&p, "Ready");
+    assert_eq!(
+        (c.status.as_str(), c.reason.as_str()),
+        ("False", "InvalidSpec")
+    );
+    assert!(
+        c.message.starts_with(
+            "spec.network.egress.allowCIDRs[1]: `169.254.169.254/32` overlaps the link-local"
+        ) && !c.message.contains("192.0.2.0/24"),
+        "{}",
+        c.message
+    );
+
+    // The operator permits it: the pool applies its sandbox and scales.
+    f.network.permitted_cidrs = vec!["169.254.169.254/32".into()];
+    let p = f.plan();
+    assert_eq!(creates(&p), vec![0, 1]);
+    assert!(
+        p.actions
+            .iter()
+            .any(|a| matches!(a, Action::ApplyNetworkPolicy))
+    );
+    assert_eq!(cond(&p, "Ready").status, "True");
+
+    // A cluster range is refused the same way.
+    f.network.permitted_cidrs.clear();
+    f.network.cluster_cidrs = vec!["192.0.2.128/25".into()];
+    f.pool.spec.network.egress.allow_cidrs = vec!["192.0.2.0/24".into()];
+    let c = cond(&f.plan(), "Ready").clone();
+    assert_eq!(c.reason, "InvalidSpec");
+    assert!(
+        c.message.contains("the cluster range 192.0.2.128/25"),
+        "{}",
+        c.message
+    );
 }
 
 #[test]

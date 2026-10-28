@@ -31,7 +31,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use buildkit_controller_api::v1alpha1::{BuildKitPool, BuildKitPoolStatus, Waiter, condition};
+use buildkit_controller_api::v1alpha1::{
+    BuildKitPool, BuildKitPoolSpec, BuildKitPoolStatus, Waiter, condition,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use k8s_openapi::jiff::tz::TimeZone;
 use k8s_openapi::jiff::{SignedDuration, Timestamp};
@@ -40,6 +42,7 @@ use kube::ResourceExt;
 use super::pods::{Alloc, Phase, WorkerPod, parse_slot, slot_name};
 use super::schedule;
 use crate::pki::{CA_EXPIRY_WARNING, CaBundle, LoadOutcome};
+use crate::render::{WorkerNetwork, refused_allow_cidrs};
 
 /// Max length of a condition message.
 const MESSAGE_MAX: usize = 1024;
@@ -139,6 +142,9 @@ pub struct Observed<'a> {
     pub time_zone: Option<TimeZone>,
     /// Template validation and hash.
     pub template: TemplateCheck,
+    /// `workerNetwork`: the planner refuses (`InvalidSpec`) a pool whose
+    /// `allowCIDRs` would reopen a range it keeps closed.
+    pub network: &'a WorkerNetwork,
     /// Hash of `spec.workers.buildkitdConfig` (render `config_hash`).
     pub config_hash: String,
     /// Derived `status.platforms`.
@@ -444,6 +450,18 @@ pub fn ca_warning_at(ca: &CaBundle) -> Option<Timestamp> {
         .and_then(|t| Timestamp::from_second(t.unix_timestamp()).ok())
 }
 
+/// The `InvalidSpec` message for refused `allowCIDRs` entries, naming each one.
+fn egress_refused(spec: &BuildKitPoolSpec, net: &WorkerNetwork) -> Option<String> {
+    let refused = refused_allow_cidrs(spec, net);
+    (!refused.is_empty()).then(|| {
+        refused
+            .iter()
+            .map(|c| format!("{}: {}", c.field, c.reason))
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
 /// Plans one pass for one pool.
 #[must_use]
 pub fn plan(o: &Observed<'_>, now: Timestamp, cfg: &PlanConfig) -> Plan {
@@ -494,7 +512,7 @@ impl<'a> Planner<'_, 'a> {
                 format!("unknown time zone `{}`", spec.scaling.time_zone),
             )),
             (_, TemplateCheck::Conflict { message }) => Some(("TemplateConflict", message.clone())),
-            _ => None,
+            _ => egress_refused(spec, o.network).map(|m| ("InvalidSpec", m)),
         };
         // Step 2.
         let ca = self.plan_ca();

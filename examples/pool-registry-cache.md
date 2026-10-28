@@ -22,4 +22,4 @@ The registry cache is not scoped to a caller. Every caller the pool admits can
 name any `cacheKey`, and anyone who can push to the repository can overwrite
 its refs. Use it on pools whose access rules admit one trust domain.
 
-The worker needs egress to the registry, which the default pool network policy allows for public addresses. For a registry on a private address, add its CIDR to `spec.network.egress.allowCIDRs`.
+The worker needs egress to the registry, which the default pool network policy allows for public addresses. For a registry on a private address, add its CIDR to `spec.network.egress.allowCIDRs`. The controller refuses a range that overlaps the cluster's own pod, service or node ranges, link-local or loopback; a registry inside the cluster needs its range in the operator's `workerNetwork.permittedCIDRs` (see [Worker egress](../docs/operations.md#worker-egress)).

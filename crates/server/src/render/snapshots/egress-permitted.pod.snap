@@ -1,0 +1,107 @@
+---
+source: crates/server/src/render/tests.rs
+expression: y
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    buildkit.smrt-devops.net/alloc: free
+    buildkit.smrt-devops.net/internal-ca: 0123456789abcdef
+    buildkit.smrt-devops.net/worker-cert-not-after: "2026-11-19T12:00:00Z"
+    buildkit.smrt-devops.net/worker-nonce: 00000000000000aa
+  labels:
+    app.kubernetes.io/managed-by: buildkit-controller
+    app.kubernetes.io/name: buildkitd
+    buildkit.smrt-devops.net/pool: egress-permitted
+    buildkit.smrt-devops.net/state: free
+    buildkit.smrt-devops.net/template-hash: 5783ab96b3
+  name: egress-permitted-0
+  namespace: render-verify
+  ownerReferences:
+  - apiVersion: buildkit.smrt-devops.net/v1alpha1
+    controller: true
+    kind: BuildKitPool
+    name: egress-permitted
+    uid: 2f6c1f4e-3b0a-4c43-9a55-5d4f0c7b1a10
+spec:
+  automountServiceAccountToken: false
+  containers:
+  - args:
+    - --addr=unix:///run/user/1000/buildkit/buildkitd.sock
+    - --addr=tcp://0.0.0.0:1234
+    - --tlscacert=/certs/ca.crt
+    - --tlscert=/certs/tls.crt
+    - --tlskey=/certs/tls.key
+    - --config=/etc/buildkit/buildkitd.toml
+    - --oci-worker-no-process-sandbox
+    image: moby/buildkit:v0.34.0-rootless
+    imagePullPolicy: IfNotPresent
+    name: buildkitd
+    ports:
+    - containerPort: 1234
+      name: buildkit
+      protocol: TCP
+    readinessProbe:
+      exec:
+        command:
+        - buildctl
+        - --addr
+        - unix:///run/user/1000/buildkit/buildkitd.sock
+        - debug
+        - workers
+      failureThreshold: 3
+      periodSeconds: 1
+      timeoutSeconds: 5
+    resources:
+      limits:
+        ephemeral-storage: 20Gi
+        memory: 4Gi
+      requests:
+        cpu: 500m
+        ephemeral-storage: 1Gi
+        memory: 1Gi
+    securityContext:
+      privileged: false
+    volumeMounts:
+    - mountPath: /certs
+      name: certs
+      readOnly: true
+    - mountPath: /etc/buildkit/buildkitd.toml
+      name: certs
+      readOnly: true
+      subPath: buildkitd.toml
+    - mountPath: /home/user/.local/share/buildkit
+      name: state
+  enableServiceLinks: false
+  hostIPC: false
+  hostNetwork: false
+  hostPID: false
+  restartPolicy: Never
+  securityContext:
+    appArmorProfile:
+      type: Unconfined
+    fsGroup: 1000
+    runAsGroup: 1000
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile:
+      type: Unconfined
+  serviceAccountName: egress-permitted-buildkit-worker
+  terminationGracePeriodSeconds: 5
+  volumes:
+  - name: certs
+    secret:
+      defaultMode: 288
+      items:
+      - key: tls.crt
+        path: tls.crt
+      - key: tls.key
+        path: tls.key
+      - key: ca.crt
+        path: ca.crt
+      - key: buildkitd.toml
+        path: buildkitd.toml
+      secretName: egress-permitted-0-00000000000000aa
+  - emptyDir: {}
+    name: state

@@ -134,12 +134,16 @@ fn dns_rule(net: &WorkerNetwork) -> Option<NetworkPolicyEgressRule> {
 }
 
 /// `NetworkPolicy` `<pool>-buildkit-worker`.
+///
+/// Refuses with [`RenderError::EgressRefused`] rather than render an `allowCIDRs`
+/// rule that would reopen a link-local, metadata, loopback or cluster range.
 pub fn network_policy(
     pool: &BuildKitPool,
     cfg: &RenderConfig,
 ) -> Result<NetworkPolicy, RenderError> {
     let (name, _, _) = pool_identity(pool)?;
     let net = &cfg.worker_network;
+    super::validate::check_egress(&pool.spec, net)?;
     let mut egress = Vec::new();
     egress.extend(dns_rule(net));
     let spec = &pool.spec.network.egress;

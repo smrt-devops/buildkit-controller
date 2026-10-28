@@ -856,3 +856,178 @@ proptest! {
         }
     }
 }
+
+/// A network with the pod, service and node ranges of a dual-stack cluster.
+fn cluster_net() -> WorkerNetwork {
+    WorkerNetwork {
+        cluster_cidrs: vec![
+            "10.244.0.0/16".into(),
+            "10.96.0.0/12".into(),
+            "fd00:10:244::/56".into(),
+        ],
+        ..WorkerNetwork::default()
+    }
+}
+
+#[test]
+fn allow_cidr_overlapping_a_protected_range_is_refused() {
+    let net = cluster_net();
+    for (entry, hit) in [
+        // Inside a protected range.
+        ("169.254.169.254/32", "169.254.0.0/16"),
+        ("168.63.129.16/32", "168.63.129.16/32"),
+        ("127.0.0.1/32", "127.0.0.0/8"),
+        ("fe80::1/128", "fe80::/10"),
+        ("::1/128", "::1/128"),
+        // Holding a protected range.
+        ("169.0.0.0/8", "169.254.0.0/16"),
+        ("168.63.0.0/16", "168.63.129.16/32"),
+        ("fe00::/7", "fe80::/10"),
+        ("::/120", "::1/128"),
+        // Holding or inside a cluster range.
+        ("10.0.0.0/8", "10.244.0.0/16"),
+        ("10.244.3.0/24", "10.244.0.0/16"),
+        ("10.100.0.10/32", "10.96.0.0/12"),
+        ("fd00::/8", "fd00:10:244::/56"),
+        ("fd00:10:244:7::/64", "fd00:10:244::/56"),
+        // IPv4-mapped IPv6 names the IPv4 hosts.
+        ("::ffff:169.254.169.254/128", "169.254.0.0/16"),
+        ("::ffff:10.244.1.0/120", "10.244.0.0/16"),
+        // An IPv6 range holding the whole IPv4-mapped block holds every IPv4 range.
+        ("::ffff:0:0/95", "169.254.0.0/16"),
+    ] {
+        let why = refused_allow_cidr(entry, &net).unwrap_or_else(|| panic!("{entry} allowed"));
+        assert!(
+            why.starts_with("overlaps ")
+                && why.ends_with(&format!(
+                    "{hit}; an operator can permit it in workerNetwork.permittedCIDRs"
+                )),
+            "{entry}: {why}"
+        );
+    }
+}
+
+#[test]
+fn allow_cidr_outside_protected_ranges_is_rendered() {
+    let net = cluster_net();
+    for entry in [
+        "10.20.0.0/16",
+        "192.168.10.0/24",
+        "172.16.0.0/12",
+        "192.0.2.10/32",
+        "2001:db8::/32",
+        "fd00:20::/32",
+        "169.255.0.0/16",
+        "192.0.0.0/3",
+        "::ffff:192.0.2.0/120",
+    ] {
+        assert_eq!(refused_allow_cidr(entry, &net), None, "{entry}");
+    }
+    // Without cluster ranges, 10.0.0.0/8 (a private registry network) is open.
+    assert_eq!(
+        refused_allow_cidr("10.0.0.0/8", &WorkerNetwork::default()),
+        None
+    );
+}
+
+#[test]
+fn whole_family_and_garbage_are_always_refused() {
+    let mut net = cluster_net();
+    net.permitted_cidrs = vec!["0.0.0.0/0".into(), "::/0".into()];
+    for entry in ["0.0.0.0/0", "::/0", "::ffff:0.0.0.0/96"] {
+        let why = refused_allow_cidr(entry, &net).unwrap_or_default();
+        assert_eq!(why, "opens a whole address family", "{entry}");
+    }
+    // A permitted /0 permits nothing.
+    assert!(refused_allow_cidr("169.254.169.254/32", &net).is_some());
+    for entry in [
+        "10.0.0.0",
+        "10.0.0.0/33",
+        "fe80::/129",
+        "x/8",
+        "10.0.0.0/-1",
+    ] {
+        assert_eq!(
+            refused_allow_cidr(entry, &net).as_deref(),
+            Some("is not a CIDR range"),
+            "{entry}"
+        );
+    }
+}
+
+#[test]
+fn permitted_cidrs_reopen_only_ranges_they_hold() {
+    let mut net = cluster_net();
+    net.permitted_cidrs = vec![
+        "169.254.20.0/24".into(),
+        "10.96.0.10/32".into(),
+        "fd00:10:244:1::/64".into(),
+    ];
+    for entry in [
+        "169.254.20.10/32",
+        "169.254.20.0/24",
+        "10.96.0.10/32",
+        "fd00:10:244:1::53/128",
+        "::ffff:169.254.20.10/128",
+    ] {
+        assert_eq!(refused_allow_cidr(entry, &net), None, "{entry}");
+    }
+    // A wider entry, or one outside the permitted range, stays refused.
+    for entry in [
+        "169.254.0.0/16",
+        "169.254.169.254/32",
+        "10.96.0.0/24",
+        "fd00:10:244::/56",
+    ] {
+        assert!(refused_allow_cidr(entry, &net).is_some(), "{entry}");
+    }
+}
+
+#[test]
+fn network_policy_refuses_instead_of_widening() {
+    let p = pool(
+        "p",
+        json!({"network": {"egress": {"internet": "Deny",
+            "allowCIDRs": ["192.0.2.10/32", "169.254.169.254/32", "10.244.0.0/24"]}}}),
+    );
+    let mut cfg = default_config();
+    cfg.worker_network = cluster_net();
+    let err = network_policy(&p, &cfg).unwrap_err();
+    assert!(matches!(err, RenderError::EgressRefused(_)), "{err}");
+    assert_eq!(
+        conflict_names(&err),
+        vec![
+            "spec.network.egress.allowCIDRs[1]",
+            "spec.network.egress.allowCIDRs[2]"
+        ]
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("`169.254.169.254/32` overlaps") && msg.contains("`10.244.0.0/24` overlaps"),
+        "{msg}"
+    );
+
+    // Permitting the cluster entry still leaves the metadata one refused.
+    cfg.worker_network.permitted_cidrs = vec!["10.244.0.0/24".into()];
+    assert_eq!(
+        conflict_names(&network_policy(&p, &cfg).unwrap_err()),
+        vec!["spec.network.egress.allowCIDRs[1]"]
+    );
+    // Permitting both renders every entry as its own rule.
+    cfg.worker_network
+        .permitted_cidrs
+        .push("169.254.169.254/32".into());
+    let np = network_policy(&p, &cfg).unwrap();
+    let opened: Vec<String> = np
+        .spec
+        .and_then(|s| s.egress)
+        .into_iter()
+        .flatten()
+        .flat_map(|r| r.to.into_iter().flatten())
+        .filter_map(|p| p.ip_block.map(|b| b.cidr))
+        .collect();
+    assert_eq!(
+        opened,
+        vec!["192.0.2.10/32", "169.254.169.254/32", "10.244.0.0/24"]
+    );
+}

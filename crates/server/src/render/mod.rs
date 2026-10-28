@@ -33,7 +33,9 @@ pub use cache::{
 pub use hash::{config_hash, template_hash};
 pub use objects::{ca_bundle_config_map, network_policy, service_account, worker_secret};
 pub use pod::{CACHE_INIT_NAME, pod_spec, worker_pod};
-pub use validate::{Conflict, validate_template};
+pub use validate::{
+    Conflict, PROTECTED_CIDRS, refused_allow_cidr, refused_allow_cidrs, validate_template,
+};
 
 pub use crate::pki::worker_secret_name;
 use crate::pki::{Ca, IssuedCert};
@@ -102,6 +104,10 @@ pub enum RenderError {
     /// (`Ready=False/TemplateConflict`).
     #[error("template conflict: {}", .0.iter().map(|c| format!("{} ({})", c.field, c.reason)).collect::<Vec<_>>().join("; "))]
     TemplateConflict(Vec<TemplateConflictField>),
+    /// A `spec.network.egress.allowCIDRs` entry would reopen a range the sandbox
+    /// must keep closed (`Ready=False/InvalidSpec`); see [`refused_allow_cidr`].
+    #[error("egress refused: {}", .0.iter().map(|c| format!("{} ({})", c.field, c.reason)).collect::<Vec<_>>().join("; "))]
+    EgressRefused(Vec<TemplateConflictField>),
     /// The pool object lacks a field only the API server sets.
     #[error("pool is missing metadata.{0}")]
     MissingMetadata(&'static str),
@@ -121,7 +127,9 @@ impl RenderError {
     #[must_use]
     pub fn conflict_fields(&self) -> Vec<&str> {
         match self {
-            Self::TemplateConflict(c) => c.iter().map(|c| c.field.as_str()).collect(),
+            Self::TemplateConflict(c) | Self::EgressRefused(c) => {
+                c.iter().map(|c| c.field.as_str()).collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -148,6 +156,9 @@ pub struct WorkerNetwork {
     /// range: without one the controller cannot tell cluster addresses (often global
     /// unicast on IPv6 clusters) from the internet, so IPv6 egress stays closed.
     pub cluster_cidrs: Vec<String>,
+    /// Ranges a pool's `allowCIDRs` may open although they overlap the link-local,
+    /// metadata, loopback or cluster ranges. An entry must lie wholly inside one.
+    pub permitted_cidrs: Vec<String>,
     /// Where workers may resolve names.
     pub dns: WorkerDns,
 }
@@ -183,6 +194,7 @@ impl Default for WorkerNetwork {
             .to_vec(),
             extra_denied_cidrs: Vec::new(),
             cluster_cidrs: Vec::new(),
+            permitted_cidrs: Vec::new(),
             dns: WorkerDns {
                 namespace: "kube-system".into(),
                 pod_labels: BTreeMap::from([("k8s-app".into(), "kube-dns".into())]),
@@ -197,7 +209,8 @@ impl Default for WorkerNetwork {
 pub struct Claim {
     /// 26-char allocation id.
     pub alloc_id: String,
-    /// `oidc:<iss>#<sub>` or `sa:<namespace>/<name>`.
+    /// The caller, as [`crate::auth::Identity::owner`] builds it: `sa:<namespace>/<name>`,
+    /// `claim:<namespace>/<name>#<uid>`, or `oidc:<iss>#<sub>` followed by any run claims.
     pub owner: String,
     /// RFC 3339 UTC, seconds precision.
     pub allocated_at: String,

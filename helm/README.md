@@ -188,7 +188,10 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
   selects the worker pods widens the sandbox.
 - List the cluster's IPv6 pod, service and node ranges in `workerNetwork.clusterCIDRs`, plus
   any IPv4 pod or node ranges outside RFC 1918 and 100.64.0.0/10. Until it holds an IPv6
-  range, workers get no IPv6 egress, so on an IPv6-only cluster image pulls fail.
+  range, workers get no IPv6 egress, so on an IPv6-only cluster image pulls fail. Listing
+  every pod, service and node range there also stops a pool's `allowCIDRs` from opening
+  them; `workerNetwork.permittedCIDRs` lists the exceptions (see docs/operations.md, Worker
+  egress).
 
 ## Values
 

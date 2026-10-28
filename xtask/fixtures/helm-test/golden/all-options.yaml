@@ -130,6 +130,8 @@ data:
           k8s-app: kube-dns
       extraDeniedCIDRs:
       - 203.0.113.0/24
+      permittedCIDRs:
+      - 169.254.20.10/32
 
 ---
 # Source: buildkit-controller/templates/rbac.yaml
@@ -401,7 +403,7 @@ spec:
         helm.sh/chart: buildkit-controller-0.1.0
         team: ci
       annotations:
-        checksum/config: 6d16c17f6e4c4c3d9fe16f67b6be7fb1577c1cd358131746517542aeda742ef5
+        checksum/config: 146f641520918cf70dc2f4b3dcd24b288db17ebafa4821efc56e5935bd8bb4d6
         example.com/x: "1"
     spec:
       serviceAccountName: bkc
