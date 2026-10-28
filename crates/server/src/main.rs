@@ -138,7 +138,7 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
     );
 
     let ops_stop = CancellationToken::new();
-    let ops_listener = ops::bind(ctx.config().listen.ops).await?;
+    let ops_listener = ops::bind(ctx.config().listen.ops)?;
     let mut ops_task = tokio::spawn(ops::serve(
         ops_listener,
         ops::OpsState {
