@@ -36,6 +36,9 @@ helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
   --set 'auth.oidc[0].audiences={buildkit-controller}'
 
 # 2. Create a namespace and a pool that accepts your GitHub organization.
+#    Edit the access rules in the example first: set repository_owner_id to your
+#    organization's id (gh api orgs/<org> --jq .id) and replace the sample repository. The
+#    first rule allows the main branch only; drop its `ref` claim to allow pull requests.
 kubectl create namespace ci
 kubectl label namespace ci pod-security.kubernetes.io/enforce=privileged
 kubectl apply -f examples/pool-github-oidc.yaml
@@ -59,10 +62,16 @@ jobs:
         with:
           url: https://bk.example.com:8443
           pools: ci/amd64
+          ca-cert: ${{ vars.BK_CA }}
       - run: docker buildx build --platform linux/amd64 .
 ```
 
-Replace `bk.example.com` with a DNS name that points at the Service load balancer.
+Replace `bk.example.com` with a DNS name that points at the Service load balancer. Unless you give the edge a certificate from a public CA (`edge.tls.secretName`), it serves one issued by the controller, and the Action must trust that CA. Store it in a repository or organization variable named `BK_CA`:
+
+```sh
+kubectl -n buildkit-system get configmap buildkit-controller-ca-bundle -o 'jsonpath={.data.ca\.crt}' \
+  | gh variable set BK_CA --org <org> --visibility all
+```
 
 ## Security model
 
@@ -73,6 +82,8 @@ Replace `bk.example.com` with a DNS name that points at the Service load balance
 - The controller makes and repairs its own CAs. If the CA Secret goes missing or is corrupted, the leader saves a copy, creates a new one, and the pools recover without operator action.
 
 ## Documentation
+
+The documentation site is at <https://smrt-devops.github.io/buildkit-controller/>. The same pages are linked below.
 
 - [docs/quickstart.md](docs/quickstart.md): install, first pool, first build.
 - [docs/architecture.md](docs/architecture.md): roles, the CRD, the data path.

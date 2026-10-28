@@ -10,6 +10,7 @@ See `action/`. The job needs `permissions: id-token: write`.
 - uses: smrt-devops/buildkit-controller/action@v0
   with:
     url: https://bk.example.com:8443
+    ca-cert: ${{ vars.BK_CA }}   # omit with a public-CA edge certificate
     pools: |
       ci/amd64
       ci/arm64        # more than one pool needs edge.allocationDomain and distinct pool platforms
@@ -44,6 +45,7 @@ With `docker/build-push-action`:
   uses: smrt-devops/buildkit-controller/action@v0
   with:
     url: https://bk.example.com:8443
+    ca-cert: ${{ vars.BK_CA }}   # omit with a public-CA edge certificate
     pools: ci/amd64
     cache-key: ${{ github.event.repository.name }}
 - uses: docker/build-push-action@v6

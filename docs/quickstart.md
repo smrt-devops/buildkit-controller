@@ -79,17 +79,17 @@ steps:
     with:
       url: https://bk.example.com:8443
       pools: ci/amd64
-      # ca-cert: |            # set this when the serving certificate is self-issued
-      #   -----BEGIN CERTIFICATE-----
+      ca-cert: ${{ vars.BK_CA }}   # the controller's CA; see below
   - run: docker buildx build .
 ```
 
 Inputs are `url`, `pools` (one `namespace/pool` per entry), `ttl`, `queue-timeout`, `audience` (default `buildkit-controller`), `builder-name` and `ca-cert`. The outputs are `builder`, `platforms` and `allocation-ids`. The post step removes the builder and releases every allocation even when the job fails.
 
-By default the edge serves a certificate issued by the controller's client CA. To trust it, read the CA from the ConfigMap the leader maintains and pass it as `ca-cert`.
+By default the edge serves a certificate issued by the controller's client CA. To trust it, read the CA from the ConfigMap the leader maintains and store it in the `BK_CA` variable that the workflow passes as `ca-cert`.
 
 ```sh
-kubectl -n buildkit-system get configmap buildkit-controller-ca-bundle -o 'jsonpath={.data.ca\.crt}'
+kubectl -n buildkit-system get configmap buildkit-controller-ca-bundle -o 'jsonpath={.data.ca\.crt}' \
+  | gh variable set BK_CA --repo <owner>/<repo>
 ```
 
 Use a certificate from a public CA, through `edge.tls.secretName`, to skip this step.
@@ -102,7 +102,7 @@ On a cluster, a ServiceAccount token is the simplest credential. The pool above 
 
 ```sh
 export TOKEN=$(kubectl -n ci create token builder --audience buildkit-controller)
-export API=https://localhost:8443 POOL=ci/dev
+export API=https://bk.example.com:8443 POOL=ci/dev   # https://localhost:8443 on kind
 kubectl -n buildkit-system get configmap buildkit-controller-ca-bundle -o 'jsonpath={.data.ca\.crt}' > /tmp/bk-ca.pem
 export API_CA=/tmp/bk-ca.pem
 sh docs/ci/buildkit-allocate.sh sh -c 'docker buildx build --builder "$BUILDER" .'
