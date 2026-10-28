@@ -2298,8 +2298,10 @@ async fn two_replicas_never_claim_the_same_pod() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn two_replicas_creating_in_one_slot_move_the_loser_to_the_next() {
-    let e = env_with(2, true, 10);
+async fn two_replicas_creating_in_one_slot_leave_one_pod_and_one_loser() {
+    // One slot, and both replicas see it free: the second create gets
+    // AlreadyExists, finds no other slot, and claims nothing.
+    let e = env_with(1, true, 10);
     let pods = e.fake.w.lock().unwrap().writer.as_reader();
     let (b, _) = e.replica(pods);
     let ea = Arc::clone(&e.engine);
@@ -2309,17 +2311,20 @@ async fn two_replicas_creating_in_one_slot_move_the_loser_to_the_next() {
     let creates: Vec<String> = (e.fake.calls().into_iter())
         .filter(|c| c.starts_with("create "))
         .collect();
-    // Both picked the same free slot; the loser got AlreadyExists and took the other.
-    assert_eq!(creates.len(), 3, "{creates:?}");
-    assert_eq!(creates[0], creates[1]);
-    assert_ne!(creates[1], creates[2]);
+    assert_eq!(creates, ["create p-0", "create p-0"]);
     e.fake.set_ready("p-0");
-    e.fake.set_ready("p-1");
-    let (a, b) = (ha.await.unwrap().unwrap(), hb.await.unwrap().unwrap());
-    let mut names = [a.pod().0.to_owned(), b.pod().0.to_owned()];
-    names.sort();
-    assert_eq!(names, ["p-0", "p-1"]);
-    let _ = (a.commit(), b.commit());
+    let (a, b) = (ha.await.unwrap(), hb.await.unwrap());
+    let (won, lost) = if a.is_ok() { (a, b) } else { (b, a) };
+    assert!(
+        matches!(lost, Err(AllocError::PoolExhausted(_))),
+        "{:?}",
+        lost.err()
+    );
+    let won = won.unwrap();
+    assert_eq!(won.pod().0, "p-0");
+    let pod = e.fake.get("p-0").unwrap();
+    assert_eq!(ann(&pod, ANN_ALLOC), Some(won.response().id.as_str()));
+    let _ = won.commit();
 }
 
 #[tokio::test(start_paused = true)]
