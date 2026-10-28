@@ -215,6 +215,13 @@ fn containers(spec: &BuildKitPoolSpec, out: &mut Vec<Conflict>) {
             );
         }
     }
+    mounts(spec, &at, out);
+}
+
+fn mounts(spec: &BuildKitPoolSpec, at: &str, out: &mut Vec<Conflict>) {
+    let Some(c) = spec.template.spec.containers.first() else {
+        return;
+    };
     for (i, m) in c.volume_mounts.iter().enumerate() {
         let path = &m.mount_path;
         if has_control(path) {
