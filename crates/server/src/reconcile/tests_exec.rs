@@ -10,7 +10,7 @@ use buildkit_controller_api::v1alpha1::{BuildKitPool, BuildKitPoolStatus, condit
 use futures::future::BoxFuture;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret};
 use k8s_openapi::api::events::v1::Event;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use k8s_openapi::jiff::Timestamp;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -94,8 +94,12 @@ impl KubeOps for Fake {
         pod: &str,
         _uid: &str,
         expected: &str,
+        expires_at: Option<&str>,
     ) -> OpResult<Option<String>> {
-        self.call(format!("retire:{pod}:{expected}"))?;
+        match expires_at {
+            Some(e) => self.call(format!("retire:{pod}:{expected}:{e}"))?,
+            None => self.call(format!("retire:{pod}:{expected}"))?,
+        }
         Ok(Some("rv-7".into()))
     }
     async fn delete_pod(
@@ -241,6 +245,7 @@ fn full_pass() -> Vec<Action> {
             pod: "p-3".into(),
             uid: "u3".into(),
             alloc_id: "a3".into(),
+            expires_at: Some("2026-01-01T00:00:00Z".into()),
             reason: RetireReason::Expired,
         },
         Action::CreatePod {
@@ -285,11 +290,10 @@ async fn actions_run_in_plan_order() {
             "delete:p-5",
             "retire:p-2:free",
             "delete:p-2",
-            "retire:p-3:a3",
+            "retire:p-3:a3:2026-01-01T00:00:00Z",
             "delete:p-3",
-            "secret_create:p-0-N",
             "create:p-0",
-            "secret_reown:p-0-N:Pod/uid-p-0",
+            "secret_create:p-0-N:Pod/uid-p-0",
             "status",
             "prune:1",
             "prune:0",
@@ -421,25 +425,43 @@ async fn create_outcomes_are_classified() {
     assert!(matches!(results[1], CreateResult::Failed { .. }));
     assert_eq!(results[2], CreateResult::Created);
     assert_eq!(r.created.len(), 1);
-    // The 409 deletes its own Secret by name; the unknown outcome keeps it (the
-    // pod may mount it); the created pod takes it over.
+    // A refused create gets no Secret. An unknown outcome is read back first,
+    // and no pod of this create means no Secret. The created pod owns its
+    // Secret from the start.
     assert_eq!(
         fake.calls_n(),
         [
-            "secret_create:p-0-N",
             "create:p-0",
-            "secret_delete:p-0-N",
-            "secret_create:p-1-N",
             "create:p-1",
-            "secret_create:p-2-N",
+            "get_pod:p-1",
             "create:p-2",
-            "secret_reown:p-2-N:Pod/uid-p-2",
+            "secret_create:p-2-N:Pod/uid-p-2",
         ]
     );
-    let calls = fake.calls();
+}
+
+#[tokio::test]
+async fn a_refused_secret_create_leaves_a_pod_that_cannot_start() {
+    let (p, ca) = (pool(), valid_ca());
+    let fake = Fake::failing(&[("secret_create", OpError::Other("forbidden".into()))]);
+    let create = vec![Action::CreatePod {
+        slot: 0,
+        name: "p-0".into(),
+    }];
+    let r = execute(
+        &fake,
+        &CaGuard::default(),
+        &env(&p, &ca, None, 0),
+        &plan(create),
+    )
+    .await;
+    // The pod exists (the planner retires it at startTimeout), and the
+    // failure counts toward the create backoff.
+    assert_eq!(r.created.len(), 1);
+    assert!(matches!(r.creates[0].result, CreateResult::Failed { .. }));
     assert_eq!(
-        calls[0]["secret_create:".len()..],
-        calls[2]["secret_delete:".len()..]
+        fake.calls_n(),
+        ["create:p-0", "secret_create:p-0-N:Pod/uid-p-0"]
     );
 }
 
@@ -885,7 +907,14 @@ impl KubeOps for Hang {
     async fn create_pod(&self, _ns: &str, _pod: &Pod) -> OpResult<Pod> {
         self.hang("create").await
     }
-    async fn retire(&self, _: &str, _: &str, _: &str, _: &str) -> OpResult<Option<String>> {
+    async fn retire(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+    ) -> OpResult<Option<String>> {
         self.hang("retire").await
     }
     async fn delete_pod(
@@ -1077,23 +1106,24 @@ fn all_trigger_reaches_remembered_pools_that_left_the_store() {
 }
 
 impl WorkerSecrets for Fake {
+    /// Records the owner; the key `secret_create` in `fail` fails every create.
     fn create_worker_secret(&self, s: &Secret) -> BoxFuture<'static, Result<(), String>> {
         let name = s.metadata.name.clone().unwrap_or_default();
-        let res = self.call(format!("secret_create:{name}"));
+        let owners: Vec<String> = (s.metadata.owner_references.iter().flatten())
+            .map(|o| format!("{}/{}", o.kind, o.uid))
+            .collect();
+        let res = self
+            .call(format!("secret_create:{name}:{}", owners.join(",")))
+            .and(self.fail.get("secret_create").cloned().map_or(Ok(()), Err));
         Box::pin(async move { res.map_err(|e| e.to_string()) })
     }
-    fn reown_worker_secret(
+    fn get_worker_pod(
         &self,
         _: &str,
         name: &str,
-        owner: OwnerReference,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        let res = self.call(format!("secret_reown:{name}:{}/{}", owner.kind, owner.uid));
-        Box::pin(async move { res.map_err(|e| e.to_string()) })
-    }
-    fn delete_worker_secret(&self, _: &str, name: &str) -> BoxFuture<'static, Result<(), String>> {
-        let res = self.call(format!("secret_delete:{name}"));
-        Box::pin(async move { res.map_err(|e| e.to_string()) })
+    ) -> BoxFuture<'static, Result<Option<Pod>, String>> {
+        let res = self.call(format!("get_pod:{name}"));
+        Box::pin(async move { res.map(|()| None).map_err(|e| e.to_string()) })
     }
 }
 
@@ -1101,16 +1131,8 @@ impl WorkerSecrets for Hang {
     fn create_worker_secret(&self, _: &Secret) -> BoxFuture<'static, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
-    fn reown_worker_secret(
-        &self,
-        _: &str,
-        _: &str,
-        _: OwnerReference,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn delete_worker_secret(&self, _: &str, _: &str) -> BoxFuture<'static, Result<(), String>> {
-        Box::pin(async { Ok(()) })
+    fn get_worker_pod(&self, _: &str, _: &str) -> BoxFuture<'static, Result<Option<Pod>, String>> {
+        Box::pin(async { Ok(None) })
     }
 }
 
@@ -1179,12 +1201,10 @@ async fn cached_slot_creates_its_volume_before_the_pod() {
         [
             "get_pvc:p-cache-1",
             "create_pvc:p-cache-1",
-            "secret_create:p-1-N",
             "create:p-1",
-            "secret_reown:p-1-N:Pod/uid-p-1",
-            "secret_create:p-2-N",
+            "secret_create:p-1-N:Pod/uid-p-1",
             "create:p-2",
-            "secret_reown:p-2-N:Pod/uid-p-2",
+            "secret_create:p-2-N:Pod/uid-p-2",
         ]
     );
     assert_eq!(state_claim(&r.created[0]).as_deref(), Some("p-cache-1"));
@@ -1217,34 +1237,66 @@ async fn volume_create_conflict_goes_on_and_other_errors_fail_the_create() {
 
 #[tokio::test]
 async fn current_volume_passes_its_cache_key_to_the_pod() {
+    use crate::render::{KEY_CACHE_GENERATION, KEY_CACHE_KEYS, KEY_CACHE_SCOPE, pod_cache_keys};
+    let ann = |p: &Pod, k: &str| {
+        p.metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(k).cloned())
+    };
     let (p, ca) = (cached_pool(), valid_ca());
-    let fake = Fake::default();
-    seed_pvc(&fake, &p, 0, |v| {
-        v.metadata.annotations.get_or_insert_default().insert(
-            crate::render::KEY_CACHE_KEYS.into(),
-            "repo-main,repo-dev".into(),
+    // (PVC cache-scope, expected P cache-scope, P cache-generation, keys copied)
+    let cases = [
+        // Bound: the warm pod serves the owner and keeps the generation and keys.
+        (Some("s1@g1"), "s1", Some("g1"), true),
+        // Never bound (or a volume from before scopes): serves any scope, emptied.
+        (None, "", None, false),
+        // Unbound by a recycle.
+        (Some(""), "", None, false),
+        // Malformed: treated as unbound.
+        (Some("s1"), "", None, false),
+    ];
+    for (binding, scope, generation, keys) in cases {
+        let fake = Fake::default();
+        seed_pvc(&fake, &p, 0, |v| {
+            let a = v.metadata.annotations.get_or_insert_default();
+            a.insert(KEY_CACHE_KEYS.into(), "repo-main,repo-dev".into());
+            if let Some(b) = binding {
+                a.insert(KEY_CACHE_SCOPE.into(), b.into());
+            }
+        });
+        let r = execute(
+            &fake,
+            &CaGuard::default(),
+            &env(&p, &ca, None, 0),
+            &plan(vec![create(0)]),
+        )
+        .await;
+        assert_eq!(
+            fake.calls_n(),
+            [
+                "get_pvc:p-cache-0",
+                "create:p-0",
+                "secret_create:p-0-N:Pod/uid-p-0",
+            ]
         );
-    });
-    let r = execute(
-        &fake,
-        &CaGuard::default(),
-        &env(&p, &ca, None, 0),
-        &plan(vec![create(0)]),
-    )
-    .await;
-    assert_eq!(
-        fake.calls_n(),
-        [
-            "get_pvc:p-cache-0",
-            "secret_create:p-0-N",
-            "create:p-0",
-            "secret_reown:p-0-N:Pod/uid-p-0",
-        ]
-    );
-    assert_eq!(
-        crate::render::pod_cache_keys(&r.created[0]),
-        Some("repo-main,repo-dev")
-    );
+        let pod = &r.created[0];
+        assert_eq!(
+            ann(pod, KEY_CACHE_SCOPE).as_deref(),
+            Some(scope),
+            "{binding:?}"
+        );
+        assert_eq!(
+            ann(pod, KEY_CACHE_GENERATION).as_deref(),
+            generation,
+            "{binding:?}"
+        );
+        assert_eq!(
+            pod_cache_keys(pod),
+            keys.then_some("repo-main,repo-dev"),
+            "{binding:?}"
+        );
+    }
 }
 
 #[tokio::test]

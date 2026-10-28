@@ -128,7 +128,7 @@ impl AllocMetrics {
             .set(i64::try_from(n).unwrap_or(i64::MAX));
     }
 
-    /// `result` = `ok`, `timeout`, `cancelled`, `full`.
+    /// `result` = `ok`, `timeout`, `cancelled`, `full`, `shutting_down`.
     pub fn queue_wait(&self, ns: &str, p: &str, result: &str, secs: f64) {
         self.queue_wait
             .get_or_create(&with(pool(ns, p), "result", result))
@@ -140,14 +140,16 @@ impl AllocMetrics {
         self.conflicts.get_or_create(&pool(ns, p)).inc();
     }
 
-    /// `reason` = `released`, `abandoned`, `start_timeout`.
+    /// `reason` = `released`, `abandoned`, `start_timeout`, or `cache_scope` (a warm pod
+    /// bound to another cache scope was retired so a request could take its slot).
     pub fn release(&self, ns: &str, p: &str, reason: &str) {
         self.releases
             .get_or_create(&with(pool(ns, p), "reason", reason))
             .inc();
     }
 
-    /// `result` = `hit`, `miss`, `spill`, `cold` or `uncached`.
+    /// `result` = `hit`, `miss`, `spill`, `cold`, `wiped` (a pod created on a volume that
+    /// another cache scope owned) or `uncached`.
     pub fn affinity(&self, ns: &str, p: &str, result: &str) {
         self.cache_affinity
             .get_or_create(&with(pool(ns, p), "result", result))

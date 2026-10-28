@@ -166,6 +166,14 @@ pub fn scenarios() -> Result<Vec<Scenario>, FixtureError> {
     let mut dual_stack = scenario("dual-stack-cluster", json!({}))?;
     dual_stack.config.worker_network.cluster_cidrs =
         vec!["34.118.224.0/20".into(), "2600:1f18:1234:5600::/56".into()];
+    // allowCIDRs entries inside cluster and link-local ranges the operator permits.
+    let mut permitted = scenario(
+        "egress-permitted",
+        json!({"network": {"egress": {"internet": "Deny", "allowCIDRs": ["169.254.20.10/32", "10.96.0.10/32"]}}}),
+    )?;
+    permitted.config.worker_network.cluster_cidrs = vec!["10.96.0.0/12".into()];
+    permitted.config.worker_network.permitted_cidrs =
+        vec!["169.254.20.10/32".into(), "10.96.0.0/24".into()];
     vec![
         scenario("default", json!({})),
         scenario("full-template", full_template()),
@@ -197,6 +205,7 @@ pub fn scenarios() -> Result<Vec<Scenario>, FixtureError> {
         Ok(preclaimed),
         Ok(nodelocal),
         Ok(dual_stack),
+        Ok(permitted),
     ]
     .into_iter()
     .collect()

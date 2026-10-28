@@ -21,7 +21,7 @@ spec:
         {{- with .Values.podAnnotations }}{{ toYaml . | nindent 8 }}{{ end }}
     spec:
       serviceAccountName: {{ $fn }}
-      terminationGracePeriodSeconds: {{ add (include "bkc.seconds" .Values.shutdown.delay | int) (include "bkc.seconds" .Values.shutdown.drainTimeout | int) 10 }}
+      terminationGracePeriodSeconds: {{ add (include "bkc.seconds" .Values.shutdown.delay | int) (include "bkc.drainSeconds" . | int) 10 }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets: {{- toYaml . | nindent 8 }}
       {{- end }}

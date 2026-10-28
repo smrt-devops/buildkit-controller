@@ -16,11 +16,13 @@ spec:
           claims:
             repository_owner_id: "12345678"   # the org's numeric id (gh api orgs/<org> --jq .id); names can be re-registered
             ref: refs/heads/main
-      # One repository, any ref, but only from release workflows.
+            event_name: push   # pull_request_target runs can run fork code, so admit pushes only
+      # One repository, any ref, but only pushes from release workflows.
       - oidc:
           issuer: https://token.actions.githubusercontent.com
           claims:
-            repository: smrt-devops/app
+            repository_id: "87654321"   # the repository's numeric id (gh api repos/<owner>/<name> --jq .id)
+            event_name: push
             job_workflow_ref: smrt-devops/app/.github/workflows/release.yml@*
       # In-cluster jobs that run as the builder ServiceAccount in this namespace.
       - serviceAccount:

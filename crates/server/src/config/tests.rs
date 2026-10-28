@@ -85,6 +85,51 @@ fn bad_duration_is_reported() {
 }
 
 #[test]
+fn drain_timeout_is_unset_by_default_and_bounded_by_the_connection_lifetime() {
+    let c = Config::from_yaml(MIN).unwrap();
+    assert_eq!(c.shutdown_delay(), Duration::from_secs(5));
+    assert_eq!(c.drain_timeout(), None);
+    assert_eq!(c.drain_budget(), MAX_CONNECTION_LIFETIME);
+    assert_eq!(MAX_CONNECTION_LIFETIME, Duration::from_mins(1445));
+}
+
+#[test]
+fn drain_timeout_when_set_is_a_hard_cap() {
+    let c = Config::from_yaml(&format!("{MIN}shutdown:\n  drainTimeout: 90s\n")).unwrap();
+    assert_eq!(c.drain_timeout(), Some(Duration::from_secs(90)));
+    assert_eq!(c.drain_budget(), Duration::from_secs(90));
+    let v = errs(&format!("{MIN}shutdown:\n  drainTimeout: later\n"));
+    assert!(
+        v.iter().any(|m| m.contains("shutdown.drainTimeout")),
+        "{v:?}"
+    );
+}
+
+/// The drain bound follows the longest connection the edge lets live: the CRD's
+/// `maxTTL` cap plus the cert margin past the allocation's expiry.
+#[test]
+fn max_connection_lifetime_matches_the_ttl_cap_and_cert_margin() {
+    use buildkit_controller_api::v1alpha1::BuildKitPoolSpec;
+    let spec = |ttl: &str| {
+        let mut s: BuildKitPoolSpec = serde_json::from_value(serde_json::json!(
+            {"access": {"rules": [{"serviceAccount": {"name": "builder"}}]}}
+        ))
+        .unwrap();
+        s.allocation.max_ttl = CrdDuration::new(ttl);
+        s.validate()
+    };
+    assert!(spec("24h").is_ok());
+    assert!(
+        spec("24h0m1s").is_err(),
+        "the CRD cap moved; update MAX_CONNECTION_LIFETIME"
+    );
+    let margin = Duration::from_secs(
+        u64::try_from(crate::alloc::pods::CERT_MARGIN.whole_seconds()).unwrap(),
+    );
+    assert_eq!(MAX_CONNECTION_LIFETIME, Duration::from_hours(24) + margin);
+}
+
+#[test]
 fn settings_require_pod_env() {
     let dir = std::env::temp_dir().join(format!("bkc-cfg-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -290,6 +335,34 @@ fn worker_network_cidrs_must_be_canonical_strict_subsets() {
 }
 
 #[test]
+fn permitted_cidrs_must_be_canonical_and_not_a_whole_family() {
+    let v = errs(&format!(
+        "{MIN}workerNetwork:\n  permittedCIDRs: ['10.0.0.1/8', '0.0.0.0/0', '::/0']\n"
+    ));
+    assert!(
+        v.iter()
+            .any(|m| m.contains("permittedCIDRs: `10.0.0.1/8` is not a canonical CIDR")),
+        "{v:?}"
+    );
+    for whole in ["0.0.0.0/0", "::/0"] {
+        assert!(
+            v.iter()
+                .any(|m| m.contains(&format!("`{whole}` would permit a whole address family"))),
+            "{whole}: {v:?}"
+        );
+    }
+    assert_eq!(v.len(), 3, "{v:?}");
+    let ok = Config::from_yaml(&format!(
+        "{MIN}workerNetwork:\n  permittedCIDRs: ['169.254.20.10/32']\n"
+    ))
+    .unwrap();
+    assert_eq!(
+        ok.render_config("ns").worker_network.permitted_cidrs,
+        vec!["169.254.20.10/32"]
+    );
+}
+
+#[test]
 fn sa_audiences_must_not_name_the_api_server() {
     for aud in [
         "https://kubernetes.default.svc",
@@ -353,4 +426,119 @@ fn claims_are_off_unless_enabled() {
     assert!(c.claims.enabled && c.claims.namespaces == ["ci"]);
     let e = Config::from_yaml(&format!("{MIN}claims:\n  enable: true\n")).unwrap_err();
     assert!(matches!(e, ConfigError::Parse(_)), "{e}");
+}
+
+#[test]
+fn watch_namespaces_default_to_cluster_wide() {
+    let c = Config::from_yaml(MIN).unwrap();
+    assert!(c.watched_namespaces().is_empty());
+    let c =
+        Config::from_yaml(&format!("{MIN}watchNamespace: \"\"\nwatchNamespaces: []\n")).unwrap();
+    assert!(c.watched_namespaces().is_empty());
+}
+
+#[test]
+fn watch_namespaces_list_and_deprecated_alias() {
+    let c = Config::from_yaml(&format!("{MIN}watchNamespaces: [team-a, team-b]\n")).unwrap();
+    assert_eq!(c.watched_namespaces(), ["team-a", "team-b"]);
+    let c = Config::from_yaml(&format!("{MIN}watchNamespace: ci\n")).unwrap();
+    assert_eq!(c.watched_namespaces(), ["ci"]);
+}
+
+#[test]
+fn watch_namespace_and_watch_namespaces_are_exclusive() {
+    let v = errs(&format!("{MIN}watchNamespace: ci\nwatchNamespaces: [ci]\n"));
+    assert!(v.iter().any(|m| m.contains("both set")), "{v:?}");
+}
+
+#[test]
+fn watch_namespaces_must_be_unique_namespace_names() {
+    let v = errs(&format!(
+        "{MIN}watchNamespaces: [ci, ci, \"\", Bad_Name, -x]\n"
+    ));
+    assert!(
+        v.iter().any(|m| m.contains("`ci` is listed twice")),
+        "{v:?}"
+    );
+    for bad in ["``", "`Bad_Name`", "`-x`"] {
+        assert!(
+            v.iter()
+                .any(|m| m.contains(&format!("{bad} is not a namespace name"))),
+            "{bad}: {v:?}"
+        );
+    }
+    let v = errs(&format!("{MIN}watchNamespace: Bad\n"));
+    assert!(v.iter().any(|m| m.contains("`Bad` is not")), "{v:?}");
+}
+
+#[test]
+fn proxy_protocol_is_off_by_default() {
+    let c = Config::from_yaml(MIN).unwrap();
+    for p in [&c.api.proxy_protocol, &c.edge.proxy_protocol] {
+        assert!(!p.enabled);
+        assert!(p.trusted_cidrs.is_empty());
+        assert_eq!(p.header_timeout.as_str(), "5s");
+    }
+}
+
+#[test]
+fn proxy_protocol_parses_per_listener() {
+    let c = Config::from_yaml(&format!(
+        "{MIN}  proxyProtocol: {{enabled: true, trustedCIDRs: [10.244.0.0/16, \"fd00::/8\"], headerTimeout: 2s}}\napi:\n  proxyProtocol: {{enabled: true, trustedCIDRs: [192.0.2.10/32]}}\n"
+    ))
+    .unwrap();
+    assert_eq!(c.edge.proxy_protocol.trusted_cidrs.len(), 2);
+    assert_eq!(c.edge.proxy_protocol.header_timeout.as_str(), "2s");
+    assert!(c.api.proxy_protocol.enabled);
+}
+
+#[test]
+fn proxy_protocol_needs_canonical_trusted_cidrs() {
+    let v = errs(&format!(
+        "{MIN}  proxyProtocol: {{enabled: true}}\napi:\n  proxyProtocol: {{enabled: true, trustedCIDRs: [10.0.0.1/8, 0.0.0.0/0, \"::ffff:10.0.0.0/104\", nonsense], headerTimeout: 0s}}\n"
+    ));
+    assert!(
+        v.iter()
+            .any(|m| m.contains("edge.proxyProtocol.trustedCIDRs must list")),
+        "{v:?}"
+    );
+    for bad in ["10.0.0.1/8", "::ffff:10.0.0.0/104", "nonsense"] {
+        assert!(
+            v.iter()
+                .any(|m| m.starts_with("api.proxyProtocol.trustedCIDRs") && m.contains(bad)),
+            "{bad}: {v:?}"
+        );
+    }
+    assert!(
+        v.iter().any(|m| m.contains("would trust every address")),
+        "{v:?}"
+    );
+    assert!(
+        v.iter()
+            .any(|m| m.contains("api.proxyProtocol.headerTimeout must be positive")),
+        "{v:?}"
+    );
+}
+
+#[test]
+fn request_timeout_must_be_below_the_read_timeout() {
+    let v = errs(&format!("{MIN}kube:\n  requestTimeout: 90s\n"));
+    assert!(
+        v.iter()
+            .any(|m| m.contains("kube.requestTimeout (90s)")
+                && m.contains("client read timeout (90s)")),
+        "{v:?}"
+    );
+    let ok = format!(
+        "{MIN}kube:\n  requestTimeout: 89s\nleaderElection:\n  fenceMargin: 89s\n  leaseDuration: 600s\n"
+    );
+    let errors = match Config::from_yaml(&ok) {
+        Ok(_) => Vec::new(),
+        Err(ConfigError::Invalid(v)) => v,
+        Err(e) => panic!("{e}"),
+    };
+    assert!(
+        !errors.iter().any(|m| m.contains("read timeout")),
+        "{errors:?}"
+    );
 }

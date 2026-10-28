@@ -47,6 +47,10 @@ pub enum AllocError {
     /// HTTP 503, Kubernetes API timeout or 5xx with unknown outcome.
     #[error("kubernetes API unavailable")]
     UpstreamError,
+    /// HTTP 503 with `Retry-After`, the replica is shutting down. Returned only
+    /// before a pod was claimed for the request.
+    #[error("replica is shutting down; retry")]
+    ShuttingDown,
 }
 
 impl AllocError {
@@ -66,6 +70,7 @@ impl AllocError {
             Self::NotReady => ErrorCode::NotReady,
             Self::CaUnavailable => ErrorCode::CaUnavailable,
             Self::UpstreamError => ErrorCode::UpstreamError,
+            Self::ShuttingDown => ErrorCode::ShuttingDown,
         }
     }
 }

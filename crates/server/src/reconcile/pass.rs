@@ -218,6 +218,7 @@ pub async fn run<O: KubeOps>(
         pool,
         time_zone: TimeZone::get(&pool.spec.scaling.time_zone).ok(),
         template: template_check(pool),
+        network: &settings.render.worker_network,
         config_hash: config_hash.clone(),
         platforms: platforms(pool),
         ca: &loaded,

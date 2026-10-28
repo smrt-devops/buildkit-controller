@@ -1,0 +1,5 @@
+# expect: set watchNamespaces or the deprecated watchNamespace, not both
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+watchNamespace: ci
+watchNamespaces: [ci]
+gateway: {enabled: false}

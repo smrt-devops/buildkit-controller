@@ -24,14 +24,18 @@ use buildkit_controller_api::v1alpha1::{BuildKitPool, GROUP, VERSION};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 
 pub use cache::{
-    CACHE_VOLUME_NAME, KEY_CACHE_KEYS, LABEL_VOLUME_HASH, buildkitd_config, cache_limit,
-    cache_volume, cache_volume_name, cache_volume_slot, gc_keep_bytes, is_cached_slot,
-    keys_contain, pod_cache_keys, push_key, quantity_bytes, set_pod_cache_keys, volume_hash,
+    Binding, Bound, CACHE_VOLUME_NAME, GENERATION_FILE, KEY_CACHE_GENERATION, KEY_CACHE_KEYS,
+    KEY_CACHE_SCOPE, LABEL_VOLUME_HASH, bind_pod, buildkitd_config, cache_limit, cache_volume,
+    cache_volume_name, cache_volume_slot, gc_keep_bytes, is_cached_slot, keys_contain,
+    pod_cache_keys, pod_serves, push_key, quantity_bytes, scope_id, set_pod_cache_keys,
+    volume_hash, won_binding,
 };
 pub use hash::{config_hash, template_hash};
 pub use objects::{ca_bundle_config_map, network_policy, service_account, worker_secret};
-pub use pod::{pod_spec, worker_pod};
-pub use validate::{Conflict, validate_template};
+pub use pod::{CACHE_INIT_NAME, pod_spec, worker_pod};
+pub use validate::{
+    Conflict, PROTECTED_CIDRS, refused_allow_cidr, refused_allow_cidrs, validate_template,
+};
 
 pub use crate::pki::worker_secret_name;
 use crate::pki::{Ca, IssuedCert};
@@ -146,6 +150,9 @@ pub struct WorkerNetwork {
     /// range: without one the controller cannot tell cluster addresses (often global
     /// unicast on IPv6 clusters) from the internet, so IPv6 egress stays closed.
     pub cluster_cidrs: Vec<String>,
+    /// Ranges a pool's `allowCIDRs` may open although they overlap the link-local,
+    /// metadata, loopback, cluster or extra denied ranges. An entry must lie wholly inside one.
+    pub permitted_cidrs: Vec<String>,
     /// Where workers may resolve names.
     pub dns: WorkerDns,
 }
@@ -181,6 +188,7 @@ impl Default for WorkerNetwork {
             .to_vec(),
             extra_denied_cidrs: Vec::new(),
             cluster_cidrs: Vec::new(),
+            permitted_cidrs: Vec::new(),
             dns: WorkerDns {
                 namespace: "kube-system".into(),
                 pod_labels: BTreeMap::from([("k8s-app".into(), "kube-dns".into())]),
@@ -195,7 +203,8 @@ impl Default for WorkerNetwork {
 pub struct Claim {
     /// 26-char allocation id.
     pub alloc_id: String,
-    /// `oidc:<iss>#<sub>` or `sa:<namespace>/<name>`.
+    /// The caller, as [`crate::auth::Identity::owner`] builds it: `sa:<namespace>/<name>`,
+    /// `claim:<namespace>/<name>#<uid>`, or `oidc:<iss>#<sub>` followed by any run claims.
     pub owner: String,
     /// RFC 3339 UTC, seconds precision.
     pub allocated_at: String,

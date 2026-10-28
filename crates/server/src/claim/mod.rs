@@ -26,9 +26,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::alloc::AllocService;
+use crate::config::Config;
 use crate::runtime::AppContext;
 use crate::runtime::hooks::{BoxResult, Component, LeaderWork};
 use crate::runtime::leader::{BoxFut, supervise};
+use crate::runtime::stores::scoped_watch;
 use logic::{Binding, Disposition};
 
 /// Claims allocating at once; the rest wait for the next tick.
@@ -130,6 +132,18 @@ impl LeaderWork for Term {
     }
 }
 
+/// Namespaces whose claims are watched, `[]` = all. Cluster-wide the
+/// controller reads every claim and refuses those outside `claims.namespaces`;
+/// with `watchNamespaces` set it has no cluster-wide read and watches
+/// `claims.namespaces` only.
+fn claim_scope(cfg: &Config) -> &[String] {
+    if cfg.watched_namespaces().is_empty() {
+        &[]
+    } else {
+        &cfg.claims.namespaces
+    }
+}
+
 /// One leadership term: watch claims and reconcile them until dropped.
 async fn run_term(t: Term, term: u64) {
     let (ctx, alloc, metrics) = (&t.ctx, &t.alloc, &t.metrics);
@@ -137,9 +151,11 @@ async fn run_term(t: Term, term: u64) {
     let (store, writer) = reflector::store::<BuildKitClaim>();
     let watch = reflector(
         writer,
-        watcher(
-            Api::<BuildKitClaim>::all(client.clone()),
-            watcher::Config::default(),
+        scoped_watch(
+            client.clone(),
+            claim_scope(ctx.config()),
+            &watcher::Config::default(),
+            store.clone(),
         )
         .default_backoff(),
     )
@@ -511,5 +527,14 @@ mod tests {
             all.map(Outcome::as_str),
             ["bound", "queued", "failed", "expired", "lost"]
         );
+    }
+
+    #[test]
+    fn claims_are_watched_cluster_wide_only_when_pools_are() {
+        let min = "edge:\n  endpoint: tcp://bk.example.com:8444\n  serverName: bk.example.com\nclaims:\n  enabled: true\n  namespaces: [apps]\n";
+        let cfg = Config::from_yaml(min).unwrap();
+        assert!(claim_scope(&cfg).is_empty());
+        let cfg = Config::from_yaml(&format!("{min}watchNamespaces: [ci-a, ci-b]\n")).unwrap();
+        assert_eq!(claim_scope(&cfg), ["apps"]);
     }
 }

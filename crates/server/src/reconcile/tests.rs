@@ -58,6 +58,7 @@ pub(super) struct Fx {
     pub ca: &'static LoadOutcome,
     pub tz: Option<TimeZone>,
     pub template: TemplateCheck,
+    pub network: crate::render::WorkerNetwork,
     pub sandbox_gen: Option<i64>,
     pub prev_fail: bool,
     pub creates: Vec<CreateOutcome>,
@@ -82,6 +83,7 @@ pub(super) fn fx() -> Fx {
         ca: &CA,
         tz: Some(TimeZone::UTC),
         template: TemplateCheck::Current { hash: "h".into() },
+        network: crate::render::WorkerNetwork::default(),
         sandbox_gen: Some(1),
         prev_fail: false,
         creates: Vec::new(),
@@ -108,6 +110,7 @@ pub(super) fn pod(slot: u32) -> WorkerPod {
         grace_seconds: 5,
         template_hash: Some("h".into()),
         expires_at: None,
+        expires_at_raw: None,
         worker_cert_not_after: Some(later(30 * 86_400)),
         internal_ca: Some(fp()[..16].to_owned()),
         evicted: false,
@@ -132,6 +135,7 @@ impl Fx {
             pool: &self.pool,
             time_zone: self.tz.clone(),
             template: self.template.clone(),
+            network: &self.network,
             config_hash: "cfg".into(),
             platforms: Vec::new(),
             ca: self.ca,
@@ -342,20 +346,59 @@ fn expiry_retires_allocated_with_expected_id() {
     let mut f = fx();
     f.pods = vec![WorkerPod {
         expires_at: Some(*NOW),
+        expires_at_raw: Some("2026-01-01T00:00:00Z".into()),
         ..allocated(0)
     }];
     let p = f.plan();
+    // The retire tests the value it judged expired, so it loses to a commit
+    // that moved `expires-at` from a claim's short value in the meantime.
     assert!(p.actions.contains(&Action::RetireAllocated {
         pod: "p-0".into(),
         uid: "uid-0".into(),
         alloc_id: ALLOC_ID.into(),
+        expires_at: Some("2026-01-01T00:00:00Z".into()),
         reason: RetireReason::Expired,
     }));
+
+    // Other reasons hold whatever `expires-at` says, so they do not test it.
+    f.pods = vec![WorkerPod {
+        phase: Phase::Succeeded,
+        expires_at_raw: Some("2099-01-01T00:00:00Z".into()),
+        ..allocated(0)
+    }];
+    assert!(f.plan().actions.iter().any(|a| matches!(
+        a,
+        Action::RetireAllocated {
+            reason: RetireReason::PodFinished,
+            expires_at: None,
+            ..
+        }
+    )));
 
     f.pods = vec![allocated(0)];
     let p = f.plan();
     assert!(retires(&p).is_empty());
     assert_eq!(p.requeue_at, Some(later(3600)));
+}
+
+/// A cold pod judged not started may commit (and move `expires-at`) before
+/// the retire lands. The retire tests the value it saw, so it loses then.
+#[test]
+fn start_timeout_retire_of_an_allocated_pod_tests_the_expires_at_it_saw() {
+    let mut f = fx();
+    f.pods = vec![WorkerPod {
+        phase: Phase::Pending,
+        created: Some(ago(121)),
+        expires_at_raw: Some("2026-01-01T00:03:00Z".into()),
+        ..allocated(0)
+    }];
+    assert!(f.plan().actions.contains(&Action::RetireAllocated {
+        pod: "p-0".into(),
+        uid: "uid-0".into(),
+        alloc_id: ALLOC_ID.into(),
+        expires_at: Some("2026-01-01T00:03:00Z".into()),
+        reason: RetireReason::StartTimeout,
+    }));
 }
 
 #[test]
@@ -774,6 +817,100 @@ fn template_conflict_and_invalid_spec_stop_creates_but_retire() {
         };
         assert_eq!(cond(&p, "Ready").reason, want);
     }
+}
+
+/// A refused entry narrows the policy even when another spec error blocks the pool,
+/// and a pool already running warm pods under a wider policy (a new term, so no
+/// sandbox apply recorded) gets the narrowed one too, while its pods keep running.
+#[test]
+fn refused_allow_cidr_narrows_the_policy_under_any_block() {
+    let mut f = fx().scale(2, 10);
+    f.sandbox_gen = None;
+    f.pods = vec![pod(0), allocated(1)];
+    f.network.extra_denied_cidrs = vec!["203.0.113.0/24".into()];
+    f.pool.spec.network.egress.allow_cidrs = vec!["203.0.113.7/32".into()];
+    let p = f.plan();
+    assert!(
+        p.actions
+            .iter()
+            .any(|a| matches!(a, Action::ApplyNetworkPolicy))
+    );
+    assert!(retires(&p).is_empty() && creates(&p).is_empty());
+    assert_eq!(cond(&p, "Ready").reason, "InvalidSpec");
+
+    f.template = TemplateCheck::Conflict {
+        message: "sets metadata.name".into(),
+    };
+    let p = f.plan();
+    assert!(
+        p.actions
+            .iter()
+            .any(|a| matches!(a, Action::ApplyNetworkPolicy))
+    );
+    assert_eq!(cond(&p, "Ready").reason, "TemplateConflict");
+
+    // Without a refused entry a template conflict still applies nothing.
+    f.pool.spec.network.egress.allow_cidrs.clear();
+    let p = f.plan();
+    assert!(
+        !p.actions
+            .iter()
+            .any(|a| matches!(a, Action::ApplyNetworkPolicy))
+    );
+}
+
+/// An `allowCIDRs` entry that reopens a protected range blocks the pool:
+/// no creates, `Ready=False/InvalidSpec` naming it. The sandbox is still applied,
+/// because render leaves the entry out and so narrows an older, wider policy.
+#[test]
+fn refused_allow_cidr_is_invalid_spec() {
+    let mut f = fx().scale(2, 10);
+    f.sandbox_gen = None;
+    f.pool.spec.network.egress.allow_cidrs =
+        vec!["192.0.2.0/24".into(), "169.254.169.254/32".into()];
+    let p = f.plan();
+    assert!(creates(&p).is_empty());
+    assert!(
+        p.actions
+            .iter()
+            .any(|a| matches!(a, Action::ApplyNetworkPolicy)),
+        "the narrowed policy is applied"
+    );
+    let c = cond(&p, "Ready");
+    assert_eq!(
+        (c.status.as_str(), c.reason.as_str()),
+        ("False", "InvalidSpec")
+    );
+    assert!(
+        c.message.starts_with(
+            "spec.network.egress.allowCIDRs[1]: `169.254.169.254/32` overlaps the link-local"
+        ) && !c.message.contains("192.0.2.0/24"),
+        "{}",
+        c.message
+    );
+
+    // The operator permits it: the pool applies its sandbox and scales.
+    f.network.permitted_cidrs = vec!["169.254.169.254/32".into()];
+    let p = f.plan();
+    assert_eq!(creates(&p), vec![0, 1]);
+    assert!(
+        p.actions
+            .iter()
+            .any(|a| matches!(a, Action::ApplyNetworkPolicy))
+    );
+    assert_eq!(cond(&p, "Ready").status, "True");
+
+    // A cluster range is refused the same way.
+    f.network.permitted_cidrs.clear();
+    f.network.cluster_cidrs = vec!["192.0.2.128/25".into()];
+    f.pool.spec.network.egress.allow_cidrs = vec!["192.0.2.0/24".into()];
+    let c = cond(&f.plan(), "Ready").clone();
+    assert_eq!(c.reason, "InvalidSpec");
+    assert!(
+        c.message.contains("the cluster range 192.0.2.128/25"),
+        "{}",
+        c.message
+    );
 }
 
 #[test]

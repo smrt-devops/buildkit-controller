@@ -112,8 +112,12 @@ impl Settings {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct Config {
-    /// `""` = all namespaces.
+    /// Deprecated single-namespace form of `watchNamespaces`; `""` = unset.
+    /// Setting both is a validation error.
     pub watch_namespace: String,
+    /// Namespaces whose pools, pods and claims the controller watches; `[]` =
+    /// all namespaces. Read through [`Config::watched_namespaces`].
+    pub watch_namespaces: Vec<String>,
     /// Listen addresses.
     pub listen: Listen,
     /// API listener limits.
@@ -166,6 +170,8 @@ pub struct Api {
     pub max_connections: u32,
     /// Open API connections from one client address; more are closed on accept. 0: no cap.
     pub max_connections_per_ip: u32,
+    /// PROXY protocol v2 from a gateway in front of the listener.
+    pub proxy_protocol: ProxyProtocol,
 }
 
 impl Default for Api {
@@ -173,6 +179,54 @@ impl Default for Api {
         Self {
             max_connections: 4096,
             max_connections_per_ip: 128,
+            proxy_protocol: ProxyProtocol::default(),
+        }
+    }
+}
+
+/// `api.proxyProtocol` and `edge.proxyProtocol`: PROXY protocol v2, read only
+/// from `trustedCIDRs` (see [`crate::net::ProxyProtocol`]).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct ProxyProtocol {
+    /// Off by default: every connection counts as its socket peer.
+    pub enabled: bool,
+    /// Sources that must send a header (the gateway's addresses). Required when enabled.
+    #[serde(rename = "trustedCIDRs")]
+    pub trusted_cidrs: Vec<String>,
+    /// Longest wait for the header after accept.
+    pub header_timeout: CrdDuration,
+}
+
+impl Default for ProxyProtocol {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trusted_cidrs: Vec::new(),
+            header_timeout: CrdDuration::new("5s"),
+        }
+    }
+}
+
+impl ProxyProtocol {
+    fn validate(&self, field: &str, p: &mut Vec<String>) {
+        if secs(&self.header_timeout, &format!("{field}.headerTimeout"), p).is_zero() {
+            p.push(format!("{field}.headerTimeout must be positive"));
+        }
+        if self.enabled && self.trusted_cidrs.is_empty() {
+            p.push(format!(
+                "{field}.trustedCIDRs must list the gateway's addresses when enabled"
+            ));
+        }
+        for c in &self.trusted_cidrs {
+            match c.parse::<crate::net::Cidr>() {
+                Err(e) => p.push(format!("{field}.trustedCIDRs: {e}")),
+                // Trusting every address lets any client choose its own address.
+                Ok(n) if n.prefix() == 0 => p.push(format!(
+                    "{field}.trustedCIDRs: `{c}` would trust every address"
+                )),
+                Ok(_) => {}
+            }
         }
     }
 }
@@ -181,7 +235,9 @@ impl Default for Api {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct Kube {
-    /// Timeout of every non-watch API call.
+    /// Timeout of every non-watch API call. Must be below the client read
+    /// timeout (90 s, [`READ_TIMEOUT`](crate::runtime::READ_TIMEOUT)), which
+    /// would otherwise cut a silent call first.
     pub request_timeout: CrdDuration,
 }
 
@@ -279,6 +335,8 @@ pub struct Edge {
     pub max_handshakes: u32,
     /// In-handshake connections from one client address. 0: no cap.
     pub max_handshakes_per_ip: u32,
+    /// PROXY protocol v2 from a gateway in front of the listener.
+    pub proxy_protocol: ProxyProtocol,
 }
 
 impl Default for Edge {
@@ -295,6 +353,7 @@ impl Default for Edge {
             max_connections: 10_000,
             max_handshakes: 1024,
             max_handshakes_per_ip: 32,
+            proxy_protocol: ProxyProtocol::default(),
         }
     }
 }
@@ -418,6 +477,10 @@ pub struct WorkerNetwork {
     /// The cluster's pod, service and node CIDRs.
     #[serde(rename = "clusterCIDRs")]
     pub cluster_cidrs: Vec<String>,
+    /// Ranges a pool's `allowCIDRs` may open although they overlap the link-local,
+    /// metadata, loopback, cluster or extra denied ranges.
+    #[serde(rename = "permittedCIDRs")]
+    pub permitted_cidrs: Vec<String>,
     /// DNS allowance.
     pub dns: Dns,
 }
@@ -429,6 +492,7 @@ impl Default for WorkerNetwork {
             denied_cidrs: d.denied_cidrs,
             extra_denied_cidrs: d.extra_denied_cidrs,
             cluster_cidrs: d.cluster_cidrs,
+            permitted_cidrs: d.permitted_cidrs,
             dns: Dns {
                 namespace: d.dns.namespace,
                 pod_labels: d.dns.pod_labels,
@@ -456,21 +520,29 @@ impl Default for Dns {
     }
 }
 
+/// The longest an edge connection can live: the CRD caps `maxTTL` at 24h, and
+/// the allocation cert, whose `notAfter` closes the connection, outlives the
+/// allocation by [`CERT_MARGIN`](crate::alloc::pods::CERT_MARGIN) (5 minutes).
+/// The edge allows no skew past `notAfter`. With `shutdown.drainTimeout` unset
+/// this bounds the drain, and the chart sizes the termination grace period from it.
+pub const MAX_CONNECTION_LIFETIME: Duration = Duration::from_mins(24 * 60 + 5);
+
 /// `shutdown`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct Shutdown {
     /// Pause between going unready and closing listeners.
     pub delay: CrdDuration,
-    /// Drain budget.
-    pub drain_timeout: CrdDuration,
+    /// Hard cap on the drain. Unset: the drain waits for every edge connection
+    /// to end on its own, which takes at most [`MAX_CONNECTION_LIFETIME`].
+    pub drain_timeout: Option<CrdDuration>,
 }
 
 impl Default for Shutdown {
     fn default() -> Self {
         Self {
             delay: CrdDuration::new("5s"),
-            drain_timeout: CrdDuration::new("300s"),
+            drain_timeout: None,
         }
     }
 }
@@ -530,6 +602,15 @@ fn dur(d: &CrdDuration) -> time::Duration {
 /// Smallest `pki.testLeafLifetimes.edgeValidity` (see `validate_test_leaf`).
 const MIN_TEST_EDGE_VALIDITY: Duration = Duration::from_mins(3);
 
+/// A DNS-1123 label, the form of a namespace name.
+fn is_namespace_name(s: &str) -> bool {
+    (1..=63).contains(&s.len())
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 fn is_dns_name(s: &str) -> bool {
     let s = s.strip_suffix('.').unwrap_or(s);
     !s.is_empty()
@@ -575,10 +656,20 @@ impl Config {
         Duration::from_secs(self.shutdown.delay.seconds().unwrap_or(0))
     }
 
-    /// `shutdown.drainTimeout`; call only on a validated config.
+    /// `shutdown.drainTimeout`, `None` when unset; call only on a validated config.
     #[must_use]
-    pub fn drain_timeout(&self) -> Duration {
-        Duration::from_secs(self.shutdown.drain_timeout.seconds().unwrap_or(0))
+    pub fn drain_timeout(&self) -> Option<Duration> {
+        self.shutdown
+            .drain_timeout
+            .as_ref()
+            .map(|d| Duration::from_secs(d.seconds().unwrap_or(0)))
+    }
+
+    /// The longest the drain may take: `shutdown.drainTimeout`, else
+    /// [`MAX_CONNECTION_LIFETIME`].
+    #[must_use]
+    pub fn drain_budget(&self) -> Duration {
+        self.drain_timeout().unwrap_or(MAX_CONNECTION_LIFETIME)
     }
 
     /// Check every config rule, returning all failures.
@@ -613,12 +704,20 @@ impl Config {
                 "edge.upstreamConnectTimeout",
             ),
             (&self.shutdown.delay, "shutdown.delay"),
-            (&self.shutdown.drain_timeout, "shutdown.drainTimeout"),
         ] {
             secs(d, f, &mut p);
         }
+        if let Some(d) = &self.shutdown.drain_timeout {
+            secs(d, "shutdown.drainTimeout", &mut p);
+        }
         if rt.is_zero() {
             p.push("kube.requestTimeout must be positive".into());
+        }
+        let read = crate::runtime::READ_TIMEOUT;
+        if rt >= read {
+            p.push(format!(
+                "kube.requestTimeout ({rt:?}) must be below the client read timeout ({read:?}), which ends any API request that receives nothing for that long"
+            ));
         }
         if ri.is_zero() {
             p.push("leaderElection.renewInterval must be positive".into());
@@ -636,14 +735,48 @@ impl Config {
                 "renewInterval + requestTimeout must be < leaseDuration - fenceMargin ({ri:?} + {rt:?} >= {ld:?} - {fm:?})"
             ));
         }
+        self.validate_watch(&mut p);
         self.validate_edge(&mut p);
         self.validate_auth(&mut p);
         self.validate_network(&mut p);
+        self.api
+            .proxy_protocol
+            .validate("api.proxyProtocol", &mut p);
+        self.edge
+            .proxy_protocol
+            .validate("edge.proxyProtocol", &mut p);
         self.validate_test_leaf(&mut p);
         if p.is_empty() {
             Ok(())
         } else {
             Err(ConfigError::Invalid(p))
+        }
+    }
+
+    /// The namespaces to watch, `[]` = all. Call only on a validated config.
+    #[must_use]
+    pub fn watched_namespaces(&self) -> &[String] {
+        if self.watch_namespace.is_empty() {
+            &self.watch_namespaces
+        } else {
+            std::slice::from_ref(&self.watch_namespace)
+        }
+    }
+
+    fn validate_watch(&self, p: &mut Vec<String>) {
+        if !self.watch_namespace.is_empty() && !self.watch_namespaces.is_empty() {
+            p.push(
+                "watchNamespace and watchNamespaces are both set; use watchNamespaces only (watchNamespace is deprecated)"
+                    .into(),
+            );
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for ns in self.watched_namespaces() {
+            if !is_namespace_name(ns) {
+                p.push(format!("watchNamespaces: `{ns}` is not a namespace name"));
+            } else if !seen.insert(ns.as_str()) {
+                p.push(format!("watchNamespaces: `{ns}` is listed twice"));
+            }
         }
     }
 
@@ -728,27 +861,33 @@ impl Config {
     }
 
     fn validate_network(&self, p: &mut Vec<String>) {
+        const DENY: Option<&str> = Some("would deny a whole address family");
+        // A pool can never open a whole family, so permitting one is a mistake.
+        const PERMIT: Option<&str> = Some("would permit a whole address family");
         let n = &self.worker_network;
         // The NetworkPolicy API refuses host bits, IPv4-mapped IPv6 and an `except` entry
         // equal to its `0.0.0.0/0` or `::/0` block. One bad entry fails every pool's
         // NetworkPolicy apply, so refuse it at load.
-        for (f, list, except) in [
-            ("workerNetwork.deniedCIDRs", &n.denied_cidrs, true),
+        for (f, list, whole) in [
+            ("workerNetwork.deniedCIDRs", &n.denied_cidrs, DENY),
             (
                 "workerNetwork.extraDeniedCIDRs",
                 &n.extra_denied_cidrs,
-                true,
+                DENY,
             ),
-            ("workerNetwork.clusterCIDRs", &n.cluster_cidrs, true),
-            ("workerNetwork.dns.cidrs", &n.dns.cidrs, false),
+            ("workerNetwork.clusterCIDRs", &n.cluster_cidrs, DENY),
+            ("workerNetwork.permittedCIDRs", &n.permitted_cidrs, PERMIT),
+            ("workerNetwork.dns.cidrs", &n.dns.cidrs, None),
         ] {
             for c in list {
                 if !buildkit_controller_api::v1alpha1::is_canonical_cidr(c) {
                     p.push(format!(
                         "{f}: `{c}` is not a canonical CIDR (no bits set beyond the prefix length, no IPv4-mapped IPv6)"
                     ));
-                } else if except && c.ends_with("/0") {
-                    p.push(format!("{f}: `{c}` would deny a whole address family"));
+                } else if let Some(why) = whole
+                    && c.ends_with("/0")
+                {
+                    p.push(format!("{f}: `{c}` {why}"));
                 }
             }
         }
@@ -834,6 +973,7 @@ impl Config {
                 denied_cidrs: n.denied_cidrs.clone(),
                 extra_denied_cidrs: n.extra_denied_cidrs.clone(),
                 cluster_cidrs: n.cluster_cidrs.clone(),
+                permitted_cidrs: n.permitted_cidrs.clone(),
                 dns: crate::render::WorkerDns {
                     namespace: n.dns.namespace.clone(),
                     pod_labels: n.dns.pod_labels.clone(),

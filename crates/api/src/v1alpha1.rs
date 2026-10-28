@@ -466,7 +466,11 @@ pub struct Cache {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_limit: Option<Quantity>,
     /// Persistent state volumes for cache affinity. Unset turns the
-    /// feature off. Every caller this pool admits can write cache that later callers read.
+    /// feature off. A volume is shared only by callers of one cache scope, see `local.scope`,
+    /// and is emptied before a pod of another scope starts on it. With it set, buildkitd runs
+    /// with build history off (`[history] maxEntries = 0`) and `history.db` is deleted at
+    /// every start, so no build logs or build arguments reach a later allocation and
+    /// `buildx history` shows nothing on this pool.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "non_null::<LocalCache>")]
     pub local: Option<LocalCache>,
@@ -479,6 +483,14 @@ pub struct Cache {
 }
 
 /// `spec.workers.cache.local`: one PVC per cached slot, mounted at the buildkitd state dir.
+///
+/// A volume holds the whole buildkitd state: the content store, the cache records and
+/// any image built on it. Each volume belongs to one cache scope (`scope`). A pod whose
+/// caller is in another scope never gets the volume as it is: the volume is emptied
+/// before buildkitd starts. buildkitd runs with build history off
+/// (`[history] maxEntries = 0`) and `history.db` is deleted at every start, so no
+/// build logs or build arguments reach a later allocation and `buildx history`
+/// shows nothing on these pools.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 #[schemars(extend("x-kubernetes-validations" = [{"rule": "!has(self.gcKeepStorage) || quantity(string(self.gcKeepStorage)).compareTo(quantity(string(self.size))) <= 0", "message": "gcKeepStorage must not exceed size"}]))]
@@ -503,6 +515,13 @@ pub struct LocalCache {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "opt_quantity")]
     pub gc_keep_storage: Option<Quantity>,
+    /// Who shares a volume. `identity` (the default) gives each caller its own cache. An
+    /// OIDC token is scoped to its issuer and its `repository_id` claim (GitHub Actions),
+    /// else its `repository` claim, else its `sub`. A `ServiceAccount` is scoped to its
+    /// namespace and name, and a `BuildKitClaim` to its namespace. `pool` lets every caller
+    /// the pool admits read and write the same volumes, so use it only when they are one
+    /// trust domain.
+    pub scope: CacheScope,
 }
 
 impl Default for LocalCache {
@@ -514,6 +533,7 @@ impl Default for LocalCache {
             affinity: CacheAffinity::Soft,
             keys_per_volume: 8,
             gc_keep_storage: None,
+            scope: CacheScope::Identity,
         }
     }
 }
@@ -586,6 +606,17 @@ impl CacheMode {
             Self::Min => "min",
         }
     }
+}
+
+/// `cache.local.scope`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheScope {
+    /// One cache per caller identity.
+    #[default]
+    Identity,
+    /// One cache for every caller the pool admits.
+    Pool,
 }
 
 /// `cache.local.affinity`.
@@ -754,7 +785,7 @@ pub struct Network {
 pub struct Egress {
     /// Whether workers may reach the internet.
     pub internet: Internet,
-    /// CIDR ranges re-opened through the egress deny list (for example a private registry or proxy), so they apply to every pool, not just under `Deny`.
+    /// CIDR ranges re-opened through the egress deny list (for example a private registry or proxy), so they apply to every pool, not just under `Deny`. The controller refuses (`Ready=False/InvalidSpec`) an entry of `0.0.0.0/0` or `::/0`, or one that overlaps link-local (`169.254.0.0/16`, `fe80::/10`), `168.63.129.16/32`, loopback, the cluster's own ranges or the operator's `workerNetwork.extraDeniedCIDRs`, unless the operator lists a range holding it in `workerNetwork.permittedCIDRs`. A refused entry is left out of the pool's network policy.
     #[serde(rename = "allowCIDRs")]
     #[schemars(
         length(max = 32),

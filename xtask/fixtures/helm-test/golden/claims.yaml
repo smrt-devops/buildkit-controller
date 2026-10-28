@@ -108,7 +108,8 @@ data:
     shutdown:
       delay: 10s
       drainTimeout: 10m
-    watchNamespace: ci
+    watchNamespaces:
+    - ci
     workerNetwork:
       clusterCIDRs: []
       deniedCIDRs:
@@ -131,6 +132,7 @@ data:
           k8s-app: kube-dns
       extraDeniedCIDRs:
       - 203.0.113.0/24
+      permittedCIDRs: []
 
 ---
 # Source: buildkit-controller/templates/crd-buildkitclaims.yaml
@@ -358,26 +360,6 @@ rules:
 ---
 # Source: buildkit-controller/templates/rbac.yaml
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: bkc-buildkit-system-claims
-  labels:
-    app.kubernetes.io/name: buildkit-controller
-    app.kubernetes.io/instance: bk
-    app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.1.0"
-    helm.sh/chart: buildkit-controller-0.1.0
-rules:
-  - apiGroups: [buildkit.smrt-devops.net]
-    resources: [buildkitclaims]
-    verbs: [get, list, watch]
-  - apiGroups: [buildkit.smrt-devops.net]
-    resources: [buildkitclaims/status]
-    verbs: [get, patch, update]
-
----
-# Source: buildkit-controller/templates/rbac.yaml
-apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: bkc-buildkit-system-tokenreview
@@ -388,24 +370,6 @@ metadata:
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: buildkit-controller-0.1.0
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: bkc-buildkit-system-tokenreview}
-subjects:
-  - kind: ServiceAccount
-    name: bkc
-    namespace: buildkit-system
-
----
-# Source: buildkit-controller/templates/rbac.yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: bkc-buildkit-system-claims
-  labels:
-    app.kubernetes.io/name: buildkit-controller
-    app.kubernetes.io/instance: bk
-    app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.1.0"
-    helm.sh/chart: buildkit-controller-0.1.0
-roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: bkc-buildkit-system-claims}
 subjects:
   - kind: ServiceAccount
     name: bkc
@@ -540,6 +504,22 @@ metadata:
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: buildkit-controller-0.1.0
 rules:
+  - apiGroups:
+    - buildkit.smrt-devops.net
+    resources:
+    - buildkitclaims
+    verbs:
+    - get
+    - list
+    - watch
+  - apiGroups:
+    - buildkit.smrt-devops.net
+    resources:
+    - buildkitclaims/status
+    verbs:
+    - get
+    - patch
+    - update
   - apiGroups: [""]
     resources: [secrets]
     verbs: [get, create, delete]
@@ -558,6 +538,22 @@ metadata:
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: buildkit-controller-0.1.0
 rules:
+  - apiGroups:
+    - buildkit.smrt-devops.net
+    resources:
+    - buildkitclaims
+    verbs:
+    - get
+    - list
+    - watch
+  - apiGroups:
+    - buildkit.smrt-devops.net
+    resources:
+    - buildkitclaims/status
+    verbs:
+    - get
+    - patch
+    - update
   - apiGroups: [""]
     resources: [secrets]
     verbs: [get, create, delete]
@@ -720,7 +716,7 @@ spec:
         helm.sh/chart: buildkit-controller-0.1.0
         team: ci
       annotations:
-        checksum/config: 41bfee90dc846c239cd3452dbc0750513dc02f3b9cc5575cc942c5d344269ec9
+        checksum/config: 3f5b6357da12f8dc415bbadbd4dbca6e787da357ffc482dce93277f4f8603462
         example.com/x: "1"
     spec:
       serviceAccountName: bkc

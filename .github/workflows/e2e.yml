@@ -29,7 +29,8 @@ jobs:
       - run: cargo xtask e2e
 
   # The real GitHub Action with this job's OIDC token, against a kind install
-  # that trusts GitHub's issuer for this repository only.
+  # that trusts GitHub's issuer for this repository only. The install sits behind
+  # Envoy Gateway; target/e2e/api-ca.pem is the Gateway's self-signed certificate.
   action:
     if: >-
       github.event_name != 'schedule' &&
@@ -49,6 +50,7 @@ jobs:
       - name: Install the controller on kind
         run: |
           cargo xtask e2e-up "$GITHUB_REPOSITORY"
+          echo "BK_URL=$(cat target/e2e/api-url)" >> "$GITHUB_ENV"
           {
             echo 'BK_CA<<BK_CA_EOF'
             cat target/e2e/api-ca.pem
@@ -61,7 +63,7 @@ jobs:
         id: bk
         uses: ./action
         with:
-          url: https://localhost:18443
+          url: ${{ env.BK_URL }}
           pools: ci/amd64
           ca-cert: ${{ env.BK_CA }}
       - name: Build through the builder the Action created
@@ -77,6 +79,8 @@ jobs:
         run: |
           kubectl --kubeconfig target/e2e/kubeconfig get pods -A
           kubectl --kubeconfig target/e2e/kubeconfig -n bk-system logs deploy/buildkit-controller --tail=100
+          kubectl --kubeconfig target/e2e/kubeconfig get gateway,httproute,tlsroute,backendtlspolicy -A -o yaml
+          kubectl --kubeconfig target/e2e/kubeconfig -n envoy-gateway-system logs deploy/envoy-gateway --tail=100
 
   # Cert-lifecycle soak (cargo xtask soak). Long: nightly and on demand only.
   soak:
@@ -89,3 +93,17 @@ jobs:
           persist-credentials: false
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
       - run: cargo xtask soak
+
+  # Controller shutdown never cuts a live build: a 390 s build survives a rollout,
+  # the Lease moves within seconds, and a queued request on a stopping replica
+  # gets 503 shutting_down (cargo xtask drain-verify). Slow: nightly and on demand only.
+  drain:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - run: cargo xtask drain-verify

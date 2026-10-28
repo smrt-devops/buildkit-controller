@@ -1,7 +1,7 @@
 //! The per-replica FIFO per pool and its `status.waiters`
 //! entry.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -94,6 +94,12 @@ impl Queues {
         })
     }
 
+    /// Whether anyone waits in the queue of `key`.
+    #[must_use]
+    pub fn is_waiting(&self, key: &PoolKey) -> bool {
+        self.lock().get(key).is_some_and(|q| !q.order.is_empty())
+    }
+
     /// Let the head of `key` retry.
     pub fn wake(&self, key: &PoolKey) {
         if let Some(q) = self.lock().get(key) {
@@ -178,6 +184,10 @@ pub struct WaitersWriter {
     replica: String,
     pools: Store<BuildKitPool>,
     last: HashMap<PoolKey, (usize, Instant)>,
+    /// Entries that may hold a non-zero count: a non-zero apply was sent
+    /// (whatever its result, since a timed-out PATCH can still land) and no
+    /// apply of 0 has succeeded since.
+    unsettled: HashSet<PoolKey>,
 }
 
 impl WaitersWriter {
@@ -188,6 +198,32 @@ impl WaitersWriter {
             replica,
             pools,
             last: HashMap::new(),
+            unsettled: HashSet::new(),
+        }
+    }
+
+    /// Sets every entry this writer may have left non-zero back to 0
+    /// (shutdown), including one whose apply failed, because a PATCH that
+    /// timed out can still land. The applies run concurrently, each bounded by
+    /// the backend's request timeout.
+    pub async fn clear(&mut self, backend: &dyn Backend) {
+        let ts = fmt_ts(time::OffsetDateTime::now_utc());
+        let keys: Vec<PoolKey> = self.unsettled.iter().cloned().collect();
+        let applies = keys
+            .iter()
+            .map(|(ns, pool)| backend.apply_waiters(ns, pool, &self.replica, 0, &ts));
+        let results = futures::future::join_all(applies).await;
+        let now = Instant::now();
+        for (key, result) in keys.into_iter().zip(results) {
+            match result {
+                Ok(()) => {
+                    self.unsettled.remove(&key);
+                    self.last.insert(key, (0, now));
+                }
+                Err(error) => {
+                    warn!(namespace = %key.0, pool = %key.1, error, "clearing status.waiters");
+                }
+            }
         }
     }
 
@@ -205,6 +241,7 @@ impl WaitersWriter {
                 .is_none()
             {
                 self.last.remove(&key);
+                self.unsettled.remove(&key);
                 queues.forget_empty(&key);
                 continue;
             }
@@ -219,6 +256,12 @@ impl WaitersWriter {
                 due.push((key, len));
             }
         }
+        // Recorded before the apply: if it times out, the PATCH may still land.
+        self.unsettled.extend(
+            due.iter()
+                .filter(|(_, len)| *len > 0)
+                .map(|(key, _)| key.clone()),
+        );
         let applies = due.iter().map(|((ns, pool), len)| {
             let count = i32::try_from(*len).unwrap_or(i32::MAX);
             backend.apply_waiters(ns, pool, &self.replica, count, &ts)
@@ -227,6 +270,9 @@ impl WaitersWriter {
         for ((key, len), result) in due.into_iter().zip(results) {
             match result {
                 Ok(()) => {
+                    if len == 0 {
+                        self.unsettled.remove(&key);
+                    }
                     self.last.insert(key, (len, now));
                 }
                 Err(error) => {

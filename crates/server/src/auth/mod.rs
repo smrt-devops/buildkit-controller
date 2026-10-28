@@ -51,13 +51,17 @@ pub enum Identity {
 }
 
 impl Identity {
-    /// Owner string: `oidc:<iss>#<sub>` or `sa:<ns>/<name>`.
+    /// Owner string: `oidc:<iss>#<sub>` (with the run claims appended when the
+    /// token has them, see [`RUN_CLAIMS`]), `sa:<ns>/<name>` or
+    /// `claim:<ns>/<name>#<uid>`. Only the same caller may release an allocation.
     #[must_use]
     pub fn owner(&self) -> String {
         match self {
             Self::Oidc {
-                issuer, subject, ..
-            } => format!("oidc:{issuer}#{subject}"),
+                issuer,
+                subject,
+                claims,
+            } => oidc_owner(issuer, subject, claims),
             Self::ServiceAccount {
                 namespace, name, ..
             } => format!("sa:{namespace}/{name}"),
@@ -68,6 +72,40 @@ impl Identity {
             } => format!("claim:{namespace}/{name}#{uid}"),
         }
     }
+}
+
+/// Claims that tie a CI token to one run of one workflow (GitHub Actions sets
+/// all three). The `sub` of a GitHub token is shared by every run of a
+/// repository and ref, and by every `pull_request` run, so an owner built from
+/// `iss#sub` alone would let one run release another's allocation.
+pub const RUN_CLAIMS: [&str; 3] = ["run_id", "run_attempt", "job_workflow_ref"];
+
+/// The OIDC owner string: `oidc:<iss>#<sub>`, then each present [`RUN_CLAIMS`]
+/// claim as `#<name>=<value>` in the order of [`RUN_CLAIMS`]. `sub` and every
+/// value have `%` and `#` percent-encoded in both forms, so no two callers
+/// produce the same string: without the escape in the plain form, sub
+/// `x#run_id=1` with no run claims would equal sub `x` with `run_id` 1.
+fn oidc_owner(issuer: &str, subject: &str, claims: &Map<String, Value>) -> String {
+    let run: Vec<(&str, String)> = RUN_CLAIMS
+        .iter()
+        .filter_map(|&name| {
+            let v = match claims.get(name)? {
+                Value::String(s) if !s.is_empty() => s.clone(),
+                Value::Number(n) => n.to_string(),
+                _ => return None,
+            };
+            Some((name, v))
+        })
+        .collect();
+    let esc = |s: &str| s.replace('%', "%25").replace('#', "%23");
+    let mut owner = format!("oidc:{issuer}#{}", esc(subject));
+    for (name, v) in run {
+        owner.push('#');
+        owner.push_str(name);
+        owner.push('=');
+        owner.push_str(&esc(&v));
+    }
+    owner
 }
 
 /// Authentication failure, mapped to the API error table.

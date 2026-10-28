@@ -36,7 +36,7 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- end -}}
 {{- $fn := include "bkc.fullname" . -}}
 {{- $cfg := dict
-  "watchNamespace" .Values.watchNamespace
+  "watchNamespace" ""
   "listen" (dict "api" "0.0.0.0:8443" "edge" "0.0.0.0:8444" "ops" (printf "0.0.0.0:%d" (int .Values.metrics.port)))
   "pki" (dict "caSecretName" (printf "%s-ca" $fn))
   "leaderElection" (dict "leaseName" (printf "%s-leader" $fn))
@@ -56,8 +56,21 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
     "maxConnectionsPerIp" (int .Values.api.maxConnectionsPerIp))
   "auth" (dict "oidc" $issuers "serviceAccount" .Values.auth.serviceAccount)
   "workerNetwork" .Values.workerNetwork
-  "shutdown" .Values.shutdown
+  "shutdown" (ternary .Values.shutdown (omit .Values.shutdown "drainTimeout") (not (empty .Values.shutdown.drainTimeout)))
   "claims" (dict "enabled" .Values.claims.enabled "namespaces" .Values.claims.namespaces) -}}
+{{- /* PROXY protocol only when on, so configs without it (and their checksum) stay the same. */ -}}
+{{- range $l := list "api" "edge" -}}
+  {{- $p := (get $.Values $l).proxyProtocol -}}
+  {{- if $p.enabled -}}
+    {{- if not $p.trustedCIDRs }}{{ fail (printf "%s.proxyProtocol.trustedCIDRs is required when %s.proxyProtocol.enabled is true: list the gateway's source addresses" $l $l) }}{{ end -}}
+    {{- $_ := set (get $cfg $l) "proxyProtocol" (dict "enabled" true "trustedCIDRs" $p.trustedCIDRs "headerTimeout" $p.headerTimeout) -}}
+  {{- end -}}
+{{- end -}}
+{{- /* Scoped: the list. Cluster-wide: the old empty key, so existing configs (and their checksum) stay the same. */ -}}
+{{- with include "bkc.watchNamespaces" . | fromJsonArray -}}
+  {{- $_ := unset $cfg "watchNamespace" -}}
+  {{- $_ := set $cfg "watchNamespaces" . -}}
+{{- end -}}
 {{- toYaml $cfg -}}
 {{- end -}}
 
@@ -71,4 +84,26 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
   {{- else -}}{{- $t = add $t $n -}}{{- end -}}
 {{- end -}}
 {{- $t -}}
+{{- end -}}
+
+{{/* Watched namespaces as a JSON list, [] = cluster-wide. watchNamespace is the deprecated single form. */}}
+{{- define "bkc.watchNamespaces" -}}
+{{- if and .Values.watchNamespace .Values.watchNamespaces -}}
+{{- fail "set watchNamespaces or the deprecated watchNamespace, not both" -}}
+{{- end -}}
+{{- if .Values.watchNamespace -}}
+{{- list .Values.watchNamespace | toJson -}}
+{{- else -}}
+{{- default (list) .Values.watchNamespaces | toJson -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Seconds the controller may drain: shutdown.drainTimeout, or when unset the
+longest edge connection lifetime (24h maxTTL cap + 5m cert margin = 86700 s). */}}
+{{- define "bkc.drainSeconds" -}}
+{{- if .Values.shutdown.drainTimeout -}}
+{{- include "bkc.seconds" .Values.shutdown.drainTimeout -}}
+{{- else -}}
+86700
+{{- end -}}
 {{- end -}}

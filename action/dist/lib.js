@@ -220,7 +220,110 @@ function apiError(what, res) {
   return new Error(`${what} failed: HTTP ${res.status}${msg ? ` ${String(msg).slice(0, 200)}` : ''}`);
 }
 
+/**
+ * The queue timeout a request to `pool` (a GET /v1/pools entry) runs under: the caller's value if
+ * set, else the pool default the server reports. Undefined when neither is known (a server that
+ * predates `queueTimeoutSeconds` in the pool list).
+ */
+function effectiveQueueTimeout(queueTimeoutSeconds, pool) {
+  if (queueTimeoutSeconds !== undefined) return queueTimeoutSeconds;
+  const d = pool && pool.queueTimeoutSeconds;
+  return Number.isInteger(d) && d >= 0 ? d : undefined;
+}
+
+/** Bound on the whole retry loop: the request's queue timeout (1 h, the largest allowed, if unknown) + 60 s. */
+function retryBudgetMs(queueTimeoutSeconds) {
+  const q = queueTimeoutSeconds === undefined ? 3600 : queueTimeoutSeconds;
+  return (q + 60) * 1000;
+}
+
+/**
+ * Queue timeout for an attempt that starts with `remainingMs` of the retry budget left: the requested
+ * value, cut so that a full queue wait still ends inside the budget (budget minus 60 s of slack).
+ * Undefined stays undefined: the pool default is unknown, so it is not overridden. Pass the
+ * `effectiveQueueTimeout` result so that an unset input still gets a bound from the pool default.
+ */
+function queueTimeoutFor(queueTimeoutSeconds, remainingMs) {
+  if (queueTimeoutSeconds === undefined) return undefined;
+  return Math.max(0, Math.min(queueTimeoutSeconds, Math.floor((remainingMs - 60000) / 1000)));
+}
+
+const MIN_WAIT_MS = 1000;
+const MAX_WAIT_MS = 30000;
+// Errors raised while connecting, before any byte of the request was written.
+const PRE_SEND_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH']);
+
+/** Retry-After header (delta-seconds or HTTP date) -> ms clamped to [1 s, 30 s]; undefined if absent or unusable. */
+function retryAfterMs(headers, now = Date.now()) {
+  const v = headers && headers['retry-after'];
+  if (typeof v !== 'string' || !v.trim()) return undefined;
+  let ms;
+  if (/^\d+$/.test(v.trim())) ms = Number(v.trim()) * 1000;
+  else {
+    const t = Date.parse(v);
+    if (Number.isNaN(t)) return undefined;
+    ms = t - now;
+  }
+  return Math.min(MAX_WAIT_MS, Math.max(MIN_WAIT_MS, ms));
+}
+
+/** True for a failure that happened before the request was sent. A reset or timeout is not. */
+function isPreSendError(err) {
+  return Boolean(err) && PRE_SEND_CODES.has(err.code);
+}
+
+/**
+ * `request` with retries that cannot repeat a claim: only HTTP 503 with a usable Retry-After, and
+ * connection errors raised before the request was sent. Everything else returns or throws at once.
+ * `getToken` runs for every attempt (OIDC tokens are short-lived). Stops retrying when the next wait
+ * would pass `budgetMs` from the first attempt, returning the last 503 or throwing the last error.
+ * `opts` may be a function of `{remainingMs}` (budget left at the start of the attempt) so a retry can
+ * shrink its queue timeout and socket timeout; a retry must not queue for a full timeout again.
+ * `what` labels the log line; `log`, `sleep` and `now` are injectable for tests.
+ */
+async function requestWithRetry(url, opts, { what, getToken, budgetMs, log = () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now } = {}) {
+  const start = now();
+  for (let attempt = 1; ; attempt++) {
+    let wait;
+    let why;
+    try {
+      const headers = {};
+      if (getToken) headers.Authorization = `Bearer ${await getToken()}`;
+      const o = typeof opts === 'function' ? opts({ remainingMs: budgetMs - (now() - start) }) : opts;
+      const res = await request(url, { ...o, headers: { ...(o.headers || {}), ...headers } });
+      if (res.status !== 503) return res;
+      wait = retryAfterMs(res.headers, now());
+      if (wait === undefined) return res;
+      why = `HTTP 503`;
+      if (now() - start + wait > budgetMs) return res;
+    } catch (e) {
+      if (!isPreSendError(e)) throw e;
+      wait = Math.min(MAX_WAIT_MS, 1000 * 2 ** (attempt - 1));
+      why = `${e.code} before send`;
+      if (now() - start + wait > budgetMs) throw e;
+    }
+    log(`${what || 'request'}: ${why}, retrying in ${Math.round(wait / 1000)}s (attempt ${attempt + 1})`);
+    await sleep(wait);
+  }
+}
+
+/** GitHub OIDC token for `audience`. Masks the bearer and the token via `setSecret`. */
+async function fetchOidcToken(audience, setSecret) {
+  const base = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+  const bearer = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+  if (!base || !bearer) throw new Error('OIDC unavailable: add `permissions: id-token: write` to the job');
+  setSecret(bearer);
+  const url = `${base}${base.includes('?') ? '&' : '?'}audience=${encodeURIComponent(audience)}`;
+  const res = await request(url, { headers: { Authorization: `Bearer ${bearer}` }, timeoutMs: 30000 });
+  if (res.status !== 200) throw apiError('OIDC token request', res);
+  const token = JSON.parse(res.body).value;
+  if (!token) throw new Error('OIDC token response had no value');
+  setSecret(token);
+  return token;
+}
+
 module.exports = {
   parseList, parsePool, postTimeoutMs, parseDuration, generateKey, allocationBody,
   validatePools, buildxCommands, parseCacheInputs, cacheFlags, checkAllocationId, createBuilder, writeMaterial, request, apiError,
+  effectiveQueueTimeout, retryBudgetMs, queueTimeoutFor, retryAfterMs, isPreSendError, requestWithRetry, fetchOidcToken,
 };

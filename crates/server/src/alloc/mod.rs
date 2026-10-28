@@ -151,16 +151,19 @@ impl Component for AllocService {
                 .map(Duration::from_secs)
                 .map_err(|e| anyhow::anyhow!("kube.requestTimeout: {e}"))?;
             let sub_ctx = ctx.clone();
-            let engine = Arc::new(Engine::new(
-                Arc::new(KubeBackend::new(ctx.client(), timeout)),
-                ctx.pools(),
-                ctx.pods(),
-                Box::new(move || sub_ctx.pod_events()),
-                Arc::new(MaterialSource::new(material)),
-                cfg,
-                metrics.clone(),
-                Arc::new(Queues::new(MAX_WAITERS, metrics)),
-            ));
+            let engine = Arc::new(
+                Engine::new(
+                    Arc::new(KubeBackend::new(ctx.client(), timeout)),
+                    ctx.pools(),
+                    ctx.pods(),
+                    Box::new(move || sub_ctx.pod_events()),
+                    Arc::new(MaterialSource::new(material)),
+                    cfg,
+                    metrics.clone(),
+                    Arc::new(Queues::new(MAX_WAITERS, metrics)),
+                )
+                .with_stopping(shutdown.clone()),
+            );
             ctx.wait_synced().await;
             let _ = cell.set(Arc::clone(&engine));
             info!(component = "alloc", "allocation service running");
@@ -175,7 +178,16 @@ fn key_of(p: &k8s_openapi::api::core::v1::Pod) -> Option<PoolKey> {
     Some((p.metadata.namespace.clone()?, pool.clone()))
 }
 
-/// Keeps this replica's `status.waiters` entries current until `stop`.
+/// Keeps this replica's `status.waiters` entries current until `stop`, then
+/// sets every entry it wrote back to 0. The requests it counted have been
+/// refused by then and retry on another replica, which counts them again; a
+/// stale count here would make the leader start surplus workers until the entry
+/// ages out.
+///
+/// `stop` is checked only between ticks. A tick that has started runs to the
+/// end, each apply bounded by `kube.requestTimeout`. The writer records an
+/// entry before its non-zero apply is sent, so `clear` also zeroes one whose
+/// apply timed out and may still have landed.
 async fn write_waiters(
     mut writer: WaitersWriter,
     queues: Arc<Queues>,
@@ -184,13 +196,15 @@ async fn write_waiters(
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    stop.run_until_cancelled(async {
-        loop {
-            tick.tick().await;
-            writer.tick(&queues, &*backend).await;
+    loop {
+        tokio::select! {
+            biased;
+            () = stop.cancelled() => break,
+            _ = tick.tick() => {}
         }
-    })
-    .await;
+        writer.tick(&queues, &*backend).await;
+    }
+    writer.clear(&*backend).await;
 }
 
 /// Wakes queue heads on pod events and keeps `status.waiters` current, until
@@ -201,7 +215,7 @@ pub async fn drive(engine: &Engine, replica: String, shutdown: CancellationToken
     // hold back pod events and queue wakes.
     let writer_stop = shutdown.child_token();
     let _writer_guard = writer_stop.clone().drop_guard();
-    tokio::spawn(write_waiters(
+    let writer = tokio::spawn(write_waiters(
         WaitersWriter::new(replica, engine.pools.clone()),
         Arc::clone(&engine.queues),
         Arc::clone(&engine.backend),
@@ -209,7 +223,11 @@ pub async fn drive(engine: &Engine, replica: String, shutdown: CancellationToken
     ));
     loop {
         tokio::select! {
-            () = shutdown.cancelled() => return,
+            () = shutdown.cancelled() => {
+                // The final zero write must land before the replica exits.
+                let _ = writer.await;
+                return;
+            }
             ev = sub.recv() => match ev {
                 None => return,
                 Some(PodEvent::Resync) => engine.queues.wake_all(),
@@ -228,5 +246,162 @@ pub async fn drive(engine: &Engine, replica: String, shutdown: CancellationToken
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod waiters_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::sync::Mutex;
+
+    use buildkit_controller_api::v1alpha1::BuildKitPool;
+    use futures::future::BoxFuture;
+    use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret};
+    use kube::runtime::reflector::store::Writer;
+    use kube::runtime::watcher;
+    use serde_json::{Value, json};
+
+    use super::backend::{CreateOutcome, PatchOutcome, PvcCreate};
+    use super::*;
+    use crate::reconcile::spawn::WorkerSecrets;
+    use crate::render::fixtures;
+
+    /// Records each `status.waiters` count when the apply is sent; the apply
+    /// then takes 2 s and fails with `timeout` while its flag is set. Nothing
+    /// else is called.
+    #[derive(Default)]
+    struct SlowWaiters(Mutex<Vec<i32>>, std::sync::atomic::AtomicBool);
+
+    fn unused<T: Send + 'static>(out: T) -> BoxFuture<'static, T> {
+        Box::pin(async move { out })
+    }
+
+    impl Backend for SlowWaiters {
+        fn patch_pod(&self, _: &str, _: &str, _: Value) -> BoxFuture<'static, PatchOutcome> {
+            unused(PatchOutcome::Failed("unused".into()))
+        }
+        fn create_pod(&self, _: &str, _: Pod) -> BoxFuture<'static, CreateOutcome> {
+            unused(CreateOutcome::Failed("unused".into()))
+        }
+        fn delete_pod(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Option<u32>,
+        ) -> BoxFuture<'static, Result<(), String>> {
+            unused(Err("unused".into()))
+        }
+        fn apply_waiters(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            count: i32,
+            _: &str,
+        ) -> BoxFuture<'static, Result<(), String>> {
+            self.0.lock().unwrap().push(count);
+            let fail = self.1.load(std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if fail { Err("timeout".into()) } else { Ok(()) }
+            })
+        }
+        fn get_pvc(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> BoxFuture<'static, Result<Option<PersistentVolumeClaim>, String>> {
+            unused(Err("unused".into()))
+        }
+        fn create_pvc(&self, _: &str, _: PersistentVolumeClaim) -> BoxFuture<'static, PvcCreate> {
+            unused(PvcCreate::Failed("unused".into()))
+        }
+        fn delete_pvc(&self, _: &str, _: &str, _: &str) -> BoxFuture<'static, Result<(), String>> {
+            unused(Err("unused".into()))
+        }
+        fn annotate_pvc(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> BoxFuture<'static, Result<(), String>> {
+            unused(Err("unused".into()))
+        }
+    }
+
+    impl WorkerSecrets for SlowWaiters {
+        fn create_worker_secret(&self, _: &Secret) -> BoxFuture<'static, Result<(), String>> {
+            unused(Err("unused".into()))
+        }
+        fn get_worker_pod(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> BoxFuture<'static, Result<Option<Pod>, String>> {
+            unused(Err("unused".into()))
+        }
+    }
+
+    /// A stop that lands while the first non-zero apply is in flight must
+    /// not lose it: the PATCH may land, and an entry `clear` does not know
+    /// about stays above 0 until the leader prunes it.
+    #[tokio::test(start_paused = true)]
+    async fn stop_during_the_first_apply_still_sets_the_entry_back_to_zero() {
+        let spec = json!({
+            "template": {"spec": {"containers": [{"name": "buildkitd", "image": "moby/buildkit:v0.26.3"}]}},
+            "scaling": {"min": 0, "max": 1},
+            "access": {"rules": [{"serviceAccount": {}}]},
+        });
+        let mut pools = Writer::<BuildKitPool>::default();
+        pools.apply_watcher_event(&watcher::Event::Apply(fixtures::pool("p", spec).unwrap()));
+        let queues = Arc::new(Queues::new(MAX_WAITERS, AllocMetrics::default()));
+        let _queued = queues
+            .enqueue(&(fixtures::POOL_NAMESPACE.into(), "p".into()))
+            .unwrap();
+        let backend = Arc::new(SlowWaiters::default());
+        let stop = CancellationToken::new();
+        let writer = tokio::spawn(write_waiters(
+            WaitersWriter::new("r1".into(), pools.as_reader()),
+            Arc::clone(&queues),
+            Arc::clone(&backend) as Arc<dyn Backend>,
+            stop.clone(),
+        ));
+        // The first tick is due at once and its apply is now in flight.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(*backend.0.lock().unwrap(), [1]);
+        stop.cancel();
+        writer.await.unwrap();
+        assert_eq!(*backend.0.lock().unwrap(), [1, 0]);
+    }
+
+    /// A non-zero apply that times out may still land, so `clear` must zero
+    /// its entry too.
+    #[tokio::test(start_paused = true)]
+    async fn clear_zeroes_an_entry_whose_apply_timed_out() {
+        let spec = json!({
+            "template": {"spec": {"containers": [{"name": "buildkitd", "image": "moby/buildkit:v0.26.3"}]}},
+            "scaling": {"min": 0, "max": 1},
+            "access": {"rules": [{"serviceAccount": {}}]},
+        });
+        let mut pools = Writer::<BuildKitPool>::default();
+        pools.apply_watcher_event(&watcher::Event::Apply(fixtures::pool("p", spec).unwrap()));
+        let queues = Queues::new(MAX_WAITERS, AllocMetrics::default());
+        let queues = Arc::new(queues);
+        let _queued = queues
+            .enqueue(&(fixtures::POOL_NAMESPACE.into(), "p".into()))
+            .unwrap();
+        let backend = SlowWaiters::default();
+        backend.1.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut writer = WaitersWriter::new("r1".into(), pools.as_reader());
+        writer.tick(&queues, &backend).await;
+        backend.1.store(false, std::sync::atomic::Ordering::SeqCst);
+        writer.clear(&backend).await;
+        assert_eq!(*backend.0.lock().unwrap(), [1, 0]);
+        // Settled: a second clear sends nothing.
+        writer.clear(&backend).await;
+        assert_eq!(*backend.0.lock().unwrap(), [1, 0]);
     }
 }

@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 pub use api::{Allocator, ApiState, Authenticate, EdgeInfo, Grant, router};
-pub use listener::{Limits, ServingCerts, serve, server_config};
+pub use listener::{Limits, ServingCerts, Stopping, serve, serve_with_proxy, server_config};
 pub use metrics::HttpMetrics;
 
 use crate::alloc::AllocService;
@@ -31,6 +31,7 @@ use crate::auth::{
     AuthConfig, Authenticator, KubeTokenReviewer, OidcIssuer, https_client, public_roots,
 };
 use crate::certs::CertMaterial;
+use crate::net::ProxyProtocol;
 use crate::runtime::AppContext;
 use crate::runtime::hooks::{BoxResult, Component};
 
@@ -127,7 +128,11 @@ impl Component for HttpComponent {
                     .unwrap_or(usize::MAX),
                 ..Limits::default()
             };
-            serve(listener, router(state), certs, limits, shutdown).await;
+            let proxy = ProxyProtocol::from_config(&c.api.proxy_protocol, ctx.metrics(), "api")?;
+            if proxy.is_on() {
+                info!(component = "http", trusted = ?proxy.trusted(), "API reads PROXY protocol v2 from trusted sources");
+            }
+            serve_with_proxy(listener, router(state), certs, limits, proxy, shutdown).await;
             follower.cancel();
             Ok(())
         })

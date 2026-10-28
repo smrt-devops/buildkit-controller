@@ -1,0 +1,18 @@
+# Built by `cargo xtask docs`, which copies the pages listed in SUMMARY.md into
+# target/book/src at their repository paths.
+[book]
+title = "buildkit-controller"
+description = "Per-job BuildKit workers on Kubernetes for CI."
+language = "en"
+src = "src"
+
+[build]
+build-dir = "html"
+create-missing = false
+# The index preprocessor would turn every README.md into index.html without
+# fixing the links to it. mdBook still writes the first page as index.html.
+use-default-preprocessors = false
+
+[output.html]
+site-url = "/buildkit-controller/"
+git-repository-url = "https://github.com/smrt-devops/buildkit-controller"

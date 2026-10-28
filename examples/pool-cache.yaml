@@ -8,9 +8,12 @@
 # Local: slots 0 and 1 each keep a 50Gi PVC as the buildkitd state directory.
 # A volume serves one build at a time, so it speeds up only the build that
 # lands on its slot. Use a StorageClass with volumeBindingMode: WaitForFirstConsumer.
+# Each volume belongs to one repository (scope: identity, the default). Before
+# a build of another repository lands on it, the volume is emptied. The pool
+# records no build history, so build logs and arguments do not reach later builds.
 #
-# Every caller this pool admits can write cache that later callers read, so the
-# rule admits one repository only.
+# The registry cache is shared by every caller this pool admits, so the rule
+# admits one repository only.
 apiVersion: buildkit.smrt-devops.net/v1alpha1
 kind: BuildKitPool
 metadata:
@@ -26,9 +29,11 @@ spec:
       local:
         size: 50Gi
         maxVolumes: 2
+        scope: identity
   access:
     rules:
       - oidc:
           issuer: https://token.actions.githubusercontent.com
           claims:
-            repository: example/app
+            repository_id: "87654321"   # gh api repos/example/app --jq .id; names can be re-registered
+            event_name: push

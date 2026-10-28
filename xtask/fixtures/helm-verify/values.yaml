@@ -1,10 +1,15 @@
-# Values for `cargo xtask helm-verify`: the real chart on kind, one pool.
-# Values for `cargo xtask helm-verify`. It installs the real chart on kind with one pool.
+# Values for `cargo xtask helm-verify`. It installs the real chart on kind,
+# scoped to two pool namespaces, with claims served from one more. It covers the
+# LoadBalancer exposure: no gateway.parentRefs, so the chart renders no routes.
 image: {repository: buildkit-controller, tag: dev, pullPolicy: Never}
 replicaCount: 2
-service: {type: ClusterIP}
+service: {type: LoadBalancer}
 shutdown: {delay: 0s, drainTimeout: 30s}
 logFormat: text
 edge:
   endpoint: tcp://bk.example.com:8444
   serverName: bk.example.com
+watchNamespaces: [bk-helm-pool, bk-helm-pool-b]
+claims:
+  enabled: true
+  namespaces: [bk-helm-apps]

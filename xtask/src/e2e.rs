@@ -1,18 +1,22 @@
-//! `cargo xtask e2e`: the end-to-end suite on a kind cluster `bk-e2e`.
 //! `cargo xtask e2e` runs the end-to-end suite on a kind cluster `bk-e2e`.
 //!
 //! The task installs the controller from the Helm chart. A mock OIDC issuer
 //! runs in this process (trusted through the issuer's `caBundleConfigMap`) and
 //! a `registry:2` runs in the cluster. The clients are the real recipe
 //! `docs/ci/buildkit-allocate.sh` and real `docker buildx` on the host. They go
-//! through the real API and mTLS edge, which kind publishes on 127.0.0.1:18443
-//! and :18444 (`NodePorts`). `*.localhost` resolves to loopback, which makes
-//! per-allocation endpoints (`<id>.localhost:18444`) reachable.
+//! through the real API and mTLS edge behind Envoy Gateway (see `gateway.rs`),
+//! installed with the chart's default Gateway API exposure: an `HTTPRoute` with a
+//! `BackendTLSPolicy` for the API and a `TLSRoute` for the edge. kind publishes the
+//! Gateway's listeners (`NodePorts`) on two loopback host ports, 18443 and 18444
+//! by default (see [`HostPorts`]). `*.localhost` resolves to loopback, which makes
+//! per-allocation endpoints (`<id>.localhost:<edge port>`) reachable.
 //!
 //! Every kind, kubectl and helm call gets the private kubeconfig under
-//! `target/e2e`. The task never touches `~/.kube/config`, and `e2e` deletes the
-//! cluster on every exit path. `e2e-up` installs the same cluster trusting
-//! GitHub's OIDC issuer and leaves it running, for the Action job in CI.
+//! `target/e2e` (`target/e2e-<suffix>` with `BK_KIND_SUFFIX`). The task never
+//! touches `~/.kube/config`, and `e2e` deletes the cluster on every exit path.
+//! `e2e-up` installs the same cluster trusting GitHub's OIDC issuer and leaves
+//! it running, for the Action job in CI. It writes the API URL to `api-url` in
+//! the work directory.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -22,6 +26,7 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::e2e_issuer::Issuer;
 use crate::helm_verify::{Env, until};
+use crate::image::WORKER_IMAGE;
 use crate::root;
 
 static CLUSTER: std::sync::LazyLock<String> =
@@ -29,10 +34,13 @@ static CLUSTER: std::sync::LazyLock<String> =
 const NS: &str = "bk-system";
 const POOL_NS: &str = "ci";
 const OIDC_HOST: &str = "mock-oidc.bk-oidc.svc";
-const SOCAT_IMAGE: &str = "alpine/socat:latest";
-const API: &str = "https://localhost:18443";
-const WORKER_IMAGE: &str = "moby/buildkit:v0.34.0-rootless";
-const LOCAL_BUILDKIT: &str = "moby/buildkit:rootless";
+/// The mock issuer's server, pulled by digest (the multi-arch index) and tagged locally.
+const SOCAT_IMAGE: &str = "docker.io/alpine/socat:1.8.1.3";
+const SOCAT_DIGEST: &str =
+    "sha256:603174b77eebaba25ba8f8ebb15e1234d6600409554e95d6fb203fd106150287";
+/// The API URL clients use, through the Gateway.
+static API: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("https://localhost:{}", HostPorts::get().api));
 const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const REGISTRY_IMAGE: &str = "registry:2";
 const REG: &str = "registry.e2e-reg.svc.cluster.local:5000";
@@ -45,6 +53,71 @@ enum Mode<'a> {
     Mock(&'a Issuer),
     /// GitHub's, for the repository `owner/name`.
     Github(&'a str),
+}
+
+/// Kind's pod and service ranges, set in `xtask/fixtures/e2e/kind.yaml`. The
+/// controller lists them as cluster ranges, and the pools open them (the
+/// in-cluster registry) through `workerNetwork.permittedCIDRs`.
+const KIND_CIDRS: &str = "10.244.0.0/16, 10.96.0.0/16";
+
+/// The loopback host ports kind publishes the Gateway's API and edge listeners on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HostPorts {
+    api: u16,
+    edge: u16,
+}
+
+impl HostPorts {
+    /// Without a suffix (CI), the fixed 18443 and 18444.
+    const DEFAULT: Self = Self {
+        api: 18443,
+        edge: 18444,
+    };
+    /// Suffixed runs get a port pair in `[FIRST, FIRST + 2 * PAIRS)`.
+    const FIRST: u16 = 20000;
+    const PAIRS: u32 = 1000;
+
+    /// The ports for `BK_KIND_SUFFIX`.
+    fn get() -> Self {
+        Self::for_suffix(std::env::var("BK_KIND_SUFFIX").ok().as_deref())
+    }
+
+    /// A stable pair per suffix, so two checkouts with different suffixes run at
+    /// once and `e2e-up` gives the same URL every time. FNV-1a, which needs no
+    /// dependency and does not change between Rust releases.
+    fn for_suffix(suffix: Option<&str>) -> Self {
+        let Some(s) = suffix.filter(|s| !s.is_empty()) else {
+            return Self::DEFAULT;
+        };
+        let hash = s.bytes().fold(0x811c_9dc5_u32, |h, b| {
+            (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+        });
+        // hash % PAIRS < 1000, so the pair fits under 22000.
+        let pair = u16::try_from(hash % Self::PAIRS).unwrap_or(0);
+        let api = Self::FIRST + 2 * pair;
+        Self { api, edge: api + 1 }
+    }
+
+    /// Fails when another process holds one of the ports, naming it, instead of
+    /// letting kind fail later with "port is already allocated".
+    fn check_free(self) -> Result<()> {
+        for port in [self.api, self.edge] {
+            std::net::TcpListener::bind(("127.0.0.1", port)).with_context(|| {
+                format!(
+                    "host port {port} for {} is taken; delete that cluster or pick another BK_KIND_SUFFIX",
+                    CLUSTER.as_str()
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// The work directory: `target/e2e`, or `target/e2e-<suffix>`, so two runs from
+/// one checkout keep their kubeconfigs and files apart.
+fn work_dir() -> PathBuf {
+    let name = super::kind_cluster("e2e");
+    root().join("target").join(name)
 }
 
 struct Cleanup(Env);
@@ -80,21 +153,6 @@ fn output(c: &mut Command) -> Result<String> {
     Ok(text)
 }
 
-fn have_image(image: &str) -> bool {
-    Command::new("docker")
-        .args(["image", "inspect", image])
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
-/// Make `image` present locally, pulling when it is not.
-fn ensure_image(image: &str) -> Result<()> {
-    if !have_image(image) {
-        status(Command::new("docker").args(["pull", image]))?;
-    }
-    Ok(())
-}
-
 /// The pool platform of this host.
 fn host_platform() -> Result<&'static str> {
     match std::env::consts::ARCH {
@@ -117,7 +175,7 @@ fn pool_yaml(name: &str, platforms: &str, rules: &str) -> String {
       platforms: [{platforms}]
       scaling: {{min: 1, max: 1}}
       network:
-        egress: {{allowCIDRs: [10.0.0.0/8]}}
+        egress: {{allowCIDRs: [{KIND_CIDRS}]}}
       workers:
         buildkitdConfig: |
           [registry.\"{REG}\"]
@@ -183,7 +241,16 @@ fn cache_pool_yaml(name: &str, platform: &str, rules: &str, scaling: &str, cache
 fn install(env: &Env, work: &Path, mode: &Mode) -> Result<PathBuf> {
     let root = root();
     let _ = env.tool("kind", &["delete", "cluster", "--name", CLUSTER.as_str()]);
-    let kind_cfg = root.join("xtask/fixtures/e2e/kind.yaml");
+    let ports = HostPorts::get();
+    ports.check_free()?;
+    let kind_template = std::fs::read_to_string(root.join("xtask/fixtures/e2e/kind.yaml"))?;
+    let kind_cfg = work.join("kind.yaml");
+    write(
+        &kind_cfg,
+        &kind_template
+            .replace("API_PORT", &ports.api.to_string())
+            .replace("EDGE_PORT", &ports.edge.to_string()),
+    )?;
     env.tool(
         "kind",
         &[
@@ -198,24 +265,25 @@ fn install(env: &Env, work: &Path, mode: &Mode) -> Result<PathBuf> {
         ],
     )?;
 
+    // The image build (target/image and its cargo volume), the image pulls and
+    // the gateway download (target/gateway) are shared by every run from this
+    // checkout, so a parallel run waits here. The lock ends with the process at worst.
+    let lock = std::fs::File::create(root.join("target/e2e-host.lock"))?;
+    lock.lock().context("locking target/e2e-host.lock")?;
     crate::image::image(CONTROLLER_IMAGE, Some(CLUSTER.as_str()))?;
-    if !have_image(WORKER_IMAGE) {
-        if have_image(LOCAL_BUILDKIT) {
-            status(Command::new("docker").args(["tag", LOCAL_BUILDKIT, WORKER_IMAGE]))?;
-        } else {
-            ensure_image(WORKER_IMAGE)?;
-        }
-    }
+    crate::image::ensure_worker()?;
     let mut images = vec![WORKER_IMAGE];
     if matches!(mode, Mode::Mock(_)) {
-        ensure_image(REGISTRY_IMAGE)?;
+        crate::image::ensure(REGISTRY_IMAGE)?;
         images.push(REGISTRY_IMAGE);
-        ensure_image(SOCAT_IMAGE)?;
+        crate::gateway::ensure_image(SOCAT_IMAGE, SOCAT_DIGEST)?;
         images.push(SOCAT_IMAGE);
     }
     for image in images {
         status(&mut crate::kube::kind_load(image, CLUSTER.as_str()))?;
     }
+    let gateway_ca = crate::gateway::install(env, CLUSTER.as_str(), work)?;
+    drop(lock);
 
     for ns in [NS, POOL_NS] {
         env.kubectl(&["create", "namespace", ns])?;
@@ -287,21 +355,31 @@ fullnameOverride: buildkit-controller
 image: {{repository: buildkit-controller, tag: dev, pullPolicy: Never}}
 replicaCount: 1
 podDisruptionBudget: {{enabled: false}}
+watchNamespaces: [{POOL_NS}]
 logFormat: text
-service:
-  type: NodePort
-  nodePorts: {{api: 30443, edge: 30444}}
+gateway:
+  api:
+    parentRefs: [{{name: {gw}, namespace: {gw_ns}, sectionName: api}}]
+    hostnames: [localhost]
+  edge:
+    parentRefs: [{{name: {gw}, namespace: {gw_ns}, sectionName: edge}}]
 shutdown: {{delay: 0s, drainTimeout: 30s}}
 edge:
-  endpoint: tcp://localhost:18444
+  endpoint: tcp://localhost:{edge_port}
   serverName: bk.e2e.test
   allocationDomain: localhost
   extraNames: [localhost, 127.0.0.1]
+workerNetwork:
+  clusterCIDRs: [{KIND_CIDRS}]
+  permittedCIDRs: [{KIND_CIDRS}]
 auth:
   oidc:
     - url: \"{issuer_url}\"
       audiences: [{AUD}]
-{oidc_ca}"
+{oidc_ca}",
+        edge_port = ports.edge,
+        gw = crate::gateway::NAME,
+        gw_ns = crate::gateway::NS,
     );
     let values_file = write(&work.join("values.yaml"), &values)?;
     let chart = root
@@ -360,58 +438,61 @@ auth:
         "--timeout=300s",
     ])?;
     for p in &ready {
-        env.kubectl(&[
-            "wait",
-            "--for=condition=Ready",
+        crate::kube::wait_condition(
+            &env.kubeconfig,
             &format!("buildkitpool/{p}"),
-            "-n",
-            POOL_NS,
-            "--timeout=300s",
-        ])?;
+            Some(POOL_NS),
+            "Ready",
+            Duration::from_mins(5),
+        )?;
     }
     println!("pools Ready: {ready:?}");
 
-    let ca = env.kubectl(&[
-        "get",
-        "secret",
-        "buildkit-controller-ca",
-        "-n",
-        NS,
-        "-o",
-        "jsonpath={.data.client-ca\\.crt}",
-    ])?;
-    let decoded =
-        output(Command::new("sh").args(["-c", &format!("printf %s '{ca}' | base64 -d")]))?;
+    // API clients trust the Gateway's certificate, not the controller's.
     let path = work.join("api-ca.pem");
-    write(&path, &decoded)?;
+    std::fs::copy(&gateway_ca, &path)?;
     until("API listener", Duration::from_mins(2), || {
-        // A TLS-verified 401 shows the API listener is serving.
+        // A TLS-verified 401 through the Gateway shows the HTTPRoute and the
+        // BackendTLSPolicy work: the gateway answers 503 when it cannot re-encrypt.
         let probe = Command::new("curl")
             .args(["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--cacert"])
             .arg(&path)
-            .arg(format!("{API}/v1/pools"))
+            .arg(format!("{}/v1/pools", *API))
             .output()?;
         Ok(String::from_utf8_lossy(&probe.stdout)
             .starts_with("401")
             .then_some(()))
     })?;
+    for (kind, name) in [
+        ("httproute", "buildkit-controller-api"),
+        ("backendtlspolicy", "buildkit-controller-api"),
+        ("tlsroute", "buildkit-controller-edge"),
+    ] {
+        ensure!(
+            crate::gateway::accepted(env, kind, name, NS)?,
+            "{kind}/{name} is not Accepted"
+        );
+    }
+    println!("PASS routes Accepted: HTTPRoute and BackendTLSPolicy (API), TLSRoute (edge)");
     Ok(path)
 }
 
 /// Install a cluster for the GitHub Action job and leave it running.
 pub(crate) fn e2e_up(repo: &str) -> Result<()> {
-    let work = root().join("target/e2e");
+    let work = work_dir();
     std::fs::create_dir_all(&work)?;
     let env = Env {
         kubeconfig: work.join("kubeconfig"),
     };
     let ca = install(&env, &work, &Mode::Github(repo))?;
-    println!("e2e-up: API {API}, CA {}", ca.display());
+    // The CI job reads the URL from this file, not from a fixed port.
+    write(&work.join("api-url"), &format!("{}\n", *API))?;
+    println!("e2e-up: API {}, CA {}", *API, ca.display());
     Ok(())
 }
 
 pub(crate) fn e2e() -> Result<()> {
-    let work = root().join("target/e2e");
+    let work = work_dir();
     std::fs::create_dir_all(&work)?;
     let cleanup = Cleanup(Env {
         kubeconfig: work.join("kubeconfig"),
@@ -435,6 +516,7 @@ pub(crate) fn e2e() -> Result<()> {
                 eprintln!("--- kubectl {args:?}\n{o}");
             }
         }
+        crate::gateway::dump(env);
     }
     result
 }
@@ -453,7 +535,7 @@ impl Client<'_> {
         c.arg(root().join("docs/ci/buildkit-allocate.sh"))
             .args(["sh", "-c", script])
             .current_dir(&self.ctx)
-            .env("API", API)
+            .env("API", API.as_str())
             .env("API_CA", &self.ca)
             .env("POOL", pool)
             .env("TOKEN", token)
@@ -617,6 +699,108 @@ fn prepare(work: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok((ctx, mp))
 }
 
+/// How many build records `docker buildx history ls` listed between the
+/// markers. The listing runs after the build, in the same allocation.
+fn history_records(out: &str) -> Result<usize> {
+    let start = out
+        .find("HISTORY-START")
+        .context("history listing did not run")?;
+    let end = out.find("HISTORY-END").context("history listing failed")?;
+    Ok(out[start..end]
+        .lines()
+        .skip(1)
+        .filter(|l| l.trim_start().starts_with('{'))
+        .count())
+}
+
+/// Scenario k: cache scopes and build history on `cache-local` (one slot).
+fn scopes(c: &Client, host_pool: &str, oidc: &str) -> Result<()> {
+    let sa = &c.sa_token()?;
+    let local_pool = format!("{POOL_NS}/cache-local");
+    let build = "docker buildx build --builder \"$BUILDER\" --progress=plain -o type=cacheonly $CACHE_ARGS .";
+    let script = format!(
+        "{build} && echo HISTORY-START && docker buildx history ls --builder \"$BUILDER\" --format json && echo HISTORY-END"
+    );
+    let go = |pool: &str, token: &str| {
+        let mut cmd = c.recipe(pool, token, &script);
+        if pool == local_pool {
+            cmd.env("CACHE_KEY", "e2e-local").env("CACHE", "local");
+        }
+        output(&mut cmd)
+    };
+    let binding = || {
+        c.env.kubectl(&[
+            "get",
+            "pvc",
+            "-n",
+            POOL_NS,
+            "cache-local-cache-0",
+            "-o",
+            "jsonpath={.metadata.annotations.buildkit\\.smrt-devops\\.net/cache-scope}",
+        ])
+    };
+    c.wait_warm("cache-local-0", "e2e-local")?;
+    let owner = binding()?;
+    ensure!(
+        owner.contains('@'),
+        "the volume has no owner after g: {owner:?}"
+    );
+
+    // History works through the edge on a pool without cache.local.
+    let control = go(host_pool, sa)?;
+    let n = history_records(&control)?;
+    ensure!(n >= 1, "no build record on {host_pool}:\n{control}");
+
+    // Another identity: a fresh volume, no cache, no history.
+    let other = go(&local_pool, sa)?;
+    ensure!(
+        !other.contains("local hit"),
+        "the ServiceAccount hit the OIDC caller's volume:\n{other}"
+    );
+    let cached = other.matches("CACHED").count();
+    ensure!(
+        cached == 0,
+        "the ServiceAccount got {cached} CACHED steps from another identity's volume:\n{other}"
+    );
+    let records = history_records(&other)?;
+    ensure!(
+        records == 0,
+        "{records} build records readable on a cache pool:\n{other}"
+    );
+    let result = other
+        .lines()
+        .find_map(|l| l.strip_prefix("cache: key e2e-local, local "))
+        .unwrap_or("?")
+        .to_owned();
+    let now = binding()?;
+    ensure!(now != owner, "the volume binding did not change: {now:?}");
+
+    // The same identity hits its own cache on the next pod.
+    c.wait_warm("cache-local-0", "e2e-local")?;
+    let again = go(&local_pool, sa)?;
+    let hits = again.matches("CACHED").count();
+    ensure!(
+        again.contains("cache: key e2e-local, local hit") && hits >= 3,
+        "the ServiceAccount did not hit its own cache ({hits} CACHED):\n{again}"
+    );
+    ensure!(
+        history_records(&again)? == 0,
+        "build records readable on a cache pool:\n{again}"
+    );
+
+    // The OIDC caller's volume was taken over, so it starts empty too.
+    c.wait_warm("cache-local-0", "e2e-local")?;
+    let back = go(&local_pool, oidc)?;
+    ensure!(
+        !back.contains("local hit") && back.matches("CACHED").count() == 0,
+        "the OIDC caller got the ServiceAccount's cache:\n{back}"
+    );
+    println!(
+        "PASS k: another identity gets an empty volume (local {result}, 0 CACHED, 0 build records; {n} on {host_pool}); the same identity then hits ({hits} CACHED); the first identity starts empty again"
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines, reason = "one linear scenario script")]
 fn run(env: &Env, work: &Path) -> Result<()> {
     let issuer = Issuer::new(OIDC_HOST)?;
@@ -631,6 +815,12 @@ fn run(env: &Env, work: &Path) -> Result<()> {
         work: work.to_path_buf(),
     };
     let oidc = issuer.token(AUD, "e2e")?;
+    let foreign = if host == "arm64" { "amd64" } else { "arm64" };
+
+    // l. A long poll through the Gateway, beside scenarios a to h. X holds the only
+    // worker of the foreign pool for 330 s, and Y queues behind it. The API sends
+    // nothing while Y waits, past Envoy's default 5-minute stream idle timeout.
+    let long = LongPoll::start(&c, &format!("{POOL_NS}/{foreign}"), &issuer)?;
 
     // a. A build with a RUN step succeeds through the edge (OIDC token).
     let out = c.build(&pool, &oidc, "")?;
@@ -840,12 +1030,18 @@ fn run(env: &Env, work: &Path) -> Result<()> {
         "PASS h: two overlapping e2e-spill builds both succeed; A local hit on {holder}, B local spill on {other}"
     );
 
+    // k. Cache scopes. After g, the only volume of cache-local belongs to the OIDC
+    // caller. A caller of another identity (the ServiceAccount) neither gets its
+    // cache nor reads any build history through the edge, then hits its own cache.
+    scopes(&c, &pool, &oidc)?;
+
+    long.finish()?;
+
     // e. Multi-platform. Two pools and a two-node builder, built the way the Action builds it.
-    let foreign = if host == "arm64" { "amd64" } else { "arm64" };
     let out = output(
         Command::new("bash")
             .arg(root().join("xtask/fixtures/e2e/multiplatform.sh"))
-            .env("API", API)
+            .env("API", API.as_str())
             .env("API_CA", &ca)
             .env("TOKEN", &oidc)
             .env(
@@ -887,6 +1083,191 @@ fn run(env: &Env, work: &Path) -> Result<()> {
         "PASS e: two nodes running (native pool + emulated-arch pool declaring two platforms); linux/arm64,linux/amd64 build and each platform build alone succeed; multiplatform path: {path}"
     );
 
+    gateway_options(env, &c, &pool, &issuer)?;
     println!("e2e: all scenarios passed");
     Ok(())
+}
+
+/// Scenario l: an allocation request that stays queued, and silent, for over
+/// five minutes behind the Gateway.
+struct LongPoll {
+    holder: std::process::Child,
+    waiter: std::process::Child,
+    launched: u64,
+    outd: PathBuf,
+}
+
+/// How long X holds the worker, so Y waits past Envoy's default 5-minute stream idle timeout.
+const LONG_HOLD_SECS: u64 = 330;
+
+impl LongPoll {
+    fn start(c: &Client, pool: &str, issuer: &Issuer) -> Result<Self> {
+        let outd = c.work.clone();
+        for stale in ["l.x", "l.y"] {
+            let _ = std::fs::remove_file(outd.join(stale));
+        }
+        let holder = c
+            .recipe(
+                pool,
+                &issuer.token(AUD, "e2e")?,
+                &format!(r#"date +%s > "$OUTD/l.x"; sleep {LONG_HOLD_SECS}"#),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        until("X holds the foreign worker", Duration::from_mins(3), || {
+            Ok(outd.join("l.x").exists().then_some(()))
+        })?;
+        let launched = now()?;
+        let waiter = c
+            .recipe(
+                pool,
+                &issuer.token(AUD, "e2e")?,
+                r#"date +%s > "$OUTD/l.y""#,
+            )
+            .env("QUEUE_TIMEOUT", "600")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        Ok(Self {
+            holder,
+            waiter,
+            launched,
+            outd,
+        })
+    }
+
+    fn finish(mut self) -> Result<()> {
+        ensure!(self.holder.wait()?.success(), "long-poll holder X failed");
+        let y = self.waiter.wait_with_output()?;
+        ensure!(
+            y.status.success(),
+            "long-poll Y failed:\n{}{}",
+            String::from_utf8_lossy(&y.stdout),
+            String::from_utf8_lossy(&y.stderr)
+        );
+        let started = read_secs(&self.outd.join("l.y"))?;
+        let waited = started.saturating_sub(self.launched);
+        ensure!(
+            waited >= 300,
+            "Y waited {waited}s, not past the 5-minute idle bound the scenario tests"
+        );
+        println!(
+            "PASS l: an allocation request queued silently for {waited}s through the Gateway and got the worker"
+        );
+        Ok(())
+    }
+}
+
+/// `helm upgrade --reuse-values` of the e2e release with `sets`.
+fn upgrade(env: &Env, sets: &[&str]) -> Result<()> {
+    let chart = root().join("helm/buildkit-controller");
+    let chart = chart.to_string_lossy();
+    let mut args = vec!["upgrade", "bk", &chart, "-n", NS, "--reuse-values"];
+    for s in sets {
+        args.extend(["--set", s]);
+    }
+    env.tool("helm", &args)?;
+    Ok(())
+}
+
+/// Scenarios i and j: the chart's other Gateway options on the same Gateway.
+fn gateway_options(env: &Env, c: &Client, pool: &str, issuer: &Issuer) -> Result<()> {
+    // i. Envoy Gateway extras. Both BackendTrafficPolicies are Accepted and a build
+    // with a RUN step still goes through the API route and the edge.
+    upgrade(env, &["gateway.envoy.enabled=true"])?;
+    for route in ["api", "edge"] {
+        let name = format!("buildkit-controller-{route}");
+        until(
+            &format!("backendtrafficpolicy/{name} Accepted"),
+            Duration::from_mins(2),
+            || Ok(crate::gateway::accepted(env, "backendtrafficpolicy", &name, NS)?.then_some(())),
+        )?;
+    }
+    let out = c.build(pool, &issuer.token(AUD, "e2e")?, "")?;
+    ensure!(
+        out.contains("built-through-edge"),
+        "build with the Envoy extras:\n{out}"
+    );
+    println!(
+        "PASS i: gateway.envoy.enabled: both BackendTrafficPolicies Accepted; a build succeeds"
+    );
+
+    // j. The API by TLS passthrough. The TLSRoute on the Gateway's passthrough
+    // listener reaches the controller, which serves its own certificate.
+    upgrade(
+        env,
+        &[
+            "gateway.api.mode=passthrough",
+            &format!(
+                "gateway.api.parentRefs[0].sectionName=api-passthrough,gateway.api.parentRefs[0].name={},gateway.api.parentRefs[0].namespace={}",
+                crate::gateway::NAME,
+                crate::gateway::NS
+            ),
+        ],
+    )?;
+    until(
+        "tlsroute/buildkit-controller-api Accepted",
+        Duration::from_mins(2),
+        || {
+            Ok(
+                crate::gateway::accepted(env, "tlsroute", "buildkit-controller-api", NS)?
+                    .then_some(()),
+            )
+        },
+    )?;
+    let ca = env.kubectl(&[
+        "get",
+        "configmap",
+        "buildkit-controller-ca-bundle",
+        "-n",
+        NS,
+        "-o",
+        "jsonpath={.data.ca\\.crt}",
+    ])?;
+    let ca_file = write(&c.work.join("controller-ca.pem"), &ca)?;
+    // kubectl port-forward exits when the pod refuses a connection, which it does
+    // until Envoy has the listener, so each attempt opens its own.
+    let code = until("API by passthrough", Duration::from_mins(2), || {
+        let port = crate::gateway::PortForward::envoy(env, 9443)?;
+        let url = format!("https://localhost:{}/v1/pools", port.local);
+        let probe = Command::new("curl")
+            .args(["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--cacert"])
+            .arg(&ca_file)
+            .arg(&url)
+            .output()?;
+        let code = String::from_utf8_lossy(&probe.stdout).into_owned();
+        ensure!(
+            code.starts_with("401"),
+            "{url}: HTTP {code} {}",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        Ok(Some(code))
+    })?;
+    println!(
+        "PASS j: gateway.api.mode=passthrough: TLSRoute Accepted; the API answers {code} with the controller's own certificate"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HostPorts;
+
+    #[test]
+    fn host_ports_are_fixed_without_a_suffix_and_stable_per_suffix() {
+        assert_eq!(HostPorts::for_suffix(None), HostPorts::DEFAULT);
+        assert_eq!(HostPorts::for_suffix(Some("")), HostPorts::DEFAULT);
+        let a = HostPorts::for_suffix(Some("cidrs1"));
+        let b = HostPorts::for_suffix(Some("cidrs2"));
+        assert_eq!(a, HostPorts::for_suffix(Some("cidrs1")));
+        assert_ne!(a, b);
+        for p in [a, b] {
+            assert!(
+                p.api >= HostPorts::FIRST && p.edge == p.api + 1 && p.edge < 22000,
+                "{p:?}"
+            );
+            assert!(p.api % 2 == 0, "pairs never overlap: {p:?}");
+        }
+    }
 }

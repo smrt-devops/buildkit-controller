@@ -46,8 +46,8 @@ fn pool_meta(pool: &BuildKitPool) -> Result<ObjectMeta, RenderError> {
 
 /// The per-pod Secret `<pod>-<nonce>` of the pod [`super::worker_pod`] renders
 /// from the same `inputs`: `tls.crt`, `tls.key`, `ca.crt`, `buildkitd.toml`.
-/// It is owned by the pool until the pod exists; the creator then moves the
-/// ownerReference to the pod.
+/// It carries the pool's ownerReference as rendered; [`crate::reconcile::spawn`]
+/// replaces it with the pod's before the Secret is created.
 pub fn worker_secret(
     pool: &BuildKitPool,
     inputs: &PodInputs,
@@ -134,6 +134,11 @@ fn dns_rule(net: &WorkerNetwork) -> Option<NetworkPolicyEgressRule> {
 }
 
 /// `NetworkPolicy` `<pool>-buildkit-worker`.
+///
+/// Leaves out every `allowCIDRs` entry [`super::refused_allow_cidr`] refuses, so the
+/// policy never reopens a link-local, metadata, loopback, cluster or extra denied
+/// range. Applied while the pool is `InvalidSpec`, it narrows the policy of
+/// pods that run under an older, wider one.
 pub fn network_policy(
     pool: &BuildKitPool,
     cfg: &RenderConfig,
@@ -160,6 +165,7 @@ pub fn network_policy(
     egress.extend(
         spec.allow_cidrs
             .iter()
+            .filter(|c| super::refused_allow_cidr(c, net).is_none())
             .map(|c| to(vec![block(c, None)], None)),
     );
 

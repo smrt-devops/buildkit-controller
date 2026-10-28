@@ -73,9 +73,10 @@ impl Client {
 
     /// `POST /v1/allocations`.
     ///
-    /// The GitHub Action and the curl recipe always set `public_key`, so the private
-    /// key never leaves the caller. The field stays optional on the wire for other
-    /// clients. The call is not idempotent, so retry only when
+    /// The HTTP API requires `public_key` (400 `invalid_request` without it), so the
+    /// private key never leaves the caller. Only the in-cluster `BuildKitClaim`
+    /// controller allocates without one, and the server then generates the key. The
+    /// call is not idempotent, so retry only when
     /// [`ClientError::is_retryable`] is true.
     pub async fn create_allocation(
         &self,

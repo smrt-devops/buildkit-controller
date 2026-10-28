@@ -85,8 +85,8 @@ data:
       caSecretName: buildkit-controller-ca
     shutdown:
       delay: 5s
-      drainTimeout: 300s
-    watchNamespace: ci
+    watchNamespaces:
+    - ci
     workerNetwork:
       clusterCIDRs: []
       deniedCIDRs:
@@ -107,6 +107,7 @@ data:
         podLabels:
           k8s-app: kube-dns
       extraDeniedCIDRs: []
+      permittedCIDRs: []
 
 ---
 # Source: buildkit-controller/templates/rbac.yaml
@@ -306,8 +307,7 @@ metadata:
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: buildkit-controller-0.1.0
 spec:
-  type: LoadBalancer
-  externalTrafficPolicy: Local
+  type: ClusterIP
   selector:
     app.kubernetes.io/name: buildkit-controller
     app.kubernetes.io/instance: bk
@@ -369,10 +369,10 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: buildkit-controller-0.1.0
       annotations:
-        checksum/config: 5050c51cb1fe1f025e3627f7fcce1ef6926b3ac015d211d54b3d2a8995ee9eba
+        checksum/config: bc9419ccaa82fc6ec9ef6feb9a188d7b7fb0cc8d975f496a958519d71dbc7f49
     spec:
       serviceAccountName: buildkit-controller
-      terminationGracePeriodSeconds: 315
+      terminationGracePeriodSeconds: 86715
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

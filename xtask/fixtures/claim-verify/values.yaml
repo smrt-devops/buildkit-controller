@@ -5,6 +5,8 @@ image: {repository: buildkit-controller, tag: dev, pullPolicy: Never}
 fullnameOverride: bkc
 replicaCount: 1
 service: {type: ClusterIP}
+# In-cluster only: pods use the claim Secret's Service endpoint, so no Gateway routes.
+gateway: {enabled: false}
 shutdown: {delay: 0s, drainTimeout: 30s}
 logFormat: text
 edge:

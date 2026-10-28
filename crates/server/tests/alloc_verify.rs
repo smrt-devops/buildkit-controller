@@ -500,9 +500,11 @@ async fn alloc_verify() {
     };
     assert_eq!(na, ts(&expires), "notAfter = expires-at");
     assert_eq!(na - ts(&allocated), 900, "lifetime = TTL");
+    // Both are whole seconds, and the cert is issued just after the claim,
+    // possibly in the next second.
     assert!(
-        ts(&allocated) - nb >= 300 && ts(&allocated) - nb <= 302,
-        "backdated 5m"
+        (299..=302).contains(&(ts(&allocated) - nb)),
+        "backdated 5m: allocated-at {allocated}, notBefore {nb}"
     );
     assert_eq!(
         r.endpoint,

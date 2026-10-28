@@ -21,7 +21,10 @@ pub struct CreateAllocationRequest {
     /// Longest time to wait in the queue. Defaults to the pool's `allocation.queueTimeout` and may not exceed `maxQueueTimeout`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_timeout_seconds: Option<u64>,
-    /// PEM SPKI ECDSA P-256 public key. When set, the server returns no private key.
+    /// PEM SPKI ECDSA P-256 public key of a key pair the client generated. Required on the
+    /// HTTP API (400 `invalid_request` without it), so the private key never leaves the
+    /// client. Only the in-cluster `BuildKitClaim` controller allocates without one, and the
+    /// server then generates the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
     /// Cache key of both cache layers. Defaults to the pool's `registry.defaultKey`, else its name.
@@ -118,7 +121,8 @@ pub struct AllocationResponse {
     pub namespace: String,
     /// Pool name.
     pub pool: String,
-    /// Caller identity, `oidc:<iss>#<sub>` or `sa:<ns>/<name>`.
+    /// Caller identity: `sa:<ns>/<name>`, `claim:<ns>/<name>#<uid>`, or `oidc:<iss>#<sub>`
+    /// followed by any run claims (see the allocation owner section of the architecture doc).
     pub owner: String,
     /// Edge endpoint, for example `tcp://bk.example.com:8444`.
     pub endpoint: String,
@@ -128,7 +132,8 @@ pub struct AllocationResponse {
     pub ca_cert: Option<String>,
     /// Allocation client certificate (PEM, no chain).
     pub client_cert: String,
-    /// PKCS#8 PEM private key. The server omits it when the request carried a `publicKey`.
+    /// PKCS#8 PEM private key the server generated. Never present on the HTTP API, which
+    /// requires a `publicKey`; only the `BuildKitClaim` path fills it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_key: Option<String>,
     /// RFC 3339 UTC expiry.
@@ -166,6 +171,19 @@ pub struct PoolSummary {
     pub endpoint: String,
     /// TLS server name.
     pub server_name: String,
+    /// `allocation.queueTimeout` in seconds: the queue wait of a request that
+    /// sends no `queueTimeoutSeconds`. Absent from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_timeout_seconds: Option<u64>,
+    /// `allocation.maxQueueTimeout` in seconds. Absent from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_queue_timeout_seconds: Option<u64>,
+    /// `allocation.defaultTTL` in seconds. Absent from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_ttl_seconds: Option<u64>,
+    /// `allocation.maxTTL` in seconds. Absent from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ttl_seconds: Option<u64>,
 }
 
 /// `GET /v1/pools` response.
@@ -182,7 +200,7 @@ pub struct PoolList {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
-    /// HTTP 400 for bad JSON, an unknown field, a TTL out of range or a bad `publicKey`.
+    /// HTTP 400 for bad JSON, an unknown field, a TTL out of range, or a missing or bad `publicKey`.
     InvalidRequest,
     /// HTTP 401 for a missing or invalid token.
     Unauthenticated,
@@ -211,6 +229,9 @@ pub enum ErrorCode {
     CaUnavailable,
     /// HTTP 503 when a Kubernetes API call times out or returns 5xx and the outcome is unknown.
     UpstreamError,
+    /// HTTP 503 when the replica is shutting down and took no pod for the request. Retry
+    /// at once: the replica has already left the Service endpoints.
+    ShuttingDown,
 }
 
 impl ErrorCode {
@@ -230,15 +251,17 @@ impl ErrorCode {
             | Self::PodLost
             | Self::NotReady
             | Self::CaUnavailable
-            | Self::UpstreamError => 503,
+            | Self::UpstreamError
+            | Self::ShuttingDown => 503,
         }
     }
 
-    /// Whether the response carries `Retry-After: 5`.
+    /// The `Retry-After` the response carries, in seconds.
     #[must_use]
     pub const fn retry_after_seconds(self) -> Option<u64> {
         match self {
             Self::PoolExhausted | Self::StartTimeout => Some(5),
+            Self::ShuttingDown => Some(1),
             _ => None,
         }
     }
@@ -275,7 +298,7 @@ impl ErrorBody {
 
 impl ErrorCode {
     /// Every code, in the order of the API error table.
-    pub const ALL: [ErrorCode; 14] = [
+    pub const ALL: [ErrorCode; 15] = [
         Self::InvalidRequest,
         Self::Unauthenticated,
         Self::Forbidden,
@@ -290,6 +313,7 @@ impl ErrorCode {
         Self::NotReady,
         Self::CaUnavailable,
         Self::UpstreamError,
+        Self::ShuttingDown,
     ];
 
     /// The stable wire string. It is also the metrics `result` label value.
@@ -310,6 +334,7 @@ impl ErrorCode {
             Self::NotReady => "not_ready",
             Self::CaUnavailable => "ca_unavailable",
             Self::UpstreamError => "upstream_error",
+            Self::ShuttingDown => "shutting_down",
         }
     }
 }

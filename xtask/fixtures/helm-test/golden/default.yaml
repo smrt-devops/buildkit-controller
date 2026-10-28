@@ -85,7 +85,6 @@ data:
       caSecretName: buildkit-controller-ca
     shutdown:
       delay: 5s
-      drainTimeout: 300s
     watchNamespace: ""
     workerNetwork:
       clusterCIDRs: []
@@ -107,6 +106,7 @@ data:
         podLabels:
           k8s-app: kube-dns
       extraDeniedCIDRs: []
+      permittedCIDRs: []
 
 ---
 # Source: buildkit-controller/templates/rbac.yaml
@@ -304,8 +304,7 @@ metadata:
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: buildkit-controller-0.1.0
 spec:
-  type: LoadBalancer
-  externalTrafficPolicy: Local
+  type: ClusterIP
   selector:
     app.kubernetes.io/name: buildkit-controller
     app.kubernetes.io/instance: bk
@@ -367,10 +366,10 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: buildkit-controller-0.1.0
       annotations:
-        checksum/config: d8b5bd52898ebd2e45058d64694076f681c86275bd2c91355bc108bb591dec75
+        checksum/config: c122728f7f9bc9c4a7592ba1923a18d1bd8b8e608fdd0ec482c36e0cfe41fa81
     spec:
       serviceAccountName: buildkit-controller
-      terminationGracePeriodSeconds: 315
+      terminationGracePeriodSeconds: 86715
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -427,3 +426,77 @@ spec:
                   matchLabels:
                     app.kubernetes.io/name: buildkit-controller
                     app.kubernetes.io/instance: bk
+
+---
+# Source: buildkit-controller/templates/gateway.yaml
+# The gateway re-encrypts to the controller's API port and checks its serving certificate.
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: buildkit-controller-api
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+spec:
+  targetRefs:
+    - {group: "", kind: Service, name: buildkit-controller, sectionName: api}
+  validation:
+    hostname: bk.example.com
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: buildkit-controller-ca-bundle
+
+---
+# Source: buildkit-controller/templates/gateway.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: buildkit-controller-api
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+spec:
+  parentRefs:
+    - name: shared
+      namespace: gateway-system
+  hostnames:
+    - bk.example.com
+  rules:
+    - backendRefs:
+        - {name: buildkit-controller, port: 8443}
+      timeouts:
+        backendRequest: 15m
+        request: 15m
+
+---
+# Source: buildkit-controller/templates/gateway.yaml
+# The edge is TLS passthrough only: the controller authenticates the client certificate.
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata:
+  name: buildkit-controller-edge
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+spec:
+  parentRefs:
+    - name: shared
+      namespace: gateway-system
+  hostnames:
+    - bk.example.com
+  rules:
+    - backendRefs:
+        - {name: buildkit-controller, port: 8444}

@@ -93,15 +93,7 @@ pub fn alloc_verify() -> Result<()> {
             .arg(&crd),
         "kubectl apply crd",
     )?;
-    run(
-        crate::kube::kubectl(&cluster.kubeconfig).args([
-            "wait",
-            "--for=condition=Established",
-            "crd/buildkitpools.buildkit.smrt-devops.net",
-            "--timeout=60s",
-        ]),
-        "kubectl wait crd",
-    )?;
+    crate::kube::wait_crd_established(&cluster.kubeconfig)?;
     run(
         Command::new("cargo")
             .current_dir(&root)

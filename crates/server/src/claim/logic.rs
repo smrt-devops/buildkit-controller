@@ -93,6 +93,7 @@ pub fn classify(e: &AllocError) -> Disposition {
         AllocError::CaUnavailable => Disposition::Retry("CAUnavailable"),
         AllocError::StartTimeout => Disposition::Retry("StartTimeout"),
         AllocError::PodLost => Disposition::Retry("PodLost"),
+        AllocError::ShuttingDown => Disposition::Retry("ShuttingDown"),
         AllocError::UpstreamError
         | AllocError::Internal
         | AllocError::NotFound

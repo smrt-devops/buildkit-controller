@@ -96,6 +96,8 @@ pub struct WorkerPod {
     pub template_hash: Option<String>,
     /// `P expires-at`.
     pub expires_at: Option<Timestamp>,
+    /// `P expires-at` as written, which an expiry retire tests.
+    pub expires_at_raw: Option<String>,
     /// `P worker-cert-not-after`.
     pub worker_cert_not_after: Option<Timestamp>,
     /// `P internal-ca` (16 hex chars).
@@ -167,6 +169,7 @@ impl WorkerPod {
                 .and_then(|l| l.get(LABEL_TEMPLATE_HASH))
                 .cloned(),
             expires_at: ts(ANN_EXPIRES_AT),
+            expires_at_raw: ann(ANN_EXPIRES_AT).cloned(),
             worker_cert_not_after: ts(ANN_WORKER_CERT_NOT_AFTER),
             internal_ca: ann(ANN_INTERNAL_CA).cloned(),
             evicted: status.and_then(|s| s.reason.as_ref()).is_some(),

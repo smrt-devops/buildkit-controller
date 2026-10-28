@@ -126,6 +126,19 @@ pub fn claim_patch(uid: &str, alloc_id: &str, owner: &str, now: &str, expires: &
     ])
 }
 
+/// The commit patch: moves `expires-at` from the claim's short value `from`
+/// to the allocation's real expiry `to`. The test on `from` makes it lose to
+/// a leader that retired the pod at `from`, and makes that retire lose to it.
+#[must_use]
+pub fn extend_patch(uid: &str, alloc_id: &str, from: &str, to: &str) -> Value {
+    json!([
+        {"op": "test", "path": "/metadata/uid", "value": uid},
+        {"op": "test", "path": ptr("annotations", ANN_ALLOC), "value": alloc_id},
+        {"op": "test", "path": ptr("annotations", ANN_EXPIRES_AT), "value": from},
+        {"op": "replace", "path": ptr("annotations", ANN_EXPIRES_AT), "value": to},
+    ])
+}
+
 /// The retire patch; `uid: None` only for the cold-create undo.
 #[must_use]
 pub fn retire_patch(uid: Option<&str>, expected: &str) -> Value {

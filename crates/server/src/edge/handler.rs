@@ -36,8 +36,9 @@ pub enum Refusal {
     /// Check 6 fails when the pod is not Running, has no IP, or another
     /// Running pod reports the same IP.
     PodNotReady,
-    /// Check 0 fails when the Pool or Pod store is not fresh (a watch error
-    /// since the last completed list).
+    /// Check 0 fails when the Pool or Pod store has not listed yet, or has
+    /// gone longer than [`STALE_AFTER`](crate::runtime::stores::STALE_AFTER)
+    /// since a watch error without completing a relist.
     StoreStale,
 }
 

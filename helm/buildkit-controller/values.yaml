@@ -1,4 +1,5 @@
-# buildkit-controller. edge.endpoint and edge.serverName are required.
+# buildkit-controller. edge.endpoint and edge.serverName are required, and gateway.parentRefs
+# unless service.type is LoadBalancer or gateway.enabled is false.
 
 image:
   repository: ghcr.io/smrt-devops/buildkit-controller
@@ -25,8 +26,14 @@ resources:
 logLevel: info
 logFormat: json
 
-# "" watches every namespace (ClusterRole); a namespace name scopes the
-# controller and its RBAC to that one namespace.
+# Namespaces whose pools the controller serves, e.g. [ci-builders, team-b-builders].
+# Recommended. Each listed namespace gets a Role for the worker pods, Secrets,
+# ServiceAccounts, PVCs and NetworkPolicies, and the controller can write nothing
+# outside them, the release namespace and claims.namespaces. A pool in another
+# namespace is ignored. [] = every namespace, through a ClusterRole that can create
+# pods and Secrets in any namespace, kube-system included.
+watchNamespaces: []
+# Deprecated single-namespace form of watchNamespaces. Setting both fails.
 watchNamespace: ""
 
 edge:
@@ -40,10 +47,27 @@ edge:
   maxConnections: 10000      # established connections per replica; taken after the handshake
   maxHandshakes: 1024        # connections still in the TLS handshake, per replica
   maxHandshakesPerIp: 32     # in-handshake connections from one client address (IPv4, or IPv6 /64); 0 = no cap
+  # PROXY protocol v2 from a gateway or load balancer, off by default. When on, a
+  # connection from trustedCIDRs (the gateway's own source addresses, never the
+  # clients') must open with a v2 header, and its source address replaces the
+  # gateway's in the per-address caps and the logs. Other sources are served as
+  # themselves. See docs/operations.md (PROXY protocol).
+  proxyProtocol:
+    enabled: false
+    # Required when enabled: the gateway pods' addresses as /32s (or a subnet or node
+    # range only the gateway uses), e.g. [10.244.3.17/32]. Never the whole pod CIDR:
+    # any pod in it could send its own header and pick its address, and pods in it
+    # that dial the Service directly are refused. Trust model: docs/operations.md.
+    trustedCIDRs: []
+    headerTimeout: 5s        # longest wait for the header after accept
 
 api:
   maxConnections: 4096       # open API connections per replica
   maxConnectionsPerIp: 128   # open API connections from one client address; 0 = no cap
+  proxyProtocol:             # as edge.proxyProtocol, for the API listener
+    enabled: false
+    trustedCIDRs: []
+    headerTimeout: 5s
 
 auth:
   # The chart ships no issuers. Example:
@@ -66,24 +90,101 @@ workerNetwork:
   # Pod, service and node ranges of this cluster, both families. IPv6 egress stays
   # closed until an IPv6 range is listed here.
   clusterCIDRs: []
+  # Ranges a pool's allowCIDRs may open although they overlap link-local, metadata,
+  # loopback, clusterCIDRs or extraDeniedCIDRs. An allowCIDRs entry passes only
+  # inside one of these. Never 0.0.0.0/0 or ::/0.
+  permittedCIDRs: []
   dns:
     namespace: kube-system
     podLabels: {k8s-app: kube-dns}
     cidrs: []
 
 shutdown:
-  delay: 5s
-  drainTimeout: 300s
+  delay: 5s          # unready to listeners closed, so Service endpoints converge first
+  # Hard cap on the drain. "" waits for every open edge connection to end on its
+  # own (release, expiry, worker gone), at most 24h5m: the 24h maxTTL cap plus the
+  # 5m allocation cert margin. The termination grace period follows this value.
+  drainTimeout: ""
 
 service:
-  type: LoadBalancer  # ClusterIP | NodePort | LoadBalancer
+  # ClusterIP behind a Gateway (the default). LoadBalancer exposes the API and edge
+  # ports directly instead and makes gateway.parentRefs optional.
+  type: ClusterIP  # ClusterIP | NodePort | LoadBalancer
   annotations: {}
   loadBalancerClass: ""
-  externalTrafficPolicy: Local   # keeps client source IPs, which the per-address caps count; "" = Cluster (SNAT)
+  externalTrafficPolicy: Local   # NodePort/LoadBalancer only; keeps client source IPs, which the per-address caps count; "" = Cluster (SNAT)
   ports:
     api: 8443
     edge: 8444
   nodePorts: {api: null, edge: null}
+
+# Exposure through Gateway API (gateway.networking.k8s.io/v1), the default. The chart
+# renders upstream kinds only, and only those the cluster serves (NOTES.txt names any
+# that are missing): HTTPRoute (Gateway API v1.0+), BackendTLSPolicy (v1.4+) and
+# TLSRoute (v1.5+), all in the standard channel. You bring the Gateway and its listeners.
+#
+# Behind a gateway the controller sees the gateway's addresses, not the clients', so
+# every client shares edge.maxHandshakesPerIp (32), api.maxConnectionsPerIp (128) and
+# auth.serviceAccount.maxReviewsPerIp (4). Turn on PROXY protocol (edge.proxyProtocol,
+# api.proxyProtocol, and gateway.envoy.proxyProtocol on Envoy Gateway) so they count
+# clients again, or raise them, or set them to 0, to match the number of CI jobs that
+# can start at once.
+gateway:
+  # true: render routes for gateway.parentRefs. Without parentRefs the chart fails to
+  # render unless service.type is LoadBalancer. false: no routes, e.g. an in-cluster-only
+  # install reached through the Service or a port-forward.
+  enabled: true
+  # Default listeners for both routes. The API and the edge need different listeners
+  # (HTTPS and TLS passthrough), so set api.parentRefs and edge.parentRefs instead, each
+  # with a sectionName. A ref without sectionName attaches the API HTTPRoute to every
+  # HTTP and HTTPS listener that admits it, plain HTTP included (NOTES.txt warns).
+  parentRefs: []
+  annotations: {}
+  labels: {}
+  api:
+    # terminate: an HTTPRoute; the gateway terminates TLS with its own certificate and
+    #   re-encrypts to the controller (BackendTLSPolicy). Clients need no CA when the
+    #   gateway's certificate is publicly trusted. Needs an HTTPS listener.
+    # passthrough: a TLSRoute; clients see the controller's serving certificate. Needs a
+    #   TLS listener in Passthrough mode.
+    mode: terminate
+    parentRefs: []         # e.g. [{name: shared, namespace: gateway-system, sectionName: https}]
+    hostnames: []          # [] = [edge.serverName]
+    # HTTPRoute timeouts (terminate mode). A queued allocation request is silent until a
+    # worker is free: up to the pool's maxQueueTimeout + workers.startTimeout + 10s, which
+    # is 12m10s with default pool settings. Keep both above that.
+    timeouts:
+      request: 15m
+      backendRequest: 15m
+    # How the gateway verifies the controller (terminate mode).
+    backendTLS:
+      hostname: ""                 # name checked in the controller's certificate; "" = edge.serverName
+      # [] = the controller's CA bundle ConfigMap <fullname>-ca-bundle (key ca.crt), which
+      # trusts the self-issued serving certificate. Set your own with edge.tls.secretName.
+      caCertificateRefs: []        # e.g. [{group: "", kind: ConfigMap, name: my-ca}]
+      wellKnownCACertificates: ""  # "System" for a publicly trusted edge.tls.secretName; exclusive with caCertificateRefs
+  edge:
+    # TLS passthrough only: the controller checks the client certificate itself, so the
+    # gateway must never terminate this TLS. Needs a TLS listener in Passthrough mode. The
+    # TLSRoute matches the SNI edge.serverName, plus *.<edge.allocationDomain> when set.
+    # e.g. parentRefs: [{name: shared, namespace: gateway-system, sectionName: bk-edge}]
+    parentRefs: []
+  # Envoy Gateway extras, off by default: a BackendTrafficPolicy per route with TCP
+  # keepalive, a connect timeout and, on the HTTPRoute, a stream idle timeout equal to
+  # api.timeouts.request, which holds even when a ClientTrafficPolicy on the Gateway sets
+  # a shorter one. Needs the gateway.envoyproxy.io/v1alpha1 CRDs.
+  envoy:
+    enabled: false
+    connectTimeout: 10s
+    tcpKeepalive: {idleTime: 30s, interval: 10s, probes: 3}
+    # true: Envoy sends PROXY protocol v2 to each listener whose api.proxyProtocol or
+    # edge.proxyProtocol is enabled, so the controller sees client addresses. Set the
+    # trustedCIDRs there to the Envoy pods' addresses (/32s, not the pod CIDR).
+    # NOTES.txt warns when one side is on without the other.
+    proxyProtocol: false
+  # Extra objects for other implementations (policies, ReferenceGrants). Each item is an
+  # object or a string; both go through tpl, so {{ include "bkc.fullname" . }} works.
+  extraManifests: []
 
 metrics:
   port: 8080          # ops port: /healthz /readyz /metrics (own ClusterIP Service)
@@ -106,15 +207,17 @@ priorityClassName: ""
 # BuildKitClaim support, see docs/architecture.md (BuildKitClaim). Installs the claim CRD, runs the
 # claim controller on the leader and lets it read claims in every namespace. Secret
 # get/create/delete is granted by a Role in each of `namespaces` only, and the controller
-# refuses claims from any other namespace. `namespaces` is required when enabled. Pools
+# refuses claims from any other namespace. With watchNamespaces set, claims are read in
+# `namespaces` only and claims elsewhere are ignored. `namespaces` is required when enabled. Pools
 # still admit claims with an access rule `claims: {namespaces: [...]}`.
 claims:
   enabled: false
   namespaces: []
 
 # One BuildKitPool per item: {name, namespace, spec}; the chart copies spec unchanged.
-# namespace defaults to watchNamespace and must not be the release namespace, which
-# holds the CA Secret. The chart does not create namespaces; label each one
+# namespace defaults to the only entry of watchNamespaces, must be one of them when
+# they are set, and must not be the release namespace, which holds the CA Secret.
+# The chart does not create namespaces; label each one
 # pod-security.kubernetes.io/enforce=privileged.
 #
 # An item may also set `cache: {registry: {...}, local: {...}}`, which the chart merges

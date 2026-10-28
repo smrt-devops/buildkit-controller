@@ -193,7 +193,12 @@ spec:
                         default: []
                         description: >-
                           CIDR ranges re-opened through the egress deny list (for example a private
-                          registry or proxy), so they apply to every pool, not just under `Deny`.
+                          registry or proxy), so they apply to every pool, not just under `Deny`. The controller
+                          refuses (`Ready=False/InvalidSpec`) an entry of `0.0.0.0/0` or `::/0`, or one
+                          that overlaps link-local (`169.254.0.0/16`, `fe80::/10`), `168.63.129.16/32`,
+                          loopback, the cluster's own ranges or the operator's `workerNetwork.extraDeniedCIDRs`,
+                          unless the operator lists a range holding it in `workerNetwork.permittedCIDRs`.
+                          A refused entry is left out of the pool's network policy.
                         items:
                           maxLength: 64
                           type: string
@@ -2066,7 +2071,11 @@ spec:
                       local:
                         description: |-
                           Persistent state volumes for cache affinity. Unset turns the
-                          feature off. Every caller this pool admits can write cache that later callers read.
+                          feature off. A volume is shared only by callers of one cache scope, see `local.scope`,
+                          and is emptied before a pod of another scope starts on it. With it set, buildkitd runs
+                          with build history off (`[history] maxEntries = 0`) and `history.db` is deleted at
+                          every start, so no build logs or build arguments reach a later allocation and
+                          `buildx history` shows nothing on this pool.
                         properties:
                           affinity:
                             default: soft
@@ -2095,6 +2104,19 @@ spec:
                             maximum: 500.0
                             minimum: 1.0
                             type: integer
+                          scope:
+                            default: identity
+                            description: |-
+                              Who shares a volume. `identity` (the default) gives each caller its own cache. An
+                              OIDC token is scoped to its issuer and its `repository_id` claim (GitHub Actions),
+                              else its `repository` claim, else its `sub`. A `ServiceAccount` is scoped to its
+                              namespace and name, and a `BuildKitClaim` to its namespace. `pool` lets every caller
+                              the pool admits read and write the same volumes, so use it only when they are one
+                              trust domain.
+                            enum:
+                            - identity
+                            - pool
+                            type: string
                           size:
                             default: 20Gi
                             description: Storage request of each volume, from 1Gi to 10Ti.

@@ -22,7 +22,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -32,13 +31,12 @@ use time::OffsetDateTime;
 
 use super::edge_verify::{Env, run_ok};
 use super::{CRD_PATH, root};
+use crate::image::WORKER_IMAGE;
 
 static CLUSTER: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| super::kind_cluster("bk-soak"));
 const SYSTEM_NS: &str = "buildkit-system";
 const NS: &str = "bk-soak";
-const WORKER_IMAGE: &str = "moby/buildkit:v0.34.0-rootless";
-const LOCAL_BUILDKIT: &str = "moby/buildkit:rootless";
 const CURL_IMAGE: &str = "curlimages/curl:8.11.1";
 const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const CA_SECRET: &str = "buildkit-controller-ca";
@@ -325,18 +323,6 @@ impl Soak {
             .to_owned())
     }
 
-    fn worker_secret(&self) -> Result<String> {
-        self.k(&[
-            "-n",
-            NS,
-            "get",
-            "secret",
-            "soak-buildkit-worker",
-            "-o",
-            "jsonpath={.data}",
-        ])
-    }
-
     /// Worker pod UIDs (names are slots and get reused).
     fn worker_pods(&self) -> Result<BTreeSet<String>> {
         let out = self.k(&[
@@ -481,7 +467,8 @@ pub(crate) fn soak() -> Result<()> {
 }
 
 /// Scenario a. Waits until every renewable leaf has renewed on every replica and
-/// every worker pod from before the worker Secret's reissue has been retired.
+/// every worker pod has been replaced. Each worker holds its own certificate,
+/// and a free worker retires once that certificate nears `workerMinLeft`.
 fn renewals(s: &Soak) -> Result<Window> {
     let from = s.pod_now()?;
     let mut notes = Vec::new();
@@ -502,19 +489,14 @@ fn renewals(s: &Soak) -> Result<Window> {
             took.as_secs_f64()
         ));
     }
-    let secret = s.worker_secret()?;
-    let took = wait_for("worker Secret reissue", Duration::from_mins(10), || {
-        Ok(s.worker_secret()? != secret)
-    })?;
     let old = s.worker_pods()?;
     let gone = wait_for(
-        "pods with the old worker cert to retire",
-        Duration::from_mins(5),
+        "every worker to be replaced with a fresh certificate",
+        Duration::from_mins(10),
         || Ok(s.worker_pods()?.is_disjoint(&old)),
     )?;
     notes.push(format!(
-        "worker Secret reissued ({:.0} s); all {} older pods retired {:.0} s later",
-        took.as_secs_f64(),
+        "all {} workers replaced with fresh certificates ({:.0} s)",
         old.len(),
         gone.as_secs_f64()
     ));
@@ -765,26 +747,15 @@ fn verdict(windows: &[Window], builds: &[Build]) -> (String, bool) {
 /// the user serving CA (scenario b), which the client trusts from the start.
 fn setup(s: &Soak, root: &std::path::Path) -> Result<CaBundle> {
     super::image::image(CONTROLLER_IMAGE, Some(CLUSTER.as_str()))?;
-    run_ok(Command::new("docker").args(["tag", LOCAL_BUILDKIT, WORKER_IMAGE]))?;
-    let have_curl = Command::new("docker")
-        .args(["image", "inspect", CURL_IMAGE])
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !have_curl {
-        run_ok(Command::new("docker").args(["pull", CURL_IMAGE]))?;
-    }
+    crate::image::ensure_worker()?;
+    crate::image::ensure(CURL_IMAGE)?;
     for img in [WORKER_IMAGE, CURL_IMAGE] {
         run_ok(&mut crate::kube::kind_load(img, CLUSTER.as_str()))?;
     }
 
     let crd = root.join(CRD_PATH).to_string_lossy().into_owned();
     s.k(&["apply", "--server-side", "-f", &crd])?;
-    s.k(&[
-        "wait",
-        "--for=condition=established",
-        "--timeout=60s",
-        "crd/buildkitpools.buildkit.smrt-devops.net",
-    ])?;
+    crate::kube::wait_crd_established(&s.env.kubeconfig)?;
     s.k(&["create", "namespace", SYSTEM_NS])?;
     s.k(&[
         "label",

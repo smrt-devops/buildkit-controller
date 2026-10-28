@@ -32,14 +32,13 @@ use time::OffsetDateTime;
 use super::edge_verify::{Env, run_ok, secret_from_files};
 use super::reconcile_verify::KIND_CONFIG;
 use super::{CRD_PATH, root};
+use crate::image::WORKER_IMAGE;
 
 static CLUSTER: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| super::kind_cluster("bk-perf"));
 const SYSTEM_NS: &str = "buildkit-system";
 const NS: &str = "bk-perf";
 const POOL: &str = "perf";
-const WORKER_IMAGE: &str = "moby/buildkit:v0.34.0-rootless";
-const LOCAL_BUILDKIT: &str = "moby/buildkit:rootless";
 const CURL_IMAGE: &str = "curlimages/curl:8.11.1";
 const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const SERVER_NAME: &str = "bk.example.com";
@@ -135,6 +134,11 @@ spec:
           mkdir -p /work/big
           head -c {BIG} /dev/urandom > /work/big/big
           printf 'FROM scratch\\nCOPY big /big\\n' > /work/big/Dockerfile
+          # The client key pair: only the public half is sent, as JSON string
+          # content (newlines escaped).
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out /work/key.pem
+          openssl pkey -in /work/key.pem -pubout -out /work/pub.pem
+          sed 's/$/\\\\n/' /work/pub.pem | tr -d '\\n' > /work/pub.json
       securityContext: &sc
         allowPrivilegeEscalation: false
         capabilities: {{drop: [ALL]}}
@@ -290,7 +294,7 @@ impl Perf {
             "curl -s -o {out} -w '{fmt}' --cacert /trust/ca.crt \
              -H \"Authorization: Bearer $(cat /var/run/secrets/bk/token)\" \
              -H 'Content-Type: application/json' \
-             -d '{{\"namespace\":\"{NS}\",\"pool\":\"{POOL}\",\"ttlSeconds\":{ttl}}}' {API}/v1/allocations"
+             -d '{{\"namespace\":\"{NS}\",\"pool\":\"{POOL}\",\"ttlSeconds\":{ttl},\"publicKey\":\"'\"$(cat /work/pub.json)\"'\"}}' {API}/v1/allocations"
         )
     }
 
@@ -412,25 +416,14 @@ impl Drop for Cleanup {
 #[allow(clippy::too_many_lines, reason = "one linear setup script")]
 fn setup(p: &Perf, work: &std::path::Path) -> Result<CaBundle> {
     super::image::image(CONTROLLER_IMAGE, Some(CLUSTER.as_str()))?;
-    run_ok(Command::new("docker").args(["tag", LOCAL_BUILDKIT, WORKER_IMAGE]))?;
-    let have_curl = Command::new("docker")
-        .args(["image", "inspect", CURL_IMAGE])
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !have_curl {
-        run_ok(Command::new("docker").args(["pull", CURL_IMAGE]))?;
-    }
+    crate::image::ensure_worker()?;
+    crate::image::ensure(CURL_IMAGE)?;
     for img in [WORKER_IMAGE, CURL_IMAGE] {
         run_ok(&mut crate::kube::kind_load(img, CLUSTER.as_str()))?;
     }
     let crd = root().join(CRD_PATH).to_string_lossy().into_owned();
     p.k(&["apply", "--server-side", "-f", &crd])?;
-    p.k(&[
-        "wait",
-        "--for=condition=established",
-        "--timeout=60s",
-        "crd/buildkitpools.buildkit.smrt-devops.net",
-    ])?;
+    crate::kube::wait_crd_established(&p.env.kubeconfig)?;
     p.k(&["create", "namespace", SYSTEM_NS])?;
     p.k(&[
         "label",
@@ -612,7 +605,7 @@ pub(crate) fn perf(batches: usize, idle_secs: u64) -> Result<()> {
         NS,
         &format!(
             "set -e\n{FIELD}{} >/dev/null\nfield clientCert /work/e.json > /work/e.crt\n\
-             field clientKey /work/e.json > /work/e.key\n{{ field caCert /work/e.json; cat /trust/ca.crt; }} > /work/e.ca\n\
+             cp /work/key.pem /work/e.key\n{{ field caCert /work/e.json; cat /trust/ca.crt; }} > /work/e.ca\n\
              field id /work/e.json",
             Perf::post(1800, "/work/e.json", "%{http_code}")
         ),
@@ -802,6 +795,20 @@ pub(crate) fn perf(batches: usize, idle_secs: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The client makes its own key and sends only the public half, as JSON
+    /// string content. These are the exact shell lines checked in the worker image.
+    #[test]
+    fn client_sends_its_own_public_key() {
+        let pod = pool_client();
+        assert!(pod.contains("openssl pkey -in /work/key.pem -pubout -out /work/pub.pem\n"));
+        assert!(pod.contains("sed 's/$/\\\\n/' /work/pub.pem | tr -d '\\n' > /work/pub.json\n"));
+        let post = Perf::post(120, "/work/a.json", "%{http_code}");
+        assert!(
+            post.contains(r#""ttlSeconds":120,"publicKey":"'"$(cat /work/pub.json)"'"}'"#),
+            "{post}"
+        );
+    }
 
     #[test]
     fn percentile_is_nearest_rank() {

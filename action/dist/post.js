@@ -14,18 +14,14 @@ async function run() {
   try {
     if (builder) spawnSync('docker', ['buildx', 'rm', '--force', builder], { encoding: 'utf8' });
     if (ids.length) {
-      const base = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
-      const bearer = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
-      if (!base || !bearer) throw new Error('OIDC unavailable: allocations will drain at their TTL');
-      gha.setSecret(bearer);
-      const url = `${base}${base.includes('?') ? '&' : '?'}audience=${encodeURIComponent(gha.getState('audience'))}`;
-      const tr = await L.request(url, { headers: { Authorization: `Bearer ${bearer}` }, timeoutMs: 30000 });
-      if (tr.status !== 200) throw L.apiError('OIDC token request', tr);
-      const token = JSON.parse(tr.body).value;
-      gha.setSecret(token);
+      const aud = gha.getState('audience');
+      const getToken = () => L.fetchOidcToken(aud, gha.setSecret);
+      const qtState = gha.getState('queue-timeout');
+      const budgetMs = L.retryBudgetMs(qtState === '' ? undefined : Number(qtState));
       for (const id of ids) {
         try {
-          const res = await L.request(`${api}/v1/allocations/${id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` }, ca, timeoutMs: 60000 });
+          const res = await L.requestWithRetry(`${api}/v1/allocations/${id}`, { method: 'DELETE', ca, timeoutMs: 60000 },
+            { what: `release ${id}`, getToken, budgetMs, log: gha.info });
           if (res.status !== 204 && res.status !== 404) throw L.apiError(`release ${id}`, res);
         } catch (e) { failed = true; gha.warning(e.message); }
       }

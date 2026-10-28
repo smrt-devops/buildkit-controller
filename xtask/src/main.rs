@@ -9,14 +9,18 @@ use clap::{Parser, Subcommand};
 mod alloc_verify;
 mod api_verify;
 mod claim_verify;
+mod docs;
+mod drain_verify;
 mod e2e;
 mod e2e_issuer;
 mod edge_verify;
+mod gateway;
 mod helm_test;
 mod helm_verify;
 mod image;
 mod kube;
 mod perf;
+mod proxy_verify;
 mod reconcile_verify;
 mod render_verify;
 mod runtime_verify;
@@ -24,12 +28,15 @@ mod soak;
 use alloc_verify::alloc_verify;
 use api_verify::api_verify;
 use claim_verify::claim_verify;
+use docs::docs;
+use drain_verify::drain_verify;
 use e2e::{e2e, e2e_up};
 use edge_verify::edge_verify;
 use helm_test::helm_test;
 use helm_verify::helm_verify;
 use image::{image, prune};
 use perf::{perf, perf_loopback};
+use proxy_verify::proxy_verify;
 use reconcile_verify::reconcile_verify;
 use render_verify::render_verify;
 use runtime_verify::runtime_verify;
@@ -93,13 +100,19 @@ enum Task {
     },
     /// Install the chart on a throwaway kind cluster with one pool and check the replicas, the leader, the pool and readiness.
     HelmVerify,
+    /// Install the chart with two replicas on a throwaway kind cluster and check that stopping a replica never cuts a live build: a long build survives a rollout, the Lease moves within seconds, and a queued request gets 503 `shutting_down`.
+    DrainVerify,
     /// Install the chart with claims on a throwaway kind cluster and check the claim lifecycle, a real build through a claim Secret, refusal, expiry and a lost worker.
     ClaimVerify,
     /// Soak the certificate lifecycle on a throwaway kind cluster. Runs continuous builds through leaf renewals, a serving certificate swap, a leader failover, and deletion and corruption of the CA Secret.
     Soak,
-    /// Run the end-to-end suite on a kind cluster. Covers chart install, OIDC and `TokenReview`, builds, the registry cache, queueing and multi-platform builds.
+    /// Build the documentation site with mdBook into target/book/html. Fails on a broken repository link.
+    Docs,
+    /// Install the chart behind Envoy Gateway with PROXY protocol on, on a throwaway kind cluster, and check that the logs and the per-address caps see client addresses, that a build through the edge works, and that an untrusted pod cannot forge its address.
+    ProxyVerify,
+    /// Run the end-to-end suite on a kind cluster, exposed through Envoy Gateway. Covers chart install, the Gateway API routes, OIDC and `TokenReview`, builds, the registry cache, queueing, a long poll, multi-platform builds and the Envoy extras.
     E2e,
-    /// Install the chart on kind, trust GitHub OIDC for REPO (owner/name) and leave the cluster running. Used by the CI Action job.
+    /// Install the chart on kind behind Envoy Gateway, trust GitHub OIDC for REPO (owner/name) and leave the cluster running. Used by the CI Action job.
     E2eUp {
         /// Repository whose workflow tokens may allocate.
         repo: String,
@@ -252,18 +265,7 @@ fn crd_verify() -> Result<()> {
     if !applied.status.success() {
         bail!("CRD rejected: {}", String::from_utf8_lossy(&applied.stderr));
     }
-    let waited = kubectl(&[
-        "wait",
-        "--for=condition=established",
-        "--timeout=60s",
-        "crd/buildkitpools.buildkit.smrt-devops.net",
-    ])?;
-    if !waited.status.success() {
-        bail!(
-            "CRD not established: {}",
-            String::from_utf8_lossy(&waited.stderr)
-        );
-    }
+    crate::kube::wait_crd_established(&kubeconfig).context("CRD not established")?;
     let (mut passed, mut failed) = (0usize, Vec::new());
     for (dir, want_ok) in [("accept", true), ("reject", false)] {
         for file in yaml_files(&root.join(FIXTURES).join(dir))? {
@@ -321,8 +323,11 @@ fn main() -> Result<()> {
         Task::ReconcileVerify => reconcile_verify(),
         Task::HelmTest { update } => helm_test(update),
         Task::HelmVerify => helm_verify(),
+        Task::DrainVerify => drain_verify(),
         Task::ClaimVerify => claim_verify(),
         Task::Soak => soak(),
+        Task::Docs => docs(),
+        Task::ProxyVerify => proxy_verify(),
         Task::E2e => e2e(),
         Task::E2eUp { repo } => e2e_up(&repo),
         Task::Perf { loopback: true, .. } => perf_loopback(),
@@ -354,6 +359,8 @@ mod tests {
         assert!(Cli::try_parse_from(["xtask", "runtime-verify"]).is_ok());
         assert!(Cli::try_parse_from(["xtask", "reconcile-verify"]).is_ok());
         assert!(Cli::try_parse_from(["xtask", "soak"]).is_ok());
+        assert!(Cli::try_parse_from(["xtask", "drain-verify"]).is_ok());
+        assert!(Cli::try_parse_from(["xtask", "proxy-verify"]).is_ok());
         assert!(Cli::try_parse_from(["xtask", "perf", "--idle-secs", "60"]).is_ok());
     }
 }

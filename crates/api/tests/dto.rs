@@ -148,7 +148,37 @@ fn pool_list() {
                 platforms: vec!["linux/amd64".into()],
                 endpoint: "tcp://bk.example.com:8444".into(),
                 server_name: "bk.example.com".into(),
+                queue_timeout_seconds: None,
+                max_queue_timeout_seconds: None,
+                default_ttl_seconds: None,
+                max_ttl_seconds: None,
             }],
+        },
+    );
+    // A current server adds the pool's queue and TTL limits; the body above,
+    // from an older server, still parses.
+    roundtrip(
+        r#"{"namespace": "ci", "name": "default", "ready": true, "warm": 0, "starting": 0, "allocated": 0,
+            "waiting": 0, "min": 0, "max": 1, "platforms": [], "endpoint": "tcp://bk.example.com:8444",
+            "serverName": "bk.example.com", "queueTimeoutSeconds": 120, "maxQueueTimeoutSeconds": 600,
+            "defaultTtlSeconds": 3600, "maxTtlSeconds": 86400}"#,
+        &PoolSummary {
+            namespace: "ci".into(),
+            name: "default".into(),
+            ready: true,
+            warm: 0,
+            starting: 0,
+            allocated: 0,
+            waiting: 0,
+            min: 0,
+            max: 1,
+            platforms: Vec::new(),
+            endpoint: "tcp://bk.example.com:8444".into(),
+            server_name: "bk.example.com".into(),
+            queue_timeout_seconds: Some(120),
+            max_queue_timeout_seconds: Some(600),
+            default_ttl_seconds: Some(3600),
+            max_ttl_seconds: Some(86400),
         },
     );
     roundtrip(
@@ -189,6 +219,7 @@ fn error_codes_match_spec_table() {
         (ErrorCode::NotReady, "not_ready", 503),
         (ErrorCode::CaUnavailable, "ca_unavailable", 503),
         (ErrorCode::UpstreamError, "upstream_error", 503),
+        (ErrorCode::ShuttingDown, "shutting_down", 503),
     ];
     assert_eq!(table.len(), ErrorCode::ALL.len());
     for (code, s, status) in table {
@@ -201,4 +232,5 @@ fn error_codes_match_spec_table() {
     assert_eq!(ErrorCode::PoolExhausted.retry_after_seconds(), Some(5));
     assert_eq!(ErrorCode::StartTimeout.retry_after_seconds(), Some(5));
     assert_eq!(ErrorCode::NotReady.retry_after_seconds(), None);
+    assert_eq!(ErrorCode::ShuttingDown.retry_after_seconds(), Some(1));
 }

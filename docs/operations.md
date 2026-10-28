@@ -4,12 +4,63 @@
 
 The chart renders one YAML file from `values.yaml` into a ConfigMap, and the controller reads it. Unknown keys and invalid values stop startup with exit code 2 and a list of every error. There is no live reload. Helm rolls the Deployment when the file changes. Every key is documented in [values.yaml](../helm/buildkit-controller/values.yaml) and checked by `values.schema.json`, the chart is described in the [Helm README](../helm/buildkit-controller/README.md), and the pool fields are in [architecture.md](architecture.md#one-crd).
 
+## Namespace scope
+
+Set `watchNamespaces` to the namespaces that hold pools, for example `watchNamespaces: [ci-builders, team-b-builders]`. The chart then renders a Role and RoleBinding in each listed namespace for the worker pods, Secrets, ServiceAccounts, PVCs and NetworkPolicies, and the controller watches pools and worker pods in those namespaces only. A pool in another namespace gets no status and no pods. The only cluster-wide grant left is TokenReview, and the release namespace keeps its own Role for the Lease, the CA Secret, Events and the CA bundle ConfigMap. To add a pool namespace, add it to the list and run `helm upgrade`; the controller restarts and picks it up.
+
+The default, `[]`, serves every namespace through a ClusterRole that can create and delete pods, Secrets and ServiceAccounts in any namespace, kube-system included. Anyone who takes over the controller then controls the cluster. `helm install` prints a warning in that mode.
+
+`watchNamespace` (one string) still works as a deprecated alias for a one-entry list. Setting both fails, in the chart and at controller startup.
+
+## Worker egress
+
+A pool's `spec.network.egress.allowCIDRs` opens ranges such as a private registry or proxy to its workers. The controller refuses an entry that overlaps the link-local range (169.254.0.0/16 and fe80::/10, which hold the cloud metadata endpoints), the Azure wire server 168.63.129.16, loopback (127.0.0.0/8 and ::1), any range in `workerNetwork.clusterCIDRs` or `workerNetwork.extraDeniedCIDRs`, and an entry of 0.0.0.0/0 or ::/0. Overlap means either range holds the other, and an IPv4-mapped IPv6 entry counts as the IPv4 range it maps. The pool then reports `Ready=False/InvalidSpec` naming the entry and gets no new pods or allocations. The controller still applies its NetworkPolicy, without the refused entries, so a policy that an older spec or config opened wider is narrowed. NetworkPolicy applies to running pods at once: warm pods and running builds lose the refused ranges, and the builds keep running. The same happens when an operator adds a range to `clusterCIDRs` or `extraDeniedCIDRs`, or removes one from `permittedCIDRs`, once the controller restarts with the new config.
+
+List the pod, service and node ranges of the cluster in `workerNetwork.clusterCIDRs` so no pool can open them. To let pools open one of these ranges anyway, for example a NodeLocal DNSCache address or an in-cluster proxy's service IP, list it in `workerNetwork.permittedCIDRs`. An entry passes only when one permitted range holds all of it, so permit the narrowest range that works. `permittedCIDRs` never permits 0.0.0.0/0 or ::/0, and the controller refuses to start with either in the list.
+
+## Exposure
+
+By default the chart exposes the controller through a Gateway API Gateway that you run, and its Service is ClusterIP. The API gets an HTTPRoute, and the Gateway re-encrypts to the controller under a BackendTLSPolicy that trusts the controller's CA bundle ConfigMap. The edge gets a TLSRoute in TLS passthrough, because the controller authenticates each build by its client certificate. Set `gateway.api.parentRefs` and `gateway.edge.parentRefs` to the Gateway's HTTPS and TLS passthrough listeners, each with a `sectionName`. Without one, the API route also attaches to any plain HTTP listener that admits it, which would carry bearer tokens in cleartext. The routes need the Gateway API v1.5.0 or later standard-channel CRDs. `gateway.api.mode: passthrough` turns the API route into a TLSRoute as well. Where no implementation with TLS passthrough is available, such as GKE's managed Gateway or the AWS Load Balancer Controller, set `service.type: LoadBalancer` instead. [helm/README.md](../helm/README.md#exposure) has the modes, an Envoy Gateway example and the implementations that support them.
+
+Timeouts on the path matter because a queued allocation request is silent for up to 12 minutes 10 seconds with default pool timeouts. The HTTPRoute's `timeouts.request` and `timeouts.backendRequest` default to 15 minutes (`gateway.api.timeouts`). Raise them, and any idle timeout of the gateway or of the load balancer in front of it, above the pool's `allocation.maxQueueTimeout` plus `workers.startTimeout` plus 10 seconds when a pool allows longer waits.
+
+Behind a gateway, the controller sees the gateway's addresses instead of the clients'. The per-address caps (32 TLS handshakes in progress per address on the edge, 128 API connections, 4 TokenReviews in flight) then apply to every client together, and the logs show the gateway's pod addresses. Either turn on PROXY protocol (below), or raise `edge.maxHandshakesPerIp`, `api.maxConnectionsPerIp` and `auth.serviceAccount.maxReviewsPerIp` to the number of jobs that start at once, or set them to 0 and limit clients at the gateway.
+
+### PROXY protocol
+
+With PROXY protocol the gateway opens each backend connection with a short binary header that names the client's address. The controller reads version 2 (the binary form; v1 text headers are refused) on each listener where it is on, and uses the client's address for the per-address caps, the TokenReview cap and the `peer` log field. The gateway's own address is logged as `via`.
+
+Turn it on per listener, together with the gateway side:
+
+```yaml
+api:
+  proxyProtocol: {enabled: true, trustedCIDRs: [10.244.3.17/32, 10.244.5.9/32]}   # the Envoy pods
+edge:
+  proxyProtocol: {enabled: true, trustedCIDRs: [10.244.3.17/32, 10.244.5.9/32]}   # the Envoy pods
+gateway:
+  envoy: {enabled: true, proxyProtocol: true}   # Envoy Gateway: BackendTrafficPolicy proxyProtocol V2
+```
+
+`gateway.envoy.proxyProtocol` asks Envoy to send the header to each listener whose `proxyProtocol` is on. On another implementation, configure its PROXY protocol v2 option for the controller's Service, for example through `gateway.extraManifests`. `helm install` warns when the chart asks Envoy to send PROXY protocol to a listener that does not read it, or the reverse.
+
+The trust model:
+
+- Only connections from `trustedCIDRs` are parsed. List the gateway's source addresses: the Envoy pods' addresses, or a node or subnet range that only the gateway uses. Never a range that clients or other pods share, because any host in it could then claim any address. Pods in a trusted range that dial the Service directly, without a header, are refused. `0.0.0.0/0` and `::/0` are refused.
+- A connection from a trusted address must open with a valid header within `headerTimeout` (5 s), or it is closed. There is no fallback to the gateway's address. The header may be at most 1040 bytes (1024 of addresses and TLVs).
+- A connection from any other address is served as itself and never parsed. A client that sends its own header from outside the trusted range only breaks its own TLS handshake.
+- A `LOCAL` header (a gateway health check) is accepted and the connection counts as the gateway's address.
+
+Each header from a trusted source is counted in `buildkit_api_proxy_protocol_headers_total` or `buildkit_edge_proxy_protocol_headers_total` by `result`: `proxied`, `local`, or why the connection was closed (`timeout`, `truncated`, `bad_signature`, `bad_version`, `bad_command`, `oversized`, `short`, `unsupported_family`, `io_error`). A rising `bad_signature` or `timeout` count usually means the gateway does not send the header, or something else connects from a trusted range. The refused connections are logged at `debug`.
+
+Pod addresses change when the Envoy pods are rescheduled. Pin them to a node pool or subnet and trust that range, or keep the list in sync. Without PROXY protocol, or when the gateway does not send it, everything works as before, and the caps count the gateway's addresses.
+
 ## Sizing
 
 - Pool size. Set `scaling.max` to the number of builds you want to run at once. Each worker pod requests 500m CPU, 1Gi memory and 1Gi ephemeral storage by default, with limits of 4Gi memory and 20Gi ephemeral storage. Override these in `spec.template.spec.containers[0].resources`. Limits must include `memory` and `ephemeral-storage`.
 - Cache. Worker storage is an `emptyDir`, so the BuildKit cache disappears with the pod. Use registry cache (`--cache-to` and `--cache-from`) in your builds. The ephemeral-storage limit bounds the local cache, and `spec.workers.cache.sizeLimit` caps the `emptyDir`.
-- Controller. The chart defaults are 2 replicas, a 100m CPU and 128Mi memory request, and a 512Mi memory limit. The edge copies bytes for every build, so watch CPU on the replicas under heavy load and raise `replicaCount` or enable `autoscaling` (CPU-based HPA). Per replica, the edge allows 10000 established connections (`edge.maxConnections`) and 1024 connections in the TLS handshake (`edge.maxHandshakes`), 32 of them from one client address (`edge.maxHandshakesPerIp`). The API allows 4096 connections (`api.maxConnections`), 128 of them from one client address (`api.maxConnectionsPerIp`). An IPv6 client address is its /64. Connections over a cap are closed on accept and logged at `debug`. The per-address caps count the source address the controller sees, so they need source-IP preservation. The chart sets `service.externalTrafficPolicy: Local` for that. With `Cluster`, a load balancer that rewrites the source, a proxy, or runners behind one NAT address, many clients share one address: raise `api.maxConnectionsPerIp`, `edge.maxHandshakesPerIp` and `auth.serviceAccount.maxReviewsPerIp`, or set them to 0 to disable them.
-- Load balancer. A queued request is silent for up to 12 minutes 10 seconds with default pool timeouts. Raise the load balancer idle timeout above that, per the table in [../helm/README.md](../helm/README.md).
+- Local cache volumes. With `cache.local` the state directory is a PVC that outlives the pod, and `maxVolumes` caps how many slots have one. A volume belongs to one cache scope, and a pod of another scope starts only after an init step empties it. Those pools run buildkitd with BuildKit history off (`[history] maxEntries = 0`), and the init step deletes `history.db`. Build records hold logs, build arguments and provenance, and the volume outlives the allocation, so a later build must not read an earlier build's records through the history API. `buildx history` therefore shows nothing on these pools. See [Build cache](architecture.md#build-cache).
+- Controller. The chart defaults are 2 replicas, a 100m CPU and 128Mi memory request, and a 512Mi memory limit. The edge copies bytes for every build, so watch CPU on the replicas under heavy load and raise `replicaCount` or enable `autoscaling` (CPU-based HPA). Per replica, the edge allows 10000 established connections (`edge.maxConnections`) and 1024 connections in the TLS handshake (`edge.maxHandshakes`), 32 of them from one client address (`edge.maxHandshakesPerIp`). The API allows 4096 connections (`api.maxConnections`), 128 of them from one client address (`api.maxConnectionsPerIp`). An IPv6 client address is its /64. Connections over a cap are closed on accept and logged at `debug`. The per-address caps count the source address the controller sees, so they need source-IP preservation. With `service.type: LoadBalancer` the chart sets `service.externalTrafficPolicy: Local` for that. Behind a Gateway without [PROXY protocol](#proxy-protocol), with `Cluster`, a load balancer that rewrites the source, a proxy, or runners behind one NAT address, many clients share one address: turn on PROXY protocol where the proxy supports it, or raise `api.maxConnectionsPerIp`, `edge.maxHandshakesPerIp` and `auth.serviceAccount.maxReviewsPerIp`, or set them to 0 to disable them.
+- Load balancer and gateway. A queued request is silent for up to 12 minutes 10 seconds with default pool timeouts. Raise the load balancer or gateway idle timeout above that, per [Exposure](#exposure) and the table in [../helm/README.md](../helm/README.md#load-balancer-idle-timeout).
 - Quotas. Pods count against the pool namespace's ResourceQuota. A refused create shows as `Degraded=True/PodCreateFailed`.
 
 ## Scaling
@@ -26,10 +77,32 @@ Check the state with `kubectl get bkp -A`. The Warm, Allocated and Waiting colum
 
 ## Upgrades
 
-- Upgrade with `helm upgrade`. The Deployment rolls one replica at a time and the PodDisruptionBudget keeps one replica up. A leaving replica keeps accepting for `shutdown.delay` (5 s), closes its listeners, and lets open edge connections run for up to `shutdown.drainTimeout` (300 s). Running builds on other replicas are unaffected, and a build on a draining replica has up to that long to finish.
+- Upgrade with `helm upgrade`. The Deployment rolls one replica at a time and the PodDisruptionBudget keeps one replica up. Running builds survive it: see [Stopping a replica](#stopping-a-replica).
 - Helm installs the CRD on first install only and never upgrades it. When a release changes `crds/`, apply it yourself first with `kubectl apply --server-side -f helm/buildkit-controller/crds/`.
 - A change to a pool's template changes its pod template hash. The reconciler retires free pods with the old hash and starts new ones. Allocated pods run to the end of their allocation.
+- Since the run-bound owner change, an OIDC allocation's owner includes the token's run claims (see [Allocation owner](architecture.md#allocation-owner)). An allocation a GitHub Actions run made before the upgrade has the old owner `oidc:<iss>#<sub>`, so a release from that run after the upgrade is refused with 403 (the Action's post step logs a warning and the job still passes) and the worker is freed at the allocation's expiry instead. Accepting the old form would let every run with the same `sub` release those workers, which is the hole the change closes. To avoid holding workers, upgrade while few builds are running.
+- Since the owner escape change, `%` and `#` in an OIDC `sub` are percent-encoded in every owner, also when the token carries no run claims. Owners of tokens whose `sub` holds neither character are unchanged. An allocation made before the upgrade by a caller whose `sub` holds one of them keeps the old owner, so a release of it after the upgrade is refused with 403 and the worker is freed at the allocation's expiry.
+- Since the allowCIDRs check, a pool whose `allowCIDRs` overlaps a protected, cluster or extra denied range turns `Ready=False/InvalidSpec` after the upgrade, and its NetworkPolicy loses the refused ranges, also for builds already running (see [Worker egress](#worker-egress)). Before upgrading, find such pools with `kubectl get bkp -A -o yaml` and narrow their entries or permit them in `workerNetwork.permittedCIDRs`.
 - A config change restarts the controller. No pool state is lost, because state lives in pods and pool status.
+
+## Stopping a replica
+
+A replica that gets SIGTERM, from a rollout, an HPA scale-in, a node drain or a pod delete, does not cut a running build:
+
+1. `/readyz` fails, so the replica leaves the Service endpoints.
+2. If it leads, it stops the reconciler and releases the Lease at once. Another replica leads within a few seconds, whatever the drain takes.
+3. After `shutdown.delay` (5 s) the API stops accepting connections. Requests already in flight finish. Allocation requests still queued on this replica, and new ones sent on a connection that was already open, get 503 `shutting_down` with `Retry-After: 1` before any worker is claimed for them, so a retry reaches another replica. The Action and the curl recipe retry it on their own (see [Retries](ci/README.md#retries)).
+4. The edge stops accepting connections and keeps the open ones until each ends on its own: the build finishes and the client releases the allocation, the allocation expires, the worker pod goes away, or the client certificate's `notAfter` passes. The Pod watch, revocation and certificate timers keep running until the last connection closes. Then the process exits.
+
+With `shutdown.drainTimeout` unset (the default), the drain has no fixed budget. It is bounded by the longest a connection can live: the 24h `maxTTL` cap plus the 5-minute certificate margin, 24h5m. The chart sets `terminationGracePeriodSeconds` to `shutdown.delay` + 86700 s + 10 s, so Kubernetes does not kill a draining replica early. Set `shutdown.drainTimeout` to cap the drain instead; connections still open at the cap are cut and counted as `buildkit_edge_revocations_total{reason="drain"}`, and the grace period becomes `shutdown.delay` + `shutdown.drainTimeout` + 10 s. A draining replica logs `edge draining` with its open connection count every minute.
+
+A Deployment rollout does not wait for old replicas to finish draining: new replicas take traffic as soon as they are Ready, and the old ones exit when their last build ends. The same holds for HPA scale-in, so `autoscaling` is safe to enable. A terminating replica is not Ready, so the PodDisruptionBudget counts it as down and lets the next eviction wait for its replacement.
+
+Node drains are bounded by whatever evicts the pod:
+
+- `kubectl drain` waits for evicted pods to exit. Its `--timeout` (none by default) caps the wait, and on expiry it stops and leaves the node cordoned; the pod keeps draining.
+- cluster-autoscaler caps the grace period of pods it evicts on scale-down at `--max-graceful-termination-sec`, 600 s by default. A build that runs longer through a replica on that node is cut. Raise the flag, or keep the controller on nodes it does not scale down (annotate the pods `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` with `podAnnotations`).
+- Karpenter honours the pod's `terminationGracePeriodSeconds` when it drains a node, up to the NodePool's `terminationGracePeriod` when that is set.
 
 ## CA rotation
 
@@ -47,9 +120,9 @@ What breaks:
 
 - Every allocation in flight. Its pod was issued under the old internal CA, so the leader retires it and the edge closes its connections. Those builds fail and the job must retry.
 - Clients that saved a copy of the CA bundle ConfigMap for a self-issued serving certificate must fetch the new one. Clients that trust a public CA are unaffected.
-- `POST /v1/allocations` returns 503 `ca_unavailable` until the new CA loads on each replica.
+- `POST /v1/allocations` returns 503 `ca_unavailable` until the new CA loads on each replica. That answer carries no `Retry-After`, so the Action and the curl recipe do not retry it.
 
-Several things recover on their own. Replicas reload the CA within the watch latency, the reconciler reissues worker Secrets, the reconciler retires free pods issued under the old CA and starts new ones, and new requests queue until the pool's `status.workerTLS.caFingerprint` matches. Expect one reconcile pass plus one pod start. While old pods remain, pools show `Degraded=True/CAReplaced`.
+Several things recover on their own. Replicas reload the CA within the watch latency. Each worker pod carries its own serving certificate and Secret, issued when the pod is created, so nothing is reissued in place. The leader retires every free pod issued under the old CA (`buildkit_releases_total{reason="ca_replaced"}` counts the allocated ones it retires) and starts new ones. A request never gets a pod from the old CA, so it takes a new pod, or waits in the queue until one is Ready. Expect one reconcile pass plus one pod start. While old pods remain, pools show `Degraded=True/CAReplaced`. No pool status field gates new requests.
 
 Worker, edge and serving certificates renew without any action.
 
@@ -65,6 +138,8 @@ Metrics to watch:
 | `buildkit_allocation_duration_seconds{path}` | Warm and cold latency. |
 | `buildkit_queue_depth`, `buildkit_queue_wait_seconds` | Demand above `scaling.max`. |
 | `buildkit_pool_pods{state}`, `buildkit_pool_desired_warm` | Pool state (leader only). |
+| `buildkit_cache_affinity_total{result}` | Local cache outcome per allocation: `hit`, `miss`, `spill` (a busy volume of the caller's scope served the key), `cold`, `wiped` (a pod created on a volume of another scope, so it started empty) or `uncached`. |
+| `buildkit_releases_total{reason}` | Pod retirements by reason. Includes `cache_scope`, a warm pod bound to another cache scope that the allocator retired so a request could use its slot, and `ca_replaced`. |
 | `buildkit_edge_connections_total{result}` | Edge failures such as `tls_error`, `expired` and `upstream_error`. |
 | `buildkit_leader` | Sum across replicas must be 1. |
 | `buildkit_ca_valid`, `buildkit_cert_not_after_seconds{kind}` | CA and certificate health. |
@@ -81,7 +156,27 @@ Suggested alerts, with thresholds to tune:
 | Allocation failures | `sum(rate(buildkit_allocations_total{result!="ok"}[5m])) / sum(rate(buildkit_allocations_total[5m])) > 0.05` | 10m |
 | JWKS fetch failing | `increase(buildkit_jwks_fetch_total{result="error"}[10m]) > 5` | 10m |
 
-Health probes are `/healthz` (process alive) and `/readyz` (config loaded, caches synced, CA loaded, serving certificate loaded, listeners bound). Leadership is not part of readiness.
+Health probes are `/healthz` (process alive) and `/readyz` (config loaded, Pool and Pod caches listed and not stale, CA loaded, serving certificate loaded, listeners bound). Leadership is not part of readiness. See [Kubernetes API outages](#kubernetes-api-outages) for when a cache counts as stale.
+
+## Kubernetes API outages
+
+Each replica keeps in-memory caches of pools and pods, fed by watches. When a watch fails, for example while the API server restarts, the replica keeps its last list and starts a new watch after 1, 2, 4, 8, 16 and then every 30 s. Each new watch lists everything again. An API server blip reaches every replica at once, so the replicas ride it out instead of all leaving the Service together.
+
+- For 60 s after the first watch error the replica stays Ready and the edge keeps admitting new connections from the cache. Five retries fit in that window, so an outage of up to about 30 s shows only in `buildkit_watch_errors_total`.
+- If no new list completes within 60 s, `/readyz` fails naming `pool_store` or `pod_store`, and the edge refuses new connections with `store_stale`. By then the cache may have missed too many changes to vouch for an allocation.
+- The first completed list makes the replica Ready again and the edge admits again.
+- Builds already connected keep their connections throughout. A release or pod deletion during the outage closes its connection once the cache catches up.
+- At startup there is no grace: a replica is not Ready until both caches have listed once.
+
+Inside the 60 s the cache can miss a release or a deletion. Workers are single-use, so that can only admit the client that already held the worker. Expiry is checked against the clock, so an expired allocation is refused anyway. If a deleted pod's IP now belongs to another pod, the connection fails at the upstream handshake, because each worker's serving certificate names its own pod and nonce.
+
+### Stalled connections
+
+A watch can also hang without failing, for example when the API server freezes or a load balancer drops the flow without closing it. The controller's Kubernetes client fails any request that receives nothing for 90 s: no response headers within 90 s of sending it, or no data for 90 s after that. The limit belongs to each request, so a request sent on a connection that sat idle still gets the full 90 s. A watch that fails this way is handled like any other watch error. A stalled watch therefore goes unnoticed for at most 90 s. If no list completes after that, the 60 s bound above applies, so `/readyz` fails and the edge refuses with `store_stale` at most 150 s after the API server last sent anything. Until then a release or pod deletion can be missed, so a released allocation's open connection can stay up that long.
+
+- A healthy watch is never silent for 90 s. The API server sends a bookmark on every watch about once a minute, and 90 s leaves 30 s of margin.
+- If the API server runs with the watch cache disabled (`--watch-cache=false`), there are no bookmarks. A watch that sees no change then fails after 90 s and starts again; for the Pool and Pod caches that means a full list, so expect one extra list of each every 90 s on each replica. The replica stays Ready through these relists, but `buildkit_watch_errors_total` counts each one.
+- The timeout covers every request on the client: the Pool, Pod, Secret, Lease and claim watches, each namespace's watch when `watchNamespaces` lists several, and every write. It counts silence, not duration, so a large list that keeps streaming is not cut. Allocation, reconcile, TokenReview and Lease calls give up after `kube.requestTimeout`. The controller refuses a `kube.requestTimeout` of 90 s or more, because the 90 s limit would end those calls first and the setting would have no effect. The default is 5 s. The chart renders no `kube` key, so the default applies to a chart install. In practice the 90 s limit ends only stalled watches and lists, and calls that have no timeout of their own.
 
 ## Troubleshooting
 
@@ -93,10 +188,9 @@ kubectl get bkp -n ci <pool> -o jsonpath='{range .status.conditions[*]}{.type}={
 
 | Condition and reason | Cause | Fix |
 |---|---|---|
-| `Ready=False/InvalidSpec` | The controller rejected the spec, for example an unknown `scaling.timeZone`. | Fix the field named in the message. |
+| `Ready=False/InvalidSpec` | The controller rejected the spec, for example an unknown `scaling.timeZone` or an `allowCIDRs` entry that overlaps a protected or cluster range ([Worker egress](#worker-egress)). | Fix the field named in the message. |
 | `Ready=False/TemplateConflict` | The template sets a key the controller owns, such as a reserved label, volume name, mount path or a CPU architecture that contradicts `platforms`. | Remove the fields named in the message. No pod is created while this is set. |
 | `Ready=False/CAUnavailable` | No valid CA is loaded yet. | Check the leader's logs and the Secret. The leader repairs it by itself. |
-| `Ready=False/WorkerTLSPending` | The worker Secret is not written, or was issued under another internal CA. | Wait one reconcile pass. If it persists, check the controller's RBAC and logs for write errors. |
 | `Ready=False/SandboxPending` | The worker ServiceAccount or NetworkPolicy could not be applied. | Check the message and the pool namespace for admission webhooks that reject them. |
 | `Degraded=True/PodCreateFailed` | Pod creation failed (quota, admission, API error). | `kubectl get events -n <ns>`, then fix quota or policy. The controller retries with backoff. |
 | `Degraded=True/PodStartTimeout` | A pod was not Ready within `workers.startTimeout`. | Check scheduling, image pull and node resources. Raise `startTimeout` for slow image pulls. |
@@ -112,7 +206,8 @@ Errors the API returns to clients, and the usual cause:
 - 503 `upstream_error` with `Retry-After: 2` on authentication. A ServiceAccount token could not be reviewed: the API server timed out (`kube.requestTimeout`), throttled the controller (429), or `auth.serviceAccount.maxConcurrentReviews` reviews were already in flight. A sustained rate usually means a flood of SA-shaped tokens. Look at `buildkit_auth_total{method="serviceaccount",result="error"}`.
 - 404 `pool_not_found`. The pool does not exist, or no access rule matches the caller. The API never answers 403 for this, so pools cannot be probed.
 - 503 `pool_exhausted`. The pool is at `scaling.max` and the queue wait ran out. Raise `max`, or `queueTimeout`.
-- 503 `ca_unavailable`. The CA is being replaced. Retry shortly.
+- 503 `ca_unavailable`. No valid CA is loaded on that replica, for example while the CA Secret is being replaced. It carries no `Retry-After`, so the Action and the curl recipe fail on it instead of retrying. Run the job again.
+- 503 `shutting_down` with `Retry-After: 1`. The replica that held the request is stopping (rollout, scale-in, node drain) and claimed nothing for it. The Action and the curl recipe retry it, and the retry reaches another replica.
 
 A client that cannot connect to the edge usually has a certificate problem. Check `buildkit_edge_connections_total` for `tls_error`, `bad_san` and `expired`, and set `--set logLevel=debug` on the chart to see handshake failures. The curl recipe can use `API_CA` to trust a self-issued certificate.
 
@@ -130,7 +225,11 @@ controller on the leader and grant it `buildkitclaims` read and status write.
 Also set `claims.namespaces` to the namespaces whose claims it serves; the
 chart fails without it. Secret `get`, `create` and `delete` are granted by a
 Role in each listed namespace only, and a claim from any other namespace fails
-with `NamespaceNotServed`.
+with `NamespaceNotServed`. With `watchNamespaces` set, the claim read and status rights are
+Roles in each `claims.namespaces` namespace as well, and a claim in any other namespace is
+ignored: it gets no status, not `NamespaceNotServed`. This also applies to the
+deprecated `watchNamespace`, so an install that set it and relied on
+`NamespaceNotServed` no longer sees that status.
 
 A pool admits claims only through an access rule naming their namespaces:
 

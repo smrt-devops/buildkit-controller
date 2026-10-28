@@ -1,18 +1,111 @@
 buildkit-controller {{ .Chart.AppVersion }} installed in {{ .Release.Namespace }}.
+{{- $fn := include "bkc.fullname" . }}
+{{- $gw := .Values.gateway }}
+{{- $plan := include "bkc.gateway" . | fromJson }}
+{{- $ca := printf "kubectl -n %s get configmap %s-ca-bundle -o 'jsonpath={.data.ca\\.crt}' > bk-ca.pem" .Release.Namespace $fn }}
+{{- if $plan.missing }}
 
-API URL (HTTPS, port {{ .Values.service.ports.api }}):
-{{- if eq .Values.service.type "LoadBalancer" }}
-  export HOST=$(kubectl -n {{ .Release.Namespace }} get svc {{ include "bkc.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}')
+WARNING: this cluster does not serve gateway.networking.k8s.io/v1 {{ join ", " $plan.missing }},
+so the chart rendered no route that needs it and the controller is not reachable through
+the Gateway. HTTPRoute is in Gateway API v1.0+, BackendTLSPolicy in v1.4+ and TLSRoute in
+v1.5+, all in the standard channel. Install the Gateway API CRDs your implementation
+supports, then run helm upgrade. With helm template, pass them with --api-versions, e.g.
+--api-versions gateway.networking.k8s.io/v1/TLSRoute.
+{{- end }}
+{{- if $plan.apiUnpinned }}
+
+WARNING: a gateway.api.parentRefs entry (or gateway.parentRefs) names no sectionName or
+port, so the HTTPRoute attaches to every HTTP and HTTPS listener of that Gateway that
+admits it. On a plain HTTP listener the API, and the bearer tokens clients send to it,
+would travel in cleartext. Set sectionName to the HTTPS listener.
+{{- end }}
+{{- if $plan.envoyMissing }}
+
+WARNING: gateway.envoy.enabled is set, but this cluster does not serve
+gateway.envoyproxy.io/v1alpha1 BackendTrafficPolicy, so the chart rendered no Envoy policies.
+{{- end }}
+{{- $e := $gw.envoy }}
+{{- if and $e.proxyProtocol (not $e.enabled) }}
+
+WARNING: gateway.envoy.proxyProtocol is true but gateway.envoy.enabled is false, so the chart
+renders no Envoy policy and Envoy sends no PROXY header.
+{{- end }}
+{{- range $l := list "api" "edge" }}
+{{- $p := (get $.Values $l).proxyProtocol }}
+{{- $routed := get $plan (printf "%sRefs" $l) }}
+{{- if and $e.enabled $e.proxyProtocol $routed (not $p.enabled) }}
+
+WARNING: gateway.envoy.proxyProtocol is true but {{ $l }}.proxyProtocol.enabled is false, so the
+chart does not ask Envoy to send PROXY protocol to the {{ $l }} listener, and the controller
+counts every {{ $l }} client as an Envoy pod address. Enable {{ $l }}.proxyProtocol with
+trustedCIDRs set to the Envoy pods' addresses (/32s, never the pod CIDR).
+{{- else if and $e.enabled $p.enabled $routed (or (not $e.proxyProtocol) $plan.envoyMissing) }}
+
+WARNING: {{ $l }}.proxyProtocol.enabled is true, but the chart does not ask Envoy to send PROXY
+protocol to that listener ({{ ternary "no BackendTrafficPolicy CRD" "gateway.envoy.proxyProtocol is false" $plan.envoyMissing }}).
+The controller closes every {{ $l }} connection from {{ join ", " $p.trustedCIDRs }} that carries
+no PROXY header.
+{{- end }}
+{{- end }}
+{{- if $plan.apiRefs }}
+
+API URL (HTTPS) through the Gateway, {{ ternary "TLS terminated at the gateway (HTTPRoute)" "TLS passthrough (TLSRoute)" (eq $gw.api.mode "terminate") }}:
+  https://{{ first $plan.apiHostnames }}:<listener port>
+Point DNS for {{ join ", " $plan.apiHostnames }} at the Gateway address. Check the route:
+  kubectl -n {{ .Release.Namespace }} get {{ ternary "httproute,backendtlspolicy" "tlsroute" (eq $gw.api.mode "terminate") }} {{ $fn }}-api -o yaml
+{{- if eq $gw.api.mode "terminate" }}
+Clients trust the gateway's certificate; with a publicly trusted one they need no CA, and with a
+private CA they need that CA.
+{{- end }}
+{{- else if eq .Values.service.type "LoadBalancer" }}
+
+API URL (HTTPS, port {{ .Values.service.ports.api }}) on the Service load balancer:
+  export HOST=$(kubectl -n {{ .Release.Namespace }} get svc {{ $fn }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}')
   echo "https://$HOST:{{ .Values.service.ports.api }}"
 {{- else if eq .Values.service.type "NodePort" }}
-  kubectl -n {{ .Release.Namespace }} get svc {{ include "bkc.fullname" . }}   # <node address>:<api nodePort>
+
+API URL (HTTPS) on a node port:
+  kubectl -n {{ .Release.Namespace }} get svc {{ $fn }}   # <node address>:<api nodePort>
 {{- else }}
-  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "bkc.fullname" . }} {{ .Values.service.ports.api }}:{{ .Values.service.ports.api }}
-  # then https://localhost:{{ .Values.service.ports.api }}
+
+API URL (HTTPS), in-cluster only (the Service is ClusterIP):
+  https://{{ $fn }}.{{ .Release.Namespace }}.svc:{{ .Values.service.ports.api }}
+From outside the cluster, forward both the API and the edge port, because a build needs both:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $fn }} {{ .Values.service.ports.api }}:{{ .Values.service.ports.api }} {{ .Values.service.ports.edge }}:{{ .Values.service.ports.edge }}
+Then the API URL is https://localhost:{{ .Values.service.ports.api }}, and edge.endpoint must point at the forwarded edge port
+(tcp://localhost:{{ .Values.service.ports.edge }}, with edge.serverName set to localhost).
+{{- end }}
+{{- if not (and $plan.apiRefs (eq $gw.api.mode "terminate")) }}
+The API serves the controller's certificate. Unless edge.tls.secretName is publicly trusted,
+clients need its CA (the Action's ca-cert, the recipe's API_CA):
+  {{ $ca }}
+The edge needs no CA setup: each allocation response carries the CA for it.
 {{- end }}
 
-The edge endpoint returned to clients is {{ .Values.edge.endpoint }}; point DNS for
-{{ .Values.edge.serverName }} at the Service's edge port ({{ .Values.service.ports.edge }}).
+The edge endpoint returned to clients is {{ .Values.edge.endpoint }}.
+{{- if $plan.edgeRefs }}
+Point DNS for {{ join ", " $plan.edgeHostnames }} at the Gateway's TLS passthrough listener; that
+address and port must match edge.endpoint. Check the route:
+  kubectl -n {{ .Release.Namespace }} get tlsroute {{ $fn }}-edge -o yaml
+{{- if and .Values.edge.proxyProtocol.enabled .Values.api.proxyProtocol.enabled }}
+PROXY protocol is on for the API and the edge, so the per-address caps count the client
+addresses in the gateway's PROXY headers.
+{{- else }}
+Every client now reaches the controller from the gateway's addresses, so the per-address
+caps (edge.maxHandshakesPerIp {{ .Values.edge.maxHandshakesPerIp }}, api.maxConnectionsPerIp {{ .Values.api.maxConnectionsPerIp }},
+auth.serviceAccount.maxReviewsPerIp {{ .Values.auth.serviceAccount.maxReviewsPerIp }}) apply to all clients together. Raise them or set 0,
+or turn on PROXY protocol (api.proxyProtocol, edge.proxyProtocol) so they count clients.
+{{- end }}
+{{- else if eq .Values.service.type "LoadBalancer" }}
+Reach the edge on the same load balancer, port {{ .Values.service.ports.edge }}. Point DNS for {{ .Values.edge.serverName }}
+at the load balancer address; that name and port must match edge.endpoint.
+{{- else if eq .Values.service.type "NodePort" }}
+Reach the edge on its node port (kubectl -n {{ .Release.Namespace }} get svc {{ $fn }}). Point DNS for
+{{ .Values.edge.serverName }} at a node address; that name and port must match edge.endpoint.
+{{- else }}
+The edge is on the Service's port {{ .Values.service.ports.edge }}, in-cluster only. Port-forward it together with the API
+(see above) and set edge.endpoint to the forwarded address.
+{{- end }}
 {{- if .Values.auth.oidc }}
 
 OIDC issuers configured:
@@ -28,12 +121,29 @@ No OIDC issuer is configured (auth.oidc is empty), so only Kubernetes ServiceAcc
 tokens (TokenReview) can authenticate. To use GitHub Actions, add the issuer
 https://token.actions.githubusercontent.com with an audience under auth.oidc.
 {{- end }}
+{{- $watch := include "bkc.watchNamespaces" . | fromJsonArray }}
+{{- if not $watch }}
+
+WARNING: watchNamespaces is empty, so the controller serves pools in every namespace
+and its ClusterRole can create and delete pods, Secrets and ServiceAccounts in any
+namespace, kube-system included. A compromised controller can take over the cluster.
+List the pool namespaces instead:
+  helm upgrade {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} --reuse-values \
+    --set 'watchNamespaces={ci-builders}'
+{{- else }}
+
+Watching pools in: {{ join ", " $watch }}. A pool in any other namespace is ignored.
+{{- end }}
+{{- if .Values.watchNamespace }}
+
+watchNamespace is deprecated; set watchNamespaces: [{{ .Values.watchNamespace }}] instead.
+{{- end }}
 {{- if not .Values.pools }}
 
 The chart created no pools. Add them under `pools:` in values, or apply BuildKitPool objects separately.
 {{- end }}
 
-Requirements for the build sandbox (see "Requirements" in the chart README):
+Requirements for the build sandbox (see "Requirements" in the chart README, helm/buildkit-controller/README.md):
   - The CNI must enforce NetworkPolicy. On one that ignores it (kindnet, the default
     EKS VPC CNI) builds reach every pod and the cloud metadata endpoint.
   - Each pool namespace must allow privileged pods:

@@ -1,9 +1,19 @@
 # Values for: helm install bk helm/buildkit-controller -n buildkit-system -f helm-values.yaml
 replicaCount: 2
 
+# The edge endpoint is the Gateway's TLS passthrough listener.
 edge:
   endpoint: tcp://bk.example.com:8444
   serverName: bk.example.com
+  # Behind a gateway every client shares the gateway's addresses, so the per-address
+  # caps apply to all CI jobs together. Size them for the jobs that start at once.
+  maxHandshakesPerIp: 256
+api:
+  maxConnectionsPerIp: 1024
+
+# Pool namespaces. The controller gets a Role in each and no cluster-wide write
+# access; pools in other namespaces are ignored.
+watchNamespaces: [ci]
 
 auth:
   oidc:
@@ -12,13 +22,28 @@ auth:
   serviceAccount:
     enabled: true
     audiences: [buildkit-controller]
+    maxReviewsPerIp: 32
 
-service:
-  type: LoadBalancer
-  annotations:
-    # For AWS NLB, keep idle connections open longer than a queued request can stay silent.
-    service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-8443: tcp.idle_timeout.seconds=900
-    service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-8444: tcp.idle_timeout.seconds=900
+# Routes on the Gateway bk (namespace gateway-system): the API on its HTTPS listener,
+# where the Gateway's certificate is publicly trusted, and the edge on its TLS
+# passthrough listener. See helm/README.md#exposure for a Gateway to match.
+gateway:
+  api:
+    parentRefs: [{name: bk, namespace: gateway-system, sectionName: api}]
+  edge:
+    parentRefs: [{name: bk, namespace: gateway-system, sectionName: edge}]
+  # envoy: {enabled: true}   # Envoy Gateway only: keepalive and timeout policies
+
+# Without a Gateway with TLS passthrough (GKE's managed Gateway, the AWS Load Balancer
+# Controller), expose the Service instead: drop the gateway block, restore the
+# per-address caps above, and use
+#
+#   service:
+#     type: LoadBalancer
+#     annotations:
+#       # AWS NLB: keep idle connections open longer than a queued request can stay silent.
+#       service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-8443: tcp.idle_timeout.seconds=900
+#       service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-8444: tcp.idle_timeout.seconds=900
 
 metrics:
   serviceMonitor:
@@ -38,3 +63,4 @@ pools:
               issuer: https://token.actions.githubusercontent.com
               claims:
                 repository_owner_id: "12345678"   # the org's numeric id (gh api orgs/<org> --jq .id); names can be re-registered
+                event_name: push   # not pull_request_target, which can run fork code

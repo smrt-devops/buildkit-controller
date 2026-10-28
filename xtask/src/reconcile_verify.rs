@@ -13,6 +13,8 @@
 //! `edge.endpoint` and `serverName`, a short shutdown, and non-default
 //! `workerNetwork` values that scenario S7 looks for literally in the applied
 //! `NetworkPolicy`. The controller must still be running when the scenarios end.
+//! The scenarios get the binary (`RV_BIN`) and its kubeconfig
+//! (`RV_CTRL_KUBECONFIG`) to start and kill a second replica of their own.
 //!
 //! Every kind and kubectl call passes `--kubeconfig target/reconcile-verify/...`.
 //! The task never reads or writes `~/.kube/config`. It kills the controller and
@@ -31,7 +33,7 @@ const NAMESPACE: &str = "bk-reconcile";
 const SA: &str = "buildkit-controller";
 /// The worker image the scenarios' pools run. The task loads it into kind
 /// because Docker Hub DNS inside kind is unreliable on this host.
-const IMAGE: &str = "moby/buildkit:rootless";
+const IMAGE: &str = crate::image::WORKER_IMAGE;
 
 /// Logs every request of the controller's `ServiceAccount` at `Metadata`
 /// (verb, resource, name, response code) and nothing else.
@@ -118,18 +120,6 @@ fn free_port() -> Result<u16> {
     Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
 
-fn ensure_image() -> Result<()> {
-    let have = Command::new("docker")
-        .args(["image", "inspect", IMAGE])
-        .output()
-        .context("docker")?;
-    if !have.status.success() {
-        let st = Command::new("docker").args(["pull", IMAGE]).status()?;
-        ensure!(st.success(), "docker pull {IMAGE} failed");
-    }
-    Ok(())
-}
-
 /// A kubeconfig that authenticates as the controller's `ServiceAccount`, so the
 /// audit policy can pick out its requests.
 fn controller_kubeconfig(c: &Cleanup, work: &Path) -> Result<PathBuf> {
@@ -181,7 +171,7 @@ pub fn reconcile_verify() -> Result<()> {
         &kind_config,
         KIND_CONFIG.replace("POLICY_DIR", &policies.display().to_string()),
     )?;
-    ensure_image()?;
+    crate::image::ensure_worker()?;
     let built = Command::new("cargo")
         .args(["build", "--locked", "-p", "buildkit-controller"])
         .current_dir(&root)
@@ -215,12 +205,7 @@ pub fn reconcile_verify() -> Result<()> {
     let crd = work.join("crd.yaml");
     std::fs::write(&crd, crate::render_crd()?)?;
     c.kubectl(&["apply", "-f", &crd.display().to_string()])?;
-    c.kubectl(&[
-        "wait",
-        "--for=condition=Established",
-        "crd/buildkitpools.buildkit.smrt-devops.net",
-        "--timeout=60s",
-    ])?;
+    crate::kube::wait_crd_established(&c.kubeconfig)?;
     let ctrl_kc = controller_kubeconfig(&c, &work)?;
 
     let ops = free_port()?;
@@ -263,6 +248,8 @@ pub fn reconcile_verify() -> Result<()> {
         .env("RV_NAMESPACE", NAMESPACE)
         .env("RV_CONFIG", &config)
         .env("RV_IMAGE", IMAGE)
+        .env("RV_BIN", &bin)
+        .env("RV_CTRL_KUBECONFIG", &ctrl_kc)
         .args([
             "test",
             "--locked",
