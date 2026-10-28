@@ -10,7 +10,8 @@ ServiceMonitor and BuildKitPools.
 ```
 helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
   --set edge.endpoint=tcp://bk.example.com:8444 --set edge.serverName=bk.example.com \
-  --set 'gateway.parentRefs[0].name=bk' --set 'gateway.parentRefs[0].namespace=gateway-system' \
+  --set-json 'gateway.api.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"api"}]' \
+  --set-json 'gateway.edge.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"edge"}]' \
   --set 'auth.oidc[0].url=https://token.actions.githubusercontent.com' \
   --set 'auth.oidc[0].audiences={buildkit-controller}'
 ```
@@ -66,10 +67,14 @@ The API has two modes:
   match the same SNI, so give them different listeners with `gateway.api.parentRefs`
   and `gateway.edge.parentRefs` (`sectionName`).
 
-One `gateway.parentRefs` entry without `sectionName` is enough for a Gateway with an
-HTTPS listener and a TLS passthrough listener, because each route attaches only to
-listeners of its protocol. `gateway.api.parentRefs` and `gateway.edge.parentRefs`
-replace it per route.
+Give each route its listener with `sectionName`: `gateway.api.parentRefs` for the
+HTTPS listener and `gateway.edge.parentRefs` for the TLS passthrough listener. A
+parentRef without `sectionName` (or `port`) attaches the HTTPRoute to every HTTP and
+HTTPS listener of that Gateway that admits it. On a shared Gateway with a plain HTTP
+listener, the API, and the bearer tokens clients send it, would then also be served in
+cleartext, so NOTES.txt warns about it. `gateway.parentRefs` is the default for both
+routes when the per-route lists are empty. In passthrough mode the chart fails to
+render when both TLSRoutes could match the same SNI on the same listener.
 
 An Envoy Gateway example. The API is on 443 with a publicly trusted certificate, and
 the edge on 8444:

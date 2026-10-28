@@ -111,10 +111,10 @@ gateway:
   # render unless service.type is LoadBalancer. false: no routes, e.g. an in-cluster-only
   # install reached through the Service or a port-forward.
   enabled: true
-  # The Gateway listeners both routes attach to, e.g.
-  #   [{name: shared, namespace: gateway-system, sectionName: https}]
-  # api.parentRefs and edge.parentRefs replace it per route, which you need when the API
-  # and the edge use different listeners (they always do in passthrough mode).
+  # Default listeners for both routes. The API and the edge need different listeners
+  # (HTTPS and TLS passthrough), so set api.parentRefs and edge.parentRefs instead, each
+  # with a sectionName. A ref without sectionName attaches the API HTTPRoute to every
+  # HTTP and HTTPS listener that admits it, plain HTTP included (NOTES.txt warns).
   parentRefs: []
   annotations: {}
   labels: {}
@@ -125,7 +125,7 @@ gateway:
     # passthrough: a TLSRoute; clients see the controller's serving certificate. Needs a
     #   TLS listener in Passthrough mode.
     mode: terminate
-    parentRefs: []
+    parentRefs: []         # e.g. [{name: shared, namespace: gateway-system, sectionName: https}]
     hostnames: []          # [] = [edge.serverName]
     # HTTPRoute timeouts (terminate mode). A queued allocation request is silent until a
     # worker is free: up to the pool's maxQueueTimeout + workers.startTimeout + 10s, which
@@ -144,6 +144,7 @@ gateway:
     # TLS passthrough only: the controller checks the client certificate itself, so the
     # gateway must never terminate this TLS. Needs a TLS listener in Passthrough mode. The
     # TLSRoute matches the SNI edge.serverName, plus *.<edge.allocationDomain> when set.
+    # e.g. parentRefs: [{name: shared, namespace: gateway-system, sectionName: bk-edge}]
     parentRefs: []
   # Envoy Gateway extras, off by default: a BackendTrafficPolicy per route with TCP
   # keepalive, a connect timeout and, on the HTTPRoute, a stream idle timeout equal to

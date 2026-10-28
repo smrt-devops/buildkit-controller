@@ -12,6 +12,13 @@ v1.5+, all in the standard channel. Install the Gateway API CRDs your implementa
 supports, then run helm upgrade. With helm template, pass them with --api-versions, e.g.
 --api-versions gateway.networking.k8s.io/v1/TLSRoute.
 {{- end }}
+{{- if $plan.apiUnpinned }}
+
+WARNING: a gateway.api.parentRefs entry (or gateway.parentRefs) names no sectionName or
+port, so the HTTPRoute attaches to every HTTP and HTTPS listener of that Gateway that
+admits it. On a plain HTTP listener the API, and the bearer tokens clients send to it,
+would travel in cleartext. Set sectionName to the HTTPS listener.
+{{- end }}
 {{- if $plan.envoyMissing }}
 
 WARNING: gateway.envoy.enabled is set, but this cluster does not serve

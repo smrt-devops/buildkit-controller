@@ -32,7 +32,8 @@ You need a cluster that meets the requirements above, `helm`, and a GitHub repos
 # 1. Install the controller and its CRD, attached to the Gateway bk in gateway-system.
 helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
   --set edge.endpoint=tcp://bk.example.com:8444 --set edge.serverName=bk.example.com \
-  --set 'gateway.parentRefs[0].name=bk' --set 'gateway.parentRefs[0].namespace=gateway-system' \
+  --set-json 'gateway.api.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"api"}]' \
+  --set-json 'gateway.edge.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"edge"}]' \
   --set 'watchNamespaces={ci}' \
   --set 'auth.oidc[0].url=https://token.actions.githubusercontent.com' \
   --set 'auth.oidc[0].audiences={buildkit-controller}'

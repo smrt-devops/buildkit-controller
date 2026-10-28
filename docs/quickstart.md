@@ -20,7 +20,8 @@ Pick a DNS name, install, then point the name at the Gateway's address.
 ```sh
 helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
   --set edge.endpoint=tcp://bk.example.com:8444 --set edge.serverName=bk.example.com \
-  --set 'gateway.parentRefs[0].name=bk' --set 'gateway.parentRefs[0].namespace=gateway-system' \
+  --set-json 'gateway.api.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"api"}]' \
+  --set-json 'gateway.edge.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"edge"}]' \
   --set 'watchNamespaces={ci}' \
   --set 'auth.oidc[0].url=https://token.actions.githubusercontent.com' \
   --set 'auth.oidc[0].audiences={buildkit-controller}'
@@ -31,7 +32,7 @@ kubectl get httproute,tlsroute -n buildkit-system
 
 Behind a gateway every client reaches the controller from the gateway's addresses, so the per-address caps apply to all clients together. Raise `edge.maxHandshakesPerIp`, `api.maxConnectionsPerIp` and `auth.serviceAccount.maxReviewsPerIp`, or set them to 0, before many jobs start at once (see [operations.md](operations.md#exposure)).
 
-Without a Gateway, or where the managed gateway has no TLS passthrough (GKE's managed Gateway, the AWS Load Balancer Controller), use a load balancer instead: replace the two `gateway.parentRefs` flags with `--set service.type=LoadBalancer`, point the DNS name at the Service address from `kubectl get svc -n buildkit-system`, and use `https://bk.example.com:8443` as the API URL. Some load balancers need a higher idle timeout. See [helm/README.md](../helm/README.md#load-balancer-idle-timeout).
+Without a Gateway, or where the managed gateway has no TLS passthrough (GKE's managed Gateway, the AWS Load Balancer Controller), use a load balancer instead: replace the two `parentRefs` flags with `--set service.type=LoadBalancer`, point the DNS name at the Service address from `kubectl get svc -n buildkit-system`, and use `https://bk.example.com:8443` as the API URL. Some load balancers need a higher idle timeout. See [helm/README.md](../helm/README.md#load-balancer-idle-timeout).
 
 ### On kind
 

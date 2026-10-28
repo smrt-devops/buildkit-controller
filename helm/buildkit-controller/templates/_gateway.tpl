@@ -5,7 +5,9 @@ What the chart renders for Gateway API exposure, as JSON:
   edgeHostnames       TLSRoute hostnames (SNI) of the edge
   missing             kinds the routes need that the cluster does not serve
   envoyMissing        gateway.envoy.enabled but no BackendTrafficPolicy CRD
-Fails when a route has no parentRefs and service.type is not LoadBalancer.
+  apiUnpinned         an HTTPRoute parentRef names no sectionName or port
+Fails when a route has no parentRefs and service.type is not LoadBalancer, and in
+passthrough mode when both TLSRoutes could match one SNI on one listener.
 */}}
 {{- define "bkc.gateway" -}}
 {{- $gw := .Values.gateway -}}
@@ -26,6 +28,37 @@ Fails when a route has no parentRefs and service.type is not LoadBalancer.
   {{- $edgeHosts := list .Values.edge.serverName -}}
   {{- with .Values.edge.allocationDomain }}{{ $edgeHosts = append $edgeHosts (printf "*.%s" .) }}{{ end -}}
   {{- $apiHosts := default (list .Values.edge.serverName) $gw.api.hostnames -}}
+  {{- /* Passthrough: two TLSRoutes on one listener with overlapping SNI would let the
+         gateway send edge connections to the API port. */ -}}
+  {{- if eq $gw.api.mode "passthrough" -}}
+    {{- range $a := $apiRefs -}}
+      {{- range $e := $edgeRefs -}}
+        {{- $same := and (eq $a.name $e.name) (eq (default "" $a.namespace) (default "" $e.namespace)) (eq (default "Gateway" $a.kind) (default "Gateway" $e.kind)) -}}
+        {{- $sameSection := or (not $a.sectionName) (not $e.sectionName) (eq $a.sectionName $e.sectionName) -}}
+        {{- $samePort := or (not $a.port) (not $e.port) (eq (int $a.port) (int $e.port)) -}}
+        {{- if and $same $sameSection $samePort -}}
+          {{- range $ha := $apiHosts -}}
+            {{- range $he := $edgeHosts -}}
+              {{- $da := trimPrefix "*." $ha -}}
+              {{- $de := trimPrefix "*." $he -}}
+              {{- if or (eq $ha $he) (and (hasPrefix "*." $ha) (hasSuffix (printf ".%s" $da) $he)) (and (hasPrefix "*." $he) (hasSuffix (printf ".%s" $de) $ha)) -}}
+                {{- fail (printf "gateway.api.mode=passthrough: the API and edge TLSRoutes would both match SNI %s on Gateway %s listener %s, so edge connections could reach the API. Attach them to different listeners (gateway.api.parentRefs and gateway.edge.parentRefs with sectionName) or give the API other gateway.api.hostnames." $ha $a.name (default "(any)" (default $e.sectionName $a.sectionName))) -}}
+              {{- end -}}
+            {{- end -}}
+          {{- end -}}
+        {{- end -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+  {{- /* Terminate: an HTTPRoute ref with no sectionName or port attaches to every HTTP
+         and HTTPS listener that admits it, plain HTTP included. */ -}}
+  {{- $unpinned := false -}}
+  {{- if eq $gw.api.mode "terminate" -}}
+    {{- range $apiRefs -}}
+      {{- if not (or .sectionName .port) }}{{ $unpinned = true }}{{ end -}}
+    {{- end -}}
+  {{- end -}}
+  {{- $_ := set $out "apiUnpinned" $unpinned -}}
   {{- $caps := .Capabilities.APIVersions -}}
   {{- $missing := list -}}
   {{- $apiKinds := ternary (list "HTTPRoute" "BackendTLSPolicy") (list "TLSRoute") (eq $gw.api.mode "terminate") -}}
