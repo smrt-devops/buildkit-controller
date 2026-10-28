@@ -258,7 +258,6 @@ mod waiters_tests {
     use buildkit_controller_api::v1alpha1::BuildKitPool;
     use futures::future::BoxFuture;
     use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret};
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
     use kube::runtime::reflector::store::Writer;
     use kube::runtime::watcher;
     use serde_json::{Value, json};
@@ -335,15 +334,11 @@ mod waiters_tests {
         fn create_worker_secret(&self, _: &Secret) -> BoxFuture<'static, Result<(), String>> {
             unused(Err("unused".into()))
         }
-        fn reown_worker_secret(
+        fn get_worker_pod(
             &self,
             _: &str,
             _: &str,
-            _: OwnerReference,
-        ) -> BoxFuture<'static, Result<(), String>> {
-            unused(Err("unused".into()))
-        }
-        fn delete_worker_secret(&self, _: &str, _: &str) -> BoxFuture<'static, Result<(), String>> {
+        ) -> BoxFuture<'static, Result<Option<Pod>, String>> {
             unused(Err("unused".into()))
         }
     }
