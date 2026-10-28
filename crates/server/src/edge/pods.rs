@@ -23,7 +23,8 @@ use crate::runtime::stores::StoreFreshness;
 pub struct PodView {
     pub pods: Store<Pod>,
     pub pools: Store<BuildKitPool>,
-    /// Both stores finished a list with no watch error since.
+    /// Both stores listed and have not been without a working watch for
+    /// longer than [`STALE_AFTER`](crate::runtime::stores::STALE_AFTER).
     pub fresh: StoreFreshness,
 }
 
@@ -41,8 +42,11 @@ impl PodView {
     /// identity. The proxy runs this inside the handshake and again just
     /// before it dials.
     pub fn resolve(&self, id: &AllocationId, now: OffsetDateTime) -> Result<Target, Refusal> {
-        // A store that missed events may still list a deleted pod whose IP now
-        // belongs to another tenant's pod.
+        // Check 0. A store that lost its watch may miss a release or a delete.
+        // Within STALE_AFTER that only admits the client that already held the
+        // single-use worker, and a reused IP still fails the upstream
+        // handshake on the worker's serving-cert name. Past the bound the
+        // cache is too old to vouch for an allocation, so refuse.
         if !self.fresh.is_fresh() {
             return Err(Refusal::StoreStale);
         }

@@ -1,9 +1,9 @@
-//! `cargo xtask runtime-verify`: two controller replicas against a throwaway
 //! `cargo xtask runtime-verify` runs two controller replicas against a
-//! throwaway kind cluster. It shows exactly one leader, failover within the
-//! spec bound after SIGKILL of the leader, `/readyz` turning true only after
-//! `InitDone` (the CRD is applied late on purpose), and Lease release on
-//! SIGTERM.
+//! throwaway kind cluster. It shows `/readyz` turning true only after
+//! `InitDone` (the CRD is applied late on purpose), `/readyz` staying true
+//! while the API server restarts and the watches relist, exactly one leader,
+//! failover within the spec bound after SIGKILL of the leader, and Lease
+//! release on SIGTERM.
 //!
 //! The cluster uses a private kubeconfig under `target/runtime-verify`. The
 //! task never reads or writes the user's `~/.kube/config`, and it deletes the
@@ -20,6 +20,9 @@ static CLUSTER: std::sync::LazyLock<String> =
 const NAMESPACE: &str = "bk-runtime";
 /// leaseDuration (15 s) plus slack for polling and the contender's timer.
 const FAILOVER_BOUND: Duration = Duration::from_secs(20);
+/// How long `/readyz` is sampled after the API server answers again: the
+/// longest watch restart backoff (30 s) plus time for the relist.
+const RELIST_SETTLE: Duration = Duration::from_secs(35);
 
 struct Env {
     kubeconfig: PathBuf,
@@ -133,6 +136,78 @@ fn wait_for(what: &str, limit: Duration, mut f: impl FnMut() -> bool) -> Result<
     bail!("timed out after {limit:?} waiting for {what}")
 }
 
+/// Restart the API server in the kind node and sample `/readyz` on every
+/// replica until the API answers again and the watches have had time to
+/// relist. Every sample must be 200: a watch error alone must not fail
+/// readiness (see `STALE_AFTER` in `runtime/stores.rs`).
+fn api_server_blip(env: &Env, replicas: &[Replica]) -> Result<()> {
+    let node = format!("{}-control-plane", CLUSTER.as_str());
+    let before: Vec<u64> = replicas.iter().map(|r| pod_watch_errors(r.ops)).collect();
+    let stopped = Command::new("docker")
+        .args(["exec", &node, "sh", "-c"])
+        .arg("crictl stop $(crictl ps -q --name '^kube-apiserver$')")
+        .output()
+        .context("docker exec crictl stop")?;
+    ensure!(
+        stopped.status.success(),
+        "stopping kube-apiserver: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let start = Instant::now();
+    let (mut samples, mut down_seen, mut back_at) = (0_usize, false, None::<Instant>);
+    loop {
+        for r in replicas {
+            let got = http(r.ops, "/readyz");
+            ensure!(
+                got.as_ref().is_some_and(|(c, _)| *c == 200),
+                "{}: /readyz {got:?} {:.1?} into the API server restart",
+                r.name,
+                start.elapsed()
+            );
+            samples += 1;
+        }
+        let up = env
+            .kubectl(&["get", "--raw", "/readyz", "--request-timeout=2s"])
+            .is_ok();
+        down_seen |= !up;
+        if down_seen && up && back_at.is_none() {
+            back_at = Some(Instant::now());
+        }
+        let hit = replicas
+            .iter()
+            .zip(&before)
+            .all(|(r, b)| pod_watch_errors(r.ops) > *b);
+        if let Some(t) = back_at
+            && hit
+            && t.elapsed() >= RELIST_SETTLE
+        {
+            break;
+        }
+        ensure!(
+            start.elapsed() < Duration::from_mins(3),
+            "API server restart did not finish (down seen {down_seen}, back {back_at:?}, watch errors seen {hit})"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let outage = back_at.map(|t| t - start).unwrap_or_default();
+    println!(
+        "PASS API server restart: down {outage:.1?}, pod watch errors on every replica, /readyz 200 in all {samples} samples through the relist"
+    );
+    Ok(())
+}
+
+/// `buildkit_watch_errors_total{kind="pod"}`, 0 when absent.
+fn pod_watch_errors(port: u16) -> u64 {
+    http(port, "/metrics")
+        .and_then(|(_, body)| {
+            body.lines().find_map(|l| {
+                l.strip_prefix("buildkit_watch_errors_total{kind=\"pod\"} ")
+                    .and_then(|v| v.trim().parse().ok())
+            })
+        })
+        .unwrap_or(0)
+}
+
 fn write_config(dir: &Path, r: &Replica) -> Result<PathBuf> {
     let path = dir.join(format!("{}.yaml", r.name));
     std::fs::write(
@@ -237,8 +312,13 @@ pub fn runtime_verify() -> Result<()> {
     })?;
     println!("PASS /readyz 200 on both replicas {t:.1?} after the CRD appeared (InitDone)");
 
-    // 3. Exactly one leader, and it is the Lease holder.
-    wait_for("a leader", Duration::from_secs(30), || {
+    // 3. Restart the API server. The watches fail and relist, and /readyz stays 200.
+    api_server_blip(&cleanup.env, replicas)?;
+
+    // 4. Exactly one leader, and it is the Lease holder.
+    // The API server restart may have cost the Lease; it is re-acquired within
+    // leaseDuration.
+    wait_for("a leader", Duration::from_mins(1), || {
         replicas.iter().any(|r| is_leader(r.ops) == Some(true))
     })?;
     std::thread::sleep(Duration::from_secs(5));
@@ -259,7 +339,7 @@ pub fn runtime_verify() -> Result<()> {
     );
     println!("PASS exactly one leader: {holder} (Lease holderIdentity agrees)");
 
-    // 4. Failover. SIGKILL the leader.
+    // 5. Failover. SIGKILL the leader.
     let li = replicas
         .iter()
         .position(|r| r.name == holder)
@@ -280,7 +360,7 @@ pub fn runtime_verify() -> Result<()> {
         "PASS failover {took:.1?} after SIGKILL of {holder} (bound {FAILOVER_BOUND:?}; spec leaseDuration 15s)"
     );
 
-    // 5. SIGTERM the survivor. It releases the Lease and exits 0.
+    // 6. SIGTERM the survivor. It releases the Lease and exits 0.
     let pid = cleanup.children[1 - li].id().to_string();
     ensure!(
         Command::new("kill")

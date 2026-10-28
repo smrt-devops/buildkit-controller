@@ -23,6 +23,7 @@ use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Client, Resource, ResourceExt};
 use serde::de::DeserializeOwned;
 use tokio::sync::{broadcast, watch};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -81,12 +82,42 @@ pub struct SecretState {
 const RESTART_MIN: Duration = Duration::from_secs(1);
 /// Longest wait between watch restarts.
 const RESTART_MAX: Duration = Duration::from_secs(30);
+/// How long a store that listed once may go without a working watch before
+/// its readiness flag clears.
+///
+/// A watch error means the store may miss changes from then on, until a
+/// restarted watch completes a full list. Within this bound the store keeps
+/// serving its last list: `/readyz` stays 200 and the edge still admits. An
+/// API server blip reaches every replica at once, so failing at the first
+/// error would empty the Service and refuse every new edge connection on all
+/// replicas together. The restart backoff fits five relist attempts (after 1,
+/// 3, 7, 15 and 31 s) inside the bound, so an outage of up to about 30 s
+/// recovers without the flag clearing.
+///
+/// What staleness can let through inside the bound is narrow. Workers are
+/// single-use, so a stale entry can only show an allocation that was released
+/// or a pool that was deleted, and the client it admits is the one that
+/// already held that worker. Expiry is checked against the clock, not a
+/// watch event. A stale IP that now belongs to another tenant's pod fails the
+/// upstream handshake, because that pod's serving certificate names a
+/// different pod and nonce.
+pub const STALE_AFTER: Duration = Duration::from_mins(1);
 
 /// Drive a store from `watch()`. It applies events, taps them, and sets `ready`
-/// at each `InitDone`. A watch error clears `ready` and starts a new watch
-/// (a full relist) after a backoff, because kube's watcher resumes a failed
-/// watch without a relist and so never reports when the store caught up. A
-/// cleared flag therefore means the store may be missing changes.
+/// at each `InitDone`.
+///
+/// A watch error starts a new watch (a full relist) after a backoff, because
+/// kube's watcher resumes a failed watch without a relist and so never reports
+/// when the store caught up. The reflector writer buffers the relist and swaps
+/// it in at `InitDone`, so the store keeps its last list meanwhile.
+///
+/// `ready` means the store is usable for decisions:
+/// - It is false until the first `InitDone`, with no grace period.
+/// - A watch error leaves it set. It clears once [`STALE_AFTER`] has passed
+///   since the first error without a completed relist; errors during the
+///   relist do not restart that clock.
+/// - The next `InitDone` sets it again.
+///
 /// Returns when a stream ends (only test streams do).
 pub async fn drive<K, S>(
     mut writer: reflector::store::Writer<K>,
@@ -100,30 +131,52 @@ pub async fn drive<K, S>(
     S: Stream<Item = watcher::Result<watcher::Event<K>>>,
 {
     let mut gap = RESTART_MIN;
+    // When the store last stopped being known current; `None` while the
+    // latest watch has listed and not failed since.
+    let mut failed_at: Option<Instant> = None;
     loop {
         let events = watch();
         futures::pin_mut!(events);
         loop {
-            match events.next().await {
+            let stale_at = failed_at.map(|t| t + STALE_AFTER);
+            match clear_at(events.next(), stale_at, &ready).await {
                 None => return,
                 Some(Ok(ev)) => {
                     writer.apply_watcher_event(&ev);
                     if matches!(ev, watcher::Event::InitDone) {
                         ready.set();
+                        failed_at = None;
                         gap = RESTART_MIN;
                     }
                     tap(&ev);
                 }
                 Some(Err(e)) => {
                     on_error(&e);
-                    ready.clear();
+                    failed_at.get_or_insert_with(Instant::now);
                     break;
                 }
             }
         }
-        tokio::time::sleep(gap).await;
+        let stale_at = failed_at.map(|t| t + STALE_AFTER);
+        clear_at(tokio::time::sleep(gap), stale_at, &ready).await;
         gap = (gap * 2).min(RESTART_MAX);
     }
+}
+
+/// Await `fut`. If `deadline` passes first, clear `ready` and keep waiting.
+async fn clear_at<T>(
+    fut: impl Future<Output = T>,
+    deadline: Option<Instant>,
+    ready: &ReadyFlag,
+) -> T {
+    futures::pin_mut!(fut);
+    if let Some(at) = deadline {
+        tokio::select! {
+            out = &mut fut => return out,
+            () = tokio::time::sleep_until(at) => ready.clear(),
+        }
+    }
+    fut.await
 }
 
 /// Forward pod watcher events into the broadcast channel.
@@ -168,8 +221,9 @@ pub async fn drive_secret<S>(
     }
 }
 
-/// Whether the Pool and Pod stores are fresh: each finished a list and saw no
-/// watch error since.
+/// Whether the Pool and Pod stores can be trusted for edge decisions. It reads
+/// their readiness flags, so it agrees with `/readyz`: each store listed once
+/// and has not gone [`STALE_AFTER`] without a working watch (see [`drive`]).
 #[derive(Clone, Debug)]
 pub struct StoreFreshness {
     pools: watch::Receiver<bool>,
