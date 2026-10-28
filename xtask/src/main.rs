@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 mod alloc_verify;
 mod api_verify;
 mod claim_verify;
+mod docs;
 mod e2e;
 mod e2e_issuer;
 mod edge_verify;
@@ -24,6 +25,7 @@ mod soak;
 use alloc_verify::alloc_verify;
 use api_verify::api_verify;
 use claim_verify::claim_verify;
+use docs::docs;
 use e2e::{e2e, e2e_up};
 use edge_verify::edge_verify;
 use helm_test::helm_test;
@@ -97,6 +99,8 @@ enum Task {
     ClaimVerify,
     /// Soak the certificate lifecycle on a throwaway kind cluster. Runs continuous builds through leaf renewals, a serving certificate swap, a leader failover, and deletion and corruption of the CA Secret.
     Soak,
+    /// Build the documentation site with mdBook into target/book/html. Fails on a broken repository link.
+    Docs,
     /// Run the end-to-end suite on a kind cluster. Covers chart install, OIDC and `TokenReview`, builds, the registry cache, queueing and multi-platform builds.
     E2e,
     /// Install the chart on kind, trust GitHub OIDC for REPO (owner/name) and leave the cluster running. Used by the CI Action job.
@@ -323,6 +327,7 @@ fn main() -> Result<()> {
         Task::HelmVerify => helm_verify(),
         Task::ClaimVerify => claim_verify(),
         Task::Soak => soak(),
+        Task::Docs => docs(),
         Task::E2e => e2e(),
         Task::E2eUp { repo } => e2e_up(&repo),
         Task::Perf { loopback: true, .. } => perf_loopback(),

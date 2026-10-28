@@ -41,6 +41,7 @@ Clippy denies `unwrap`, `expect` and `unsafe` outside tests. Use `thiserror` for
 | `cargo xtask alloc-verify`, `api-verify`, `reconcile-verify`, `runtime-verify`, `edge-verify`, `helm-verify` | End-to-end checks on a throwaway kind cluster. They use a private kubeconfig and never touch `~/.kube/config`. |
 | `cargo xtask perf --loopback` | Runs the in-process loopback edge benchmark. It needs no kind cluster and no Docker. Plain `perf` uses the kind rig. |
 | `cargo xtask image` | Builds the controller image for your architecture. `--load-kind <cluster>` also loads it into kind. If Docker has no network, `BK_IMAGE_PREINSTALLED=1` builds with the toolchain the rust image ships instead of the pinned one; use it for local builds only. |
+| `cargo xtask docs` | Builds the documentation site with mdBook into `target/book/html` and fails on a broken link to a repository file. Needs `mdbook` on the PATH. |
 
 Every task that creates a kind cluster names it `bk-<task>`. Set `BK_KIND_SUFFIX=foo` to get `bk-<task>-foo` instead, so parallel checkouts do not share a cluster. It is the only override; there are no per-task cluster variables.
 
