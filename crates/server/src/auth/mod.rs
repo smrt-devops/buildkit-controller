@@ -80,10 +80,11 @@ impl Identity {
 /// `iss#sub` alone would let one run release another's allocation.
 pub const RUN_CLAIMS: [&str; 3] = ["run_id", "run_attempt", "job_workflow_ref"];
 
-/// The OIDC owner string. Without any [`RUN_CLAIMS`] it is `oidc:<iss>#<sub>`.
-/// Otherwise each present claim is appended as `#<name>=<value>` in the order
-/// of [`RUN_CLAIMS`], and `sub` and every value have `%` and `#` percent-encoded,
-/// so two different runs never produce the same string.
+/// The OIDC owner string: `oidc:<iss>#<sub>`, then each present [`RUN_CLAIMS`]
+/// claim as `#<name>=<value>` in the order of [`RUN_CLAIMS`]. `sub` and every
+/// value have `%` and `#` percent-encoded in both forms, so no two callers
+/// produce the same string: without the escape in the plain form, sub
+/// `x#run_id=1` with no run claims would equal sub `x` with `run_id` 1.
 fn oidc_owner(issuer: &str, subject: &str, claims: &Map<String, Value>) -> String {
     let run: Vec<(&str, String)> = RUN_CLAIMS
         .iter()
@@ -96,9 +97,6 @@ fn oidc_owner(issuer: &str, subject: &str, claims: &Map<String, Value>) -> Strin
             Some((name, v))
         })
         .collect();
-    if run.is_empty() {
-        return format!("oidc:{issuer}#{subject}");
-    }
     let esc = |s: &str| s.replace('%', "%25").replace('#', "%23");
     let mut owner = format!("oidc:{issuer}#{}", esc(subject));
     for (name, v) in run {

@@ -127,13 +127,5 @@ fn apply_crd(cluster: &Cluster, work: &Path) -> Result<()> {
         &mut cluster.kubectl(&["apply", "--wait", "-f", crd]),
         "kubectl apply crd",
     )?;
-    run(
-        &mut cluster.kubectl(&[
-            "wait",
-            "--for=condition=Established",
-            "crd/buildkitpools.buildkit.smrt-devops.net",
-            "--timeout=60s",
-        ]),
-        "kubectl wait crd",
-    )
+    crate::kube::wait_crd_established(&cluster.kubeconfig)
 }

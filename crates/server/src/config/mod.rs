@@ -477,6 +477,10 @@ pub struct WorkerNetwork {
     /// The cluster's pod, service and node CIDRs.
     #[serde(rename = "clusterCIDRs")]
     pub cluster_cidrs: Vec<String>,
+    /// Ranges a pool's `allowCIDRs` may open although they overlap the link-local,
+    /// metadata, loopback, cluster or extra denied ranges.
+    #[serde(rename = "permittedCIDRs")]
+    pub permitted_cidrs: Vec<String>,
     /// DNS allowance.
     pub dns: Dns,
 }
@@ -488,6 +492,7 @@ impl Default for WorkerNetwork {
             denied_cidrs: d.denied_cidrs,
             extra_denied_cidrs: d.extra_denied_cidrs,
             cluster_cidrs: d.cluster_cidrs,
+            permitted_cidrs: d.permitted_cidrs,
             dns: Dns {
                 namespace: d.dns.namespace,
                 pod_labels: d.dns.pod_labels,
@@ -856,27 +861,33 @@ impl Config {
     }
 
     fn validate_network(&self, p: &mut Vec<String>) {
+        const DENY: Option<&str> = Some("would deny a whole address family");
+        // A pool can never open a whole family, so permitting one is a mistake.
+        const PERMIT: Option<&str> = Some("would permit a whole address family");
         let n = &self.worker_network;
         // The NetworkPolicy API refuses host bits, IPv4-mapped IPv6 and an `except` entry
         // equal to its `0.0.0.0/0` or `::/0` block. One bad entry fails every pool's
         // NetworkPolicy apply, so refuse it at load.
-        for (f, list, except) in [
-            ("workerNetwork.deniedCIDRs", &n.denied_cidrs, true),
+        for (f, list, whole) in [
+            ("workerNetwork.deniedCIDRs", &n.denied_cidrs, DENY),
             (
                 "workerNetwork.extraDeniedCIDRs",
                 &n.extra_denied_cidrs,
-                true,
+                DENY,
             ),
-            ("workerNetwork.clusterCIDRs", &n.cluster_cidrs, true),
-            ("workerNetwork.dns.cidrs", &n.dns.cidrs, false),
+            ("workerNetwork.clusterCIDRs", &n.cluster_cidrs, DENY),
+            ("workerNetwork.permittedCIDRs", &n.permitted_cidrs, PERMIT),
+            ("workerNetwork.dns.cidrs", &n.dns.cidrs, None),
         ] {
             for c in list {
                 if !buildkit_controller_api::v1alpha1::is_canonical_cidr(c) {
                     p.push(format!(
                         "{f}: `{c}` is not a canonical CIDR (no bits set beyond the prefix length, no IPv4-mapped IPv6)"
                     ));
-                } else if except && c.ends_with("/0") {
-                    p.push(format!("{f}: `{c}` would deny a whole address family"));
+                } else if let Some(why) = whole
+                    && c.ends_with("/0")
+                {
+                    p.push(format!("{f}: `{c}` {why}"));
                 }
             }
         }
@@ -962,6 +973,7 @@ impl Config {
                 denied_cidrs: n.denied_cidrs.clone(),
                 extra_denied_cidrs: n.extra_denied_cidrs.clone(),
                 cluster_cidrs: n.cluster_cidrs.clone(),
+                permitted_cidrs: n.permitted_cidrs.clone(),
                 dns: crate::render::WorkerDns {
                     namespace: n.dns.namespace.clone(),
                     pod_labels: n.dns.pod_labels.clone(),

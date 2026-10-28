@@ -755,12 +755,7 @@ fn setup(s: &Soak, root: &std::path::Path) -> Result<CaBundle> {
 
     let crd = root.join(CRD_PATH).to_string_lossy().into_owned();
     s.k(&["apply", "--server-side", "-f", &crd])?;
-    s.k(&[
-        "wait",
-        "--for=condition=established",
-        "--timeout=60s",
-        "crd/buildkitpools.buildkit.smrt-devops.net",
-    ])?;
+    crate::kube::wait_crd_established(&s.env.kubeconfig)?;
     s.k(&["create", "namespace", SYSTEM_NS])?;
     s.k(&[
         "label",

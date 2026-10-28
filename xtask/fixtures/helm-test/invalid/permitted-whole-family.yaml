@@ -1,0 +1,3 @@
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+workerNetwork:
+  permittedCIDRs: ["::/0"]

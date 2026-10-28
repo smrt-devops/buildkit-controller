@@ -121,7 +121,8 @@ pub struct AllocationResponse {
     pub namespace: String,
     /// Pool name.
     pub pool: String,
-    /// Caller identity, `oidc:<iss>#<sub>` or `sa:<ns>/<name>`.
+    /// Caller identity: `sa:<ns>/<name>`, `claim:<ns>/<name>#<uid>`, or `oidc:<iss>#<sub>`
+    /// followed by any run claims (see the allocation owner section of the architecture doc).
     pub owner: String,
     /// Edge endpoint, for example `tcp://bk.example.com:8444`.
     pub endpoint: String,

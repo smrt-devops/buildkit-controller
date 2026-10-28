@@ -408,14 +408,13 @@ fn run(env: &Env, work: &Path) -> Result<()> {
         NS,
         "--timeout=300s",
     ])?;
-    env.kubectl(&[
-        "wait",
-        "--for=condition=Ready",
+    crate::kube::wait_condition(
+        &env.kubeconfig,
         "buildkitpool/proxy",
-        "-n",
-        POOL_NS,
-        "--timeout=300s",
-    ])?;
+        Some(POOL_NS),
+        "Ready",
+        Duration::from_mins(5),
+    )?;
     for p in ["p1", "p2"] {
         env.kubectl(&[
             "wait",

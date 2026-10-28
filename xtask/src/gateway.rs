@@ -195,14 +195,13 @@ pub(crate) fn install(env: &Env, cluster: &str, work: &Path) -> Result<PathBuf> 
         "-f",
         &fixtures.join("gateway.yaml").to_string_lossy(),
     ])?;
-    env.kubectl(&[
-        "wait",
-        "--for=condition=Programmed",
+    crate::kube::wait_condition(
+        &env.kubeconfig,
         &format!("gateway/{NAME}"),
-        "-n",
-        NS,
-        "--timeout=300s",
-    ])?;
+        Some(NS),
+        "Programmed",
+        std::time::Duration::from_mins(5),
+    )?;
     println!("Gateway {NS}/{NAME} Programmed");
     Ok(ca)
 }

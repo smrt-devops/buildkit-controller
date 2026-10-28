@@ -335,6 +335,34 @@ fn worker_network_cidrs_must_be_canonical_strict_subsets() {
 }
 
 #[test]
+fn permitted_cidrs_must_be_canonical_and_not_a_whole_family() {
+    let v = errs(&format!(
+        "{MIN}workerNetwork:\n  permittedCIDRs: ['10.0.0.1/8', '0.0.0.0/0', '::/0']\n"
+    ));
+    assert!(
+        v.iter()
+            .any(|m| m.contains("permittedCIDRs: `10.0.0.1/8` is not a canonical CIDR")),
+        "{v:?}"
+    );
+    for whole in ["0.0.0.0/0", "::/0"] {
+        assert!(
+            v.iter()
+                .any(|m| m.contains(&format!("`{whole}` would permit a whole address family"))),
+            "{whole}: {v:?}"
+        );
+    }
+    assert_eq!(v.len(), 3, "{v:?}");
+    let ok = Config::from_yaml(&format!(
+        "{MIN}workerNetwork:\n  permittedCIDRs: ['169.254.20.10/32']\n"
+    ))
+    .unwrap();
+    assert_eq!(
+        ok.render_config("ns").worker_network.permitted_cidrs,
+        vec!["169.254.20.10/32"]
+    );
+}
+
+#[test]
 fn sa_audiences_must_not_name_the_api_server() {
     for aud in [
         "https://kubernetes.default.svc",

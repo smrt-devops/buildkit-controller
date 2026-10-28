@@ -205,12 +205,7 @@ pub fn reconcile_verify() -> Result<()> {
     let crd = work.join("crd.yaml");
     std::fs::write(&crd, crate::render_crd()?)?;
     c.kubectl(&["apply", "-f", &crd.display().to_string()])?;
-    c.kubectl(&[
-        "wait",
-        "--for=condition=Established",
-        "crd/buildkitpools.buildkit.smrt-devops.net",
-        "--timeout=60s",
-    ])?;
+    crate::kube::wait_crd_established(&c.kubeconfig)?;
     let ctrl_kc = controller_kubeconfig(&c, &work)?;
 
     let ops = free_port()?;
