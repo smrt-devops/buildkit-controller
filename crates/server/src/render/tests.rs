@@ -712,6 +712,13 @@ fn cache_pools_run_the_init_step_before_buildkitd() {
     ] {
         assert!(script.contains(want), "{want} missing from {script}");
     }
+    // A wipe drops the generation file first and writes it last, so a wipe cut
+    // short leaves a volume without a generation, which the next pod empties.
+    let pos = |s: &str| script.find(s).unwrap_or_else(|| panic!("{s} missing"));
+    let drop_marker = pos("rm -f -- \"$m\"");
+    let wipe = pos("rm -rf -- ");
+    let write_marker = pos("printf %s \"$g\" > \"$m\"");
+    assert!(drop_marker < wipe && wipe < write_marker, "{script}");
     let env: Vec<(&str, &str)> = c
         .env
         .iter()

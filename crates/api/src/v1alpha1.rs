@@ -466,7 +466,11 @@ pub struct Cache {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_limit: Option<Quantity>,
     /// Persistent state volumes for cache affinity. Unset turns the
-    /// feature off. A volume is shared only by callers of one cache scope, see `local.scope`.
+    /// feature off. A volume is shared only by callers of one cache scope, see `local.scope`,
+    /// and is emptied before a pod of another scope starts on it. With it set, buildkitd runs
+    /// with build history off (`[history] maxEntries = 0`) and `history.db` is deleted at
+    /// every start, so no build logs or build arguments reach a later allocation and
+    /// `buildx history` shows nothing on this pool.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "non_null::<LocalCache>")]
     pub local: Option<LocalCache>,

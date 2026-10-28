@@ -143,7 +143,8 @@ pub fn won_binding(pod: &Pod, scope: &str) -> Option<Binding> {
 }
 
 /// The init container's script. It keeps the state dir only when it holds the
-/// expected generation. Otherwise it deletes everything in it and records the
+/// expected generation. Otherwise it first deletes the generation file, so an
+/// interrupted wipe is never kept, then everything else, and records the
 /// expected generation when there is one (the pod serves the scope bound to it),
 /// else the pod uid. Build history is removed either way. It
 /// runs under rootlesskit, as buildkitd does, so it can delete files that
@@ -156,6 +157,7 @@ m="$d/{GENERATION_FILE}"
 if [ -n "$EXPECT_GENERATION" ] && [ -f "$m" ] && [ "$(cat "$m")" = "$EXPECT_GENERATION" ]; then
   echo "keeping generation $EXPECT_GENERATION"
 else
+  rm -f -- "$m"
   rm -rf -- "$d"/* "$d"/.[!.]* "$d"/..?*
   g="${{EXPECT_GENERATION:-$POD_UID}}"
   printf %s "$g" > "$m"
