@@ -14,6 +14,7 @@ mod drain_verify;
 mod e2e;
 mod e2e_issuer;
 mod edge_verify;
+mod gateway;
 mod helm_test;
 mod helm_verify;
 mod image;
@@ -105,9 +106,9 @@ enum Task {
     Soak,
     /// Build the documentation site with mdBook into target/book/html. Fails on a broken repository link.
     Docs,
-    /// Run the end-to-end suite on a kind cluster. Covers chart install, OIDC and `TokenReview`, builds, the registry cache, queueing and multi-platform builds.
+    /// Run the end-to-end suite on a kind cluster, exposed through Envoy Gateway. Covers chart install, the Gateway API routes, OIDC and `TokenReview`, builds, the registry cache, queueing, a long poll, multi-platform builds and the Envoy extras.
     E2e,
-    /// Install the chart on kind, trust GitHub OIDC for REPO (owner/name) and leave the cluster running. Used by the CI Action job.
+    /// Install the chart on kind behind Envoy Gateway, trust GitHub OIDC for REPO (owner/name) and leave the cluster running. Used by the CI Action job.
     E2eUp {
         /// Repository whose workflow tokens may allocate.
         repo: String,

@@ -10,3 +10,4 @@ pools:
 claims:
   enabled: true
   namespaces: [apps]
+gateway: {enabled: false}

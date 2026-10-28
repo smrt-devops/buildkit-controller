@@ -29,3 +29,4 @@ pools:
     namespace: ci-builders
     cache:
       registry: {enabled: false}
+gateway: {enabled: false}
