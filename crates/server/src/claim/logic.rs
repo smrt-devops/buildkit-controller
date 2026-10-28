@@ -12,9 +12,9 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, ObjectMeta, Owne
 use time::OffsetDateTime;
 
 use crate::alloc::AllocError;
-use crate::alloc::pods::{DRAINING, FREE, ann, parse_ts};
+use crate::alloc::pods::{DRAINING, FREE, ann, of_pool, parse_ts};
 use crate::auth::Identity;
-use crate::render::{ANN_ALLOC, ANN_OWNER};
+use crate::render::{ANN_ALLOC, ANN_OWNER, CONTROLLER, LABEL_MANAGED_BY, LABEL_POOL};
 
 /// The allocation request a claim stands for: its pool, `ttl`, `cacheKey` and `cache`.
 ///
@@ -98,6 +98,28 @@ pub fn classify(e: &AllocError) -> Disposition {
         | AllocError::Internal
         | AllocError::NotFound
         | AllocError::Forbidden => Disposition::Retry("Error"),
+    }
+}
+
+/// How long after creation a claim waits for its pool to appear in the pool
+/// store, or for a rule admitting it, before `PoolNotFound` is terminal.
+pub const POOL_GRACE: Duration = Duration::from_mins(1);
+
+/// [`classify`] for this claim at `now`: `PoolNotFound` is retried in the
+/// claim's first [`POOL_GRACE`], since a pool applied with the claim, or an
+/// access rule added just after it, may not be in the leader's store yet.
+#[must_use]
+pub fn dispose(c: &BuildKitClaim, e: &AllocError, now: OffsetDateTime) -> Disposition {
+    let created = c
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .map(|t| t.0.as_second());
+    let grace = i64::try_from(POOL_GRACE.as_secs()).unwrap_or(i64::MAX);
+    let young = created.is_some_and(|t| now.unix_timestamp() < t.saturating_add(grace));
+    match classify(e) {
+        Disposition::Fail(reason @ "PoolNotFound") if young => Disposition::Retry(reason),
+        d => d,
     }
 }
 
@@ -238,14 +260,47 @@ pub fn lost<'a>(
     if bound_at.is_none_or(|t| now.unix_timestamp() < t.saturating_add(grace)) {
         return false;
     }
-    !pods.into_iter().any(|p| {
-        let ended = p
-            .status
-            .as_ref()
-            .and_then(|s| s.phase.as_deref())
-            .is_some_and(|ph| ph == "Failed" || ph == "Succeeded");
-        ann(p, ANN_ALLOC) == Some(id) && p.metadata.deletion_timestamp.is_none() && !ended
-    })
+    !pods.into_iter().any(|p| serves(p, id))
+}
+
+/// True when `p` carries allocation `id`, is not being deleted, and has not
+/// failed or exited.
+fn serves(p: &Pod, id: &str) -> bool {
+    let ended = p
+        .status
+        .as_ref()
+        .and_then(|s| s.phase.as_deref())
+        .is_some_and(|ph| ph == "Failed" || ph == "Succeeded");
+    ann(p, ANN_ALLOC) == Some(id) && p.metadata.deletion_timestamp.is_none() && !ended
+}
+
+/// True when an adopted Secret's allocation still has a worker owned by
+/// `owner`. The Secret can outlive its allocation: a create the server
+/// applied while the client saw an error, or a task aborted at that await,
+/// retires the pod and leaves the Secret behind.
+#[must_use]
+pub fn worker_serves<'a>(
+    pods: impl IntoIterator<Item = &'a Pod>,
+    b: &Binding,
+    owner: &str,
+) -> bool {
+    pods.into_iter()
+        .any(|p| serves(p, &b.alloc_id) && ann(p, ANN_OWNER) == Some(owner))
+}
+
+/// The API message when the Secret create was refused for good: a 4xx other
+/// than 401, 409 and 429, such as a quota (403) or an admission policy (422).
+/// Retrying would allocate a worker and retire it again on every attempt.
+#[must_use]
+pub fn secret_rejected(e: &kube::Error) -> Option<String> {
+    match e {
+        kube::Error::Api(s)
+            if (400..500).contains(&s.code) && !matches!(s.code, 401 | 409 | 429) =>
+        {
+            Some(format!("secret create refused ({}): {}", s.code, s.message))
+        }
+        _ => None,
+    }
 }
 
 /// Status for a claim whose worker went away. Rebinding would need a new
@@ -356,21 +411,49 @@ pub fn secret(c: &BuildKitClaim, r: &AllocationResponse) -> Option<Secret> {
 }
 
 /// Allocated pods whose owning claim (by uid) is gone: `(owner, alloc id)` to release.
+///
+/// Only pods the engine would release count: managed by this controller and
+/// controlled by a pool in the pool store (`pool_uid` maps namespace and pool
+/// name to the cached pool's uid). Any other labelled pod would fail release
+/// after a wait on every sweep. The owner's claim namespace must be served:
+/// claims from other namespaces never bind, and with `watchNamespaces` set the
+/// claim store does not hold them, so their absence proves nothing.
 #[must_use]
-pub fn orphans<'a, S: std::hash::BuildHasher>(
+pub fn orphans<'a, S: std::hash::BuildHasher, T: std::hash::BuildHasher>(
     pods: impl IntoIterator<Item = &'a Pod>,
     live_uids: &HashSet<String, S>,
+    served: &HashSet<String, T>,
+    pool_uid: impl Fn(&str, &str) -> Option<String>,
 ) -> Vec<(Identity, String)> {
     pods.into_iter()
+        .filter(|p| in_pool(p, &pool_uid))
         .filter_map(|p| {
             let who = parse_owner(ann(p, ANN_OWNER)?)?;
             let id = ann(p, ANN_ALLOC).filter(|a| *a != FREE && *a != DRAINING && !a.is_empty())?;
-            let Identity::Claim { uid, .. } = &who else {
+            let Identity::Claim { namespace, uid, .. } = &who else {
                 return None;
             };
-            (!live_uids.contains(uid)).then(|| (who.clone(), id.to_owned()))
+            (served.contains(namespace) && !live_uids.contains(uid))
+                .then(|| (who.clone(), id.to_owned()))
         })
         .collect()
+}
+
+/// The engine's pool membership test: the managed-by label, and the pool
+/// label, namespace and controller ownerReference of a cached pool.
+fn in_pool(p: &Pod, pool_uid: impl Fn(&str, &str) -> Option<String>) -> bool {
+    let labels = p.metadata.labels.as_ref();
+    let (Some(ns), Some(pool)) = (
+        p.metadata.namespace.as_deref(),
+        labels.and_then(|l| l.get(LABEL_POOL)),
+    ) else {
+        return false;
+    };
+    labels
+        .and_then(|l| l.get(LABEL_MANAGED_BY))
+        .map(String::as_str)
+        == Some(CONTROLLER)
+        && pool_uid(ns, pool).is_some_and(|uid| of_pool(p, ns, pool, &uid))
 }
 
 #[cfg(test)]
@@ -449,7 +532,23 @@ mod tests {
             (ANN_OWNER.to_owned(), owner.to_owned()),
             (ANN_ALLOC.to_owned(), alloc.to_owned()),
         ]));
+        // A worker of pool `pools/default` (uid `pu`).
+        p.metadata.namespace = Some("pools".into());
+        p.metadata.labels = Some(BTreeMap::from([
+            (LABEL_MANAGED_BY.to_owned(), CONTROLLER.to_owned()),
+            (LABEL_POOL.to_owned(), "default".to_owned()),
+        ]));
+        p.metadata.owner_references = Some(vec![OwnerReference {
+            uid: "pu".into(),
+            controller: Some(true),
+            ..OwnerReference::default()
+        }]);
         p
+    }
+
+    /// The pool store of the tests: only `pools/default`, uid `pu`.
+    fn pool_uid(ns: &str, name: &str) -> Option<String> {
+        (ns == "pools" && name == "default").then(|| "pu".to_owned())
     }
 
     #[test]
@@ -551,10 +650,129 @@ mod tests {
             pod("sa:ci/x", "a4"),
         ];
         let live = HashSet::from(["u1".to_owned()]);
-        let got = orphans(&pods, &live);
+        let served = HashSet::from(["ci".to_owned()]);
+        let got = orphans(&pods, &live, &served, pool_uid);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].1, "a2");
         assert_eq!(got[0].0.owner(), "claim:ci/b#u2");
+    }
+
+    /// Only pods the engine would release are swept. A labelled pod anywhere
+    /// else would make every sweep wait for a release that cannot succeed.
+    #[test]
+    fn orphans_are_workers_of_cached_pools_for_served_namespaces() {
+        let orphan = || pod("claim:ci/b#u2", "a2");
+        let served = HashSet::from(["ci".to_owned()]);
+        let live = HashSet::new();
+        let swept = |p: Pod| !orphans([&p], &live, &served, pool_uid).is_empty();
+        assert!(swept(orphan()));
+
+        let mut planted = orphan();
+        planted.metadata.owner_references = None;
+        assert!(!swept(planted), "no controller ownerReference");
+        let mut other_uid = orphan();
+        other_uid.metadata.owner_references.as_mut().unwrap()[0].uid = "old".into();
+        assert!(!swept(other_uid), "owned by a deleted or recreated pool");
+        let mut other_ns = orphan();
+        other_ns.metadata.namespace = Some("tenant".into());
+        assert!(!swept(other_ns), "pool not in the pool store");
+        let mut unmanaged = orphan();
+        unmanaged
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .remove(LABEL_MANAGED_BY);
+        assert!(!swept(unmanaged), "not managed by this controller");
+        assert!(
+            !swept(pod("claim:apps/b#u2", "a2")),
+            "claim namespace not served, so its claims may be unwatched"
+        );
+    }
+
+    #[test]
+    fn pool_not_found_is_retried_while_the_claim_is_young() {
+        let now = parse_ts("2026-10-21T12:00:00Z").unwrap();
+        let mut c = claim(None, None);
+        let created = |c: &mut BuildKitClaim, ts: &str| {
+            c.metadata.creation_timestamp = Some(Time(ts.parse().unwrap()));
+        };
+        created(&mut c, "2026-10-21T11:59:30Z");
+        assert_eq!(
+            dispose(&c, &AllocError::PoolNotFound, now),
+            Disposition::Retry("PoolNotFound")
+        );
+        assert_eq!(
+            dispose(&c, &AllocError::InvalidRequest("x".into()), now),
+            Disposition::Fail("InvalidRequest"),
+            "only PoolNotFound gets the grace"
+        );
+        assert_eq!(
+            dispose(&c, &AllocError::NotReady, now),
+            Disposition::Retry("PoolNotReady")
+        );
+        created(&mut c, "2026-10-21T11:59:00Z");
+        assert_eq!(
+            dispose(&c, &AllocError::PoolNotFound, now),
+            Disposition::Fail("PoolNotFound"),
+            "past the grace"
+        );
+        c.metadata.creation_timestamp = None;
+        assert_eq!(
+            dispose(&c, &AllocError::PoolNotFound, now),
+            Disposition::Fail("PoolNotFound")
+        );
+    }
+
+    /// A Secret is adopted only while its allocation still has a live worker
+    /// owned by the claim.
+    #[test]
+    fn adoption_needs_a_serving_worker() {
+        let b = Binding::from(&resp(None));
+        let owner = "claim:ci/build#u1";
+        let live = pod(owner, "a1");
+        assert!(worker_serves([&live], &b, owner));
+        assert!(!worker_serves([], &b, owner), "pod gone");
+        assert!(
+            !worker_serves([&pod(owner, DRAINING)], &b, owner),
+            "retired by the orphan guard"
+        );
+        assert!(
+            !worker_serves([&pod("claim:ci/build#u0", "a1")], &b, owner),
+            "another owner"
+        );
+        let mut deleting = live.clone();
+        deleting.metadata.deletion_timestamp = Some(Time(k8s_openapi::jiff::Timestamp::now()));
+        assert!(!worker_serves([&deleting], &b, owner), "being deleted");
+        let mut failed = live;
+        failed.status = Some(k8s_openapi::api::core::v1::PodStatus {
+            phase: Some("Failed".into()),
+            ..Default::default()
+        });
+        assert!(!worker_serves([&failed], &b, owner), "failed");
+    }
+
+    #[test]
+    fn secret_create_refusals_fail_the_claim_only_when_final() {
+        let api = |code: u16| {
+            kube::Error::Api(
+                kube::core::Status::failure("exceeded quota: secrets", "Forbidden")
+                    .with_code(code)
+                    .boxed(),
+            )
+        };
+        for code in [400, 403, 404, 422] {
+            let msg = secret_rejected(&api(code)).unwrap_or_default();
+            assert!(msg.contains(&code.to_string()), "{code}: {msg}");
+            assert!(msg.contains("exceeded quota"), "{msg}");
+        }
+        for code in [401, 409, 429, 500, 503] {
+            assert_eq!(secret_rejected(&api(code)), None, "{code}");
+        }
+        assert_eq!(
+            secret_rejected(&kube::Error::LinesCodecMaxLineLengthExceeded),
+            None
+        );
     }
 
     #[test]
