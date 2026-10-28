@@ -43,7 +43,7 @@ pub fn router(state: OpsState) -> Router {
 async fn readyz(State(s): State<OpsState>) -> impl IntoResponse {
     let failing = s.readiness.failing();
     let degraded = s.readiness.degraded();
-    let (code, mut body) = if failing.is_empty() {
+    let (code, head) = if failing.is_empty() {
         (StatusCode::OK, "ok\n".to_owned())
     } else {
         (
@@ -51,10 +51,11 @@ async fn readyz(State(s): State<OpsState>) -> impl IntoResponse {
             format!("not ready: {}\n", failing.join(", ")),
         )
     };
-    if !degraded.is_empty() {
-        body.push_str(&format!("degraded: {}\n", degraded.join(", ")));
+    if degraded.is_empty() {
+        (code, head)
+    } else {
+        (code, format!("{head}degraded: {}\n", degraded.join(", ")))
     }
-    (code, body)
 }
 
 async fn metrics(State(s): State<OpsState>) -> impl IntoResponse {
