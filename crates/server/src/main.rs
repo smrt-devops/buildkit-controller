@@ -14,7 +14,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
-use kube::Client;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -112,7 +111,7 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
     let timing = settings.config.election_timing();
     let metrics = Arc::new(Metrics::new());
     let readiness = Arc::new(Readiness::with_spec_checks());
-    let client = Client::try_default()
+    let client = buildkit_controller::runtime::kube_client()
         .await
         .context("building the kube client")?;
 
