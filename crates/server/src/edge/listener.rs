@@ -461,6 +461,10 @@ mod tests {
         }
 
         async fn start(trusted: &str) -> Rig {
+            start_with(trusted, ListenerOptions::default().max_handshakes_per_ip).await
+        }
+
+        async fn start_with(trusted: &str, max_handshakes_per_ip: usize) -> Rig {
             let now = OffsetDateTime::now_utc();
             let bundle = CaBundle::generate(now).unwrap();
             let names = EdgeNames::new(HOST, &[], "bkc", &"ops".parse().unwrap()).unwrap();
@@ -490,6 +494,7 @@ mod tests {
                 metrics: metrics.clone(),
                 options: ListenerOptions {
                     handshake_timeout: Duration::from_secs(2),
+                    max_handshakes_per_ip,
                     ..ListenerOptions::default()
                 },
                 ready: Readiness::with_spec_checks().register("edge_listener"),
@@ -591,6 +596,34 @@ mod tests {
                 r.peers.try_recv().is_err(),
                 "the forged connection never reached the handler"
             );
+            r.stop.cancel();
+        }
+
+        /// `max_handshakes_per_ip` counts the PROXY source: two clients behind
+        /// one trusted gateway address have separate budgets, and one client
+        /// is still capped.
+        #[tokio::test]
+        async fn handshake_cap_counts_the_proxy_source() {
+            let mut r = start_with("127.0.0.0/8", 1).await;
+            // Client A: header, then no ClientHello, so it stays in the
+            // handshake and holds A's only slot.
+            let mut stalled = TcpStream::connect(r.addr).await.unwrap();
+            stalled
+                .write_all(&header("192.0.2.7:1000".parse().unwrap()))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                dial(&r, &header("192.0.2.7:2000".parse().unwrap()))
+                    .await
+                    .is_err(),
+                "A's second handshake is over its cap"
+            );
+            dial(&r, &header("192.0.2.8:1000".parse().unwrap()))
+                .await
+                .expect("B, behind the same gateway address, has its own budget");
+            assert_eq!(next_peer(&mut r).await, "192.0.2.8:1000".parse().unwrap());
+            drop(stalled);
             r.stop.cancel();
         }
     }
