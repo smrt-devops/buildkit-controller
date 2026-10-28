@@ -45,11 +45,16 @@ BINFMT=tonistiigi/binfmt@sha256:1b804311fe87047a4c96d38b4b3ef6f62fca8cd125265917
 if [ "${CI:-}" = true ]; then
   docker run --rm --privileged "$BINFMT" --install all >/dev/null
 fi
+# The emulated RUN builds FROM this index digest, resolved with
+#   docker buildx imagetools inspect alpine:3.20
+# so a re-tag cannot change what runs. The workers still pull it from Docker
+# Hub: buildkitd resolves FROM itself, and `kind load` cannot seed its store.
+ALPINE=alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 HOST=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 FOREIGN=$(echo "$ALL" | tr , '\n' | grep -v "$HOST" | head -1)
-if docker run --rm --platform "linux/${FOREIGN#linux/}" alpine:3.20 true >/dev/null 2>&1; then
+if docker run --rm --platform "linux/${FOREIGN#linux/}" "$ALPINE" true >/dev/null 2>&1; then
   mkdir "$D/ctx"
-  printf 'FROM alpine:3.20\nRUN uname -m > /arch\n' > "$D/ctx/Dockerfile"
+  printf 'FROM %s\nRUN uname -m > /arch\n' "$ALPINE" > "$D/ctx/Dockerfile"
   CTX=$D/ctx
   echo "multiplatform path: RUN step, emulated in $FOREIGN"
 elif [ "${CI:-}" = true ]; then

@@ -170,7 +170,6 @@ async fn bad_version_command_family_and_short_blocks() {
         (0x21, 0x12, 12, "unsupported_family"), // UDP over IPv4
         (0x21, 0x22, 36, "unsupported_family"), // UDP over IPv6
         (0x21, 0x31, 36, "unsupported_family"), // UNIX stream
-        (0x21, 0x00, 0, "unsupported_family"),  // AF_UNSPEC under PROXY
         (0x21, 0x10, 12, "unsupported_family"), // IPv4, transport unspecified
         (0x21, 0x11, 11, "short"),
         (0x21, 0x21, 35, "short"),
@@ -360,4 +359,30 @@ fn cidr_contains() {
     let all: Cidr = "0.0.0.0/0".parse().unwrap();
     assert!(all.contains("203.0.113.9".parse().unwrap()));
     assert!(!all.contains("::1".parse().unwrap()));
+}
+
+/// Some load balancers probe with `PROXY` + `AF_UNSPEC` instead of `LOCAL`. The
+/// spec lets the receiver use the real endpoints and ignore the block, so the
+/// connection is treated like `LOCAL`.
+#[tokio::test]
+async fn proxy_with_af_unspec_keeps_the_gateway_address() {
+    let (p, m) = trusting(&["10.244.0.0/16"], HEADER_TIMEOUT);
+    let gw = sa("10.244.1.9:40000");
+    for (family, block) in [(0x00, &[][..]), (0x01, &[7u8; 12][..])] {
+        let mut wire = header(0x21, family, block);
+        wire.push(0x16);
+        let mut r = wire.as_slice();
+        let c = p.client(&mut r, gw).await.unwrap();
+        assert_eq!(
+            c,
+            Client {
+                addr: gw,
+                origin: Origin::Local
+            },
+            "{family:#04x}"
+        );
+        assert_eq!(r, [0x16], "the block is consumed");
+    }
+    assert_eq!(m.count("local"), 2);
+    assert_eq!(m.count("unsupported_family"), 0);
 }

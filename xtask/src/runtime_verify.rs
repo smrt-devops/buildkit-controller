@@ -12,13 +12,14 @@
 //! cluster on every exit path.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 
-static CLUSTER: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| super::kind_cluster("bk-runtime-verify"));
+use crate::kube::Cluster;
+use crate::proc::Spawned;
+
 const NAMESPACE: &str = "bk-runtime";
 /// leaseDuration (15 s) plus slack for polling and the contender's timer.
 const FAILOVER_BOUND: Duration = Duration::from_secs(20);
@@ -26,62 +27,16 @@ const FAILOVER_BOUND: Duration = Duration::from_secs(20);
 /// longest watch restart backoff (30 s) plus time for the relist.
 const RELIST_SETTLE: Duration = Duration::from_secs(35);
 
-struct Env {
-    kubeconfig: PathBuf,
-}
-
-impl Env {
-    fn kind(&self, args: &[&str]) -> Result<std::process::Output> {
-        crate::kube::kind(&self.kubeconfig)
-            .args(args)
-            .arg("--kubeconfig")
-            .arg(&self.kubeconfig)
-            .output()
-            .context("running kind")
-    }
-
-    fn kubectl(&self, args: &[&str]) -> Result<String> {
-        let out = crate::kube::kubectl(&self.kubeconfig)
-            .args(args)
-            .output()
-            .context("running kubectl")?;
-        ensure!(
-            out.status.success(),
-            "kubectl {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    }
-
-    fn lease_holder(&self) -> Result<String> {
-        self.kubectl(&[
-            "-n",
-            NAMESPACE,
-            "get",
-            "lease",
-            "buildkit-controller-leader",
-            "-o",
-            "jsonpath={.spec.holderIdentity}",
-        ])
-    }
-}
-
-/// Deletes the cluster and kills replicas when dropped.
-struct Cleanup {
-    env: Env,
-    children: Vec<Child>,
-}
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        for c in &mut self.children {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-        let _ = self
-            .env
-            .kind(&["delete", "cluster", "--name", CLUSTER.as_str()]);
-    }
+fn lease_holder(cluster: &Cluster) -> Result<String> {
+    cluster.kubectl(&[
+        "-n",
+        NAMESPACE,
+        "get",
+        "lease",
+        "buildkit-controller-leader",
+        "-o",
+        "jsonpath={.spec.holderIdentity}",
+    ])
 }
 
 /// One replica and its listener ports. Both replicas run on the host, so no
@@ -93,21 +48,25 @@ struct Replica {
     edge: u16,
 }
 
-/// The two replicas. Both run on the host.
-const REPLICAS: [Replica; 2] = [
-    Replica {
-        name: "r1",
-        ops: 18081,
-        api: 18441,
-        edge: 18451,
-    },
-    Replica {
-        name: "r2",
-        ops: 18082,
-        api: 18442,
-        edge: 18452,
-    },
-];
+/// The two replicas, on free loopback ports, so parallel runs from other
+/// checkouts never probe each other's replicas.
+fn replicas() -> Result<[Replica; 2]> {
+    let [ops1, api1, edge1, ops2, api2, edge2] = crate::proc::free_ports()?;
+    Ok([
+        Replica {
+            name: "r1",
+            ops: ops1,
+            api: api1,
+            edge: edge1,
+        },
+        Replica {
+            name: "r2",
+            ops: ops2,
+            api: api2,
+            edge: edge2,
+        },
+    ])
+}
 
 fn http(port: u16, path: &str) -> Option<(u16, String)> {
     let out = Command::new("curl")
@@ -127,23 +86,20 @@ fn is_leader(port: u16) -> Option<bool> {
         .map(|v| v.trim() == "1")
 }
 
+/// Polls `f` every 250 ms; returns how long it took to hold.
 fn wait_for(what: &str, limit: Duration, mut f: impl FnMut() -> bool) -> Result<Duration> {
     let start = Instant::now();
-    while start.elapsed() < limit {
-        if f() {
-            return Ok(start.elapsed());
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    bail!("timed out after {limit:?} waiting for {what}")
+    crate::proc::poll(what, limit, Duration::from_millis(250), || {
+        Ok(f().then(|| start.elapsed()))
+    })
 }
 
 /// Restart the API server in the kind node and sample `/readyz` on every
 /// replica until the API answers again and the watches have had time to
 /// relist. Every sample must be 200: a watch error alone must not fail
 /// readiness (see `STALE_AFTER` in `runtime/stores.rs`).
-fn api_server_blip(env: &Env, replicas: &[Replica]) -> Result<()> {
-    let node = format!("{}-control-plane", CLUSTER.as_str());
+fn api_server_blip(env: &Cluster, replicas: &[Replica]) -> Result<()> {
+    let node = format!("{}-control-plane", env.name());
     let before: Vec<u64> = replicas.iter().map(|r| pod_watch_errors(r.ops)).collect();
     let stopped = Command::new("docker")
         .args(["exec", &node, "sh", "-c"])
@@ -214,8 +170,8 @@ const STALL_RECOVER: Duration = Duration::from_secs(75);
 /// the node's own components reach it over loopback and keep working, so the
 /// API server is not restarted. Without the client read timeout the watches
 /// would hang and `/readyz` would stay 200 for good.
-fn api_server_stall(replicas: &[Replica]) -> Result<()> {
-    let node = format!("{}-control-plane", CLUSTER.as_str());
+fn api_server_stall(cluster: &Cluster, replicas: &[Replica]) -> Result<()> {
+    let node = format!("{}-control-plane", cluster.name());
     let iptables = |op: &str| -> Result<()> {
         let rules = format!(
             "iptables -w {op} INPUT -i eth0 -p tcp --dport 6443 -j DROP && \
@@ -305,52 +261,29 @@ pub fn runtime_verify() -> Result<()> {
     let root = crate::root();
     let work = root.join("target/runtime-verify");
     std::fs::create_dir_all(&work)?;
-    let env = Env {
-        kubeconfig: work.join("kubeconfig"),
-    };
-
-    let built = Command::new("cargo")
-        .args(["build", "--locked", "-p", "buildkit-controller"])
-        .current_dir(&root)
-        .status()?;
-    ensure!(built.success(), "cargo build failed");
-    let bin = root.join("target/debug/buildkit-controller");
-
-    let _ = env.kind(&["delete", "cluster", "--name", CLUSTER.as_str()]);
-    let mut cleanup = Cleanup {
-        env,
-        children: Vec::new(),
-    };
-    let created = cleanup.env.kind(&[
-        "create",
-        "cluster",
-        "--name",
-        CLUSTER.as_str(),
-        "--wait",
-        "120s",
-    ])?;
-    ensure!(
-        created.status.success(),
-        "kind create: {}",
-        String::from_utf8_lossy(&created.stderr)
+    let bin = crate::build_controller()?;
+    let cluster = Cluster::new(
+        &super::kind_cluster("bk-runtime-verify"),
+        work.join("kubeconfig"),
     );
-    cleanup.env.kubectl(&["create", "namespace", NAMESPACE])?;
+    // Declared after the cluster, so the replicas are killed before it is deleted.
+    let mut children: Vec<Spawned> = Vec::new();
+    cluster.create(None, "120s")?;
+    cluster.kubectl(&["create", "namespace", NAMESPACE])?;
 
-    let replicas = &REPLICAS;
+    let replicas = &replicas()?;
     for r in replicas {
         let cfg = write_config(&work, r)?;
         let log = std::fs::File::create(work.join(format!("{}.log", r.name)))?;
-        let child = Command::new(&bin)
+        let mut child = Command::new(&bin);
+        crate::kube::with_kubeconfig(&mut child, cluster.kubeconfig())
             .args(["--config"])
             .arg(&cfg)
-            .env("KUBECONFIG", &cleanup.env.kubeconfig)
             .env("POD_NAME", r.name)
             .env("POD_NAMESPACE", NAMESPACE)
             .env("LOG_LEVEL", "info")
-            .stderr(Stdio::from(log))
-            .spawn()
-            .context("starting replica")?;
-        cleanup.children.push(child);
+            .stderr(Stdio::from(log));
+        children.push(Spawned::spawn(&mut child).context("starting replica")?);
     }
 
     // 1. No CRD yet. The Pool store cannot reach InitDone, so /readyz is 503 and names it.
@@ -376,10 +309,8 @@ pub fn runtime_verify() -> Result<()> {
 
     // 2. Apply the CRD. The stores sync (watch backoff <= 30 s) and /readyz turns 200.
     let crd = root.join("helm/buildkit-controller/crds/buildkitpools.yaml");
-    cleanup
-        .env
-        .kubectl(&["apply", "--server-side", "-f", &crd.to_string_lossy()])?;
-    crate::kube::wait_crd_established(&cleanup.env.kubeconfig)?;
+    cluster.kubectl(&["apply", "--server-side", "-f", &crd.to_string_lossy()])?;
+    cluster.wait_crd_established()?;
     let t = wait_for("/readyz 200 on both", Duration::from_secs(90), || {
         replicas
             .iter()
@@ -388,11 +319,11 @@ pub fn runtime_verify() -> Result<()> {
     println!("PASS /readyz 200 on both replicas {t:.1?} after the CRD appeared (InitDone)");
 
     // 3. Restart the API server. The watches fail and relist, and /readyz stays 200.
-    api_server_blip(&cleanup.env, replicas)?;
+    api_server_blip(&cluster, replicas)?;
 
     // 3b. Silence the API server without an error. The client read timeout
     // turns the stall into watch errors, and /readyz fails within its bound.
-    api_server_stall(replicas)?;
+    api_server_stall(&cluster, replicas)?;
 
     // 4. Exactly one leader, and it is the Lease holder.
     // The API server restart may have cost the Lease; it is re-acquired within
@@ -410,7 +341,7 @@ pub fn runtime_verify() -> Result<()> {
         "expected exactly one leader, got {}",
         leaders.len()
     );
-    let holder = cleanup.env.lease_holder()?;
+    let holder = lease_holder(&cluster)?;
     ensure!(
         holder == leaders[0].name,
         "lease holder {holder} != leader {}",
@@ -424,13 +355,13 @@ pub fn runtime_verify() -> Result<()> {
         .position(|r| r.name == holder)
         .context("leader index")?;
     let survivor = &replicas[1 - li];
-    cleanup.children[li].kill()?;
+    children[li].kill_leader()?;
     let killed = Instant::now();
     let took = wait_for("failover", FAILOVER_BOUND, || {
         is_leader(survivor.ops) == Some(true)
     })?;
     ensure!(killed.elapsed() <= FAILOVER_BOUND);
-    let new_holder = cleanup.env.lease_holder()?;
+    let new_holder = lease_holder(&cluster)?;
     ensure!(
         new_holder == survivor.name,
         "lease holder after failover: {new_holder}"
@@ -440,7 +371,7 @@ pub fn runtime_verify() -> Result<()> {
     );
 
     // 6. SIGTERM the survivor. It releases the Lease and exits 0.
-    let pid = cleanup.children[1 - li].id().to_string();
+    let pid = children[1 - li].id().to_string();
     ensure!(
         Command::new("kill")
             .args(["-TERM", &pid])
@@ -450,7 +381,7 @@ pub fn runtime_verify() -> Result<()> {
     let status = {
         let start = Instant::now();
         loop {
-            if let Some(s) = cleanup.children[1 - li].try_wait()? {
+            if let Some(s) = children[1 - li].try_wait()? {
                 break s;
             }
             ensure!(
@@ -461,7 +392,7 @@ pub fn runtime_verify() -> Result<()> {
         }
     };
     ensure!(status.success(), "survivor exit: {status}");
-    let released = cleanup.env.lease_holder()?;
+    let released = lease_holder(&cluster)?;
     ensure!(
         released.is_empty(),
         "Lease still held by {released:?} after SIGTERM"
@@ -492,7 +423,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rv-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut all = Vec::new();
-        for r in &REPLICAS {
+        for r in &replicas().unwrap() {
             let yaml = std::fs::read_to_string(write_config(&dir, r).unwrap()).unwrap();
             let addrs = listen_addrs(&yaml);
             for key in ["ops", "api", "edge"] {

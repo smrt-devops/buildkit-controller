@@ -11,9 +11,10 @@ use std::time::Duration;
 
 use buildkit_controller_api::claim::{BuildKitClaim, BuildKitClaimStatus, ClaimPhase, secret_name};
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{Pod, Secret};
 use kube::api::{DeleteParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::runtime::reflector;
+use kube::runtime::reflector::{ObjectRef, Store};
 use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Api, Client};
 use prometheus_client::metrics::counter::Counter;
@@ -146,7 +147,7 @@ fn claim_scope(cfg: &Config) -> &[String] {
 
 /// One leadership term: watch claims and reconcile them until dropped.
 async fn run_term(t: Term, term: u64) {
-    let (ctx, alloc, metrics) = (&t.ctx, &t.alloc, &t.metrics);
+    let (ctx, metrics) = (&t.ctx, &t.metrics);
     let client = ctx.client();
     let (store, writer) = reflector::store::<BuildKitClaim>();
     let watch = reflector(
@@ -170,6 +171,8 @@ async fn run_term(t: Term, term: u64) {
     }
     info!(term, component = "claims", "claim controller running");
     let mut tasks: JoinSet<(String, Outcome)> = JoinSet::new();
+    // At most one sweep in flight, off the select loop; dropped with the term.
+    let mut sweeping: JoinSet<()> = JoinSet::new();
     let mut busy: HashSet<String> = HashSet::new();
     let mut retry: HashMap<String, (Instant, Duration)> = HashMap::new();
     let mut tick = tokio::time::interval(TICK);
@@ -194,7 +197,10 @@ async fn run_term(t: Term, term: u64) {
                 pass(&claims, &t, &mut tasks, &mut busy, &retry);
                 let live: HashSet<String> = claims.iter().filter_map(|c| c.metadata.uid.clone()).collect();
                 retry.retain(|uid, _| live.contains(uid));
-                sweep(ctx, alloc, &live, metrics).await;
+                while sweeping.try_join_next().is_some() {}
+                if sweeping.is_empty() {
+                    sweep(&t, &live, &mut sweeping);
+                }
             }
         }
     }
@@ -222,15 +228,7 @@ fn pass(
             continue;
         }
         let job: Option<Job> = match phase {
-            ClaimPhase::Pending
-                if !c
-                    .metadata
-                    .namespace
-                    .as_ref()
-                    .is_some_and(|ns| t.served.contains(ns)) =>
-            {
-                Some(Job::Refuse)
-            }
+            ClaimPhase::Pending if !logic::served(c, &t.served) => Some(Job::Refuse),
             ClaimPhase::Pending if busy.len() < MAX_IN_FLIGHT => {
                 let due = retry.get(&uid).is_none_or(|(at, _)| *at <= Instant::now());
                 due.then_some(Job::Bind)
@@ -243,8 +241,9 @@ fn pass(
         };
         if let Some(job) = job {
             busy.insert(uid.clone());
-            let (c, client, alloc) = (Arc::clone(c), client.clone(), alloc.clone());
-            tasks.spawn(async move { (uid, job.run(&c, &client, &alloc).await) });
+            let (c, client, alloc, pods) =
+                (Arc::clone(c), client.clone(), alloc.clone(), ctx.pods());
+            tasks.spawn(async move { (uid, job.run(&c, &client, &alloc, &pods).await) });
         }
     }
     for p in [
@@ -262,25 +261,37 @@ fn pass(
     }
 }
 
-/// Release workers whose claim is gone.
-async fn sweep(
-    ctx: &AppContext,
-    alloc: &AllocService,
-    live: &HashSet<String>,
-    metrics: &ClaimMetrics,
-) {
-    let pods = ctx.pods().state();
-    for (who, id) in logic::orphans(pods.iter().map(AsRef::as_ref), live) {
-        match alloc.release(&who, &id).await {
-            Ok(()) => {
-                info!(owner = %who.owner(), alloc_id = %id, "released worker of deleted claim");
-                metrics.count("released");
-            }
-            Err(e) => {
-                warn!(owner = %who.owner(), alloc_id = %id, error = %e, "claim release failed");
+/// Release workers whose claim is gone, in a task on `sweeping`.
+fn sweep(t: &Term, live: &HashSet<String>, sweeping: &mut JoinSet<()>) {
+    let pods = t.ctx.pods().state();
+    let pools = t.ctx.pools();
+    let found = logic::orphans(
+        pods.iter().map(AsRef::as_ref),
+        live,
+        &t.served,
+        |ns, name| {
+            pools
+                .get(&ObjectRef::new(name).within(ns))
+                .and_then(|p| p.metadata.uid.clone())
+        },
+    );
+    if found.is_empty() {
+        return;
+    }
+    let (alloc, metrics) = (t.alloc.clone(), t.metrics.clone());
+    sweeping.spawn(async move {
+        for (who, id) in found {
+            match alloc.release(&who, &id).await {
+                Ok(()) => {
+                    info!(owner = %who.owner(), alloc_id = %id, "released worker of deleted claim");
+                    metrics.count("released");
+                }
+                Err(e) => {
+                    warn!(owner = %who.owner(), alloc_id = %id, error = %e, "claim release failed");
+                }
             }
         }
-    }
+    });
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,9 +324,15 @@ enum Job {
 }
 
 impl Job {
-    async fn run(self, c: &BuildKitClaim, client: &Client, alloc: &AllocService) -> Outcome {
+    async fn run(
+        self,
+        c: &BuildKitClaim,
+        client: &Client,
+        alloc: &AllocService,
+        pods: &Store<Pod>,
+    ) -> Outcome {
         let r = match self {
-            Self::Bind => bind(c, client, alloc).await,
+            Self::Bind => bind(c, client, alloc, pods).await,
             Self::Refuse => refuse(c, client).await,
             Self::Expire => finish(c, client, Outcome::Expired).await,
             Self::Lose => finish(c, client, Outcome::Lost).await,
@@ -360,7 +377,13 @@ async fn unbound(
     write_status(c, client, &logic::unbound_status(c, phase, reason, message)).await
 }
 
-async fn bind(c: &BuildKitClaim, client: &Client, alloc: &AllocService) -> kube::Result<Outcome> {
+#[allow(clippy::too_many_lines, reason = "one linear bind flow")]
+async fn bind(
+    c: &BuildKitClaim,
+    client: &Client,
+    alloc: &AllocService,
+    pods: &Store<Pod>,
+) -> kube::Result<Outcome> {
     let (Some(who), Some(ns), Some(name), Some(uid)) = (
         logic::identity(c),
         c.metadata.namespace.as_deref(),
@@ -371,16 +394,39 @@ async fn bind(c: &BuildKitClaim, client: &Client, alloc: &AllocService) -> kube:
     };
     let secrets = Api::<Secret>::namespaced(client.clone(), ns);
     if let Some(s) = secrets.get_opt(&secret_name(name)).await? {
-        if let Some(b) = logic::adopt(&s, uid) {
+        let Some(b) = logic::adopt(&s, uid) else {
+            let msg = format!(
+                "secret {} exists and this claim does not own it",
+                secret_name(name)
+            );
+            unbound(c, client, ClaimPhase::Failed, "SecretConflict", &msg).await?;
+            return Ok(Outcome::Failed);
+        };
+        let owner = who.owner();
+        if logic::worker_serves(pods.state().iter().map(AsRef::as_ref), &b, &owner) {
             write_status(c, client, &logic::bound_status(c, &b)).await?;
             return Ok(Outcome::Bound);
         }
-        let msg = format!(
-            "secret {} exists and this claim does not own it",
-            secret_name(name)
-        );
-        unbound(c, client, ClaimPhase::Failed, "SecretConflict", &msg).await?;
-        return Ok(Outcome::Failed);
+        // The Secret outlived its allocation. The uid precondition spares a
+        // Secret recreated since the read; then the create below conflicts and
+        // the claim retries.
+        let dp = DeleteParams {
+            preconditions: Some(Preconditions {
+                uid: s.metadata.uid.clone(),
+                resource_version: None,
+            }),
+            ..DeleteParams::default()
+        };
+        match secrets.delete(&secret_name(name), &dp).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => {}
+            Err(e) => return Err(e),
+        }
+        // Retire the worker too, in case the pod store lags behind it.
+        if alloc.release(&who, &b.alloc_id).await.is_ok() {
+            info!(namespace = ns, claim = name, alloc_id = %b.alloc_id, "released worker of stale claim secret");
+        }
+        info!(namespace = ns, claim = name, alloc_id = %b.alloc_id, "claim secret has no worker, allocating again");
     }
     let ttl = match c
         .spec
@@ -430,7 +476,7 @@ async fn bind(c: &BuildKitClaim, client: &Client, alloc: &AllocService) -> kube:
         Ok(a) => a,
         Err(e) => {
             let msg = e.to_string();
-            return Ok(match logic::classify(&e) {
+            return Ok(match logic::dispose(c, &e, OffsetDateTime::now_utc()) {
                 Disposition::Fail(reason) => {
                     unbound(c, client, ClaimPhase::Failed, reason, &msg).await?;
                     Outcome::Failed
@@ -446,8 +492,15 @@ async fn bind(c: &BuildKitClaim, client: &Client, alloc: &AllocService) -> kube:
         // Dropping `a` retires the pod (orphan guard).
         return Ok(Outcome::Failed);
     };
-    // On error `a` drops here and the orphan guard retires the pod.
-    secrets.create(&PostParams::default(), &secret).await?;
+    if let Err(e) = secrets.create(&PostParams::default(), &secret).await {
+        // The orphan guard retires the pod.
+        drop(a);
+        if let Some(msg) = logic::secret_rejected(&e) {
+            unbound(c, client, ClaimPhase::Failed, "SecretRejected", &msg).await?;
+            return Ok(Outcome::Failed);
+        }
+        return Err(e);
+    }
     let binding = Binding::from(a.response());
     let _ = a.commit();
     write_status(c, client, &logic::bound_status(c, &binding)).await?;

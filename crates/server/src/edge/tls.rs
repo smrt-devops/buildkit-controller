@@ -136,8 +136,9 @@ impl fmt::Debug for AllocationVerifier {
 fn classify(e: &AllocCertError) -> (&'static str, CertificateError) {
     use webpki::Error as W;
     match e {
-        // Both CAs share a subject DN, so a foreign-CA leaf fails on the
-        // signature rather than the issuer name. Either way the alert is unknown_ca.
+        // Every install's client CA has the same subject DN, so a leaf from another
+        // install or from before a rotation fails on the signature, not the issuer
+        // name. Either way the alert is unknown_ca.
         AllocCertError::Chain(W::UnknownIssuer | W::InvalidSignatureForPublicKey) => {
             ("tls_error", CertificateError::UnknownIssuer)
         }

@@ -6,7 +6,7 @@
   (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitpools") "verbs" (list "get" "list" "watch"))
   (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitpools/status") "verbs" (list "patch"))
   (dict "apiGroups" (list "") "resources" (list "pods") "verbs" (list "get" "list" "watch" "create" "patch" "delete"))
-  (dict "apiGroups" (list "") "resources" (list "secrets") "verbs" (list "create" "patch" "delete"))
+  (dict "apiGroups" (list "") "resources" (list "secrets") "verbs" (list "create"))
   (dict "apiGroups" (list "") "resources" (list "serviceaccounts") "verbs" (list "create" "patch"))
   (dict "apiGroups" (list "") "resources" (list "persistentvolumeclaims") "verbs" (list "get" "list" "create" "patch" "delete"))
   (dict "apiGroups" (list "networking.k8s.io") "resources" (list "networkpolicies") "verbs" (list "create" "patch")) -}}
@@ -37,7 +37,7 @@ subjects: {{- toYaml $subjects | nindent 2 }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: {{ $fn }}-workload
+  name: {{ $fn }}-{{ $ns }}-workload
   namespace: {{ $wns }}
   labels: {{- include "bkc.labels" $ | nindent 4 }}
 rules: {{- toYaml $workload | nindent 2 }}
@@ -45,10 +45,10 @@ rules: {{- toYaml $workload | nindent 2 }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ $fn }}-workload
+  name: {{ $fn }}-{{ $ns }}-workload
   namespace: {{ $wns }}
   labels: {{- include "bkc.labels" $ | nindent 4 }}
-roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: {{ $fn }}-workload}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: {{ $fn }}-{{ $ns }}-workload}
 subjects: {{- toYaml $subjects | nindent 2 }}
 {{- else }}
 apiVersion: rbac.authorization.k8s.io/v1

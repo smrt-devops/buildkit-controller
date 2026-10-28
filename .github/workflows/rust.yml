@@ -68,3 +68,15 @@ jobs:
           file: docker/Dockerfile
           platforms: linux/amd64
           push: false
+
+  # The chart matches the code: the generated CRD is current, and helm lint, the golden
+  # renders, the invalid-values fixtures and the NOTES checks pass. Needs no cluster.
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - run: cargo xtask crdgen --check
+      - run: cargo xtask helm-test

@@ -1,0 +1,4 @@
+# expect: watchNamespaces must not include the release namespace buildkit-system
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+watchNamespaces: [buildkit-system, ci]
+gateway: {enabled: false}

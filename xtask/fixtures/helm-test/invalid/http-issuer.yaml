@@ -1,4 +1,6 @@
+# expect: at '/auth/oidc/0/url'
 edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
 auth:
   oidc:
     - {url: "http://insecure.example.com", audiences: [a]}
+gateway: {enabled: false}

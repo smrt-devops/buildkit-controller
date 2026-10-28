@@ -9,12 +9,6 @@ function docker(args) {
   if (r.status !== 0) throw new Error(`docker ${args.slice(0, 2).join(' ')} failed: ${(r.stderr || r.error || '').toString().trim()}`);
 }
 
-async function release(api, ca, getToken, budgetMs, id) {
-  const res = await L.requestWithRetry(`${api}/v1/allocations/${id}`, { method: 'DELETE', ca, timeoutMs: 60000 },
-    { what: `release ${id}`, getToken, budgetMs, log: gha.info });
-  if (res.status !== 204 && res.status !== 404) throw L.apiError(`release ${id}`, res);
-}
-
 async function run() {
   const api = gha.getInput('url').replace(/\/+$/, '');
   const pools = L.parseList(gha.getInput('pools')).map(L.parsePool);
@@ -29,10 +23,9 @@ async function run() {
   });
   const aud = gha.getInput('audience') || 'buildkit-controller';
   const getToken = () => L.fetchOidcToken(aud, gha.setSecret);
-  const budgetMs = L.retryBudgetMs(qt);
-  const auth = { Authorization: `Bearer ${await getToken()}` };
 
-  const lr = await L.request(`${api}/v1/pools`, { headers: auth, ca, timeoutMs: 30000 });
+  const lr = await L.requestWithRetry(`${api}/v1/pools`, { ca, timeoutMs: 30000 },
+    { what: 'list pools', getToken, budgetMs: L.SHORT_BUDGET_MS, idempotent: true, log: gha.info });
   if (lr.status !== 200) throw L.apiError('list pools', lr);
   const found = L.validatePools(JSON.parse(lr.body), pools);
 
@@ -42,7 +35,6 @@ async function run() {
   gha.saveState('api', api);
   gha.saveState('audience', aud);
   gha.saveState('ca', ca || '');
-  gha.saveState('queue-timeout', qt === undefined ? '' : String(qt));
   const root = process.env.RUNNER_TEMP || require('node:os').tmpdir();
   const okIds = [];
   const results = await Promise.allSettled(pools.map(async (p, i) => {
@@ -71,7 +63,8 @@ async function run() {
   const allocs = results.map((r) => (r.status === 'fulfilled' ? r.value : undefined));
   const failed = results.find((r) => r.status === 'rejected');
   if (failed) {
-    for (const a of allocs) if (a) await release(api, ca, getToken, budgetMs, a.id).catch((e) => gha.warning(e.message));
+    await Promise.all(allocs.filter(Boolean).map((a) => L.releaseAllocation({ api, ca, getToken, id: a.id, log: gha.info })
+      .catch((e) => gha.warning(e.message))));
     throw failed.reason;
   }
 

@@ -1,0 +1,5 @@
+# expect: at '': additional properties 'watchNamepsaces' not allowed
+# A misspelled top-level key would be ignored and leave the install cluster-wide.
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+watchNamepsaces: [ci]
+gateway: {enabled: false}

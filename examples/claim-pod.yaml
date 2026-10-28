@@ -1,11 +1,12 @@
-# A BuildKitClaim and a pod that builds through it. Needs the chart installed
-# with `claims.enabled: true` and `ci` in `claims.namespaces`, and a pool
-# whose access rules admit the `ci` namespace, for example:
+# A BuildKitClaim and a pod that builds through it. The claim and the pod run in `apps`,
+# not in the pool namespace `ci`, which holds no other workloads. Needs the chart installed
+# with `claims.enabled: true` and `apps` in `claims.namespaces`, and a pool in `ci`
+# whose access rules admit the `apps` namespace, for example:
 #
 #   spec:
 #     access:
 #       rules:
-#       - claims: {namespaces: [ci]}
+#       - claims: {namespaces: [apps]}
 #
 # The controller writes Secret `build-42-buildkit` once the claim is Bound.
 # Deleting the claim releases the worker; the Secret goes with it.
@@ -15,7 +16,7 @@ apiVersion: buildkit.smrt-devops.net/v1alpha1
 kind: BuildKitClaim
 metadata:
   name: build-42
-  namespace: ci
+  namespace: apps
 spec:
   poolRef: {namespace: ci, name: default}
   ttl: 30m
@@ -26,7 +27,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: build-42
-  namespace: ci
+  namespace: apps
 spec:
   restartPolicy: Never
   containers:
@@ -36,9 +37,12 @@ spec:
     args:
     - |
       printf 'FROM busybox\nRUN echo built > /out\n' > /tmp/Dockerfile
+      # The Secret has no ca.crt when the edge serves a publicly trusted certificate.
+      CA=
+      [ ! -f /certs/ca.crt ] || CA="--tlscacert /certs/ca.crt"
       buildctl --addr "$BUILDKIT_HOST" \
         --tlsservername "$BUILDKIT_SERVER_NAME" \
-        --tlscacert /certs/ca.crt --tlscert /certs/tls.crt --tlskey /certs/tls.key \
+        $CA --tlscert /certs/tls.crt --tlskey /certs/tls.key \
         build --frontend dockerfile.v0 --local context=/tmp --local dockerfile=/tmp
     env:
     - name: BUILDKIT_HOST
@@ -51,6 +55,7 @@ spec:
   - name: certs
     secret: {secretName: build-42-buildkit}
 # With buildx instead of buildctl:
+# (leave out cacert= when the Secret has no ca.crt)
 #   docker buildx create --name claim --driver remote \
 #     --driver-opt cacert=/certs/ca.crt,cert=/certs/tls.crt,key=/certs/tls.key,servername=$BUILDKIT_SERVER_NAME \
 #     "$BUILDKIT_HOST"

@@ -48,6 +48,15 @@ struct Client {
     renew_at: Option<OffsetDateTime>,
 }
 
+/// Which in-memory certs must be issued again.
+#[derive(Debug, Default)]
+struct Pending {
+    /// The edge client cert.
+    client: bool,
+    /// The self-issued serving cert.
+    serving: bool,
+}
+
 /// What a step did.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Step {
@@ -68,9 +77,9 @@ pub(super) struct Loader {
     serving: Option<Serving>,
     client: Option<Client>,
     rule_ca_crt: Option<String>,
-    /// Set on a CA change and on any failed issue; cleared when every
-    /// in-memory cert is current. Retried every [`RETRY`].
-    reissue_pending: bool,
+    /// Certs to issue again: set when the CA certificates change and when an
+    /// issue fails, retried every [`RETRY`].
+    pending: Pending,
     serving_failing: bool,
     ca_rv: Option<String>,
     srv_rv: Option<String>,
@@ -166,7 +175,7 @@ impl Loader {
             usable: false,
             serving: None,
             client: None,
-            reissue_pending: false,
+            pending: Pending::default(),
             serving_failing: false,
             ca_rv: None,
             srv_rv: None,
@@ -194,23 +203,36 @@ impl Loader {
         }
     }
 
+    /// Applies a CA Secret update; true when the snapshot changed. Only new CA
+    /// certificates replace the bundle and reissue the certs it signed, so a
+    /// metadata edit or a rewrite of the same data changes nothing.
     fn on_ca(&mut self, s: &SecretState, now: OffsetDateTime) -> bool {
         let id = rv(s);
         if self.ca_rv.as_ref() == Some(&id) {
             return false;
         }
         self.ca_rv = Some(id);
+        let was_usable = self.usable;
         match CaBundle::load(secret_data(s).as_ref(), now) {
             LoadOutcome::Valid(b) => {
+                let same = self.bundle.as_ref().is_some_and(|old| {
+                    old.client_ca().cert_der() == b.client_ca().cert_der()
+                        && old.internal_ca().cert_der() == b.internal_ca().cert_der()
+                });
                 self.metrics
                     .set_cert_not_after(CertKind::ClientCa, b.client_ca().not_after());
                 self.metrics
                     .set_cert_not_after(CertKind::InternalCa, b.internal_ca().not_after());
-                self.bundle = Some(Arc::new(*b));
                 self.usable = true;
-                self.reissue_pending = true;
                 self.metrics.set_ca_valid(true);
                 self.ready_ca.set();
+                if same {
+                    return !was_usable;
+                }
+                self.bundle = Some(Arc::new(*b));
+                self.pending.client = true;
+                self.pending.serving = !self.cfg.user_serving;
+                return true;
             }
             LoadOutcome::Missing => {
                 self.usable = false;
@@ -226,7 +248,7 @@ impl Loader {
                 );
             }
         }
-        true
+        self.usable != was_usable
     }
 
     fn on_user_serving(&mut self, s: &SecretState, now: OffsetDateTime) -> bool {
@@ -311,7 +333,7 @@ impl Loader {
         // otherwise); the held-back user cert does not.
         let issue = if !self.usable {
             None
-        } else if self.reissue_pending {
+        } else if self.pending.client || self.pending.serving {
             Some(RETRY)
         } else {
             renew
@@ -327,8 +349,7 @@ impl Loader {
         };
         let due = |renew: Option<OffsetDateTime>| renew.is_some_and(|t| now >= t);
         let mut changed = false;
-        let mut failed = false;
-        if self.reissue_pending || self.client.as_ref().is_none_or(|c| due(c.renew_at)) {
+        if self.pending.client || self.client.as_ref().is_none_or(|c| due(c.renew_at)) {
             match b
                 .issue_edge_client_for(now, self.cfg.validity.edge_client)
                 .map_err(|e| e.to_string())
@@ -347,16 +368,17 @@ impl Loader {
                 Ok(c) => {
                     info!(renew_at = ?c.renew_at, "edge client cert issued");
                     self.client = Some(c);
+                    self.pending.client = false;
                     changed = true;
                 }
                 Err(e) => {
                     error!(error = %e, "issuing the edge client cert");
-                    failed = true;
+                    self.pending.client = true;
                 }
             }
         }
         if !self.cfg.user_serving
-            && (self.reissue_pending || self.serving.as_ref().is_none_or(|s| due(s.renew_at)))
+            && (self.pending.serving || self.serving.as_ref().is_none_or(|s| due(s.renew_at)))
         {
             let provider = rustls::crypto::ring::default_provider();
             let r = match &self.cfg.names {
@@ -375,6 +397,7 @@ impl Loader {
                     info!(renew_at = ?s.renew_at, "edge serving cert issued");
                     self.serving = Some(s);
                     self.serving_failing = false;
+                    self.pending.serving = false;
                     self.ready_serving.set();
                     changed = true;
                 }
@@ -384,11 +407,10 @@ impl Loader {
                     }
                     self.serving_failing = true;
                     error!(error = %e, "self-issuing the edge serving cert");
-                    failed = true;
+                    self.pending.serving = true;
                 }
             }
         }
-        self.reissue_pending = failed;
         changed
     }
 }

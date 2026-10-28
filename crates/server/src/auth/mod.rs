@@ -8,7 +8,7 @@ mod oidc;
 mod token_review;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,11 +17,14 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 
 pub use access::{AccessRule, AccessRules, RuleError};
-pub use oidc::{OidcIssuer, https_client, public_roots};
+pub use oidc::{OidcIssuer, REFETCH_INTERVAL, https_client, public_roots};
 pub use token_review::{
     DEFAULT_MAX_CONCURRENT_REVIEWS, DEFAULT_MAX_REVIEWS_PER_IP, DEFAULT_RECENT_SUBJECT_TTL,
     DEFAULT_RESERVED_REVIEWS, KubeTokenReviewer, REVIEW_CACHE_TTL, ReviewError, TokenReviewer,
 };
+
+/// `Retry-After` seconds of a 503 from a busy, throttled or timed-out `TokenReview`.
+pub const REVIEW_RETRY_AFTER_SECS: u64 = 2;
 
 /// Largest accepted bearer token.
 pub const MAX_TOKEN_BYTES: usize = 16 * 1024;
@@ -81,10 +84,11 @@ impl Identity {
 pub const RUN_CLAIMS: [&str; 3] = ["run_id", "run_attempt", "job_workflow_ref"];
 
 /// The OIDC owner string: `oidc:<iss>#<sub>`, then each present [`RUN_CLAIMS`]
-/// claim as `#<name>=<value>` in the order of [`RUN_CLAIMS`]. `sub` and every
-/// value have `%` and `#` percent-encoded in both forms, so no two callers
-/// produce the same string: without the escape in the plain form, sub
-/// `x#run_id=1` with no run claims would equal sub `x` with `run_id` 1.
+/// claim as `#<name>=<value>` in the order of [`RUN_CLAIMS`]. The issuer, `sub`
+/// and every value have `%` and `#` percent-encoded in both forms, so no two
+/// callers produce the same string: without the escape in the plain form, sub
+/// `x#run_id=1` with no run claims would equal sub `x` with `run_id` 1. Real
+/// issuers contain neither character, so their owners read unchanged.
 fn oidc_owner(issuer: &str, subject: &str, claims: &Map<String, Value>) -> String {
     let run: Vec<(&str, String)> = RUN_CLAIMS
         .iter()
@@ -98,7 +102,7 @@ fn oidc_owner(issuer: &str, subject: &str, claims: &Map<String, Value>) -> Strin
         })
         .collect();
     let esc = |s: &str| s.replace('%', "%25").replace('#', "%23");
-    let mut owner = format!("oidc:{issuer}#{}", esc(subject));
+    let mut owner = format!("oidc:{}#{}", esc(issuer), esc(subject));
     for (name, v) in run {
         owner.push('#');
         owner.push_str(name);
@@ -117,7 +121,8 @@ pub enum AuthError {
     /// `iss` is not a configured issuer and service-account auth is off.
     #[error("unknown issuer")]
     UnknownIssuer,
-    /// No usable JWKS for the issuer (fails closed).
+    /// No usable JWKS for the issuer. It fails closed with a retryable 503:
+    /// the token may be fine and the issuer unreachable.
     #[error("issuer keys unavailable")]
     KeysUnavailable,
     /// `TokenReview` timed out or failed with unknown outcome.
@@ -133,8 +138,8 @@ impl AuthError {
     #[must_use]
     pub fn status(&self) -> u16 {
         match self {
-            Self::Invalid(_) | Self::UnknownIssuer | Self::KeysUnavailable => 401,
-            Self::Upstream(_) => 503,
+            Self::Invalid(_) | Self::UnknownIssuer => 401,
+            Self::KeysUnavailable | Self::Upstream(_) => 503,
             Self::Internal(_) => 500,
         }
     }
@@ -146,6 +151,30 @@ impl AuthError {
             401 => "unauthenticated",
             503 => "upstream_error",
             _ => "internal",
+        }
+    }
+
+    /// Why the token was refused, for the log: the fixed reason of
+    /// [`Self::Invalid`] ("expired", "audience mismatch", "unknown kid", ...),
+    /// otherwise [`Self::metric_result`]. It never holds token or claim data.
+    #[must_use]
+    pub fn detail(&self) -> &'static str {
+        match self {
+            Self::Invalid(reason) => reason,
+            _ => self.metric_result(),
+        }
+    }
+
+    /// `Retry-After` seconds of a 503: a `TokenReview` slot or an API server
+    /// answer can come back within seconds, but after a failed JWKS fetch the
+    /// issuer is not asked again for [`REFETCH_INTERVAL`], so an earlier retry
+    /// gets the same answer.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<u64> {
+        match self {
+            Self::Upstream(_) => Some(REVIEW_RETRY_AFTER_SECS),
+            Self::KeysUnavailable => Some(REFETCH_INTERVAL.as_secs()),
+            Self::Invalid(_) | Self::UnknownIssuer | Self::Internal(_) => None,
         }
     }
 

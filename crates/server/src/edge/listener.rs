@@ -214,6 +214,7 @@ pub async fn serve_with_proxy(
             }
             (tcp, peer) = accept(&listener) => {
                 let Ok(global) = Arc::clone(&handshakes).try_acquire_owned() else {
+                    shared.metrics.outcome(None, "handshake_limit");
                     debug!(remote = %peer, "edge handshake limit reached; closing");
                     continue;
                 };
@@ -224,17 +225,33 @@ pub async fn serve_with_proxy(
     }
     drop(listener);
     info!(open = conns.len(), "edge listener closed, draining");
+    let mut conns = Draining(conns);
     let mut progress = tokio::time::interval_at(
         tokio::time::Instant::now() + DRAIN_LOG_EVERY,
         DRAIN_LOG_EVERY,
     );
     loop {
         tokio::select! {
-            done = conns.join_next() => if done.is_none() { break },
-            _ = progress.tick() => info!(open = conns.len(), "edge draining"),
+            done = conns.0.join_next() => if done.is_none() { break },
+            _ = progress.tick() => info!(open = conns.0.len(), "edge draining"),
         }
     }
     info!("edge drained");
+}
+
+/// The connections a draining listener waits for. Dropped with some still open,
+/// the drain deadline aborted the edge, and it logs how many it cut.
+struct Draining(JoinSet<()>);
+
+impl Drop for Draining {
+    fn drop(&mut self) {
+        if !self.0.is_empty() {
+            warn!(
+                open = self.0.len(),
+                "edge drain deadline reached; cutting open connections"
+            );
+        }
+    }
 }
 
 /// How often a draining edge logs its open connection count.
@@ -303,6 +320,7 @@ async fn admit(
         debug!(peer = %client.addr, via = %v, "edge PROXY header accepted");
     }
     let Some(slot) = shared.per_peer.try_take(client.addr.ip()) else {
+        shared.metrics.outcome(None, "peer_handshake_limit");
         debug!(peer = %client.addr, via = ?via, "edge per-address handshake limit reached; closing");
         return;
     };
@@ -375,6 +393,7 @@ async fn connection(
     )
     .await
     else {
+        metrics.outcome(Some(&id), "connection_limit");
         debug!("edge connection limit reached; closing");
         return;
     };
@@ -443,13 +462,21 @@ mod tests {
         const HOST: &str = "edge.example.test";
         const ID: &str = "buildkit://team-a/pool-1/0f8fad5b-d9cb-469f-a165-70867728950e/abcdefghijklmnopqrstuvwxyz";
 
-        /// Reports each accepted connection's `peer`.
-        struct Peers(mpsc::UnboundedSender<SocketAddr>);
+        /// Reports each accepted connection's `peer`, then holds it until
+        /// `release` is true.
+        struct Peers {
+            tx: mpsc::UnboundedSender<SocketAddr>,
+            release: watch::Receiver<bool>,
+        }
 
         impl ConnectionHandler for Peers {
             fn handle(&self, conn: Accepted) -> futures::future::BoxFuture<'static, ()> {
-                let _ = self.0.send(conn.peer);
-                Box::pin(async move { drop(conn) })
+                let _ = self.tx.send(conn.peer);
+                let mut release = self.release.clone();
+                Box::pin(async move {
+                    let _ = release.wait_for(|r| *r).await;
+                    drop(conn);
+                })
             }
         }
 
@@ -460,13 +487,24 @@ mod tests {
             leaf: (CertificateDer<'static>, PrivateKeyDer<'static>),
             metrics: EdgeMetrics,
             stop: CancellationToken,
+            /// Set to true to end the connections the handler holds.
+            release: watch::Sender<bool>,
+        }
+
+        /// A 2 s handshake timeout, defaults otherwise.
+        fn options() -> ListenerOptions {
+            ListenerOptions {
+                handshake_timeout: Duration::from_secs(2),
+                ..ListenerOptions::default()
+            }
         }
 
         async fn start(trusted: &str) -> Rig {
-            start_with(trusted, ListenerOptions::default().max_handshakes_per_ip).await
+            start_with(trusted, options(), true).await
         }
 
-        async fn start_with(trusted: &str, max_handshakes_per_ip: usize) -> Rig {
+        /// `released`: the handler drops each connection at once.
+        async fn start_with(trusted: &str, options: ListenerOptions, released: bool) -> Rig {
             let now = OffsetDateTime::now_utc();
             let bundle = CaBundle::generate(now).unwrap();
             let names = EdgeNames::new(HOST, &[], "bkc", &"ops".parse().unwrap()).unwrap();
@@ -481,7 +519,11 @@ mod tests {
                 signer,
             ));
             let (tx, peers) = mpsc::unbounded_channel();
-            let handler: Arc<dyn ConnectionHandler> = Arc::new(Peers(tx));
+            let (release, release_rx) = watch::channel(released);
+            let handler: Arc<dyn ConnectionHandler> = Arc::new(Peers {
+                tx,
+                release: release_rx,
+            });
             let metrics = EdgeMetrics::register(&Metrics::new());
             let tls = TlsBuilder::new(Arc::clone(&handler), metrics.clone())
                 .build(key, bundle.client_ca().cert_der().clone())
@@ -494,11 +536,7 @@ mod tests {
                 tls: rx,
                 handler,
                 metrics: metrics.clone(),
-                options: ListenerOptions {
-                    handshake_timeout: Duration::from_secs(2),
-                    max_handshakes_per_ip,
-                    ..ListenerOptions::default()
-                },
+                options,
                 ready: Readiness::with_spec_checks().register("edge_listener"),
             };
             let proxy = ProxyProtocol::trusting(
@@ -524,6 +562,7 @@ mod tests {
                 leaf: (leaf.cert_der().clone(), leaf.private_key_der().unwrap()),
                 metrics,
                 stop,
+                release,
             }
         }
 
@@ -536,8 +575,12 @@ mod tests {
             h
         }
 
-        /// A TLS session with the allocation cert after writing `prefix`.
-        async fn dial(r: &Rig, prefix: &[u8]) -> std::io::Result<()> {
+        /// A TLS session with the allocation cert after writing `prefix`, left
+        /// open. The server may still refuse it after this returns.
+        async fn connect(
+            r: &Rig,
+            prefix: &[u8],
+        ) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
             let mut roots = rustls::RootCertStore::empty();
             roots.add(r.ca.clone()).unwrap();
             let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -550,9 +593,14 @@ mod tests {
             .unwrap();
             let mut tcp = TcpStream::connect(r.addr).await?;
             tcp.write_all(prefix).await?;
-            let mut s = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+            tokio_rustls::TlsConnector::from(Arc::new(cfg))
                 .connect(ServerName::try_from(HOST).unwrap(), tcp)
-                .await?;
+                .await
+        }
+
+        /// A TLS session with the allocation cert after writing `prefix`.
+        async fn dial(r: &Rig, prefix: &[u8]) -> std::io::Result<()> {
+            let mut s = connect(r, prefix).await?;
             // TLS 1.3: a refusal shows as an alert on the first read after the
             // client's flight. The test handler closes without close_notify.
             let mut b = [0u8; 1];
@@ -606,7 +654,11 @@ mod tests {
         /// is still capped.
         #[tokio::test]
         async fn handshake_cap_counts_the_proxy_source() {
-            let mut r = start_with("127.0.0.0/8", 1).await;
+            let one = ListenerOptions {
+                max_handshakes_per_ip: 1,
+                ..options()
+            };
+            let mut r = start_with("127.0.0.0/8", one, true).await;
             // Client A: header, then no ClientHello, so it stays in the
             // handshake and holds A's only slot.
             let mut stalled = TcpStream::connect(r.addr).await.unwrap();
@@ -626,6 +678,38 @@ mod tests {
                 .expect("B, behind the same gateway address, has its own budget");
             assert_eq!(next_peer(&mut r).await, "192.0.2.8:1000".parse().unwrap());
             drop(stalled);
+            r.stop.cancel();
+        }
+
+        /// With every established slot held, a further valid client is closed
+        /// after `handshake_timeout` and counted; it gets in once a slot frees.
+        #[tokio::test]
+        async fn a_full_edge_closes_after_the_handshake_timeout_then_admits() {
+            let full = ListenerOptions {
+                max_connections: 1,
+                handshake_timeout: Duration::from_secs(1),
+                ..ListenerOptions::default()
+            };
+            let mut r = start_with("10.0.0.0/8", full, false).await;
+            let _held = connect(&r, &[]).await.unwrap();
+            next_peer(&mut r).await;
+            let id: crate::pki::AllocationId = ID.parse().unwrap();
+            let start = Instant::now();
+            let mut second = connect(&r, &[]).await.unwrap();
+            let mut b = [0u8; 1];
+            let n = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::io::AsyncReadExt::read(&mut second, &mut b),
+            )
+            .await
+            .unwrap();
+            assert!(!matches!(n, Ok(1..)), "closed without data: {n:?}");
+            assert!(start.elapsed() >= Duration::from_secs(1));
+            assert_eq!(r.metrics.outcome_count(Some(&id), "connection_limit"), 1);
+            assert!(r.peers.try_recv().is_err(), "never reached the handler");
+            r.release.send_replace(true);
+            dial(&r, &[]).await.unwrap();
+            next_peer(&mut r).await;
             r.stop.cancel();
         }
     }

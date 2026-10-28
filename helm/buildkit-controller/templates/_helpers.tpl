@@ -91,11 +91,11 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- if and .Values.watchNamespace .Values.watchNamespaces -}}
 {{- fail "set watchNamespaces or the deprecated watchNamespace, not both" -}}
 {{- end -}}
-{{- if .Values.watchNamespace -}}
-{{- list .Values.watchNamespace | toJson -}}
-{{- else -}}
-{{- default (list) .Values.watchNamespaces | toJson -}}
+{{- $list := ternary (list .Values.watchNamespace) (default (list) .Values.watchNamespaces) (not (empty .Values.watchNamespace)) -}}
+{{- if has .Release.Namespace $list -}}
+{{- fail (printf "watchNamespaces must not include the release namespace %s: it holds the CA Secret, and pool workloads must not run beside it" .Release.Namespace) -}}
 {{- end -}}
+{{- $list | toJson -}}
 {{- end -}}
 
 {{/* Seconds the controller may drain: shutdown.drainTimeout, or when unset the

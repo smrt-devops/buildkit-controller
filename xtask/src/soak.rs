@@ -29,12 +29,11 @@ use base64::Engine as _;
 use buildkit_controller::pki::{CaBundle, EdgeNames};
 use time::OffsetDateTime;
 
-use super::edge_verify::{Env, run_ok};
+use super::edge_verify::{chart_rbac, controller_fixture};
 use super::{CRD_PATH, root};
 use crate::image::WORKER_IMAGE;
-
-static CLUSTER: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| super::kind_cluster("bk-soak"));
+use crate::kube::Cluster;
+use crate::proc::status;
 const SYSTEM_NS: &str = "buildkit-system";
 const NS: &str = "bk-soak";
 const CURL_IMAGE: &str = "curlimages/curl:8.11.1";
@@ -65,13 +64,11 @@ fn config(secret: &str) -> String {
     )
 }
 
-/// The edge-verify controller fixture (least-privilege RBAC, restricted
-/// securityContext, the worker `NetworkPolicy` label) with two replicas, the
-/// API port and the soak config.
+/// The edge-verify controller fixture (restricted securityContext, the worker
+/// `NetworkPolicy` label) with two replicas, the API port and the soak config.
+/// The chart's RBAC goes with it; see [`chart_rbac`].
 fn controller_manifest(secret: &str) -> Result<String> {
-    let base = std::fs::read_to_string(root().join("xtask/fixtures/edge-verify/controller.yaml"))
-        .context("reading the controller fixture")?;
-    let mut m = base;
+    let mut m = controller_fixture()?;
     for (from, to) in [
         ("    edge:\n      endpoint: tcp://bk.example.com:8444\n      serverName: bk.example.com\n    shutdown:\n      delay: 0s\n", config(secret)),
         ("  replicas: 1\n", "  replicas: 2\n".to_owned()),
@@ -160,10 +157,11 @@ struct Window {
 }
 
 struct Soak {
-    env: Env,
+    env: Cluster,
 }
 
-/// Deletes the cluster when dropped. Dumps state unless the run passed.
+/// Dumps state when dropped unless the run passed. The cluster it holds is
+/// deleted after that.
 struct Cleanup(Soak, std::cell::Cell<bool>);
 
 impl Drop for Cleanup {
@@ -202,10 +200,6 @@ impl Drop for Cleanup {
                 }
             }
         }
-        let _ = self
-            .0
-            .env
-            .kind(&["delete", "cluster", "--name", CLUSTER.as_str()]);
     }
 }
 
@@ -381,25 +375,10 @@ pub(crate) fn soak() -> Result<()> {
     let root = root();
     let work = root.join("target/soak");
     std::fs::create_dir_all(&work)?;
-    let env = Env {
-        kubeconfig: work.join("kubeconfig"),
-    };
-    let _ = env.kind(&["delete", "cluster", "--name", CLUSTER.as_str()]);
+    let env = Cluster::new(&super::kind_cluster("bk-soak"), work.join("kubeconfig"));
     let cleanup = Cleanup(Soak { env }, std::cell::Cell::new(false));
     let s = &cleanup.0;
-    let created = s.env.kind(&[
-        "create",
-        "cluster",
-        "--name",
-        CLUSTER.as_str(),
-        "--wait",
-        "120s",
-    ])?;
-    ensure!(
-        created.status.success(),
-        "kind create failed: {}",
-        String::from_utf8_lossy(&created.stderr)
-    );
+    s.env.create(None, "120s")?;
     let user_ca = setup(s, &root)?;
     let t0 = s.pod_now()?;
     s.good_builds_since(t0, 3, Duration::from_mins(5))
@@ -746,16 +725,16 @@ fn verdict(windows: &[Window], builds: &[Build]) -> (String, bool) {
 /// Installs images, CRD, namespaces, the controller and the client pod. Returns
 /// the user serving CA (scenario b), which the client trusts from the start.
 fn setup(s: &Soak, root: &std::path::Path) -> Result<CaBundle> {
-    super::image::image(CONTROLLER_IMAGE, Some(CLUSTER.as_str()))?;
+    super::image::image(CONTROLLER_IMAGE, Some(s.env.name()))?;
     crate::image::ensure_worker()?;
     crate::image::ensure(CURL_IMAGE)?;
     for img in [WORKER_IMAGE, CURL_IMAGE] {
-        run_ok(&mut crate::kube::kind_load(img, CLUSTER.as_str()))?;
+        status(&mut crate::kube::kind_load(img, s.env.name()))?;
     }
 
     let crd = root.join(CRD_PATH).to_string_lossy().into_owned();
     s.k(&["apply", "--server-side", "-f", &crd])?;
-    crate::kube::wait_crd_established(&s.env.kubeconfig)?;
+    s.env.wait_crd_established()?;
     s.k(&["create", "namespace", SYSTEM_NS])?;
     s.k(&[
         "label",
@@ -765,8 +744,10 @@ fn setup(s: &Soak, root: &std::path::Path) -> Result<CaBundle> {
     ])?;
     s.k(&["create", "namespace", NS])?;
 
-    // The controller bootstraps its own CA.
-    s.env.apply(&controller_manifest("")?)?;
+    // The controller bootstraps its own CA. The RBAC already names the user
+    // serving Secret that scenario b switches to.
+    s.env
+        .apply(&(chart_rbac(USER_TLS)? + &controller_manifest("")?))?;
     s.rollout()?;
     let user_ca = CaBundle::generate(OffsetDateTime::now_utc().replace_nanosecond(0)?)?;
     s.k(&[

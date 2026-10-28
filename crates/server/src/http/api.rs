@@ -25,8 +25,6 @@ use tracing::{info, warn};
 
 /// Upload bound for the 16 KiB body, so a trickling client cannot hold a request open.
 const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// `Retry-After` on a 503 from authentication (`TokenReview` busy, throttled or timed out).
-const AUTH_RETRY_AFTER_SECS: u64 = 2;
 /// Message of the 400 for a `POST /v1/allocations` without `publicKey`.
 pub const PUBLIC_KEY_REQUIRED: &str =
     "publicKey is required: generate an ECDSA P-256 key pair and send the PEM SPKI public key";
@@ -351,6 +349,7 @@ async fn authenticate<A: Allocator>(
                     peer,
                     result = "unauthenticated",
                     reason = e.metric_result(),
+                    detail = e.detail(),
                     suppressed,
                     "request refused"
                 );
@@ -358,16 +357,15 @@ async fn authenticate<A: Allocator>(
                 warn!(peer, result = code.as_str(), error = %e, suppressed, "authentication failed");
             }
         }
-        let message = match code {
-            ErrorCode::Unauthenticated => "missing or invalid bearer token",
-            ErrorCode::UpstreamError => "token review unavailable",
+        let message = match (&e, code) {
+            (AuthError::KeysUnavailable, _) => "token issuer keys unavailable",
+            (AuthError::Upstream(_), _) => "token review unavailable",
+            (_, ErrorCode::Unauthenticated) => "missing or invalid bearer token",
             _ => "internal error",
         };
-        let mut e = ApiError::new(code, message);
-        if code == ErrorCode::UpstreamError {
-            e.retry_after = Some(AUTH_RETRY_AFTER_SECS);
-        }
-        e
+        let mut out = ApiError::new(code, message);
+        out.retry_after = e.retry_after();
+        out
     })
 }
 

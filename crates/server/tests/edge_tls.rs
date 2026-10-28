@@ -583,7 +583,7 @@ async fn idle_connects(addr: SocketAddr, n: usize) -> Vec<TcpStream> {
 }
 
 /// The server closes `s` without a handshake (EOF or reset within 1 s).
-async fn closed_at_once(mut s: TcpStream) -> bool {
+async fn closed_at_once(s: &mut TcpStream) -> bool {
     let mut b = [0u8; 1];
     matches!(
         tokio::time::timeout(Duration::from_secs(1), s.read(&mut b)).await,
@@ -634,18 +634,28 @@ async fn handshake_caps_close_extra_connects() {
             },
         )
         .await;
-        let mut idle = idle_connects(e.addr, 2).await;
-        let extra = TcpStream::connect(e.addr).await.unwrap();
+        // The accept loop takes handshake slots in accept order, so with two
+        // idle connects in, the next connect is over the cap.
+        let mut held = idle_connects(e.addr, 2).await;
+        let mut extra = TcpStream::connect(e.addr).await.unwrap();
         assert!(
-            closed_at_once(extra).await,
+            closed_at_once(&mut extra).await,
             "cap ({global}, {per_ip}) not enforced"
         );
-        idle.clear();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        held.clear();
+        // Slots free asynchronously; retry until a valid client is admitted.
         let ca = b.client_ca().cert_der().clone();
-        let _s = dial(e.addr, client(&ca, Some(valid_cert(&b)), &[b"h2"]), HOST)
-            .await
-            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let _s = loop {
+            match dial(e.addr, client(&ca, Some(valid_cert(&b)), &[b"h2"]), HOST).await {
+                Ok(s) => break s,
+                Err(err) => assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "freed slot never admitted a client: {err}"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
         e.conns.recv().await.unwrap();
     }
 }

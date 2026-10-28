@@ -248,6 +248,20 @@ function queueTimeoutFor(queueTimeoutSeconds, remainingMs) {
   return Math.max(0, Math.min(queueTimeoutSeconds, Math.floor((remainingMs - 60000) / 1000)));
 }
 
+/** Total retry budget of a release or a pool listing: neither queues, so neither follows the queue timeout. */
+const SHORT_BUDGET_MS = 60000;
+
+// Error codes the controller answers 503 with Retry-After before it claims anything.
+const CLAIM_FREE_CODES = new Set(['pool_exhausted', 'start_timeout', 'shutting_down', 'upstream_error']);
+
+/** True when a 503 body carries one of the controller's claim-free error codes. */
+function isClaimFree503(res) {
+  try {
+    const j = JSON.parse(res.body);
+    return CLAIM_FREE_CODES.has(j && j.error && j.error.code);
+  } catch { return false; }
+}
+
 const MIN_WAIT_MS = 1000;
 const MAX_WAIT_MS = 30000;
 // Errors raised while connecting, before any byte of the request was written.
@@ -273,15 +287,16 @@ function isPreSendError(err) {
 }
 
 /**
- * `request` with retries that cannot repeat a claim: only HTTP 503 with a usable Retry-After, and
- * connection errors raised before the request was sent. Everything else returns or throws at once.
+ * `request` with retries that cannot repeat a claim: only HTTP 503 with a usable Retry-After whose
+ * body carries a claim-free error code (any 503 with Retry-After when `idempotent`, for GET and
+ * DELETE), and connection errors raised before the request was sent. Everything else returns or throws at once.
  * `getToken` runs for every attempt (OIDC tokens are short-lived). Stops retrying when the next wait
  * would pass `budgetMs` from the first attempt, returning the last 503 or throwing the last error.
  * `opts` may be a function of `{remainingMs}` (budget left at the start of the attempt) so a retry can
  * shrink its queue timeout and socket timeout; a retry must not queue for a full timeout again.
  * `what` labels the log line; `log`, `sleep` and `now` are injectable for tests.
  */
-async function requestWithRetry(url, opts, { what, getToken, budgetMs, log = () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now } = {}) {
+async function requestWithRetry(url, opts, { what, getToken, budgetMs, idempotent = false, log = () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now } = {}) {
   const start = now();
   for (let attempt = 1; ; attempt++) {
     let wait;
@@ -291,7 +306,7 @@ async function requestWithRetry(url, opts, { what, getToken, budgetMs, log = () 
       if (getToken) headers.Authorization = `Bearer ${await getToken()}`;
       const o = typeof opts === 'function' ? opts({ remainingMs: budgetMs - (now() - start) }) : opts;
       const res = await request(url, { ...o, headers: { ...(o.headers || {}), ...headers } });
-      if (res.status !== 503) return res;
+      if (res.status !== 503 || !(idempotent || isClaimFree503(res))) return res;
       wait = retryAfterMs(res.headers, now());
       if (wait === undefined) return res;
       why = `HTTP 503`;
@@ -305,6 +320,13 @@ async function requestWithRetry(url, opts, { what, getToken, budgetMs, log = () 
     log(`${what || 'request'}: ${why}, retrying in ${Math.round(wait / 1000)}s (attempt ${attempt + 1})`);
     await sleep(wait);
   }
+}
+
+/** Release allocation `id`. 404 counts as released. Own short retry budget: a down API must not hold the job. */
+async function releaseAllocation({ api, ca, getToken, id, log, ...inject }) {
+  const res = await requestWithRetry(`${api}/v1/allocations/${id}`, { method: 'DELETE', ca, timeoutMs: 30000 },
+    { what: `release ${id}`, getToken, budgetMs: SHORT_BUDGET_MS, idempotent: true, log, ...inject });
+  if (res.status !== 204 && res.status !== 404) throw apiError(`release ${id}`, res);
 }
 
 /** GitHub OIDC token for `audience`. Masks the bearer and the token via `setSecret`. */
@@ -325,5 +347,5 @@ async function fetchOidcToken(audience, setSecret) {
 module.exports = {
   parseList, parsePool, postTimeoutMs, parseDuration, generateKey, allocationBody,
   validatePools, buildxCommands, parseCacheInputs, cacheFlags, checkAllocationId, createBuilder, writeMaterial, request, apiError,
-  effectiveQueueTimeout, retryBudgetMs, queueTimeoutFor, retryAfterMs, isPreSendError, requestWithRetry, fetchOidcToken,
+  effectiveQueueTimeout, retryBudgetMs, SHORT_BUDGET_MS, isClaimFree503, releaseAllocation, queueTimeoutFor, retryAfterMs, isPreSendError, requestWithRetry, fetchOidcToken,
 };
