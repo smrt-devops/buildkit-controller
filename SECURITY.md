@@ -23,5 +23,6 @@ The two CAs and the per-pod worker identity are described in [docs/architecture.
 - The CA Secret (`buildkit-controller-ca`) holds both CA keys. Restrict `get` on it with RBAC.
 - Pool access rules. A claim pattern such as `repository_owner: *` lets every GitHub organization use your pool. Match a specific organization or repository.
 - Pool `spec.network.egress.allowCIDRs` re-opens network ranges for workers. Open only what builds need.
-- A template that sets `runtimeClassName` (gVisor or Kata) adds isolation. Rootless BuildKit needs Unconfined seccomp and AppArmor profiles, so consider it for untrusted builds.
+- Untrusted builds, such as fork pull requests. Workers run with seccomp and AppArmor Unconfined and no process sandbox, so each `RUN` step has a larger kernel attack surface on a shared node. Use a dedicated tainted node pool or a `runtimeClassName` in the pool template, as described in [Running untrusted builds](docs/operations.md#running-untrusted-builds).
+- Who may create or edit a `BuildKitPool`. A pool author is as trusted as anyone who can create pods in its namespace, see [Who may write a pool](docs/operations.md#who-may-write-a-pool).
 - Rotate the CA before it expires, see [docs/operations.md](docs/operations.md).

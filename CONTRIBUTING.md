@@ -16,7 +16,7 @@ cd buildkit-controller
 cargo build --workspace --locked
 ```
 
-The workspace has `crates/api` (CRD and API types, and the HTTP client), `crates/server` (the `buildkit-controller` binary), and `xtask` (the task runner). The GitHub Action in `action/` is JavaScript (bundled to `action/dist`).
+The workspace has `crates/api` (CRD and API types, and the HTTP client), `crates/server` (the `buildkit-controller` binary), and `xtask` (the task runner). The GitHub Action in `action/` is dependency-free JavaScript, and `action/dist` is its hand-written source with no build step. Edit it there and run `(cd action && node --test test/*.test.js)`.
 
 ## Checks
 
@@ -41,14 +41,16 @@ Clippy denies `unwrap`, `expect` and `unsafe` outside tests. Use `thiserror` for
 | `cargo xtask alloc-verify`, `api-verify`, `reconcile-verify`, `runtime-verify`, `edge-verify`, `helm-verify` | End-to-end checks on a throwaway kind cluster. They use a private kubeconfig and never touch `~/.kube/config`. |
 | `cargo xtask claim-verify` | Installs the chart with claims on kind and checks the `BuildKitClaim` lifecycle: a real build through a claim Secret, refusal, expiry and a lost worker. |
 | `cargo xtask soak` | Soaks the certificate lifecycle on kind: continuous builds through leaf renewals, a serving certificate swap, a leader failover, and deletion and corruption of the CA Secret. |
-| `cargo xtask drain-verify` | Installs the chart with two replicas on kind and checks that stopping a replica never cuts a live build. It publishes the controller on host ports 28443 and 28444. |
+| `cargo xtask drain-verify` | Installs the chart with two replicas on kind and checks that stopping a replica never cuts a live build. It publishes the controller on host ports 28443 and 28444, or, with `BK_KIND_SUFFIX` set, on a pair in 22000 to 23999 derived from the suffix. |
 | `cargo xtask proxy-verify` | Installs the chart on kind behind the pinned Envoy Gateway with PROXY protocol on, trusting the Envoy pod addresses. Checks that the logs and the per-address caps see client pod addresses, that a build through the edge TLSRoute works, and that an untrusted pod cannot forge its address with its own PROXY header. It reaches the Gateway through `kubectl port-forward`, so it binds no fixed host port. |
 | `cargo xtask e2e` | The end-to-end suite on kind: the chart behind Envoy Gateway, with real `docker buildx` builds through it. It pulls the pinned Envoy Gateway chart, Gateway API CRDs and images on the host and loads the images into kind, and publishes the Gateway on host ports 18443 and 18444. With `BK_KIND_SUFFIX` set it uses a port pair derived from the suffix (20000 to 21999) and the work directory `target/e2e-<suffix>`, so runs with different suffixes can share a host. `e2e-up` installs the same cluster, leaves it running, and writes the API URL to `api-url` in the work directory. |
 | `cargo xtask perf --loopback` | Runs the in-process loopback edge benchmark. It needs no kind cluster and no Docker. Plain `perf` uses the kind rig. |
 | `cargo xtask image` | Builds the controller image for your architecture. `--load-kind <cluster>` also loads it into kind. If Docker has no network, `BK_IMAGE_PREINSTALLED=1` builds with the toolchain the rust image ships instead of the pinned one; use it for local builds only. |
 | `cargo xtask docs` | Builds the documentation site with mdBook into `target/book/html` and fails on a broken link to a repository file. Needs `mdbook` on the PATH. |
 
-Every task that creates a kind cluster names it `bk-<task>`. Set `BK_KIND_SUFFIX=foo` to get `bk-<task>-foo` instead, so parallel checkouts do not share a cluster. It is the only override; there are no per-task cluster variables.
+Every task that creates a kind cluster names it `bk-<task>`. Set `BK_KIND_SUFFIX=foo` to get `bk-<task>-foo` instead, so parallel checkouts do not share a cluster. It is the only override; there are no per-task cluster variables. The tasks hand the cluster's kubeconfig to the ignored cargo tests in `BK_TEST_KUBECONFIG`, and those tests read no other kubeconfig. To run one by hand, point `BK_TEST_KUBECONFIG` at a `kind-*` context whose API server is on loopback; the test refuses anything else. A task also stops its child processes and deletes its cluster on SIGINT or SIGTERM.
+
+The image build keeps its cache in a Docker volume named from a hash of the checkout. `cargo xtask image --prune` removes the volumes of checkouts that no longer exist.
 
 ## Pull requests
 

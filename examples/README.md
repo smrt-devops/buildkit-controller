@@ -12,7 +12,7 @@ Every pool example uses the `ci` namespace, which you create first and label for
 | [pool-cache.yaml](pool-cache.yaml) | Both cache layers: a registry cache ref and two local volumes. |
 | [pool-registry-cache.md](pool-registry-cache.md) | Passing the registry cache flags to `docker buildx build`. |
 | [helm-values.yaml](helm-values.yaml) | Chart values with an OIDC issuer, routes on a Gateway (or a LoadBalancer Service) and a pool. |
-| [claim-pod.yaml](claim-pod.yaml) | A `BuildKitClaim` and a pod that runs `buildctl` with the Secret it gets. Needs `claims.enabled: true`. |
+| [claim-pod.yaml](claim-pod.yaml) | A `BuildKitClaim` and a pod that runs `buildctl` with the Secret it gets, both in the namespace `apps`. Needs `claims.enabled: true`, `apps` in `claims.namespaces`, and a pool rule `claims: {namespaces: [apps]}`. |
 
 A multi-platform build needs `edge.allocationDomain` set in the Helm values, with wildcard DNS for that domain pointing at the edge address. See [docs/operations.md](../docs/operations.md).
 
