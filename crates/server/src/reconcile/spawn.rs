@@ -16,9 +16,8 @@ use buildkit_controller_api::v1alpha1::BuildKitPool;
 use futures::future::BoxFuture;
 use k8s_openapi::api::core::v1::{Pod, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
+use kube::api::{Api, PostParams};
 use kube::{Client, ResourceExt};
-use serde_json::json;
 use time::{Duration, OffsetDateTime};
 
 use crate::pki::{CaBundle, Namespace, PoolName, WorkerIdentity};
@@ -28,29 +27,16 @@ use crate::render::{
 
 /// The calls [`spawn`] needs beyond the pod create: create the pod's Secret
 /// and read the pod back after a create whose outcome is unknown. RBAC grants
-/// no read of Secrets. The re-own and delete calls are not used by [`spawn`].
+/// no read of Secrets.
 pub trait WorkerSecrets: Send + Sync {
     /// POST the per-pod Secret.
     fn create_worker_secret(&self, secret: &Secret) -> BoxFuture<'static, Result<(), String>>;
-    /// Merge-patch `metadata.ownerReferences` to `[owner]` (no read first).
-    fn reown_worker_secret(
-        &self,
-        ns: &str,
-        name: &str,
-        owner: OwnerReference,
-    ) -> BoxFuture<'static, Result<(), String>>;
-    /// DELETE the Secret by name; a 404 counts as done.
-    fn delete_worker_secret(&self, ns: &str, name: &str) -> BoxFuture<'static, Result<(), String>>;
-    /// GET a pod; `Ok(None)` on 404. Without an implementation the read
-    /// fails, so an unknown create outcome stays unknown and gets no Secret.
+    /// GET a pod; `Ok(None)` on 404.
     fn get_worker_pod(
         &self,
         ns: &str,
         name: &str,
-    ) -> BoxFuture<'static, Result<Option<Pod>, String>> {
-        let _ = (ns, name);
-        Box::pin(async { Err("no pod reads".to_owned()) })
-    }
+    ) -> BoxFuture<'static, Result<Option<Pod>, String>>;
 }
 
 /// What a pod create did, as far as the Secret is concerned.
@@ -233,34 +219,6 @@ impl WorkerSecrets for Client {
                 .await
                 .map(drop)
                 .map_err(|e| e.to_string())
-        })
-    }
-
-    fn reown_worker_secret(
-        &self,
-        ns: &str,
-        name: &str,
-        owner: OwnerReference,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        let (api, name) = (secrets(self, ns), name.to_owned());
-        Box::pin(async move {
-            // A JSON merge patch replaces the whole list, so no read is needed.
-            let patch = json!({"metadata": {"ownerReferences": [owner]}});
-            api.patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
-                .await
-                .map(drop)
-                .map_err(|e| e.to_string())
-        })
-    }
-
-    fn delete_worker_secret(&self, ns: &str, name: &str) -> BoxFuture<'static, Result<(), String>> {
-        let (api, name) = (secrets(self, ns), name.to_owned());
-        Box::pin(async move {
-            match api.delete(&name, &DeleteParams::default()).await {
-                Ok(_) => Ok(()),
-                Err(kube::Error::Api(s)) if s.code == 404 => Ok(()),
-                Err(e) => Err(e.to_string()),
-            }
         })
     }
 

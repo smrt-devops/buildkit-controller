@@ -8,7 +8,6 @@ use buildkit_controller_api::dto::{CreateAllocationRequest, ErrorCode};
 use buildkit_controller_api::v1alpha1::BuildKitPool;
 use futures::future::BoxFuture;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::runtime::reflector::store::Writer;
 use kube::runtime::watcher;
 use serde_json::{Value, json};
@@ -1253,24 +1252,6 @@ impl WorkerSecrets for Fake {
         self.w.lock().unwrap().calls.push(format!("get {name}"));
         let pod = self.get(name);
         Box::pin(async move { Ok(pod) })
-    }
-    fn reown_worker_secret(
-        &self,
-        _: &str,
-        name: &str,
-        owner: OwnerReference,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        let call = format!("secret reown {name} {}/{}", owner.kind, owner.name);
-        self.w.lock().unwrap().calls.push(call);
-        Box::pin(async { Ok(()) })
-    }
-    fn delete_worker_secret(&self, _: &str, name: &str) -> BoxFuture<'static, Result<(), String>> {
-        self.w
-            .lock()
-            .unwrap()
-            .calls
-            .push(format!("secret delete {name}"));
-        Box::pin(async { Ok(()) })
     }
 }
 

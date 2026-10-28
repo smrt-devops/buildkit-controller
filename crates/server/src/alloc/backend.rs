@@ -6,7 +6,6 @@ use std::time::Duration;
 use buildkit_controller_api::v1alpha1::BuildKitPool;
 use futures::future::BoxFuture;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{DeleteParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::{Api, Client};
 use serde_json::{Value, json};
@@ -343,22 +342,6 @@ impl PodOutcome for CreateOutcome {
 impl WorkerSecrets for KubeBackend {
     fn create_worker_secret(&self, secret: &Secret) -> BoxFuture<'static, Result<(), String>> {
         bounded(self.timeout, self.client.create_worker_secret(secret))
-    }
-
-    fn reown_worker_secret(
-        &self,
-        ns: &str,
-        name: &str,
-        owner: OwnerReference,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        bounded(
-            self.timeout,
-            self.client.reown_worker_secret(ns, name, owner),
-        )
-    }
-
-    fn delete_worker_secret(&self, ns: &str, name: &str) -> BoxFuture<'static, Result<(), String>> {
-        bounded(self.timeout, self.client.delete_worker_secret(ns, name))
     }
 
     fn get_worker_pod(

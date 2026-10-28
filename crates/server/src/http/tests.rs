@@ -1303,15 +1303,11 @@ impl crate::reconcile::spawn::WorkerSecrets for NoBackend {
     ) -> BoxFuture<'static, Result<(), String>> {
         Box::pin(async { Err("no backend".into()) })
     }
-    fn reown_worker_secret(
+    fn get_worker_pod(
         &self,
         _: &str,
         _: &str,
-        _: k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        Box::pin(async { Err("no backend".into()) })
-    }
-    fn delete_worker_secret(&self, _: &str, _: &str) -> BoxFuture<'static, Result<(), String>> {
+    ) -> BoxFuture<'static, Result<Option<k8s_openapi::api::core::v1::Pod>, String>> {
         Box::pin(async { Err("no backend".into()) })
     }
 }

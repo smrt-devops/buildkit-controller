@@ -10,7 +10,7 @@ use buildkit_controller_api::v1alpha1::{BuildKitPool, BuildKitPoolStatus, condit
 use futures::future::BoxFuture;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret};
 use k8s_openapi::api::events::v1::Event;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use k8s_openapi::jiff::Timestamp;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -1117,19 +1117,6 @@ impl WorkerSecrets for Fake {
             .and(self.fail.get("secret_create").cloned().map_or(Ok(()), Err));
         Box::pin(async move { res.map_err(|e| e.to_string()) })
     }
-    fn reown_worker_secret(
-        &self,
-        _: &str,
-        name: &str,
-        owner: OwnerReference,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        let res = self.call(format!("secret_reown:{name}:{}/{}", owner.kind, owner.uid));
-        Box::pin(async move { res.map_err(|e| e.to_string()) })
-    }
-    fn delete_worker_secret(&self, _: &str, name: &str) -> BoxFuture<'static, Result<(), String>> {
-        let res = self.call(format!("secret_delete:{name}"));
-        Box::pin(async move { res.map_err(|e| e.to_string()) })
-    }
     fn get_worker_pod(
         &self,
         _: &str,
@@ -1144,16 +1131,8 @@ impl WorkerSecrets for Hang {
     fn create_worker_secret(&self, _: &Secret) -> BoxFuture<'static, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
-    fn reown_worker_secret(
-        &self,
-        _: &str,
-        _: &str,
-        _: OwnerReference,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn delete_worker_secret(&self, _: &str, _: &str) -> BoxFuture<'static, Result<(), String>> {
-        Box::pin(async { Ok(()) })
+    fn get_worker_pod(&self, _: &str, _: &str) -> BoxFuture<'static, Result<Option<Pod>, String>> {
+        Box::pin(async { Ok(None) })
     }
 }
 

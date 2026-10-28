@@ -16,7 +16,6 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use futures::future::BoxFuture;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 
 use super::plan::WaiterRef;
 use super::spawn::{WorkerSecrets, bounded};
@@ -490,19 +489,6 @@ impl WorkerSecrets for KubeClient {
         self.0.create_worker_secret(secret)
     }
 
-    fn reown_worker_secret(
-        &self,
-        ns: &str,
-        name: &str,
-        owner: OwnerReference,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        self.0.reown_worker_secret(ns, name, owner)
-    }
-
-    fn delete_worker_secret(&self, ns: &str, name: &str) -> BoxFuture<'static, Result<(), String>> {
-        self.0.delete_worker_secret(ns, name)
-    }
-
     fn get_worker_pod(
         &self,
         ns: &str,
@@ -515,22 +501,6 @@ impl WorkerSecrets for KubeClient {
 impl<O: KubeOps> WorkerSecrets for Timed<O> {
     fn create_worker_secret(&self, secret: &Secret) -> BoxFuture<'static, Result<(), String>> {
         bounded(self.timeout, self.inner.create_worker_secret(secret))
-    }
-
-    fn reown_worker_secret(
-        &self,
-        ns: &str,
-        name: &str,
-        owner: OwnerReference,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        bounded(
-            self.timeout,
-            self.inner.reown_worker_secret(ns, name, owner),
-        )
-    }
-
-    fn delete_worker_secret(&self, ns: &str, name: &str) -> BoxFuture<'static, Result<(), String>> {
-        bounded(self.timeout, self.inner.delete_worker_secret(ns, name))
     }
 
     fn get_worker_pod(
