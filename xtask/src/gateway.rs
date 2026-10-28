@@ -16,7 +16,8 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::helm_verify::Env;
+use crate::kube::Cluster;
+use crate::proc::stdout as run;
 use crate::root;
 
 /// Namespace of the Gateway the controller's routes attach to.
@@ -49,17 +50,12 @@ const IMAGES: [(&str, &str); 2] = [
 ];
 /// The TLS Secret of the Gateway's HTTPS listener.
 const API_SECRET: &str = "bk-gateway-api";
-
-fn run(c: &mut Command) -> Result<String> {
-    let o = c.output().with_context(|| format!("{c:?}"))?;
-    ensure!(
-        o.status.success(),
-        "{c:?} failed: {}{}",
-        String::from_utf8_lossy(&o.stdout),
-        String::from_utf8_lossy(&o.stderr)
-    );
-    Ok(String::from_utf8_lossy(&o.stdout).into_owned())
-}
+/// socat 1.8.1.3 as `(tag, index digest)`: the mock OIDC issuer's server in e2e
+/// and the client pods in proxy-verify. Pulled by digest and tagged locally.
+pub(crate) const SOCAT: (&str, &str) = (
+    "docker.io/alpine/socat:1.8.1.3",
+    "sha256:603174b77eebaba25ba8f8ebb15e1234d6600409554e95d6fb203fd106150287",
+);
 
 fn sha256_hex(bytes: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, bytes)
@@ -110,6 +106,7 @@ pub(crate) fn ensure_image(tag: &str, digest: &str) -> Result<()> {
 /// Downloads and checks the pinned Gateway API CRDs and Envoy Gateway chart
 /// into `target/gateway`. Returns `(CRD bundle, chart archive)`.
 fn fetch() -> Result<(PathBuf, PathBuf)> {
+    let _lock = crate::image::host_lock()?;
     let cache = root().join("target/gateway");
     std::fs::create_dir_all(&cache)?;
     let crds = cache.join("gateway-api-standard-install.yaml");
@@ -134,10 +131,10 @@ fn fetch() -> Result<(PathBuf, PathBuf)> {
 /// Installs Envoy Gateway and the Gateway `bk-gateway/bk` in `cluster`. The
 /// Gateway's HTTPS listener serves a self-signed certificate for `localhost`;
 /// returns the PEM file of that certificate, which API clients trust.
-pub(crate) fn install(env: &Env, cluster: &str, work: &Path) -> Result<PathBuf> {
+pub(crate) fn install(env: &Cluster, work: &Path) -> Result<PathBuf> {
     for (tag, digest) in IMAGES {
         ensure_image(tag, digest)?;
-        run(&mut crate::kube::kind_load(tag, cluster))?;
+        run(&mut crate::kube::kind_load(tag, env.name()))?;
     }
     let (crds, chart) = fetch()?;
     let unpacked = work.join("gateway-chart");
@@ -154,23 +151,20 @@ pub(crate) fn install(env: &Env, cluster: &str, work: &Path) -> Result<PathBuf> 
         env.kubectl(&["apply", "--server-side", "-f", &f.to_string_lossy()])?;
     }
     let fixtures = root().join("xtask/fixtures/gateway");
-    env.tool(
-        "helm",
-        &[
-            "install",
-            "eg",
-            &chart.to_string_lossy(),
-            "-n",
-            EG_NS,
-            "--create-namespace",
-            "--skip-crds",
-            "-f",
-            &fixtures.join("envoy-gateway-values.yaml").to_string_lossy(),
-            "--wait",
-            "--timeout",
-            "5m",
-        ],
-    )?;
+    env.helm(&[
+        "install",
+        "eg",
+        &chart.to_string_lossy(),
+        "-n",
+        EG_NS,
+        "--create-namespace",
+        "--skip-crds",
+        "-f",
+        &fixtures.join("envoy-gateway-values.yaml").to_string_lossy(),
+        "--wait",
+        "--timeout",
+        "5m",
+    ])?;
     println!("installed Envoy Gateway {EG_VERSION} and the Gateway API standard channel");
 
     env.kubectl(&["create", "namespace", NS])?;
@@ -195,8 +189,7 @@ pub(crate) fn install(env: &Env, cluster: &str, work: &Path) -> Result<PathBuf> 
         "-f",
         &fixtures.join("gateway.yaml").to_string_lossy(),
     ])?;
-    crate::kube::wait_condition(
-        &env.kubeconfig,
+    env.wait_condition(
         &format!("gateway/{NAME}"),
         Some(NS),
         "Programmed",
@@ -207,7 +200,7 @@ pub(crate) fn install(env: &Env, cluster: &str, work: &Path) -> Result<PathBuf> 
 }
 
 /// `status.ancestors[*].conditions[type=Accepted].status` of a route or policy.
-pub(crate) fn accepted(env: &Env, kind: &str, name: &str, ns: &str) -> Result<bool> {
+pub(crate) fn accepted(env: &Cluster, kind: &str, name: &str, ns: &str) -> Result<bool> {
     let s = env.kubectl(&[
         "get",
         kind,
@@ -222,7 +215,7 @@ pub(crate) fn accepted(env: &Env, kind: &str, name: &str, ns: &str) -> Result<bo
 }
 
 /// Envoy Gateway's logs and the Gateway API objects, for a failed run.
-pub(crate) fn dump(env: &Env) {
+pub(crate) fn dump(env: &Cluster) {
     for args in [
         vec![
             "get",
@@ -247,7 +240,7 @@ fn envoy_selector() -> String {
 }
 
 /// The name of the Gateway's Envoy Service in `envoy-gateway-system`.
-pub(crate) fn envoy_service(env: &Env) -> Result<String> {
+pub(crate) fn envoy_service(env: &Cluster) -> Result<String> {
     let svc = env.kubectl(&[
         "get",
         "svc",
@@ -264,13 +257,13 @@ pub(crate) fn envoy_service(env: &Env) -> Result<String> {
 }
 
 /// In-cluster DNS name of the Gateway's Envoy Service.
-pub(crate) fn envoy_host(env: &Env) -> Result<String> {
+pub(crate) fn envoy_host(env: &Cluster) -> Result<String> {
     Ok(format!("{}.{EG_NS}.svc", envoy_service(env)?))
 }
 
 /// Pod IPs of the Gateway's Envoy pods: the source addresses of every
 /// connection Envoy opens to a backend.
-pub(crate) fn envoy_pod_ips(env: &Env) -> Result<Vec<String>> {
+pub(crate) fn envoy_pod_ips(env: &Cluster) -> Result<Vec<String>> {
     let ips = env.kubectl(&[
         "get",
         "pods",
@@ -290,24 +283,28 @@ pub(crate) fn envoy_pod_ips(env: &Env) -> Result<Vec<String>> {
 /// `kubectl port-forward` to a port of the Gateway's Envoy Service, on a free
 /// local port. Stopped when dropped.
 pub(crate) struct PortForward {
-    child: std::process::Child,
+    /// Held only to stop kubectl when dropped.
+    _child: crate::proc::Spawned,
     pub(crate) local: u16,
 }
 
 impl PortForward {
-    pub(crate) fn envoy(env: &Env, port: u16) -> Result<Self> {
+    pub(crate) fn envoy(env: &Cluster, port: u16) -> Result<Self> {
         let svc = envoy_service(env)?;
-        let mut child = crate::kube::kubectl(&env.kubeconfig)
-            .arg("--kubeconfig")
-            .arg(&env.kubeconfig)
-            .args(["port-forward", "-n", EG_NS])
-            .arg(format!("svc/{svc}"))
-            .arg(format!(":{port}"))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("kubectl port-forward")?;
-        let stdout = child.stdout.take().context("port-forward stdout")?;
+        let mut child = crate::proc::Spawned::spawn(
+            env.kubectl_cmd()
+                .args(["port-forward", "-n", EG_NS])
+                .arg(format!("svc/{svc}"))
+                .arg(format!(":{port}"))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+        )
+        .context("kubectl port-forward")?;
+        let stdout = child
+            .child()?
+            .stdout
+            .take()
+            .context("port-forward stdout")?;
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
         reader.read_line(&mut line)?;
@@ -320,18 +317,14 @@ impl PortForward {
             .nth(2)
             .and_then(|a| a.rsplit_once(':'))
             .and_then(|(_, p)| p.parse().ok());
+        // Dropping the child on this return stops kubectl.
         let Some(local) = local else {
-            let _ = child.kill();
             bail!("unexpected port-forward output: {line:?}");
         };
-        Ok(Self { child, local })
-    }
-}
-
-impl Drop for PortForward {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        Ok(Self {
+            _child: child,
+            local,
+        })
     }
 }
 

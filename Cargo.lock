@@ -3390,6 +3390,7 @@ dependencies = [
  "serde-saphyr 2.0.0",
  "serde_json",
  "time",
+ "tokio",
 ]
 
 [[package]]

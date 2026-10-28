@@ -13,7 +13,7 @@ gateway: {enabled: false}
 # Long enough that a Lease move inside it shows the Lease went before the listeners.
 shutdown: {delay: 10s}
 edge:
-  endpoint: tcp://localhost:28444
+  endpoint: tcp://localhost:EDGE_PORT
   serverName: bk.drain.test
   extraNames: [localhost, 127.0.0.1]
 pools:
@@ -28,7 +28,7 @@ pools:
         spec:
           containers:
             - name: buildkitd
-              image: moby/buildkit:v0.34.0-rootless
+              image: WORKER_IMAGE
               imagePullPolicy: Never
               resources:
                 requests: {cpu: 100m, memory: 256Mi, ephemeral-storage: 256Mi}

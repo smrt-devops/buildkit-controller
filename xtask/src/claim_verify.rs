@@ -16,13 +16,13 @@
 //! Every call uses the private kubeconfig under `target/claim-verify`, and
 //! the cluster is deleted on every exit path.
 
-use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 
-use crate::helm_verify::{Env, until};
 use crate::image::WORKER_IMAGE;
+use crate::kube::Cluster;
+use crate::proc::until;
 use crate::root;
 
 const NS: &str = "bk-claim";
@@ -34,33 +34,14 @@ const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const ANN_OWNER: &str = "buildkit.smrt-devops.net/owner";
 const ANN_ALLOC: &str = "buildkit.smrt-devops.net/alloc";
 
-fn cluster() -> String {
-    super::kind_cluster("bk-claim-verify")
-}
-
-/// Deletes the cluster when dropped, including on failure.
-struct Cleanup(Env, String);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = self
-            .0
-            .tool("kind", &["delete", "cluster", "--name", &self.1]);
-    }
-}
-
 pub(crate) fn claim_verify() -> Result<()> {
     let work = root().join("target/claim-verify");
     std::fs::create_dir_all(&work)?;
-    let name = cluster();
-    let cleanup = Cleanup(
-        Env {
-            kubeconfig: work.join("kubeconfig"),
-        },
-        name.clone(),
+    let env = &Cluster::new(
+        &super::kind_cluster("bk-claim-verify"),
+        work.join("kubeconfig"),
     );
-    let env = &cleanup.0;
-    let result = verify(env, &name);
+    let result = verify(env);
     if result.is_err() {
         for args in [
             vec!["get", "pods,bkc", "-A", "-o", "wide"],
@@ -89,14 +70,14 @@ fn claim_yaml(ns: &str, name: &str, ttl: &str, extra: &str) -> String {
     )
 }
 
-fn apply(env: &Env, work: &std::path::Path, file: &str, yaml: &str) -> Result<String> {
+fn apply(env: &Cluster, work: &std::path::Path, file: &str, yaml: &str) -> Result<String> {
     let path = work.join(file);
     std::fs::write(&path, yaml)?;
     env.kubectl(&["apply", "-f", &path.to_string_lossy()])
 }
 
 /// `phase reason` of a claim.
-fn state(env: &Env, ns: &str, name: &str) -> Result<String> {
+fn state(env: &Cluster, ns: &str, name: &str) -> Result<String> {
     env.kubectl(&[
         "get",
         "bkc",
@@ -108,20 +89,26 @@ fn state(env: &Env, ns: &str, name: &str) -> Result<String> {
     ])
 }
 
-fn wait_phase(env: &Env, ns: &str, name: &str, phase: &str, timeout: Duration) -> Result<String> {
+fn wait_phase(
+    env: &Cluster,
+    ns: &str,
+    name: &str,
+    phase: &str,
+    timeout: Duration,
+) -> Result<String> {
     until(&format!("claim {ns}/{name} {phase}"), timeout, || {
         let s = state(env, ns, name)?;
         Ok(s.starts_with(phase).then_some(s))
     })
 }
 
-fn secret_exists(env: &Env, ns: &str, claim: &str) -> Result<bool> {
+fn secret_exists(env: &Cluster, ns: &str, claim: &str) -> Result<bool> {
     let out = env.kubectl(&["get", "secrets", "-n", ns, "-o", "name"])?;
     Ok(out.lines().any(|l| l == format!("secret/{claim}-buildkit")))
 }
 
 /// Pool pods as `name owner alloc phase` lines.
-fn workers(env: &Env) -> Result<String> {
+fn workers(env: &Cluster) -> Result<String> {
     let esc = |k: &str| k.replace('.', "\\.");
     env.kubectl(&[
         "get", "pods", "-n", POOL_NS, "-o",
@@ -134,24 +121,13 @@ fn workers(env: &Env) -> Result<String> {
 }
 
 #[allow(clippy::too_many_lines, reason = "one linear scenario script")]
-fn verify(env: &Env, cluster: &str) -> Result<()> {
+fn verify(env: &Cluster) -> Result<()> {
     let root = root();
     let work = root.join("target/claim-verify");
-    let _ = env.tool("kind", &["delete", "cluster", "--name", cluster]);
-    env.tool(
-        "kind",
-        &["create", "cluster", "--name", cluster, "--wait", "120s"],
-    )?;
-    crate::image::image(CONTROLLER_IMAGE, Some(cluster))?;
-    let ok = |c: &mut Command| -> Result<()> {
-        ensure!(
-            c.status().with_context(|| format!("{c:?}"))?.success(),
-            "{c:?} failed"
-        );
-        Ok(())
-    };
+    env.create(None, "120s")?;
+    crate::image::image(CONTROLLER_IMAGE, Some(env.name()))?;
     crate::image::ensure_worker()?;
-    ok(&mut crate::kube::kind_load(WORKER_IMAGE, cluster))?;
+    crate::proc::status(&mut crate::kube::kind_load(WORKER_IMAGE, env.name()))?;
     for ns in [NS, POOL_NS, OK_NS, DENIED_NS, UNLISTED_NS] {
         env.kubectl(&["create", "namespace", ns])?;
     }
@@ -159,24 +135,20 @@ fn verify(env: &Env, cluster: &str) -> Result<()> {
         .join("helm/buildkit-controller")
         .to_string_lossy()
         .into_owned();
-    let values = root
-        .join("xtask/fixtures/claim-verify/values.yaml")
+    let values = crate::fixture("claim-verify/values.yaml", &work, &[])?
         .to_string_lossy()
         .into_owned();
-    env.tool(
-        "helm",
-        &[
-            "install",
-            "bk",
-            &chart,
-            "-n",
-            NS,
-            "-f",
-            &values,
-            "--timeout",
-            "5m",
-        ],
-    )?;
+    env.helm(&[
+        "install",
+        "bk",
+        &chart,
+        "-n",
+        NS,
+        "-f",
+        &values,
+        "--timeout",
+        "5m",
+    ])?;
     until("pool Ready with a warm pod", Duration::from_mins(5), || {
         let s = env.kubectl(&[
             "get",
@@ -197,10 +169,7 @@ fn verify(env: &Env, cluster: &str) -> Result<()> {
         &path,
         claim_yaml(OK_NS, "keyed", "10m", "  cacheKey: Bad_Key\n"),
     )?;
-    let out = crate::kube::kubectl(&env.kubeconfig)
-        .args(["apply", "-f", &path.to_string_lossy(), "--kubeconfig"])
-        .arg(&env.kubeconfig)
-        .output()?;
+    let out = env.kubectl_raw(&["apply", "-f", &path.to_string_lossy()], None)?;
     let err = String::from_utf8_lossy(&out.stderr);
     ensure!(
         !out.status.success() && err.contains("cacheKey"),

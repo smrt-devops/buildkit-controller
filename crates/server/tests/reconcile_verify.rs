@@ -1,5 +1,5 @@
 //! Reconciler scenarios on a real API server. Run by `cargo xtask
-//! reconcile-verify`, which provides a kind cluster (`KUBECONFIG`, admin), a
+//! reconcile-verify`, which provides a kind cluster (`BK_TEST_KUBECONFIG`, admin), a
 //! controller process on the host (`RV_OPS` ops address, authenticated as the
 //! only user the API server's audit policy logs) and the node container
 //! (`RV_NODE`) holding the audit log; ignored otherwise.
@@ -14,6 +14,9 @@
     clippy::too_many_lines,
     clippy::cast_possible_truncation
 )]
+
+#[path = "support/kind.rs"]
+mod harness;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
@@ -465,10 +468,9 @@ impl Replica {
         let path = dir.join(format!("{name}.yaml"));
         std::fs::write(&path, &text).unwrap();
         let log = std::fs::File::create(dir.join(format!("{name}.log"))).unwrap();
-        let child = Command::new(env("RV_BIN"))
+        let child = harness::controller(env("RV_BIN").as_ref(), env("RV_CTRL_KUBECONFIG").as_ref())
             .arg("--config")
             .arg(&path)
-            .env("KUBECONFIG", env("RV_CTRL_KUBECONFIG"))
             .env("POD_NAME", name)
             .env("POD_NAMESPACE", env("RV_NAMESPACE"))
             .env("LOG_LEVEL", "info,buildkit_controller=debug")
@@ -529,7 +531,7 @@ fn ts(p: &Pod, key: &str) -> jiff::Timestamp {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a kind cluster; run `cargo xtask reconcile-verify`"]
 async fn reconcile_verify() {
-    let client = Client::try_default().await.unwrap();
+    let client = harness::client().await;
     let ctrl_ns = env("RV_NAMESPACE");
     let image = env("RV_IMAGE");
     let config = Config::from_yaml(&std::fs::read_to_string(env("RV_CONFIG")).unwrap()).unwrap();

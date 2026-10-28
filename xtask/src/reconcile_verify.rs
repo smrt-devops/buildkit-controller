@@ -1,4 +1,3 @@
-//! `cargo xtask reconcile-verify`: the reconciler against a real API server.
 //! `cargo xtask reconcile-verify` tests the reconciler against a real API server.
 //!
 //! The task creates the kind cluster `bk-reconcile-verify` with an API-server
@@ -16,18 +15,19 @@
 //! The scenarios get the binary (`RV_BIN`) and its kubeconfig
 //! (`RV_CTRL_KUBECONFIG`) to start and kill a second replica of their own.
 //!
-//! Every kind and kubectl call passes `--kubeconfig target/reconcile-verify/...`.
+//! Every kind and kubectl call uses the private kubeconfig under
+//! `target/reconcile-verify`, which the scenarios read from `BK_TEST_KUBECONFIG`.
 //! The task never reads or writes `~/.kube/config`. It kills the controller and
 //! deletes the cluster on every exit path.
 
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, ensure};
 
-static CLUSTER: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| super::kind_cluster("bk-reconcile-verify"));
+use crate::kube::Cluster;
+use crate::proc::Spawned;
+
 /// Namespace of the controller (Lease, CA Secret, Events).
 const NAMESPACE: &str = "bk-reconcile";
 const SA: &str = "buildkit-controller";
@@ -74,55 +74,9 @@ nodes:
         pathType: DirectoryOrCreate
 ";
 
-/// Kills the controller and deletes the cluster when dropped.
-struct Cleanup {
-    kubeconfig: PathBuf,
-    controller: Option<Child>,
-}
-
-impl Cleanup {
-    fn kind(&self, args: &[&str]) -> Result<std::process::Output> {
-        crate::kube::kind(&self.kubeconfig)
-            .args(args)
-            .arg("--kubeconfig")
-            .arg(&self.kubeconfig)
-            .output()
-            .context("running kind")
-    }
-
-    fn kubectl(&self, args: &[&str]) -> Result<String> {
-        let out = crate::kube::kubectl(&self.kubeconfig)
-            .arg("--kubeconfig")
-            .arg(&self.kubeconfig)
-            .args(args)
-            .output()
-            .context("running kubectl")?;
-        ensure!(
-            out.status.success(),
-            "kubectl {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    }
-}
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        if let Some(c) = &mut self.controller {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-        let _ = self.kind(&["delete", "cluster", "--name", CLUSTER.as_str()]);
-    }
-}
-
-fn free_port() -> Result<u16> {
-    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
-}
-
 /// A kubeconfig that authenticates as the controller's `ServiceAccount`, so the
 /// audit policy can pick out its requests.
-fn controller_kubeconfig(c: &Cleanup, work: &Path) -> Result<PathBuf> {
+fn controller_kubeconfig(c: &Cluster, work: &Path) -> Result<PathBuf> {
     c.kubectl(&["create", "namespace", NAMESPACE])?;
     c.kubectl(&["-n", NAMESPACE, "create", "serviceaccount", SA])?;
     c.kubectl(&[
@@ -172,107 +126,59 @@ pub fn reconcile_verify() -> Result<()> {
         KIND_CONFIG.replace("POLICY_DIR", &policies.display().to_string()),
     )?;
     crate::image::ensure_worker()?;
-    let built = Command::new("cargo")
-        .args(["build", "--locked", "-p", "buildkit-controller"])
-        .current_dir(&root)
-        .status()?;
-    ensure!(built.success(), "cargo build failed");
-    let bin = root.join("target/debug/buildkit-controller");
+    let bin = crate::build_controller()?;
 
-    let mut c = Cleanup {
-        kubeconfig: work.join("kubeconfig"),
-        controller: None,
-    };
-    let _ = c.kind(&["delete", "cluster", "--name", CLUSTER.as_str()]);
-    let kc = kind_config.display().to_string();
-    let created = c.kind(&[
-        "create",
-        "cluster",
-        "--name",
-        CLUSTER.as_str(),
-        "--config",
-        &kc,
-        "--wait",
-        "180s",
-    ])?;
-    ensure!(
-        created.status.success(),
-        "kind create: {}",
-        String::from_utf8_lossy(&created.stderr)
+    let c = Cluster::new(
+        &super::kind_cluster("bk-reconcile-verify"),
+        work.join("kubeconfig"),
     );
-    let loaded = crate::kube::kind_load(IMAGE, CLUSTER.as_str()).status()?;
-    ensure!(loaded.success(), "kind load docker-image failed");
+    c.create(Some(&kind_config), "180s")?;
+    crate::proc::status(&mut crate::kube::kind_load(IMAGE, c.name()))?;
     let crd = work.join("crd.yaml");
     std::fs::write(&crd, crate::render_crd()?)?;
     c.kubectl(&["apply", "-f", &crd.display().to_string()])?;
-    crate::kube::wait_crd_established(&c.kubeconfig)?;
+    c.wait_crd_established()?;
     let ctrl_kc = controller_kubeconfig(&c, &work)?;
 
-    let ops = free_port()?;
+    let [ops, api, edge] = crate::proc::free_ports()?;
     let config = work.join("controller.yaml");
     std::fs::write(
         &config,
         format!(
-            "listen:\n  ops: 127.0.0.1:{ops}\n  api: 127.0.0.1:{}\n  edge: 127.0.0.1:{}\nedge:\n  endpoint: tcp://bk.example.com:8444\n  serverName: bk.example.com\nworkerNetwork:\n  extraDeniedCIDRs: [203.0.113.0/24]\n  dns:\n    namespace: rv-dns\n    podLabels: {{rv-dns: \"yes\"}}\n    cidrs: [198.51.100.53/32]\nshutdown:\n  delay: 0s\n  drainTimeout: 5s\n",
-            free_port()?,
-            free_port()?
+            "listen:\n  ops: 127.0.0.1:{ops}\n  api: 127.0.0.1:{api}\n  edge: 127.0.0.1:{edge}\nedge:\n  endpoint: tcp://bk.example.com:8444\n  serverName: bk.example.com\nworkerNetwork:\n  extraDeniedCIDRs: [203.0.113.0/24]\n  dns:\n    namespace: rv-dns\n    podLabels: {{rv-dns: \"yes\"}}\n    cidrs: [198.51.100.53/32]\nshutdown:\n  delay: 0s\n  drainTimeout: 5s\n",
         ),
     )?;
     let log = std::fs::File::create(work.join("controller.log"))?;
-    c.controller = Some(
-        Command::new(&bin)
-            .arg("--config")
-            .arg(&config)
-            .env("KUBECONFIG", &ctrl_kc)
-            .env("POD_NAME", "rv-0")
-            .env("POD_NAMESPACE", NAMESPACE)
-            .env("LOG_LEVEL", "info,buildkit_controller=debug")
-            .stdout(Stdio::from(log.try_clone()?))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .context("starting the controller")?,
-    );
+    let mut controller = Command::new(&bin);
+    crate::kube::with_kubeconfig(&mut controller, &ctrl_kc)
+        .arg("--config")
+        .arg(&config)
+        .env("POD_NAME", "rv-0")
+        .env("POD_NAMESPACE", NAMESPACE)
+        .env("LOG_LEVEL", "info,buildkit_controller=debug")
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log));
+    // Declared after the cluster, so it is killed before the cluster is deleted.
+    let mut controller = Spawned::spawn(&mut controller).context("starting the controller")?;
     std::thread::sleep(std::time::Duration::from_secs(5));
-    let early = c
-        .controller
-        .as_mut()
-        .map(Child::try_wait)
-        .transpose()?
-        .flatten();
+    let early = controller.try_wait()?;
     ensure!(early.is_none(), "controller exited at startup: {early:?}");
-    let tests = Command::new("cargo")
-        .current_dir(&root)
-        .env("KUBECONFIG", &c.kubeconfig)
+    let tests = c
+        .server_test("reconcile_verify")
         .env("RV_OPS", format!("127.0.0.1:{ops}"))
-        .env("RV_NODE", format!("{}-control-plane", CLUSTER.as_str()))
+        .env("RV_NODE", format!("{}-control-plane", c.name()))
         .env("RV_NAMESPACE", NAMESPACE)
         .env("RV_CONFIG", &config)
         .env("RV_IMAGE", IMAGE)
         .env("RV_BIN", &bin)
         .env("RV_CTRL_KUBECONFIG", &ctrl_kc)
-        .args([
-            "test",
-            "--locked",
-            "-p",
-            "buildkit-controller",
-            "--test",
-            "reconcile_verify",
-            "--",
-            "--ignored",
-            "--nocapture",
-        ])
         .status()?;
     ensure!(
         tests.success(),
         "reconcile_verify scenarios failed (controller log: {})",
         work.join("controller.log").display()
     );
-    let exited = c
-        .controller
-        .as_mut()
-        .map(Child::try_wait)
-        .transpose()?
-        .flatten();
+    let exited = controller.try_wait()?;
     ensure!(
         exited.is_none(),
         "controller exited during the scenarios: {exited:?} (log: {})",

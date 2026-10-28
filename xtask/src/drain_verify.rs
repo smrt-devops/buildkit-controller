@@ -16,7 +16,7 @@
 //!
 //! The client is the real curl recipe `docs/ci/buildkit-allocate.sh` and real
 //! `docker buildx` on the host, through the API and edge that kind publishes on
-//! 127.0.0.1:28443 and :28444. The cluster name is `bk-drain-verify`, plus
+//! two loopback ports, 28443 and 28444 by default (see [`PORTS`]). The cluster name is `bk-drain-verify`, plus
 //! `-$BK_KIND_SUFFIX` when that is set. Every kind, kubectl and helm call uses
 //! the private kubeconfig under `target/drain-verify`, and the cluster is
 //! deleted on every exit path.
@@ -24,22 +24,33 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
+use base64::Engine as _;
 
-use crate::helm_verify::{Env, until};
-use crate::image::WORKER_IMAGE;
+use crate::image::copy_busybox;
+use crate::kube::{Cluster, HostPorts};
+use crate::proc::{Spawned, status, stdout as output, until};
 use crate::root;
 
-fn cluster() -> String {
-    super::kind_cluster("bk-drain-verify")
-}
+/// The loopback host ports of the chart's API and edge `NodePorts`: 28443 and
+/// 28444 without `BK_KIND_SUFFIX`, else a pair in 22000-23999 per suffix.
+static PORTS: std::sync::LazyLock<HostPorts> = std::sync::LazyLock::new(|| {
+    HostPorts::get(
+        HostPorts {
+            api: 28443,
+            edge: 28444,
+        },
+        22000,
+    )
+});
+static API: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("https://localhost:{}", PORTS.api));
 const NS: &str = "bk-drain";
 const POOL_NS: &str = "drain-ci";
 const POOL: &str = "drain";
-const API: &str = "https://localhost:28443";
 const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const DEPLOY: &str = "deploy/buildkit-controller";
 const LEASE: &str = "buildkit-controller-leader";
@@ -52,23 +63,13 @@ const OLD_BUDGET: Duration = Duration::from_mins(5);
 /// The longest a Lease may take to move after SIGTERM to the leader.
 const LEASE_MOVE_MAX: Duration = Duration::from_secs(15);
 
-struct Cleanup(Env);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = self
-            .0
-            .tool("kind", &["delete", "cluster", "--name", cluster().as_str()]);
-    }
-}
-
 pub(crate) fn drain_verify() -> Result<()> {
     let work = root().join("target/drain-verify");
     std::fs::create_dir_all(&work)?;
-    let cleanup = Cleanup(Env {
-        kubeconfig: work.join("kubeconfig"),
-    });
-    let env = &cleanup.0;
+    let env = &Cluster::new(
+        &super::kind_cluster("bk-drain-verify"),
+        work.join("kubeconfig"),
+    );
     let result = run(env, &work);
     if result.is_err() {
         diagnose(env);
@@ -76,7 +77,7 @@ pub(crate) fn drain_verify() -> Result<()> {
     result
 }
 
-fn diagnose(env: &Env) {
+fn diagnose(env: &Cluster) {
     for args in [
         vec!["get", "pods", "-A", "-o", "wide"],
         vec!["get", "lease", LEASE, "-n", NS, "-o", "yaml"],
@@ -95,7 +96,7 @@ fn diagnose(env: &Env) {
     }
 }
 
-fn run(env: &Env, work: &Path) -> Result<()> {
+fn run(env: &Cluster, work: &Path) -> Result<()> {
     let ca = install(env, work)?;
     let token = env
         .kubectl(&[
@@ -125,28 +126,22 @@ fn run(env: &Env, work: &Path) -> Result<()> {
     Ok(())
 }
 
-fn install(env: &Env, work: &Path) -> Result<PathBuf> {
+fn install(env: &Cluster, work: &Path) -> Result<PathBuf> {
     let root = root();
-    let _ = env.tool("kind", &["delete", "cluster", "--name", cluster().as_str()]);
-    let kind_cfg = root.join("xtask/fixtures/drain-verify/kind.yaml");
-    env.tool(
-        "kind",
-        &[
-            "create",
-            "cluster",
-            "--name",
-            cluster().as_str(),
-            "--config",
-            &kind_cfg.to_string_lossy(),
-            "--wait",
-            "120s",
-        ],
-    )?;
-    crate::image::image(CONTROLLER_IMAGE, Some(cluster().as_str()))?;
+    // A leftover cluster of this name holds the ports; delete it before checking them.
+    env.delete();
+    PORTS.check_free(env.name())?;
+    let ports = [
+        ("API_PORT", PORTS.api.to_string()),
+        ("EDGE_PORT", PORTS.edge.to_string()),
+    ];
+    let kind_cfg = crate::fixture("drain-verify/kind.yaml", work, &ports)?;
+    env.create(Some(&kind_cfg), "120s")?;
+    crate::image::image(CONTROLLER_IMAGE, Some(env.name()))?;
     crate::image::ensure_worker()?;
     status(&mut crate::kube::kind_load(
-        WORKER_IMAGE,
-        cluster().as_str(),
+        crate::image::WORKER_IMAGE,
+        env.name(),
     ))?;
 
     for ns in [NS, POOL_NS] {
@@ -154,21 +149,18 @@ fn install(env: &Env, work: &Path) -> Result<PathBuf> {
     }
     env.kubectl(&["create", "serviceaccount", "builder", "-n", POOL_NS])?;
     let chart = root.join("helm/buildkit-controller");
-    let values = root.join("xtask/fixtures/drain-verify/values.yaml");
-    env.tool(
-        "helm",
-        &[
-            "install",
-            "bk",
-            &chart.to_string_lossy(),
-            "-n",
-            NS,
-            "-f",
-            &values.to_string_lossy(),
-            "--timeout",
-            "5m",
-        ],
-    )?;
+    let values = crate::fixture("drain-verify/values.yaml", work, &ports)?;
+    env.helm(&[
+        "install",
+        "bk",
+        &chart.to_string_lossy(),
+        "-n",
+        NS,
+        "-f",
+        &values.to_string_lossy(),
+        "--timeout",
+        "5m",
+    ])?;
     let grace = env.kubectl(&[
         "get",
         DEPLOY,
@@ -195,8 +187,9 @@ fn install(env: &Env, work: &Path) -> Result<PathBuf> {
         "-o",
         "jsonpath={.data.client-ca\\.crt}",
     ])?;
-    let decoded =
-        output(Command::new("sh").args(["-c", &format!("printf %s '{ca}' | base64 -d")]))?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(ca.trim())
+        .context("decoding client-ca.crt")?;
     let path = work.join("api-ca.pem");
     std::fs::write(&path, decoded)?;
     until("API listener", Duration::from_mins(2), || {
@@ -204,7 +197,7 @@ fn install(env: &Env, work: &Path) -> Result<PathBuf> {
         let probe = Command::new("curl")
             .args(["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--cacert"])
             .arg(&path)
-            .arg(format!("{API}/v1/pools"))
+            .arg(format!("{}/v1/pools", *API))
             .output()?;
         Ok(String::from_utf8_lossy(&probe.stdout)
             .starts_with("401")
@@ -213,7 +206,7 @@ fn install(env: &Env, work: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn wait_pool_warm(env: &Env) -> Result<()> {
+fn wait_pool_warm(env: &Cluster) -> Result<()> {
     until(
         "pool Ready with one warm worker",
         Duration::from_mins(5),
@@ -232,27 +225,8 @@ fn wait_pool_warm(env: &Env) -> Result<()> {
     )
 }
 
-fn status(c: &mut Command) -> Result<()> {
-    ensure!(
-        c.status().with_context(|| format!("{c:?}"))?.success(),
-        "{c:?} failed"
-    );
-    Ok(())
-}
-
-fn output(c: &mut Command) -> Result<String> {
-    let o = c.output().with_context(|| format!("{c:?}"))?;
-    ensure!(
-        o.status.success(),
-        "{c:?} failed:\n{}{}",
-        String::from_utf8_lossy(&o.stdout),
-        String::from_utf8_lossy(&o.stderr)
-    );
-    Ok(String::from_utf8_lossy(&o.stdout).into_owned())
-}
-
 /// Controller pods by name: `(ready, terminating)`.
-fn controller_pods(env: &Env) -> Result<BTreeMap<String, (bool, bool)>> {
+fn controller_pods(env: &Cluster) -> Result<BTreeMap<String, (bool, bool)>> {
     let out = env.kubectl(&[
         "get", "pods", "-n", NS, "-l", SELECTOR, "-o",
         "jsonpath={range .items[*]}{.metadata.name} {.status.containerStatuses[0].ready} {.metadata.deletionTimestamp}{\"\\n\"}{end}",
@@ -268,7 +242,7 @@ fn controller_pods(env: &Env) -> Result<BTreeMap<String, (bool, bool)>> {
 }
 
 /// Ready controller pods that are not terminating.
-fn live_controllers(env: &Env) -> Result<Vec<String>> {
+fn live_controllers(env: &Cluster) -> Result<Vec<String>> {
     Ok(controller_pods(env)?
         .into_iter()
         .filter(|(_, (ready, terminating))| *ready && !terminating)
@@ -277,7 +251,7 @@ fn live_controllers(env: &Env) -> Result<Vec<String>> {
 }
 
 /// Sum of the samples of metric `name` on controller pod `pod`.
-fn metric(env: &Env, pod: &str, name: &str) -> Result<f64> {
+fn metric(env: &Cluster, pod: &str, name: &str) -> Result<f64> {
     let text = env.kubectl(&[
         "get",
         "--raw",
@@ -290,7 +264,7 @@ fn metric(env: &Env, pod: &str, name: &str) -> Result<f64> {
         .sum())
 }
 
-fn lease_holder(env: &Env) -> Result<String> {
+fn lease_holder(env: &Cluster) -> Result<String> {
     Ok(env
         .kubectl(&[
             "get",
@@ -303,36 +277,6 @@ fn lease_holder(env: &Env) -> Result<String> {
         ])?
         .trim()
         .to_owned())
-}
-
-/// Copies busybox and the musl loader out of the worker image into `dir`, as a
-/// tar stream (the rootless image cannot write to a host bind mount).
-fn copy_busybox(dir: &Path) -> Result<()> {
-    let mut docker = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "--entrypoint",
-            "sh",
-            WORKER_IMAGE,
-            "-c",
-            "cd / && tar -chf - bin/busybox lib/ld-musl-*.so.1 lib/libc.musl-*.so.1",
-        ])
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("starting docker run for busybox")?;
-    let stream = docker.stdout.take().context("docker stdout")?;
-    let untar = Command::new("tar")
-        .args(["-xf", "-", "-C"])
-        .arg(dir)
-        .stdin(stream)
-        .status()
-        .context("running tar")?;
-    ensure!(
-        docker.wait()?.success() && untar.success(),
-        "copying busybox failed"
-    );
-    Ok(())
 }
 
 /// A build context whose RUN step prints `tick N` every 5 s for [`BUILD_SECS`].
@@ -352,7 +296,7 @@ fn prepare(work: &Path) -> Result<PathBuf> {
 }
 
 struct Client<'a> {
-    env: &'a Env,
+    env: &'a Cluster,
     ca: PathBuf,
     token: String,
     work: PathBuf,
@@ -388,7 +332,7 @@ impl Client<'_> {
             .arg(self.work.join(format!("{tag}.body")))
             .args(["-w", "%{http_code}", "-H", "Content-Type: application/json"])
             .args(["--data", &body])
-            .arg(format!("{API}/v1/allocations"))
+            .arg(format!("{}/v1/allocations", *API))
             .stdout(File::create(self.work.join(format!("{tag}.code")))?);
         Ok(c)
     }
@@ -411,7 +355,7 @@ impl Client<'_> {
         let code = output(
             self.curl()?
                 .args(["-o", "/dev/null", "-w", "%{http_code}", "-X", "DELETE"])
-                .arg(format!("{API}/v1/allocations/{id}")),
+                .arg(format!("{}/v1/allocations/{id}", *API)),
         )?;
         ensure!(code == "204", "release {id}: HTTP {code}");
         Ok(())
@@ -423,7 +367,8 @@ fn build_survives_rollout(c: &Client<'_>, ctx: &Path) -> Result<()> {
     let env = c.env;
     let log_path = c.work.join("build.log");
     let log = File::create(&log_path)?;
-    let mut build = Command::new("sh")
+    let mut build = Command::new("sh");
+    build
         .arg(root().join("docs/ci/buildkit-allocate.sh"))
         .args([
             "sh",
@@ -431,19 +376,18 @@ fn build_survives_rollout(c: &Client<'_>, ctx: &Path) -> Result<()> {
             "docker buildx build --builder \"$BUILDER\" --progress=plain --no-cache -o type=cacheonly .",
         ])
         .current_dir(ctx)
-        .env("API", API)
+        .env("API", API.as_str())
         .env("API_CA", &c.ca)
         .env("POOL", format!("{POOL_NS}/{POOL}"))
         .env("TOKEN", &c.token)
         .env("TTL", "1800")
         .env("QUEUE_TIMEOUT", "120")
         .stdout(log.try_clone()?)
-        .stderr(log)
-        .spawn()?;
+        .stderr(log);
+    let mut build = Spawned::spawn(&mut build)?;
     let result = watch_build(c, &mut build, &log_path);
     if result.is_err() {
-        let _ = build.kill();
-        let _ = build.wait();
+        build.kill();
         eprintln!(
             "--- build log\n{}",
             std::fs::read_to_string(&log_path).unwrap_or_default()
@@ -462,7 +406,7 @@ fn has_tick(log: &Path, n: u64) -> bool {
         .any(|l| l.trim_end().ends_with(&want))
 }
 
-fn watch_build(c: &Client<'_>, build: &mut Child, log: &Path) -> Result<()> {
+fn watch_build(c: &Client<'_>, build: &mut Spawned, log: &Path) -> Result<()> {
     let env = c.env;
     until(
         "the build's RUN step to start",
@@ -548,7 +492,7 @@ fn watch_build(c: &Client<'_>, build: &mut Child, log: &Path) -> Result<()> {
 }
 
 /// b. SIGTERM to the leader moves the Lease to a live replica within seconds.
-fn lease_moves_on_sigterm(env: &Env) -> Result<()> {
+fn lease_moves_on_sigterm(env: &Cluster) -> Result<()> {
     let holder = until("a lease holder", Duration::from_mins(1), || {
         let h = lease_holder(env)?;
         Ok((!h.is_empty()).then_some(h))
@@ -601,7 +545,7 @@ fn queued_request_gets_503(c: &Client<'_>) -> Result<()> {
     wait_pool_warm(env)?;
     let held = c.allocate_ok("a", 0)?;
     println!("holding the only worker with allocation {held}");
-    let mut queued = c.allocate("b", 300)?.spawn()?;
+    let mut queued = Spawned::spawn(&mut c.allocate("b", 300)?)?;
     let replica = until(
         "the second request to queue",
         Duration::from_mins(1),
@@ -634,7 +578,7 @@ fn queued_request_gets_503(c: &Client<'_>) -> Result<()> {
             break s;
         }
         if t0.elapsed() > Duration::from_mins(1) {
-            let _ = queued.kill();
+            queued.kill();
             bail!("the queued request got no answer within 60s of SIGTERM");
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -670,7 +614,7 @@ fn retry_is_counted_once(c: &Client<'_>, replica: &str, t0: Instant, held: &str)
     // The client retries at once, while the worker is still held, so it queues
     // on a live replica. The stopping replica's entry must already read 0, or
     // the leader counts the request twice and plans surplus workers.
-    let mut retry = c.allocate("b2", 120)?.spawn()?;
+    let mut retry = Spawned::spawn(&mut c.allocate("b2", 120)?)?;
     let cleared = until(
         "the stopping replica's waiters entry to clear and the retry to queue",
         Duration::from_secs(30),
@@ -721,7 +665,7 @@ fn retry_is_counted_once(c: &Client<'_>, replica: &str, t0: Instant, held: &str)
 }
 
 /// `status.waiters` of the pool, by replica.
-fn waiters(env: &Env) -> Result<BTreeMap<String, i32>> {
+fn waiters(env: &Cluster) -> Result<BTreeMap<String, i32>> {
     let w = env.kubectl(&[
         "get",
         "buildkitpool",
@@ -740,7 +684,7 @@ fn waiters(env: &Env) -> Result<BTreeMap<String, i32>> {
 }
 
 /// Highest `status.waiting` and live worker pod count seen over 20 s.
-fn watch_for_surplus(env: &Env) -> Result<(i32, usize)> {
+fn watch_for_surplus(env: &Cluster) -> Result<(i32, usize)> {
     let mut max_waiting = 0;
     let mut max_pods = 0;
     let watch = Instant::now();
