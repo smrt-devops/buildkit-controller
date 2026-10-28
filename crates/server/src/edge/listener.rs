@@ -240,12 +240,13 @@ pub async fn serve_with_proxy(
 /// How often a draining edge logs its open connection count.
 const DRAIN_LOG_EVERY: Duration = Duration::from_mins(1);
 
-/// The next connection; accept errors (e.g. `EMFILE`) are logged and retried
+/// The next connection, its peer an IPv4 address when it came as an
+/// IPv4-mapped one (a dual-stack listener). Accept errors (e.g. `EMFILE`) are logged and retried
 /// after a short pause.
 async fn accept(listener: &TcpListener) -> (TcpStream, SocketAddr) {
     loop {
         match listener.accept().await {
-            Ok(a) => return a,
+            Ok((tcp, peer)) => return (tcp, crate::runtime::listen::canonical(peer)),
             Err(e) => {
                 warn!(error = %e, "edge accept failed");
                 tokio::time::sleep(Duration::from_millis(50)).await;
