@@ -151,8 +151,7 @@ impl AppContext {
                 ca_secret_name: &settings.config.pki.ca_secret_name,
                 serving_secret_name: &settings.config.edge.tls.secret_name,
                 metrics: Arc::clone(&metrics),
-                pools_ready: readiness.register("pool_store"),
-                pods_ready: readiness.register("pod_store"),
+                readiness: Arc::clone(&readiness),
             },
             shutdown,
         );

@@ -42,14 +42,19 @@ pub fn router(state: OpsState) -> Router {
 
 async fn readyz(State(s): State<OpsState>) -> impl IntoResponse {
     let failing = s.readiness.failing();
-    if failing.is_empty() {
+    let degraded = s.readiness.degraded();
+    let (code, mut body) = if failing.is_empty() {
         (StatusCode::OK, "ok\n".to_owned())
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             format!("not ready: {}\n", failing.join(", ")),
         )
+    };
+    if !degraded.is_empty() {
+        body.push_str(&format!("degraded: {}\n", degraded.join(", ")));
     }
+    (code, body)
 }
 
 async fn metrics(State(s): State<OpsState>) -> impl IntoResponse {
@@ -162,6 +167,13 @@ mod tests {
         assert!(body.contains("pod_store"), "{body}");
         pods.set();
         assert_eq!(get_path(&app, "/readyz").await.0, StatusCode::OK);
+        // A namespace a watch gave up on is listed, but keeps the replica ready.
+        readiness.set_degraded("pod_store/team-b", true);
+        let (code, body) = get_path(&app, "/readyz").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body, "ok\ndegraded: pod_store/team-b\n");
+        readiness.set_degraded("pod_store/team-b", false);
+        assert_eq!(get_path(&app, "/readyz").await.1, "ok\n");
         readiness.set_shutting_down();
         let (code, body) = get_path(&app, "/readyz").await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
