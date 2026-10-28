@@ -46,7 +46,7 @@ A replica that gets SIGTERM, from a rollout, an HPA scale-in, a node drain or a 
 
 1. `/readyz` fails, so the replica leaves the Service endpoints.
 2. If it leads, it stops the reconciler and releases the Lease at once. Another replica leads within a few seconds, whatever the drain takes.
-3. After `shutdown.delay` (5 s) the API stops accepting connections. Requests already in flight finish. Allocation requests still queued on this replica, and new ones sent on a connection that was already open, get 503 `shutting_down` with `Retry-After: 1` before any worker is claimed for them, so a retry reaches another replica. The Action and the curl recipe retry it.
+3. After `shutdown.delay` (5 s) the API stops accepting connections. Requests already in flight finish. Allocation requests still queued on this replica, and new ones sent on a connection that was already open, get 503 `shutting_down` with `Retry-After: 1` before any worker is claimed for them, so a retry reaches another replica. The Action and the curl recipe retry it on their own (see [Retries](ci/README.md#retries)).
 4. The edge stops accepting connections and keeps the open ones until each ends on its own: the build finishes and the client releases the allocation, the allocation expires, the worker pod goes away, or the client certificate's `notAfter` passes. The Pod watch, revocation and certificate timers keep running until the last connection closes. Then the process exits.
 
 With `shutdown.drainTimeout` unset (the default), the drain has no fixed budget. It is bounded by the longest a connection can live: the 24h `maxTTL` cap plus the 5-minute certificate margin, 24h5m. The chart sets `terminationGracePeriodSeconds` to `shutdown.delay` + 86700 s + 10 s, so Kubernetes does not kill a draining replica early. Set `shutdown.drainTimeout` to cap the drain instead; connections still open at the cap are cut and counted as `buildkit_edge_revocations_total{reason="drain"}`, and the grace period becomes `shutdown.delay` + `shutdown.drainTimeout` + 10 s. A draining replica logs `edge draining` with its open connection count every minute.
@@ -141,7 +141,7 @@ Errors the API returns to clients, and the usual cause:
 - 404 `pool_not_found`. The pool does not exist, or no access rule matches the caller. The API never answers 403 for this, so pools cannot be probed.
 - 503 `pool_exhausted`. The pool is at `scaling.max` and the queue wait ran out. Raise `max`, or `queueTimeout`.
 - 503 `ca_unavailable`. The CA is being replaced. Retry shortly.
-- 503 `shutting_down` with `Retry-After: 1`. The replica that held the request is stopping (rollout, scale-in, node drain) and claimed nothing for it. Retry; the request reaches another replica.
+- 503 `shutting_down` with `Retry-After: 1`. The replica that held the request is stopping (rollout, scale-in, node drain) and claimed nothing for it. The Action and the curl recipe retry it, and the retry reaches another replica.
 
 A client that cannot connect to the edge usually has a certificate problem. Check `buildkit_edge_connections_total` for `tls_error`, `bad_san` and `expired`, and set `--set logLevel=debug` on the chart to see handshake failures. The curl recipe can use `API_CA` to trust a self-issued certificate.
 
