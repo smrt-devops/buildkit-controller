@@ -16,7 +16,7 @@ spec:
           claims:
             repository_owner_id: "12345678"   # the org's numeric id (gh api orgs/<org> --jq .id); names can be re-registered
             ref: refs/heads/main
-            event_name: push   # a ref rule also matches pull_request_target runs, which can run fork code
+            event_name: push   # pull_request_target runs can run fork code, so admit pushes only
       # One repository, any ref, but only pushes from release workflows.
       - oidc:
           issuer: https://token.actions.githubusercontent.com
