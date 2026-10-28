@@ -118,7 +118,8 @@ pub enum AuthError {
     /// `iss` is not a configured issuer and service-account auth is off.
     #[error("unknown issuer")]
     UnknownIssuer,
-    /// No usable JWKS for the issuer (fails closed).
+    /// No usable JWKS for the issuer. It fails closed with a retryable 503:
+    /// the token may be fine and the issuer unreachable.
     #[error("issuer keys unavailable")]
     KeysUnavailable,
     /// `TokenReview` timed out or failed with unknown outcome.
@@ -134,8 +135,8 @@ impl AuthError {
     #[must_use]
     pub fn status(&self) -> u16 {
         match self {
-            Self::Invalid(_) | Self::UnknownIssuer | Self::KeysUnavailable => 401,
-            Self::Upstream(_) => 503,
+            Self::Invalid(_) | Self::UnknownIssuer => 401,
+            Self::KeysUnavailable | Self::Upstream(_) => 503,
             Self::Internal(_) => 500,
         }
     }

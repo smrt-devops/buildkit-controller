@@ -856,7 +856,7 @@ fn error_mapping() {
             "unauthenticated",
             "unknown_issuer",
         ),
-        (AuthError::KeysUnavailable, 401, "unauthenticated", "error"),
+        (AuthError::KeysUnavailable, 503, "upstream_error", "error"),
         (
             AuthError::Upstream("x".into()),
             503,
