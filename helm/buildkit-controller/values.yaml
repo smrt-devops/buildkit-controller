@@ -20,11 +20,11 @@ podDisruptionBudget:
   minAvailable: 1
 
 # Each proxied edge connection holds two 64 KiB copy buffers and two TLS sessions, about
-# 200 KiB, so a replica at edge.maxConnections (10000) needs about 2 GiB. Lower the limit
-# only together with edge.maxConnections.
+# 200 KiB, and an idle replica uses about 14 MiB, so 512Mi holds roughly 2300 connections.
+# edge.maxConnections (2000) is sized to this limit: raise one only with the other.
 resources:
   requests: {cpu: 100m, memory: 128Mi}
-  limits: {memory: 2560Mi}
+  limits: {memory: 512Mi}
 
 logLevel: info
 logFormat: json
@@ -47,7 +47,7 @@ edge:
   tls:
     secretName: ""   # "" = self-issued; else a kubernetes.io/tls Secret in the release namespace
   handshakeTimeout: 10s
-  maxConnections: 10000      # established connections per replica; taken after the handshake
+  maxConnections: 2000       # established connections per replica; taken after the handshake
   maxHandshakes: 1024        # connections still in the TLS handshake, per replica
   maxHandshakesPerIp: 32     # in-handshake connections from one client address (IPv4, or IPv6 /64); 0 = no cap
   # PROXY protocol v2 from a gateway or load balancer, off by default. When on, a

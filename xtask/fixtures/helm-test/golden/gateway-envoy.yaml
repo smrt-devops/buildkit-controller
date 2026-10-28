@@ -90,7 +90,7 @@ data:
       endpoint: tcp://bk.example.com:8444
       extraNames: []
       handshakeTimeout: 10s
-      maxConnections: 10000
+      maxConnections: 2000
       maxHandshakes: 1024
       maxHandshakesPerIp: 0
       serverName: bk.example.com
@@ -400,7 +400,7 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: buildkit-controller-0.1.0
       annotations:
-        checksum/config: 256216cfe9195da7f645aadca7a6801b2d3e17bb79178e3863023cbe480fd6e9
+        checksum/config: 4af2d3cfbbef58da328fee9ee150a4ea624f028b2be3bce2afd07af21b2daf2c
     spec:
       serviceAccountName: buildkit-controller
       terminationGracePeriodSeconds: 86715
@@ -441,7 +441,7 @@ spec:
             periodSeconds: 5
           resources:
             limits:
-              memory: 2560Mi
+              memory: 512Mi
             requests:
               cpu: 100m
               memory: 128Mi

@@ -199,4 +199,5 @@ export BUILDER CACHE_ARGS
 exec 3<&0
 "$@" <&3 3<&- &
 CMD=$!
-wait "$CMD"
+wait "$CMD" || { rc=$?; CMD=; exit "$rc"; }
+CMD=
