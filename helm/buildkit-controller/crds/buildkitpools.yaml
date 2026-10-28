@@ -2066,7 +2066,7 @@ spec:
                       local:
                         description: |-
                           Persistent state volumes for cache affinity. Unset turns the
-                          feature off. Every caller this pool admits can write cache that later callers read.
+                          feature off. A volume is shared only by callers of one cache scope, see `local.scope`.
                         properties:
                           affinity:
                             default: soft
@@ -2095,6 +2095,19 @@ spec:
                             maximum: 500.0
                             minimum: 1.0
                             type: integer
+                          scope:
+                            default: identity
+                            description: |-
+                              Who shares a volume. `identity` (the default) gives each caller its own cache. An
+                              OIDC token is scoped to its issuer and its `repository_id` claim (GitHub Actions),
+                              else its `repository` claim, else its `sub`. A `ServiceAccount` is scoped to its
+                              namespace and name, and a `BuildKitClaim` to its namespace. `pool` lets every caller
+                              the pool admits read and write the same volumes, so use it only when they are one
+                              trust domain.
+                            enum:
+                            - identity
+                            - pool
+                            type: string
                           size:
                             default: 20Gi
                             description: Storage request of each volume, from 1Gi to 10Ti.

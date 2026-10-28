@@ -12,7 +12,8 @@ use super::ops::{KubeOps, OpError};
 use super::plan::{CreateResult, RetireReason};
 use super::pods::parse_slot;
 use crate::render::{
-    self, CACHE_VOLUME_NAME, KEY_CACHE_KEYS, LABEL_NAME, LABEL_POOL, LABEL_VOLUME_HASH,
+    self, Binding, Bound, CACHE_VOLUME_NAME, KEY_CACHE_KEYS, KEY_CACHE_SCOPE, LABEL_NAME,
+    LABEL_POOL, LABEL_VOLUME_HASH,
 };
 
 fn label<'a>(pvc: &'a PersistentVolumeClaim, key: &str) -> Option<&'a str> {
@@ -46,7 +47,8 @@ async fn delete<O: KubeOps>(ops: &O, pvc: &PersistentVolumeClaim, r: &mut Report
 
 /// Ensure volume for a pod about to be created in
 /// `slot`. `None` lets the create go on; `Some` is the create's outcome
-/// without a POST. A current volume's `PVC cache-key` is copied onto `pod`.
+/// without a POST. A current volume's `PVC cache-scope` binds `pod`
+/// ([`render::bind_pod`]), and its `PVC cache-keys` are copied when the pod keeps it.
 pub(super) async fn ensure_volume<O: KubeOps>(
     ops: &O,
     pool: &BuildKitPool,
@@ -90,7 +92,15 @@ pub(super) async fn ensure_volume<O: KubeOps>(
             Some(CreateResult::VolumePending)
         }
         Ok(Some(have)) => {
-            if let Some(keys) = have.annotations().get(KEY_CACHE_KEYS) {
+            // A warm pod serves the scope that owns the volume, or any scope
+            // when none does (its init container then empties the volume).
+            let binding = have
+                .annotations()
+                .get(KEY_CACHE_SCOPE)
+                .and_then(|v| Binding::parse(v));
+            if render::bind_pod(pod, binding.as_ref(), None) == Bound::Kept
+                && let Some(keys) = have.annotations().get(KEY_CACHE_KEYS)
+            {
                 render::set_pod_cache_keys(pod, keys);
             }
             None

@@ -63,14 +63,31 @@ Every allocation records its caller as the owner, and only the same owner can re
 
 ## Build cache
 
-Workers are single-use, so a build never lands on a daemon that has already built. Cache comes from the pool's two layers, set under `spec.workers.cache`. Both are off by default.
+Each allocation gets its own worker pod, and the pod is deleted when the allocation ends. Cache comes from the pool's two layers, set under `spec.workers.cache`. Both are off by default.
 
 - The registry layer (`cache.registry`) is the one to rely on. The allocation response carries buildx `--cache-to` and `--cache-from` values for the request's cache key, built from `repository`, the `ref` template, `mode` and `importFrom`. Every build of a key imports the same ref and exports to it, so ten concurrent builds all read the cache, and the last export to finish becomes the ref. The controller holds no registry credentials. Buildx sends the client's own credentials, so grant push on the cache repository to your CI identities. A client that does not pass the returned flags builds without this layer.
-- Local volumes (`cache.local`) keep a worker's whole state directory on a PVC `<pool>-cache-<slot>`. A volume belongs to one slot and one pod uses it at a time, so it speeds up only the build that lands on that slot. `maxVolumes` caps how many slots have a volume, and `affinity: soft` prefers a slot whose volume last served the same key. Affinity never makes a request wait.
+- Local volumes (`cache.local`) keep a worker's whole buildkitd state directory on a PVC `<pool>-cache-<slot>`. That directory holds the content store, the cache records and every image built there. A volume belongs to one slot and one pod uses it at a time, so it speeds up only the build that lands on that slot. `maxVolumes` caps how many slots have a volume, and `affinity: soft` prefers a slot whose volume last served the same key. Affinity never makes a request wait.
 
 A request picks its key with `cacheKey` (1 to 63 characters, default the pool's `registry.defaultKey`, else the pool name) and its layers with `cache`: `auto` (every layer the pool enables), `registry`, `local` or `none`. Asking for a layer the pool lacks is a 400.
 
-`local.result` in the response and the allocation metric report how the slot matched: `hit` (the volume served this key before), `spill` (the matching volume was busy, so another slot was used), `miss`, `cold` (the pod was created for this request) or `uncached` (the slot has no volume). `spill` is normal when builds of one key overlap, and that build still gets the registry cache. A pool that runs concurrent builds of one repository should set the registry layer. Because every caller a pool admits can write cache that later callers read, enable cache only on pools whose access rules admit one trust domain.
+`local.result` in the response and the allocation metric report how the slot matched: `hit` (the volume served this key before), `spill` (a volume of the caller's scope that served the key was busy, so another slot was used), `miss`, `cold` (the pod was created for this request), `wiped` (the pod was created for this request on a volume that belonged to another cache scope, so it started empty) or `uncached` (the slot has no volume). `spill` is normal when builds of one key overlap, and that build still gets the registry cache. A pool that runs concurrent builds of one repository should set the registry layer.
+
+### Who shares a local volume
+
+Each volume belongs to one cache scope. `cache.local.scope` sets how scopes are drawn:
+
+- `identity`, the default, gives each caller its own scope. An OIDC token with a `repository_id` claim (GitHub Actions) is scoped to that repository id, one with only a `repository` claim to that name, and any other OIDC token to its `sub`. The token's issuer is always part of the scope. A ServiceAccount is scoped to its namespace and name, and a `BuildKitClaim` to its namespace. Every run, branch and pull request of one repository shares that repository's scope.
+- `pool` puts every caller the pool admits in one scope. Use it only when the pool's access rules admit a single trust domain.
+
+Within a scope everything in the state directory is shared: cache records, layers and the images built there. A later build of the same scope can read them through BuildKit's API, the content store included. Nothing crosses scopes:
+
+- The volume's `buildkit.smrt-devops.net/cache-scope` annotation names the scope that owns its contents and a generation id. A file in the volume holds the same id.
+- A pod in a cached slot is bound to one scope when it is created. A warm pod takes the volume's scope, and a pod created for a request takes the caller's. Before buildkitd starts, the `cache-init` init container compares the file with the generation the pod was bound to. If they differ, or the pod was bound to a scope that does not own the volume, it deletes everything in the state directory. A volume with no owner is emptied the same way, and the pod that starts on it can serve any scope. The file decides, not the annotation, so a lost or late annotation write costs a cache miss and never exposes another scope's data.
+- A warm pod bound to another scope is never offered to a request. When a request finds no pod and no free slot, and nothing is starting or terminating, the allocator clears the owner of one such pod's volume and retires the pod. The slot's next pod then starts empty and serves any scope.
+
+Pools with `cache.local` run buildkitd with `[history] maxEntries = 0`, which turns off BuildKit's build history, and `cache-init` also deletes `history.db`. Build records hold logs, build arguments and provenance, so a later allocation must not read them through the history API. `buildx history` and the build record export of `docker/build-push-action` therefore find nothing on these pools. Pools without `cache.local` keep history on the pod's `emptyDir`, which is deleted with the pod.
+
+The registry layer is not scoped. Every caller the pool admits can pass any `cacheKey`, and anyone with push access to the repository can write the refs, so cache written there can be read and overwritten by all of them. Enable the registry layer only on pools whose access rules admit one trust domain.
 
 ## BuildKitClaim
 

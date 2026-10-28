@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 
 use buildkit_controller_api::v1alpha1::{BuildKitPool, CONTAINER_NAME};
 use k8s_openapi::api::core::v1::{
-    AppArmorProfile, Container, ContainerPort, EmptyDirVolumeSource, ExecAction, KeyToPath, Pod,
-    PodSecurityContext, PodSpec, Probe, SeccompProfile, SecretVolumeSource, SecurityContext,
-    Volume, VolumeMount,
+    AppArmorProfile, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource,
+    ExecAction, KeyToPath, ObjectFieldSelector, Pod, PodSecurityContext, PodSpec, Probe,
+    SeccompProfile, SecretVolumeSource, SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
@@ -23,7 +23,13 @@ use super::{
 const SOCKET: &str = "unix:///run/user/1000/buildkit/buildkitd.sock";
 const RUN_AS: i64 = 1000;
 const CERTS_VOLUME: &str = "certs";
-use super::cache::{STATE_VOLUME, is_cached_slot, mount_cache_volume};
+use super::cache::{
+    KEY_CACHE_GENERATION, STATE_VOLUME, bind_pod, init_script, is_cached_slot, mount_cache_volume,
+};
+
+const STATE_DIR: &str = "/home/user/.local/share/buildkit";
+/// Name of the init container that prepares a cache volume.
+pub const CACHE_INIT_NAME: &str = "cache-init";
 
 fn s(v: &str) -> String {
     v.to_owned()
@@ -72,7 +78,7 @@ fn container(pool: &BuildKitPool) -> Result<Container, RenderError> {
             sub_path: Some(s("buildkitd.toml")),
             ..mount(CERTS_VOLUME, "/etc/buildkit/buildkitd.toml")
         },
-        mount(STATE_VOLUME, "/home/user/.local/share/buildkit"),
+        mount(STATE_VOLUME, STATE_DIR),
     ];
     mounts.extend(user.volume_mounts.iter().cloned());
     Ok(Container {
@@ -107,6 +113,48 @@ fn container(pool: &BuildKitPool) -> Result<Container, RenderError> {
         resources: Some(user.resources.clone()),
         env: non_empty(user.env.clone()),
         volume_mounts: Some(mounts),
+        ..Container::default()
+    })
+}
+
+/// With `cache.local`: the init container that empties the state dir unless it
+/// holds the generation the pod was bound to (`P cache-generation`), and
+/// removes build history. Every pod of the pool runs it, so the spec stays
+/// slot-independent; on an `emptyDir` it has nothing to do.
+fn cache_init(pool: &BuildKitPool, main: &Container) -> Option<Container> {
+    pool.spec.workers.cache.local.as_ref()?;
+    let field = |path: String| EnvVarSource {
+        field_ref: Some(ObjectFieldSelector {
+            api_version: None,
+            field_path: path,
+        }),
+        ..EnvVarSource::default()
+    };
+    let env = |name: &str, path: String| EnvVar {
+        name: s(name),
+        value: None,
+        value_from: Some(field(path)),
+    };
+    Some(Container {
+        name: s(CACHE_INIT_NAME),
+        image: main.image.clone(),
+        image_pull_policy: main.image_pull_policy.clone(),
+        command: Some(vec![
+            s("rootlesskit"),
+            s("sh"),
+            s("-c"),
+            init_script(STATE_DIR),
+        ]),
+        env: Some(vec![
+            env(
+                "EXPECT_GENERATION",
+                format!("metadata.annotations['{KEY_CACHE_GENERATION}']"),
+            ),
+            env("POD_UID", s("metadata.uid")),
+        ]),
+        security_context: main.security_context.clone(),
+        resources: main.resources.clone(),
+        volume_mounts: Some(vec![mount(STATE_VOLUME, STATE_DIR)]),
         ..Container::default()
     })
 }
@@ -159,6 +207,7 @@ pub fn pod_spec(pool: &BuildKitPool) -> Result<PodSpec, RenderError> {
             .or_insert_with(|| s(arch));
     }
     let unconfined = || s("Unconfined");
+    let main = container(pool)?;
     Ok(PodSpec {
         service_account_name: Some(worker_object_name(name)),
         automount_service_account_token: Some(false),
@@ -191,7 +240,8 @@ pub fn pod_spec(pool: &BuildKitPool) -> Result<PodSpec, RenderError> {
         priority_class_name: t.priority_class_name.clone(),
         image_pull_secrets: non_empty(t.image_pull_secrets.clone()),
         volumes: Some(volumes(pool)),
-        containers: vec![container(pool)?],
+        init_containers: cache_init(pool, &main).map(|c| vec![c]),
+        containers: vec![main],
         ..PodSpec::default()
     })
 }
@@ -273,6 +323,8 @@ pub fn worker_pod(pool: &BuildKitPool, inputs: &PodInputs) -> Result<Pod, Render
     };
     if is_cached_slot(pool, inputs.slot) {
         mount_cache_volume(&mut pod, name, inputs.slot);
+        // Serves any scope until a creator binds it (`bind_pod`).
+        bind_pod(&mut pod, None, None);
     }
     Ok(pod)
 }

@@ -25,6 +25,147 @@ pub const KEY_CACHE_KEYS: &str = "buildkit.smrt-devops.net/cache-keys";
 /// Name of the pod volume that holds the buildkitd state dir.
 pub(super) const STATE_VOLUME: &str = "state";
 
+/// `PVC cache-scope`: `<scope>@<generation>`, the cache scope that owns the
+/// volume's contents as of the generation the volume holds. `P cache-scope`
+/// (on a pod in a cached slot): the scope the pod serves, empty for a pod
+/// that may serve any scope because its volume was emptied when it started.
+pub const KEY_CACHE_SCOPE: &str = "buildkit.smrt-devops.net/cache-scope";
+/// `P cache-generation`: the generation the pod's volume must hold for the
+/// init container to keep it. Absent, the volume is emptied.
+pub const KEY_CACHE_GENERATION: &str = "buildkit.smrt-devops.net/cache-generation";
+/// The file in the state dir that names the volume's generation. An init
+/// container that empties the volume writes the generation its pod was bound
+/// to, or its pod uid when there was none.
+pub const GENERATION_FILE: &str = ".buildkit-controller-generation";
+
+/// Who owns a volume's contents: the scope, and the generation they belong to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Binding {
+    /// An opaque scope id (see `alloc::cache::scope`).
+    pub scope: String,
+    /// The id the volume's generation file holds (the uid of the pod that began it).
+    pub generation: String,
+}
+
+impl Binding {
+    /// Parse a `PVC cache-scope` value. `None` for anything malformed.
+    #[must_use]
+    pub fn parse(v: &str) -> Option<Self> {
+        let (scope, generation) = v.split_once('@')?;
+        let ok = |s: &str| !s.is_empty() && !s.contains('@');
+        (ok(scope) && ok(generation)).then(|| Self {
+            scope: scope.to_owned(),
+            generation: generation.to_owned(),
+        })
+    }
+
+    /// The `PVC cache-scope` value.
+    #[must_use]
+    pub fn value(&self) -> String {
+        format!("{}@{}", self.scope, self.generation)
+    }
+}
+
+/// The scope id of a scope name: the first 32 hex chars of its SHA-256, so
+/// no caller identity is written to the cluster in clear.
+#[must_use]
+pub fn scope_id(name: &str) -> String {
+    sha256_hex(name.as_bytes())[..32].to_owned()
+}
+
+/// What a new pod in a cached slot does with the slot's volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound {
+    /// The volume belongs to the pod's scope: the init container keeps it if
+    /// it still holds the bound generation.
+    Kept,
+    /// The volume belonged to another scope (or to no known one): the init container empties it.
+    Wiped,
+    /// The volume was never bound: the init container empties it, which costs nothing.
+    Fresh,
+}
+
+/// Bind a pod about to be created in a cached slot. `binding` is the volume's
+/// `PVC cache-scope`; `scope` is the caller's scope, or `None` for a warm pod
+/// that takes the volume's own scope (and serves any scope when it has none).
+/// Sets `P cache-scope`, and `P cache-generation` only when the volume is kept.
+pub fn bind_pod(pod: &mut Pod, binding: Option<&Binding>, scope: Option<&str>) -> Bound {
+    let (target, bound) = match (binding, scope) {
+        (Some(b), Some(s)) if b.scope == s => (s.to_owned(), Bound::Kept),
+        (Some(_), Some(s)) => (s.to_owned(), Bound::Wiped),
+        (Some(b), None) => (b.scope.clone(), Bound::Kept),
+        (None, s) => (s.unwrap_or_default().to_owned(), Bound::Fresh),
+    };
+    let ann = pod.metadata.annotations.get_or_insert_with(BTreeMap::new);
+    ann.insert(KEY_CACHE_SCOPE.to_owned(), target);
+    match (bound, binding) {
+        (Bound::Kept, Some(b)) => {
+            ann.insert(KEY_CACHE_GENERATION.to_owned(), b.generation.clone());
+        }
+        _ => {
+            ann.remove(KEY_CACHE_GENERATION);
+        }
+    }
+    bound
+}
+
+fn pod_ann<'a>(pod: &'a Pod, key: &str) -> Option<&'a str> {
+    pod.metadata
+        .annotations
+        .as_ref()?
+        .get(key)
+        .map(String::as_str)
+}
+
+/// Whether a pod may serve `scope`. A pod outside a cached slot always may; a
+/// pod in one only when it serves `scope` or started with an emptied volume
+/// and serves any scope. A pod with no `P cache-scope` (not rendered by this
+/// version) never may.
+#[must_use]
+pub fn pod_serves(pod: &Pod, cached: bool, scope: &str) -> bool {
+    !cached || pod_ann(pod, KEY_CACHE_SCOPE).is_some_and(|s| s.is_empty() || s == scope)
+}
+
+/// The `PVC cache-scope` to write after `scope` won `pod`, or `None` when the
+/// volume's binding already says so. The generation is the one the pod was
+/// told to keep, else the pod's own uid (its init container emptied the volume).
+#[must_use]
+pub fn won_binding(pod: &Pod, scope: &str) -> Option<Binding> {
+    let generation = pod_ann(pod, KEY_CACHE_GENERATION);
+    if generation.is_some() && pod_ann(pod, KEY_CACHE_SCOPE) == Some(scope) {
+        return None;
+    }
+    let generation = generation.or(pod.metadata.uid.as_deref())?;
+    Some(Binding {
+        scope: scope.to_owned(),
+        generation: generation.to_owned(),
+    })
+}
+
+/// The init container's script. It keeps the state dir only when it holds the
+/// expected generation. Otherwise it deletes everything in it and records the
+/// expected generation when there is one (the pod serves the scope bound to it),
+/// else the pod uid. Build history is removed either way. It
+/// runs under rootlesskit, as buildkitd does, so it can delete files that
+/// builds created with other user ids.
+pub(super) fn init_script(dir: &str) -> String {
+    format!(
+        r#"set -eu
+d={dir}
+m="$d/{GENERATION_FILE}"
+if [ -n "$EXPECT_GENERATION" ] && [ -f "$m" ] && [ "$(cat "$m")" = "$EXPECT_GENERATION" ]; then
+  echo "keeping generation $EXPECT_GENERATION"
+else
+  rm -rf -- "$d"/* "$d"/.[!.]* "$d"/..?*
+  g="${{EXPECT_GENERATION:-$POD_UID}}"
+  printf %s "$g" > "$m"
+  echo "emptied, generation $g"
+fi
+rm -f -- "$d/history.db"
+"#
+    )
+}
+
 /// `min(cache.local.maxVolumes, scaling.max)`, or 0 when `cache.local` is unset.
 #[must_use]
 pub fn cache_limit(pool: &BuildKitPool) -> u32 {
@@ -203,43 +344,48 @@ pub fn gc_keep_bytes(lc: &LocalCache) -> Option<u64> {
     }
 }
 
-/// The pool's `buildkitd.toml`. With
-/// `cache.local` it gains `[worker.oci] maxUsedSpace` and `gc = true`, unless
-/// the pool's config already sets `maxUsedSpace`. Text-level, so the rest of
-/// the config stays byte for byte.
+/// The pool's `buildkitd.toml`. With `cache.local` it gains
+/// `[worker.oci] maxUsedSpace` and `gc = true` (unless the pool's config
+/// already sets `maxUsedSpace`), and `[history] maxEntries = 0`, which turns
+/// build history off: a volume outlives the allocation, and build records
+/// (logs, build arguments) must not reach a later one. Text-level, so the
+/// rest of the config stays byte for byte.
 #[must_use]
 pub fn buildkitd_config(pool: &BuildKitPool) -> String {
     let cfg = &pool.spec.workers.buildkitd_config;
-    let Some(bytes) = pool
-        .spec
-        .workers
-        .cache
-        .local
-        .as_ref()
-        .and_then(gc_keep_bytes)
-    else {
+    let Some(lc) = pool.spec.workers.cache.local.as_ref() else {
         return cfg.clone();
     };
-    if cfg.contains("maxUsedSpace") {
-        return cfg.clone();
+    let mut out = cfg.clone();
+    if let Some(bytes) = gc_keep_bytes(lc)
+        && !cfg.contains("maxUsedSpace")
+    {
+        let lines = format!("  maxUsedSpace = \"{bytes}\"\n  gc = true\n");
+        out = set_in_section(&out, "worker.oci", &lines, "gc");
     }
-    let lines = format!("  maxUsedSpace = \"{bytes}\"\n  gc = true\n");
-    let is_header = |l: &str| l.split_whitespace().collect::<String>() == "[worker.oci]";
+    set_in_section(&out, "history", "  maxEntries = 0\n", "maxEntries")
+}
+
+/// `cfg` with `lines` placed at the top of table `[section]`, which is
+/// appended when missing. TOML forbids a duplicate key, so a `drop` key the
+/// table already has is removed.
+fn set_in_section(cfg: &str, section: &str, lines: &str, drop: &str) -> String {
+    let header = format!("[{section}]");
+    let is_header = |l: &str| l.split_whitespace().collect::<String>() == header;
     if cfg.lines().any(is_header) {
-        // TOML forbids a duplicate key, so a `gc` the section already has is dropped.
-        let is_gc = |l: &str| l.split_once('=').is_some_and(|(k, _)| k.trim() == "gc");
+        let is_drop = |l: &str| l.split_once('=').is_some_and(|(k, _)| k.trim() == drop);
         let mut out = String::with_capacity(cfg.len() + lines.len());
-        let mut in_oci = false;
+        let mut inside = false;
         for l in cfg.lines() {
             if l.trim_start().starts_with('[') {
-                in_oci = is_header(l);
-            } else if in_oci && is_gc(l) {
+                inside = is_header(l);
+            } else if inside && is_drop(l) {
                 continue;
             }
             out.push_str(l);
             out.push('\n');
             if is_header(l) {
-                out.push_str(&lines);
+                out.push_str(lines);
             }
         }
         return out;
@@ -249,5 +395,5 @@ pub fn buildkitd_config(pool: &BuildKitPool) -> String {
     } else {
         "\n"
     };
-    format!("{cfg}{sep}[worker.oci]\n{lines}")
+    format!("{cfg}{sep}{header}\n{lines}")
 }

@@ -3,6 +3,7 @@ kind: Pod
 metadata:
   annotations:
     buildkit.smrt-devops.net/alloc: free
+    buildkit.smrt-devops.net/cache-scope: ""
     buildkit.smrt-devops.net/internal-ca: 0123456789abcdef
     buildkit.smrt-devops.net/worker-cert-not-after: "2026-11-19T12:00:00Z"
     buildkit.smrt-devops.net/worker-nonce: 00000000000000aa
@@ -11,7 +12,7 @@ metadata:
     app.kubernetes.io/name: buildkitd
     buildkit.smrt-devops.net/pool: cache-local
     buildkit.smrt-devops.net/state: free
-    buildkit.smrt-devops.net/template-hash: 6c8ade3e7b
+    buildkit.smrt-devops.net/template-hash: bc1342b655
   name: cache-local-0
   namespace: render-verify
   ownerReferences:
@@ -73,6 +74,49 @@ spec:
   hostIPC: false
   hostNetwork: false
   hostPID: false
+  initContainers:
+  - command:
+    - rootlesskit
+    - sh
+    - -c
+    - |
+      set -eu
+      d=/home/user/.local/share/buildkit
+      m="$d/.buildkit-controller-generation"
+      if [ -n "$EXPECT_GENERATION" ] && [ -f "$m" ] && [ "$(cat "$m")" = "$EXPECT_GENERATION" ]; then
+        echo "keeping generation $EXPECT_GENERATION"
+      else
+        rm -rf -- "$d"/* "$d"/.[!.]* "$d"/..?*
+        g="${EXPECT_GENERATION:-$POD_UID}"
+        printf %s "$g" > "$m"
+        echo "emptied, generation $g"
+      fi
+      rm -f -- "$d/history.db"
+    env:
+    - name: EXPECT_GENERATION
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.annotations['buildkit.smrt-devops.net/cache-generation']
+    - name: POD_UID
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.uid
+    image: moby/buildkit:v0.34.0-rootless
+    imagePullPolicy: IfNotPresent
+    name: cache-init
+    resources:
+      limits:
+        ephemeral-storage: 20Gi
+        memory: 4Gi
+      requests:
+        cpu: 500m
+        ephemeral-storage: 1Gi
+        memory: 1Gi
+    securityContext:
+      privileged: false
+    volumeMounts:
+    - mountPath: /home/user/.local/share/buildkit
+      name: state
   restartPolicy: Never
   securityContext:
     appArmorProfile:
