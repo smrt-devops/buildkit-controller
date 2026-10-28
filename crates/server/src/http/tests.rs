@@ -1326,6 +1326,160 @@ impl crate::reconcile::spawn::WorkerSecrets for NoBackend {
     }
 }
 
+/// A PROXY v2 header over TCP/IPv4 from `src` to 10.0.0.1:8443.
+fn proxy_header(src: std::net::SocketAddrV4) -> Vec<u8> {
+    let mut h = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+    h.extend_from_slice(&[0x21, 0x11, 0, 12]);
+    h.extend_from_slice(&src.ip().octets());
+    h.extend_from_slice(&[10, 0, 0, 1]);
+    h.extend_from_slice(&src.port().to_be_bytes());
+    h.extend_from_slice(&8443u16.to_be_bytes());
+    h
+}
+
+/// The API listener with PROXY protocol trusted from `cidrs`, serving
+/// `GET /peer`, which answers with the [`super::api::Peer`] the handlers see.
+async fn spawn_proxied(
+    cidrs: &[&str],
+    limits: Limits,
+) -> (
+    std::net::SocketAddr,
+    CertificateDer<'static>,
+    crate::net::ProxyMetrics,
+    CancellationToken,
+) {
+    let (k, c) = serving("api.test");
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let (tx, rx) = watch::channel(Some(k));
+    std::mem::forget(tx);
+    let metrics = crate::net::ProxyMetrics::register(&Metrics::new(), "api");
+    let proxy = crate::net::ProxyProtocol::trusting(
+        cidrs.iter().map(|c| c.parse().unwrap()).collect(),
+        Duration::from_secs(2),
+        metrics.clone(),
+    );
+    let app = Router::new().route(
+        "/peer",
+        axum::routing::get(
+            |axum::Extension(p): axum::Extension<super::api::Peer>| async move { p.0.to_string() },
+        ),
+    );
+    let stop = CancellationToken::new();
+    tokio::spawn(super::serve_with_proxy(
+        l,
+        app,
+        rx,
+        limits,
+        proxy,
+        stop.clone(),
+    ));
+    (addr, c, metrics, stop)
+}
+
+/// TLS (HTTP/1.1) to `addr`, after writing `prefix` on the bare TCP stream.
+async fn dial_prefixed(
+    addr: std::net::SocketAddr,
+    trust: &CertificateDer<'static>,
+    prefix: &[u8],
+) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(trust.clone()).unwrap();
+    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let mut tcp = TcpStream::connect(addr).await?;
+    tcp.write_all(prefix).await?;
+    let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+        .connect(ServerName::try_from("api.test").unwrap(), tcp);
+    tokio::time::timeout(Duration::from_secs(5), tls)
+        .await
+        .map_err(|_| std::io::Error::other("TLS handshake timed out"))?
+}
+
+/// `GET /peer` on an open connection.
+async fn peer_seen(s: &mut tokio_rustls::client::TlsStream<TcpStream>) -> String {
+    s.write_all(b"GET /peer HTTP/1.1\r\nhost: api.test\r\nconnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    out.split("\r\n\r\n").nth(1).unwrap().to_owned()
+}
+
+/// Behind a trusted gateway the handlers see the PROXY source, not the gateway.
+#[tokio::test]
+async fn proxied_connection_is_the_header_source() {
+    let (addr, c, m, stop) = spawn_proxied(&["127.0.0.0/8"], Limits::default()).await;
+    let src = "192.0.2.7:51000".parse().unwrap();
+    let mut s = dial_prefixed(addr, &c, &proxy_header(src)).await.unwrap();
+    assert_eq!(peer_seen(&mut s).await, "192.0.2.7:51000");
+    assert_eq!(m.count("proxied"), 1);
+    stop.cancel();
+}
+
+/// `max_connections_per_ip` counts PROXY sources: two clients behind one
+/// gateway address each get their own slot, and one client is still capped.
+#[tokio::test]
+async fn per_address_cap_counts_the_proxy_source() {
+    let limits = Limits {
+        max_connections_per_ip: 1,
+        ..Limits::default()
+    };
+    let (addr, c, _m, stop) = spawn_proxied(&["127.0.0.0/8"], limits).await;
+    let a = "192.0.2.7:1000".parse().unwrap();
+    let b = "192.0.2.8:1000".parse().unwrap();
+    let _held = dial_prefixed(addr, &c, &proxy_header(a)).await.unwrap();
+    let mut other = dial_prefixed(addr, &c, &proxy_header(b))
+        .await
+        .expect("another client behind the same gateway address gets a slot");
+    assert_eq!(peer_seen(&mut other).await, "192.0.2.8:1000");
+    let again = "192.0.2.7:2000".parse().unwrap();
+    assert!(
+        dial_prefixed(addr, &c, &proxy_header(again)).await.is_err(),
+        "the first client's second connection is over its cap"
+    );
+    stop.cancel();
+}
+
+/// A trusted source that sends no header is closed, never served as itself.
+#[tokio::test]
+async fn trusted_source_without_a_header_is_closed() {
+    let (addr, c, m, stop) = spawn_proxied(&["127.0.0.0/8"], Limits::default()).await;
+    assert!(dial_prefixed(addr, &c, &[]).await.is_err());
+    // The ClientHello fails the signature check.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while m.count("bad_signature") == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.cancel();
+}
+
+/// An untrusted source is direct: its forged header goes to TLS and fails the
+/// handshake, and without one it is served as its own address.
+#[tokio::test]
+async fn untrusted_source_cannot_forge_its_address() {
+    let (addr, c, m, stop) = spawn_proxied(&["10.0.0.0/8"], Limits::default()).await;
+    let forged = proxy_header("203.0.113.9:1".parse().unwrap());
+    assert!(dial_prefixed(addr, &c, &forged).await.is_err());
+    let mut s = dial_prefixed(addr, &c, &[]).await.unwrap();
+    let seen = peer_seen(&mut s).await;
+    assert!(seen.starts_with("127.0.0.1:"), "{seen}");
+    for result in ["proxied", "bad_signature"] {
+        assert_eq!(m.count(result), 0, "{result}");
+    }
+    stop.cancel();
+}
+
 /// The HTTP API never generates a private key: a request without
 /// `publicKey` is a 400 before the allocator runs.
 #[tokio::test]

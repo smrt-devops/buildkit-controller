@@ -20,8 +20,9 @@ API (`gateway.api.mode: passthrough` makes it a TLSRoute) and a TLS passthrough
 TLSRoute for the edge. They need the Gateway API v1.5.0 or later standard-channel
 CRDs. Without `gateway.parentRefs` the chart fails to render, unless
 `service.type: LoadBalancer` exposes the Service directly or `gateway.enabled: false`
-keeps the install in-cluster. `gateway.envoy.enabled` adds Envoy Gateway policies,
-and `gateway.extraManifests` takes objects for other implementations. Modes,
+keeps the install in-cluster. `gateway.envoy.enabled` adds Envoy Gateway policies
+(with `gateway.envoy.proxyProtocol`, PROXY protocol to the listeners whose
+`api.proxyProtocol` or `edge.proxyProtocol` is on), and `gateway.extraManifests` takes objects for other implementations. Modes,
 listeners, timeouts and supported implementations are in
 [helm/README.md](../README.md#exposure).
 

@@ -1,0 +1,5 @@
+# expect: trustedCIDRs
+# A trusted source must be a CIDR block, not a bare address or a name.
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+api:
+  proxyProtocol: {enabled: true, trustedCIDRs: [envoy.envoy-gateway-system.svc]}

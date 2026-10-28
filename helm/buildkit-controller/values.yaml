@@ -47,10 +47,27 @@ edge:
   maxConnections: 10000      # established connections per replica; taken after the handshake
   maxHandshakes: 1024        # connections still in the TLS handshake, per replica
   maxHandshakesPerIp: 32     # in-handshake connections from one client address (IPv4, or IPv6 /64); 0 = no cap
+  # PROXY protocol v2 from a gateway or load balancer, off by default. When on, a
+  # connection from trustedCIDRs (the gateway's own source addresses, never the
+  # clients') must open with a v2 header, and its source address replaces the
+  # gateway's in the per-address caps and the logs. Other sources are served as
+  # themselves. See docs/operations.md (PROXY protocol).
+  proxyProtocol:
+    enabled: false
+    # Required when enabled: the gateway pods' addresses as /32s (or a subnet or node
+    # range only the gateway uses), e.g. [10.244.3.17/32]. Never the whole pod CIDR:
+    # any pod in it could send its own header and pick its address, and pods in it
+    # that dial the Service directly are refused. Trust model: docs/operations.md.
+    trustedCIDRs: []
+    headerTimeout: 5s        # longest wait for the header after accept
 
 api:
   maxConnections: 4096       # open API connections per replica
   maxConnectionsPerIp: 128   # open API connections from one client address; 0 = no cap
+  proxyProtocol:             # as edge.proxyProtocol, for the API listener
+    enabled: false
+    trustedCIDRs: []
+    headerTimeout: 5s
 
 auth:
   # The chart ships no issuers. Example:
@@ -104,8 +121,10 @@ service:
 #
 # Behind a gateway the controller sees the gateway's addresses, not the clients', so
 # every client shares edge.maxHandshakesPerIp (32), api.maxConnectionsPerIp (128) and
-# auth.serviceAccount.maxReviewsPerIp (4). Raise them, or set them to 0, to match the
-# number of CI jobs that can start at once.
+# auth.serviceAccount.maxReviewsPerIp (4). Turn on PROXY protocol (edge.proxyProtocol,
+# api.proxyProtocol, and gateway.envoy.proxyProtocol on Envoy Gateway) so they count
+# clients again, or raise them, or set them to 0, to match the number of CI jobs that
+# can start at once.
 gateway:
   # true: render routes for gateway.parentRefs. Without parentRefs the chart fails to
   # render unless service.type is LoadBalancer. false: no routes, e.g. an in-cluster-only
@@ -154,8 +173,11 @@ gateway:
     enabled: false
     connectTimeout: 10s
     tcpKeepalive: {idleTime: 30s, interval: 10s, probes: 3}
-    # proxyProtocol: reserved. The controller does not read PROXY protocol yet, so the
-    # chart never asks Envoy to send it.
+    # true: Envoy sends PROXY protocol v2 to each listener whose api.proxyProtocol or
+    # edge.proxyProtocol is enabled, so the controller sees client addresses. Set the
+    # trustedCIDRs there to the Envoy pods' addresses (/32s, not the pod CIDR).
+    # NOTES.txt warns when one side is on without the other.
+    proxyProtocol: false
   # Extra objects for other implementations (policies, ReferenceGrants). Each item is an
   # object or a string; both go through tpl, so {{ include "bkc.fullname" . }} works.
   extraManifests: []

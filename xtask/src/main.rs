@@ -20,6 +20,7 @@ mod helm_verify;
 mod image;
 mod kube;
 mod perf;
+mod proxy_verify;
 mod reconcile_verify;
 mod render_verify;
 mod runtime_verify;
@@ -35,6 +36,7 @@ use helm_test::helm_test;
 use helm_verify::helm_verify;
 use image::{image, prune};
 use perf::{perf, perf_loopback};
+use proxy_verify::proxy_verify;
 use reconcile_verify::reconcile_verify;
 use render_verify::render_verify;
 use runtime_verify::runtime_verify;
@@ -106,6 +108,8 @@ enum Task {
     Soak,
     /// Build the documentation site with mdBook into target/book/html. Fails on a broken repository link.
     Docs,
+    /// Install the chart behind Envoy Gateway with PROXY protocol on, on a throwaway kind cluster, and check that the logs and the per-address caps see client addresses, that a build through the edge works, and that an untrusted pod cannot forge its address.
+    ProxyVerify,
     /// Run the end-to-end suite on a kind cluster, exposed through Envoy Gateway. Covers chart install, the Gateway API routes, OIDC and `TokenReview`, builds, the registry cache, queueing, a long poll, multi-platform builds and the Envoy extras.
     E2e,
     /// Install the chart on kind behind Envoy Gateway, trust GitHub OIDC for REPO (owner/name) and leave the cluster running. Used by the CI Action job.
@@ -334,6 +338,7 @@ fn main() -> Result<()> {
         Task::ClaimVerify => claim_verify(),
         Task::Soak => soak(),
         Task::Docs => docs(),
+        Task::ProxyVerify => proxy_verify(),
         Task::E2e => e2e(),
         Task::E2eUp { repo } => e2e_up(&repo),
         Task::Perf { loopback: true, .. } => perf_loopback(),
@@ -366,6 +371,7 @@ mod tests {
         assert!(Cli::try_parse_from(["xtask", "reconcile-verify"]).is_ok());
         assert!(Cli::try_parse_from(["xtask", "soak"]).is_ok());
         assert!(Cli::try_parse_from(["xtask", "drain-verify"]).is_ok());
+        assert!(Cli::try_parse_from(["xtask", "proxy-verify"]).is_ok());
         assert!(Cli::try_parse_from(["xtask", "perf", "--idle-secs", "60"]).is_ok());
     }
 }

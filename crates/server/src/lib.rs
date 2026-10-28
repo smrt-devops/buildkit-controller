@@ -6,6 +6,7 @@ pub mod config;
 pub mod edge;
 pub mod election;
 pub mod http;
+pub mod net;
 pub mod pki;
 pub mod reconcile;
 pub mod render;

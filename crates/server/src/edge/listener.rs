@@ -17,6 +17,7 @@ use tracing::{Instrument, debug, info, info_span, warn};
 use super::handler::{Accepted, ConnectionHandler};
 use super::metrics::EdgeMetrics;
 use super::tls::{EdgeTls, counted_by_verifier};
+use crate::net::ProxyProtocol;
 use crate::runtime::readiness::ReadyFlag;
 
 /// Listener limits from `edge.*`.
@@ -165,6 +166,19 @@ struct Handshaking {
 /// most `handshake_timeout`. Established connections draw on the separate
 /// `max_connections` budget.
 pub async fn serve(listener: TcpListener, s: Serve, shutdown: CancellationToken) {
+    serve_with_proxy(listener, s, ProxyProtocol::off(), shutdown).await;
+}
+
+/// [`serve`] behind a gateway: a connection from a source `proxy` trusts must
+/// open with a PROXY header, whose source address then stands for the client
+/// in the per-address cap and the `peer` log field. The header read holds a
+/// global handshake slot and is bounded by the header timeout.
+pub async fn serve_with_proxy(
+    listener: TcpListener,
+    s: Serve,
+    proxy: ProxyProtocol,
+    shutdown: CancellationToken,
+) {
     let Serve {
         mut tls,
         handler,
@@ -179,9 +193,15 @@ pub async fn serve(listener: TcpListener, s: Serve, shutdown: CancellationToken)
     ready.set();
     info!(addr = ?listener.local_addr().ok(), "edge listening");
 
-    let established = Arc::new(Semaphore::new(options.max_connections.max(1)));
+    let shared = Arc::new(Shared {
+        handler,
+        metrics,
+        options,
+        established: Arc::new(Semaphore::new(options.max_connections.max(1))),
+        per_peer: PerPeer::new(options.max_handshakes_per_ip),
+        proxy,
+    });
     let handshakes = Arc::new(Semaphore::new(options.max_handshakes.max(1)));
-    let per_peer = PerPeer::new(options.max_handshakes_per_ip);
     let mut conns = JoinSet::new();
     loop {
         tokio::select! {
@@ -193,25 +213,11 @@ pub async fn serve(listener: TcpListener, s: Serve, shutdown: CancellationToken)
             }
             (tcp, peer) = accept(&listener) => {
                 let Ok(global) = Arc::clone(&handshakes).try_acquire_owned() else {
-                    debug!(%peer, "edge handshake limit reached; closing");
-                    continue;
-                };
-                let Some(slot) = per_peer.try_take(peer.ip()) else {
-                    debug!(%peer, "edge per-address handshake limit reached; closing");
+                    debug!(remote = %peer, "edge handshake limit reached; closing");
                     continue;
                 };
                 let Some(current) = tls.borrow().clone() else { continue };
-                let hs = Handshaking { _global: global, _peer: slot };
-                let conn = connection(
-                    tcp, peer, current, Arc::clone(&handler), metrics.clone(), options, hs,
-                    Arc::clone(&established),
-                );
-                conns.spawn(conn.instrument(info_span!(
-                    "edge_conn",
-                    %peer,
-                    alloc_id = tracing::field::Empty,
-                    pod_uid = tracing::field::Empty,
-                )));
+                conns.spawn(admit(tcp, peer, current, global, Arc::clone(&shared)));
             }
         }
     }
@@ -257,23 +263,82 @@ pub fn tune_socket(tcp: &TcpStream) -> std::io::Result<()> {
     SockRef::from(tcp).set_tcp_keepalive(&ka)
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one call site, all per-connection state"
-)]
-async fn connection(
-    tcp: TcpStream,
-    peer: SocketAddr,
-    tls: Arc<EdgeTls>,
+/// State every connection task of one listener shares.
+struct Shared {
     handler: Arc<dyn ConnectionHandler>,
     metrics: EdgeMetrics,
     options: ListenerOptions,
-    handshaking: Handshaking,
+    /// `max_connections`: established connections.
     established: Arc<Semaphore>,
+    /// `max_handshakes_per_ip`, keyed by the client address.
+    per_peer: PerPeer,
+    proxy: ProxyProtocol,
+}
+
+/// Finds the client address (the PROXY source behind a trusted gateway, else
+/// the socket's peer), takes that address's handshake slot and runs the
+/// connection in a span whose `peer` is the client. Everything after this
+/// point sees only the client address; the gateway's is logged as `via`.
+async fn admit(
+    mut tcp: TcpStream,
+    remote: SocketAddr,
+    tls: Arc<EdgeTls>,
+    global: OwnedSemaphorePermit,
+    shared: Arc<Shared>,
 ) {
     if let Err(e) = tune_socket(&tcp) {
         debug!(error = %e, "socket options");
     }
+    let client = match shared.proxy.client(&mut tcp, remote).await {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(via = %remote, reason = e.label(), error = %e, "edge PROXY header refused; closing");
+            return;
+        }
+    };
+    let via = client.origin.via();
+    if let Some(v) = via {
+        debug!(peer = %client.addr, via = %v, "edge PROXY header accepted");
+    }
+    let Some(slot) = shared.per_peer.try_take(client.addr.ip()) else {
+        debug!(peer = %client.addr, via = ?via, "edge per-address handshake limit reached; closing");
+        return;
+    };
+    let hs = Handshaking {
+        _global: global,
+        _peer: slot,
+    };
+    let span = info_span!(
+        "edge_conn",
+        peer = %client.addr,
+        via = tracing::field::Empty,
+        alloc_id = tracing::field::Empty,
+        pod_uid = tracing::field::Empty,
+    );
+    if let Some(via) = via {
+        span.record("via", tracing::field::display(via));
+    }
+    connection(tcp, client.addr, tls, &shared, hs)
+        .instrument(span)
+        .await;
+}
+
+/// TLS handshake, identity, connection slot, then the handler. `peer` is the
+/// client address from [`admit`].
+async fn connection(
+    tcp: TcpStream,
+    peer: SocketAddr,
+    tls: Arc<EdgeTls>,
+    shared: &Shared,
+    handshaking: Handshaking,
+) {
+    let Shared {
+        handler,
+        metrics,
+        options,
+        established,
+        ..
+    } = shared;
     let start = Instant::now();
     let acceptor = TlsAcceptor::from(Arc::clone(&tls.server));
     let stream = match tokio::time::timeout(options.handshake_timeout, acceptor.accept(tcp)).await {
@@ -302,8 +367,11 @@ async fn connection(
         return;
     };
     drop(handshaking);
-    let Ok(Ok(_slot)) =
-        tokio::time::timeout(options.handshake_timeout, established.acquire_owned()).await
+    let Ok(Ok(_slot)) = tokio::time::timeout(
+        options.handshake_timeout,
+        Arc::clone(established).acquire_owned(),
+    )
+    .await
     else {
         debug!("edge connection limit reached; closing");
         return;
@@ -351,5 +419,212 @@ mod tests {
             .map(|_| p.try_take(ip("10.0.0.1")).unwrap())
             .collect();
         assert_eq!((held.len(), p.peers()), (100, 0));
+    }
+
+    /// The edge behind a gateway, over real TLS on 127.0.0.1.
+    mod proxied {
+        use std::net::SocketAddrV4;
+
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+        use time::OffsetDateTime;
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::mpsc;
+
+        use super::super::super::TlsBuilder;
+        use super::super::super::handler::{Accepted, ConnectionHandler};
+        use super::*;
+        use crate::net::{ProxyMetrics, ProxyProtocol};
+        use crate::pki::{CaBundle, EdgeNames, LeafKey};
+        use crate::runtime::metrics::Metrics;
+        use crate::runtime::readiness::Readiness;
+
+        const HOST: &str = "edge.example.test";
+        const ID: &str = "buildkit://team-a/pool-1/0f8fad5b-d9cb-469f-a165-70867728950e/abcdefghijklmnopqrstuvwxyz";
+
+        /// Reports each accepted connection's `peer`.
+        struct Peers(mpsc::UnboundedSender<SocketAddr>);
+
+        impl ConnectionHandler for Peers {
+            fn handle(&self, conn: Accepted) -> futures::future::BoxFuture<'static, ()> {
+                let _ = self.0.send(conn.peer);
+                Box::pin(async move { drop(conn) })
+            }
+        }
+
+        struct Rig {
+            addr: SocketAddr,
+            peers: mpsc::UnboundedReceiver<SocketAddr>,
+            ca: CertificateDer<'static>,
+            leaf: (CertificateDer<'static>, PrivateKeyDer<'static>),
+            metrics: EdgeMetrics,
+            stop: CancellationToken,
+        }
+
+        async fn start(trusted: &str) -> Rig {
+            start_with(trusted, ListenerOptions::default().max_handshakes_per_ip).await
+        }
+
+        async fn start_with(trusted: &str, max_handshakes_per_ip: usize) -> Rig {
+            let now = OffsetDateTime::now_utc();
+            let bundle = CaBundle::generate(now).unwrap();
+            let names = EdgeNames::new(HOST, &[], "bkc", &"ops".parse().unwrap()).unwrap();
+            let serving = bundle.issue_edge_serving(&names, now).unwrap();
+            let provider = rustls::crypto::ring::default_provider();
+            let signer = provider
+                .key_provider
+                .load_private_key(serving.private_key_der().unwrap())
+                .unwrap();
+            let key = Arc::new(rustls::sign::CertifiedKey::new(
+                vec![serving.cert_der().clone()],
+                signer,
+            ));
+            let (tx, peers) = mpsc::unbounded_channel();
+            let handler: Arc<dyn ConnectionHandler> = Arc::new(Peers(tx));
+            let metrics = EdgeMetrics::register(&Metrics::new());
+            let tls = TlsBuilder::new(Arc::clone(&handler), metrics.clone())
+                .build(key, bundle.client_ca().cert_der().clone())
+                .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tls_tx, rx) = watch::channel(Some(Arc::new(tls)));
+            std::mem::forget(tls_tx);
+            let s = Serve {
+                tls: rx,
+                handler,
+                metrics: metrics.clone(),
+                options: ListenerOptions {
+                    handshake_timeout: Duration::from_secs(2),
+                    max_handshakes_per_ip,
+                    ..ListenerOptions::default()
+                },
+                ready: Readiness::with_spec_checks().register("edge_listener"),
+            };
+            let proxy = ProxyProtocol::trusting(
+                vec![trusted.parse().unwrap()],
+                Duration::from_secs(2),
+                ProxyMetrics::register(&Metrics::new(), "edge"),
+            );
+            let stop = CancellationToken::new();
+            tokio::spawn(serve_with_proxy(listener, s, proxy, stop.clone()));
+            let leaf = bundle
+                .issue_allocation(
+                    &ID.parse().unwrap(),
+                    LeafKey::Generate,
+                    now,
+                    now + time::Duration::hours(1)
+                        - time::Duration::nanoseconds(i64::from(now.nanosecond())),
+                )
+                .unwrap();
+            Rig {
+                addr,
+                peers,
+                ca: bundle.client_ca().cert_der().clone(),
+                leaf: (leaf.cert_der().clone(), leaf.private_key_der().unwrap()),
+                metrics,
+                stop,
+            }
+        }
+
+        fn header(src: SocketAddrV4) -> Vec<u8> {
+            let mut h = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+            h.extend_from_slice(&[0x21, 0x11, 0, 12]);
+            h.extend_from_slice(&src.ip().octets());
+            h.extend_from_slice(&[10, 0, 0, 1, 0x30, 0x39, 0x20, 0xfc]);
+            h[24..26].copy_from_slice(&src.port().to_be_bytes());
+            h
+        }
+
+        /// A TLS session with the allocation cert after writing `prefix`.
+        async fn dial(r: &Rig, prefix: &[u8]) -> std::io::Result<()> {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(r.ca.clone()).unwrap();
+            let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(vec![r.leaf.0.clone()], r.leaf.1.clone_key())
+            .unwrap();
+            let mut tcp = TcpStream::connect(r.addr).await?;
+            tcp.write_all(prefix).await?;
+            let mut s = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+                .connect(ServerName::try_from(HOST).unwrap(), tcp)
+                .await?;
+            // TLS 1.3: a refusal shows as an alert on the first read after the
+            // client's flight. The test handler closes without close_notify.
+            let mut b = [0u8; 1];
+            match tokio::io::AsyncReadExt::read(&mut s, &mut b).await {
+                Err(e) if e.kind() != std::io::ErrorKind::UnexpectedEof => Err(e),
+                _ => Ok(()),
+            }
+        }
+
+        async fn next_peer(r: &mut Rig) -> SocketAddr {
+            tokio::time::timeout(Duration::from_secs(5), r.peers.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn the_handler_sees_the_proxy_source() {
+            let mut r = start("127.0.0.0/8").await;
+            dial(&r, &header("192.0.2.7:1000".parse().unwrap()))
+                .await
+                .unwrap();
+            assert_eq!(next_peer(&mut r).await, "192.0.2.7:1000".parse().unwrap());
+            r.stop.cancel();
+        }
+
+        #[tokio::test]
+        async fn an_untrusted_forged_header_fails_the_handshake() {
+            let mut r = start("10.0.0.0/8").await;
+            let forged = header("203.0.113.9:1".parse().unwrap());
+            assert!(dial(&r, &forged).await.is_err());
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while r.metrics.outcome_count(None, "tls_error") == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            dial(&r, &[]).await.unwrap();
+            let seen = next_peer(&mut r).await;
+            assert_eq!(seen.ip(), ip("127.0.0.1"), "direct, as itself");
+            assert!(
+                r.peers.try_recv().is_err(),
+                "the forged connection never reached the handler"
+            );
+            r.stop.cancel();
+        }
+
+        /// `max_handshakes_per_ip` counts the PROXY source: two clients behind
+        /// one trusted gateway address have separate budgets, and one client
+        /// is still capped.
+        #[tokio::test]
+        async fn handshake_cap_counts_the_proxy_source() {
+            let mut r = start_with("127.0.0.0/8", 1).await;
+            // Client A: header, then no ClientHello, so it stays in the
+            // handshake and holds A's only slot.
+            let mut stalled = TcpStream::connect(r.addr).await.unwrap();
+            stalled
+                .write_all(&header("192.0.2.7:1000".parse().unwrap()))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                dial(&r, &header("192.0.2.7:2000".parse().unwrap()))
+                    .await
+                    .is_err(),
+                "A's second handshake is over its cap"
+            );
+            dial(&r, &header("192.0.2.8:1000".parse().unwrap()))
+                .await
+                .expect("B, behind the same gateway address, has its own budget");
+            assert_eq!(next_peer(&mut r).await, "192.0.2.8:1000".parse().unwrap());
+            drop(stalled);
+            r.stop.cancel();
+        }
     }
 }

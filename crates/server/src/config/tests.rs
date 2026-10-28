@@ -444,6 +444,55 @@ fn watch_namespaces_must_be_unique_namespace_names() {
 }
 
 #[test]
+fn proxy_protocol_is_off_by_default() {
+    let c = Config::from_yaml(MIN).unwrap();
+    for p in [&c.api.proxy_protocol, &c.edge.proxy_protocol] {
+        assert!(!p.enabled);
+        assert!(p.trusted_cidrs.is_empty());
+        assert_eq!(p.header_timeout.as_str(), "5s");
+    }
+}
+
+#[test]
+fn proxy_protocol_parses_per_listener() {
+    let c = Config::from_yaml(&format!(
+        "{MIN}  proxyProtocol: {{enabled: true, trustedCIDRs: [10.244.0.0/16, \"fd00::/8\"], headerTimeout: 2s}}\napi:\n  proxyProtocol: {{enabled: true, trustedCIDRs: [192.0.2.10/32]}}\n"
+    ))
+    .unwrap();
+    assert_eq!(c.edge.proxy_protocol.trusted_cidrs.len(), 2);
+    assert_eq!(c.edge.proxy_protocol.header_timeout.as_str(), "2s");
+    assert!(c.api.proxy_protocol.enabled);
+}
+
+#[test]
+fn proxy_protocol_needs_canonical_trusted_cidrs() {
+    let v = errs(&format!(
+        "{MIN}  proxyProtocol: {{enabled: true}}\napi:\n  proxyProtocol: {{enabled: true, trustedCIDRs: [10.0.0.1/8, 0.0.0.0/0, \"::ffff:10.0.0.0/104\", nonsense], headerTimeout: 0s}}\n"
+    ));
+    assert!(
+        v.iter()
+            .any(|m| m.contains("edge.proxyProtocol.trustedCIDRs must list")),
+        "{v:?}"
+    );
+    for bad in ["10.0.0.1/8", "::ffff:10.0.0.0/104", "nonsense"] {
+        assert!(
+            v.iter()
+                .any(|m| m.starts_with("api.proxyProtocol.trustedCIDRs") && m.contains(bad)),
+            "{bad}: {v:?}"
+        );
+    }
+    assert!(
+        v.iter().any(|m| m.contains("would trust every address")),
+        "{v:?}"
+    );
+    assert!(
+        v.iter()
+            .any(|m| m.contains("api.proxyProtocol.headerTimeout must be positive")),
+        "{v:?}"
+    );
+}
+
+#[test]
 fn request_timeout_must_be_below_the_read_timeout() {
     let v = errs(&format!("{MIN}kube:\n  requestTimeout: 90s\n"));
     assert!(
