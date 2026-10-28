@@ -123,6 +123,14 @@ Each replica keeps in-memory caches of pools and pods, fed by watches. When a wa
 
 Inside the 60 s the cache can miss a release or a deletion. Workers are single-use, so that can only admit the client that already held the worker. Expiry is checked against the clock, so an expired allocation is refused anyway. If a deleted pod's IP now belongs to another pod, the connection fails at the upstream handshake, because each worker's serving certificate names its own pod and nonce.
 
+### Stalled connections
+
+A watch can also hang without failing, for example when the API server freezes or a load balancer drops the flow without closing it. The controller's Kubernetes client fails any request that receives nothing for 90 s, and a watch that fails this way is handled like any other watch error. A stalled watch therefore goes unnoticed for at most 90 s. If no list completes after that, the 60 s bound above applies, so `/readyz` fails and the edge refuses with `store_stale` at most 150 s after the API server last sent anything. Until then a release or pod deletion can be missed, so a released allocation's open connection can stay up that long.
+
+- A healthy watch is never silent for 90 s. The API server sends a bookmark on every watch about once a minute, and 90 s leaves 30 s of margin.
+- If the API server runs with the watch cache disabled (`--watch-cache=false`), there are no bookmarks. A watch that sees no change then fails after 90 s and starts again; for the Pool and Pod caches that means a full list, so expect one extra list of each every 90 s on each replica. The replica stays Ready through these relists, but `buildkit_watch_errors_total` counts each one.
+- The timeout covers every request on the client: the Pool, Pod, Secret, Lease and claim watches, each namespace's watch when `watchNamespaces` lists several, and every write. It counts silence, not duration, so a large list that keeps streaming is not cut. Allocation, reconcile, TokenReview and Lease calls already give up after `kube.requestTimeout`, so in practice the 90 s limit ends only stalled watches and lists, and calls that have no timeout of their own.
+
 ## Troubleshooting
 
 Start with the pool conditions.

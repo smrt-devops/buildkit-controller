@@ -1,7 +1,9 @@
 //! `cargo xtask runtime-verify` runs two controller replicas against a
 //! throwaway kind cluster. It shows `/readyz` turning true only after
 //! `InitDone` (the CRD is applied late on purpose), `/readyz` staying true
-//! while the API server restarts and the watches relist, exactly one leader,
+//! while the API server restarts and the watches relist, `/readyz` failing
+//! within its bound when the API server goes silent without an error, exactly
+//! one leader,
 //! failover within the spec bound after SIGKILL of the leader, and Lease
 //! release on SIGTERM.
 //!
@@ -196,6 +198,84 @@ fn api_server_blip(env: &Env, replicas: &[Replica]) -> Result<()> {
     Ok(())
 }
 
+/// Earliest `/readyz` may fail once the API server goes silent: the 60 s
+/// `STALE_AFTER` of `runtime/stores.rs`, counted from a watch error, which
+/// comes no sooner than the stall.
+const STALL_STALE_MIN: Duration = Duration::from_mins(1);
+/// Latest: the 90 s client read timeout (`READ_TIMEOUT` in `runtime/mod.rs`)
+/// plus `STALE_AFTER`, plus slack for polling.
+const STALL_STALE_MAX: Duration = Duration::from_secs(150 + 15);
+/// After traffic flows again: a connect attempt in flight (30 s), the longest
+/// restart backoff (30 s) and the relist.
+const STALL_RECOVER: Duration = Duration::from_secs(75);
+
+/// Drop the API server's traffic to and from outside the kind node, so every
+/// connection the replicas hold stalls with no error and no reset. Kubelet and
+/// the node's own components reach it over loopback and keep working, so the
+/// API server is not restarted. Without the client read timeout the watches
+/// would hang and `/readyz` would stay 200 for good.
+fn api_server_stall(replicas: &[Replica]) -> Result<()> {
+    let node = format!("{}-control-plane", CLUSTER.as_str());
+    let iptables = |op: &str| -> Result<()> {
+        let rules = format!(
+            "iptables -w {op} INPUT -i eth0 -p tcp --dport 6443 -j DROP && \
+             iptables -w {op} OUTPUT -o eth0 -p tcp --sport 6443 -j DROP"
+        );
+        let out = Command::new("docker")
+            .args(["exec", &node, "sh", "-c", &rules])
+            .output()
+            .context("docker exec iptables")?;
+        ensure!(
+            out.status.success(),
+            "iptables {op}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(())
+    };
+    let readyz = || -> Vec<Option<(u16, String)>> {
+        replicas.iter().map(|r| http(r.ops, "/readyz")).collect()
+    };
+    ensure!(
+        readyz()
+            .iter()
+            .all(|g| g.as_ref().is_some_and(|(c, _)| *c == 200)),
+        "/readyz not 200 on both before the stall"
+    );
+    iptables("-I")?;
+    let start = Instant::now();
+    let mut early = None;
+    let stale = wait_for(
+        "/readyz 503 on both after the stall",
+        STALL_STALE_MAX,
+        || {
+            let got = readyz();
+            if got.iter().flatten().any(|(c, _)| *c != 200) && start.elapsed() < STALL_STALE_MIN {
+                early.get_or_insert((start.elapsed(), got.clone()));
+            }
+            got.iter().all(|g| {
+                g.as_ref().is_some_and(|(c, body)| {
+                    *c == 503 && (body.contains("pod_store") || body.contains("pool_store"))
+                })
+            })
+        },
+    );
+    let unblocked = iptables("-D");
+    let stale = stale?;
+    unblocked?;
+    if let Some((at, got)) = early {
+        bail!("/readyz failed {at:.1?} into the stall, before STALE_AFTER: {got:?}");
+    }
+    let back = wait_for("/readyz 200 on both after the stall", STALL_RECOVER, || {
+        readyz()
+            .iter()
+            .all(|g| g.as_ref().is_some_and(|(c, _)| *c == 200))
+    })?;
+    println!(
+        "PASS API server stall: /readyz 503 naming a stale store on both replicas {stale:.1?} after the API server went silent (bound {STALL_STALE_MAX:?}), 200 again {back:.1?} after traffic resumed"
+    );
+    Ok(())
+}
+
 /// `buildkit_watch_errors_total{kind="pod"}`, 0 when absent.
 fn pod_watch_errors(port: u16) -> u64 {
     http(port, "/metrics")
@@ -314,6 +394,10 @@ pub fn runtime_verify() -> Result<()> {
 
     // 3. Restart the API server. The watches fail and relist, and /readyz stays 200.
     api_server_blip(&cleanup.env, replicas)?;
+
+    // 3b. Silence the API server without an error. The client read timeout
+    // turns the stall into watch errors, and /readyz fails within its bound.
+    api_server_stall(replicas)?;
 
     // 4. Exactly one leader, and it is the Lease holder.
     // The API server restart may have cost the Lease; it is re-acquired within

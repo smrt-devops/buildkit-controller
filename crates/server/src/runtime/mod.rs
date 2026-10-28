@@ -31,6 +31,7 @@ pub mod shutdown;
 pub mod stores;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use k8s_openapi::api::core::v1::Pod;
 use kube::Client;
@@ -45,6 +46,57 @@ use crate::election::LeaderState;
 use metrics::Metrics;
 use readiness::Readiness;
 use stores::{PodSubscription, SecretState, StoreFreshness, StoreSpec, Stores};
+
+/// Longest a request to the API server may go without receiving a byte
+/// before it fails: the read timeout of the controller's kube client.
+///
+/// Without it a connection that stalls without an error (an API server that
+/// hangs, a load balancer that silently drops the flow) leaves a watch, a list
+/// or the start of a new watch waiting forever. kube's watcher notices a stall
+/// in the middle of a watch only after its 295 s idle timeout, and then
+/// re-watches without reporting it, so the stores never learn they were stale.
+/// With the timeout a stall becomes a watch error, which starts a relist and
+/// the [`stores::STALE_AFTER`] clock like any other watch error. A stalled
+/// watch therefore goes unnoticed for at most this long, and the store's
+/// readiness flag clears at most `READ_TIMEOUT + STALE_AFTER` (150 s) after
+/// the last byte, unless a relist completes first.
+///
+/// A healthy watch is never silent this long: kube asks for bookmarks, and the
+/// API server's watch cache sends one on every watch about once a minute and
+/// just before the watch's own 290 s timeout. 90 s leaves 30 s for timer
+/// slack and a loaded API server. Where the watch cache is disabled there are
+/// no bookmarks, and a watch that sees no change fails after 90 s and relists;
+/// the store stays ready through it.
+///
+/// The timeout counts silence, not the length of a request, so a long but
+/// flowing list is unaffected. A request is cut only if the API server sends
+/// nothing for 90 s. That is far beyond `kube.requestTimeout` (5 s by default),
+/// which already bounds the allocation, reconcile, token review and Lease
+/// calls; calls without their own bound, such as the claim controller's, gain
+/// this one. It is also beyond how long the API server takes to start
+/// answering a list, even a paged one served from etcd. The
+/// controller makes no exec, attach or log requests, the long-lived calls that
+/// a read timeout would break.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The controller's kube client: the inferred config (in-cluster, or the
+/// kubeconfig) with [`READ_TIMEOUT`]. Every watch, list and write shares it.
+///
+/// # Errors
+///
+/// No config could be inferred, or the client could not be built from it.
+pub async fn kube_client() -> Result<Client, kube::Error> {
+    let config = kube::Config::infer()
+        .await
+        .map_err(kube::Error::InferConfig)?;
+    client_from(config, READ_TIMEOUT)
+}
+
+/// A client for `config` whose requests fail after `read_timeout` without a byte.
+fn client_from(mut config: kube::Config, read_timeout: Duration) -> Result<Client, kube::Error> {
+    config.read_timeout = Some(read_timeout);
+    Client::try_from(config)
+}
 
 /// Shared handle to the runtime; cheap to clone.
 #[derive(Clone)]
@@ -200,3 +252,7 @@ impl AppContext {
         let _ = ca.wait_for(|s| s.init_done).await;
     }
 }
+
+#[cfg(test)]
+#[path = "client_tests.rs"]
+mod client_tests;
