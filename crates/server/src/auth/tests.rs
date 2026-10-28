@@ -1503,8 +1503,11 @@ fn owner_without_run_claims_is_iss_and_sub() {
         .owner(),
         plain
     );
-    // A subject with `#` keeps its legacy form when no run claim is present.
-    assert_eq!(oidc("a#b", json!({})).owner(), format!("oidc:{GH}#a#b"));
+    // `%` and `#` in `sub` are escaped without run claims too.
+    assert_eq!(
+        oidc("a#b%c", json!({})).owner(),
+        format!("oidc:{GH}#a%23b%25c")
+    );
 }
 
 #[test]
@@ -1531,6 +1534,17 @@ fn run_bound_owner_is_unambiguous() {
     assert_ne!(a, real);
     let pct = oidc("s%23x", json!({"run_id": "1"})).owner();
     assert_ne!(pct, oidc("s#x", json!({"run_id": "1"})).owner());
+}
+
+/// For an issuer that mints tokens with and without run claims, a `sub`
+/// carrying a run claim cannot pass for another caller's run-bound owner.
+#[test]
+fn plain_owner_cannot_forge_a_run_bound_one() {
+    let forged = oidc("x#run_id=1", json!({})).owner();
+    let real = oidc("x", json!({"run_id": "1"})).owner();
+    assert_eq!(real, format!("oidc:{GH}#x#run_id=1"));
+    assert_eq!(forged, format!("oidc:{GH}#x%23run_id=1"));
+    assert_ne!(forged, real);
 }
 
 #[test]

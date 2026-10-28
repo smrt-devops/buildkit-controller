@@ -32,6 +32,7 @@ auth:
   serviceAccount: {enabled: true, audiences: [bkc], maxConcurrentReviews: 8, maxReviewsPerIp: 2}
 workerNetwork:
   extraDeniedCIDRs: [203.0.113.0/24]
+  permittedCIDRs: [169.254.20.10/32]
   dns: {namespace: kube-system, podLabels: {k8s-app: kube-dns}, cidrs: [169.254.20.10/32]}
 shutdown: {delay: 10s, drainTimeout: 10m}
 service:

@@ -106,6 +106,7 @@ data:
         podLabels:
           k8s-app: kube-dns
       extraDeniedCIDRs: []
+      permittedCIDRs: []
 
 ---
 # Source: buildkit-controller/templates/rbac.yaml
@@ -365,7 +366,7 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: buildkit-controller-0.1.0
       annotations:
-        checksum/config: 86433f61aa197837d73a4e4fb9f227c28d141ae34312eeda51343e55b8a038f2
+        checksum/config: c122728f7f9bc9c4a7592ba1923a18d1bd8b8e608fdd0ec482c36e0cfe41fa81
     spec:
       serviceAccountName: buildkit-controller
       terminationGracePeriodSeconds: 86715

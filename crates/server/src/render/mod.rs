@@ -33,7 +33,9 @@ pub use cache::{
 pub use hash::{config_hash, template_hash};
 pub use objects::{ca_bundle_config_map, network_policy, service_account, worker_secret};
 pub use pod::{CACHE_INIT_NAME, pod_spec, worker_pod};
-pub use validate::{Conflict, validate_template};
+pub use validate::{
+    Conflict, PROTECTED_CIDRS, refused_allow_cidr, refused_allow_cidrs, validate_template,
+};
 
 pub use crate::pki::worker_secret_name;
 use crate::pki::{Ca, IssuedCert};
@@ -148,6 +150,9 @@ pub struct WorkerNetwork {
     /// range: without one the controller cannot tell cluster addresses (often global
     /// unicast on IPv6 clusters) from the internet, so IPv6 egress stays closed.
     pub cluster_cidrs: Vec<String>,
+    /// Ranges a pool's `allowCIDRs` may open although they overlap the link-local,
+    /// metadata, loopback, cluster or extra denied ranges. An entry must lie wholly inside one.
+    pub permitted_cidrs: Vec<String>,
     /// Where workers may resolve names.
     pub dns: WorkerDns,
 }
@@ -183,6 +188,7 @@ impl Default for WorkerNetwork {
             .to_vec(),
             extra_denied_cidrs: Vec::new(),
             cluster_cidrs: Vec::new(),
+            permitted_cidrs: Vec::new(),
             dns: WorkerDns {
                 namespace: "kube-system".into(),
                 pod_labels: BTreeMap::from([("k8s-app".into(), "kube-dns".into())]),
@@ -197,7 +203,8 @@ impl Default for WorkerNetwork {
 pub struct Claim {
     /// 26-char allocation id.
     pub alloc_id: String,
-    /// `oidc:<iss>#<sub>` or `sa:<namespace>/<name>`.
+    /// The caller, as [`crate::auth::Identity::owner`] builds it: `sa:<namespace>/<name>`,
+    /// `claim:<namespace>/<name>#<uid>`, or `oidc:<iss>#<sub>` followed by any run claims.
     pub owner: String,
     /// RFC 3339 UTC, seconds precision.
     pub allocated_at: String,
