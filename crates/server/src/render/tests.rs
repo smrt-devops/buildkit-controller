@@ -649,7 +649,7 @@ fn local_cache_bounds_buildkitd_gc() {
     // 80% of the 20Gi default size.
     assert_eq!(
         buildkitd_config(&p),
-        "[worker.oci]\n  maxUsedSpace = \"17179869184\"\n  gc = true\n"
+        "[worker.oci]\n  maxUsedSpace = \"17179869184\"\n  gc = true\n[history]\n  maxEntries = 0\n"
     );
     // A `gc = false` in the section is replaced; `gc` elsewhere and `gckeepstorage` stay.
     p.spec.workers.buildkitd_config =
@@ -660,16 +660,199 @@ fn local_cache_bounds_buildkitd_gc() {
     );
     assert_eq!(
         buildkitd_config(&p),
-        "debug = true\n[worker.oci]\n  maxUsedSpace = \"1073741824\"\n  gc = true\n  gckeepstorage = 1\n[worker.containerd]\n  gc = false\n"
+        "debug = true\n[worker.oci]\n  maxUsedSpace = \"1073741824\"\n  gc = true\n  gckeepstorage = 1\n[worker.containerd]\n  gc = false\n[history]\n  maxEntries = 0\n"
     );
     p.spec.workers.buildkitd_config = "debug = true".into();
     assert_eq!(
         buildkitd_config(&p),
-        "debug = true\n[worker.oci]\n  maxUsedSpace = \"1073741824\"\n  gc = true\n"
+        "debug = true\n[worker.oci]\n  maxUsedSpace = \"1073741824\"\n  gc = true\n[history]\n  maxEntries = 0\n"
     );
+    // A pool that sets maxUsedSpace keeps it; history is turned off all the same.
     p.spec.workers.buildkitd_config = "[worker.oci]\nmaxUsedSpace = \"5GB\"".into();
-    assert_eq!(buildkitd_config(&p), p.spec.workers.buildkitd_config);
+    assert_eq!(
+        buildkitd_config(&p),
+        "[worker.oci]\nmaxUsedSpace = \"5GB\"\n[history]\n  maxEntries = 0\n"
+    );
+    // A [history] of the pool's own loses its maxEntries and keeps the rest.
+    p.spec.workers.buildkitd_config =
+        "[history]\n  maxAge = 3600\n  maxEntries = 50\n[worker.oci]\nmaxUsedSpace = \"5GB\"\n"
+            .into();
+    assert_eq!(
+        buildkitd_config(&p),
+        "[history]\n  maxEntries = 0\n  maxAge = 3600\n[worker.oci]\nmaxUsedSpace = \"5GB\"\n"
+    );
     p.spec.workers.buildkitd_config = "debug = true".into();
     p.spec.workers.cache.local = None;
     assert_eq!(buildkitd_config(&p), "debug = true");
+}
+
+fn pod_ann<'a>(p: &'a k8s_openapi::api::core::v1::Pod, k: &str) -> Option<&'a str> {
+    p.metadata.annotations.as_ref()?.get(k).map(String::as_str)
+}
+
+#[test]
+fn cache_pools_run_the_init_step_before_buildkitd() {
+    let p = cached_pool(2, 5);
+    let spec = pod_spec(&p).unwrap();
+    let init = spec.init_containers.as_deref().unwrap();
+    assert_eq!(init.len(), 1);
+    let c = &init[0];
+    let main = &spec.containers[0];
+    assert_eq!(c.name, CACHE_INIT_NAME);
+    assert_eq!((&c.image, &c.resources), (&main.image, &main.resources));
+    let cmd = c.command.as_deref().unwrap();
+    assert_eq!(&cmd[..3], ["rootlesskit", "sh", "-c"]);
+    let script = &cmd[3];
+    for want in [
+        "d=/home/user/.local/share/buildkit",
+        GENERATION_FILE,
+        "rm -rf -- \"$d\"/* \"$d\"/.[!.]* \"$d\"/..?*",
+        "rm -f -- \"$d/history.db\"",
+        "${EXPECT_GENERATION:-$POD_UID}",
+    ] {
+        assert!(script.contains(want), "{want} missing from {script}");
+    }
+    // A wipe drops the generation file first and writes it last, so a wipe cut
+    // short leaves a volume without a generation, which the next pod empties.
+    let pos = |s: &str| script.find(s).unwrap_or_else(|| panic!("{s} missing"));
+    let drop_marker = pos("rm -f -- \"$m\"");
+    let wipe = pos("rm -rf -- ");
+    let write_marker = pos("printf %s \"$g\" > \"$m\"");
+    assert!(drop_marker < wipe && wipe < write_marker, "{script}");
+    let env: Vec<(&str, &str)> = c
+        .env
+        .iter()
+        .flatten()
+        .map(|e| {
+            let f = e.value_from.as_ref().unwrap().field_ref.as_ref().unwrap();
+            (e.name.as_str(), f.field_path.as_str())
+        })
+        .collect();
+    assert_eq!(
+        env,
+        [
+            (
+                "EXPECT_GENERATION",
+                "metadata.annotations['buildkit.smrt-devops.net/cache-generation']"
+            ),
+            ("POD_UID", "metadata.uid"),
+        ]
+    );
+    // The init step mounts the same state volume as buildkitd.
+    let m = &c.volume_mounts.as_deref().unwrap()[0];
+    let main_m = main
+        .volume_mounts
+        .iter()
+        .flatten()
+        .find(|v| v.name == "state")
+        .unwrap();
+    assert_eq!((&m.name, &m.mount_path), (&main_m.name, &main_m.mount_path));
+    // Without cache.local there is no init step.
+    assert!(
+        pod_spec(&pool("d", json!({})))
+            .unwrap()
+            .init_containers
+            .is_none()
+    );
+}
+
+#[test]
+fn cached_slot_pods_start_unbound() {
+    let p = cached_pool(1, 3);
+    let mut i = default_inputs();
+    i.slot = 0;
+    let pod = worker_pod(&p, &i).unwrap();
+    assert_eq!(pod_ann(&pod, KEY_CACHE_SCOPE), Some(""));
+    assert_eq!(pod_ann(&pod, KEY_CACHE_GENERATION), None);
+    i.slot = 1;
+    let pod = worker_pod(&p, &i).unwrap();
+    assert_eq!(pod_ann(&pod, KEY_CACHE_SCOPE), None);
+    // A pod outside a cached slot serves anyone; a cached one only its scope or any.
+    assert!(pod_serves(&pod, false, "a"));
+    assert!(!pod_serves(&pod, true, "a"));
+}
+
+#[test]
+fn bind_pod_keeps_only_the_owner_scope() {
+    let b = Binding::parse("s1@g1").unwrap();
+    assert_eq!(b.value(), "s1@g1");
+    for bad in ["", "s1", "@g", "s@", "s@g@h"] {
+        assert_eq!(Binding::parse(bad), None, "{bad}");
+    }
+    let pod = || {
+        let mut i = default_inputs();
+        i.slot = 0;
+        worker_pod(&cached_pool(1, 2), &i).unwrap()
+    };
+    // (binding, caller scope) -> (outcome, P cache-scope, P cache-generation)
+    let cases = [
+        (Some(&b), Some("s1"), Bound::Kept, "s1", Some("g1")),
+        (Some(&b), Some("s2"), Bound::Wiped, "s2", None),
+        (None, Some("s2"), Bound::Fresh, "s2", None),
+        (Some(&b), None, Bound::Kept, "s1", Some("g1")),
+        (None, None, Bound::Fresh, "", None),
+    ];
+    for (binding, scope, want, s, g) in cases {
+        let mut p = pod();
+        // A stale generation never survives a rebinding.
+        set_pod_cache_keys(&mut p, "k");
+        p.metadata
+            .annotations
+            .get_or_insert_default()
+            .insert(KEY_CACHE_GENERATION.into(), "stale".into());
+        assert_eq!(bind_pod(&mut p, binding, scope), want, "{scope:?}");
+        assert_eq!(pod_ann(&p, KEY_CACHE_SCOPE), Some(s));
+        assert_eq!(pod_ann(&p, KEY_CACHE_GENERATION), g);
+    }
+}
+
+#[test]
+fn won_binding_names_the_generation_on_the_volume() {
+    let mut p = {
+        let mut i = default_inputs();
+        i.slot = 0;
+        worker_pod(&cached_pool(1, 2), &i).unwrap()
+    };
+    p.metadata.uid = Some("u1".into());
+    // Unbound pod: it emptied the volume, so its uid is the generation.
+    let w = won_binding(&p, "s").unwrap();
+    assert_eq!(w.value(), "s@u1");
+    // Bound and kept by its own scope: the binding already says so.
+    let b = Binding::parse("s@g").unwrap();
+    bind_pod(&mut p, Some(&b), Some("s"));
+    assert_eq!(won_binding(&p, "s"), None);
+    // Bound to `t` on a volume of `s`: emptied, and the pod's uid starts `t`'s generation.
+    bind_pod(&mut p, Some(&b), Some("t"));
+    assert_eq!(won_binding(&p, "t").unwrap().value(), "t@u1");
+}
+
+proptest! {
+    /// Whatever the binding and the caller, a pod keeps a generation only when
+    /// the binding names the scope the pod serves, so a volume never reaches a
+    /// pod of another scope with its contents.
+    #[test]
+    fn a_kept_volume_always_belongs_to_the_pod_scope(
+        bound in proptest::option::of(("[a-c]", "[a-c]")),
+        caller in proptest::option::of("[a-c]"),
+    ) {
+        let mut i = default_inputs();
+        i.slot = 0;
+        let mut p = worker_pod(&cached_pool(1, 2), &i).unwrap();
+        let b = bound.map(|(s, g)| Binding { scope: s, generation: g });
+        let out = bind_pod(&mut p, b.as_ref(), caller.as_deref());
+        let serves = pod_ann(&p, KEY_CACHE_SCOPE).unwrap().to_owned();
+        if let Some(g) = pod_ann(&p, KEY_CACHE_GENERATION) {
+            let b = b.as_ref().unwrap();
+            prop_assert_eq!(out, Bound::Kept);
+            prop_assert_eq!(&b.scope, &serves);
+            prop_assert_eq!(&b.generation, g);
+            prop_assert!(caller.as_ref().is_none_or(|c| *c == serves));
+        } else {
+            prop_assert_ne!(out, Bound::Kept);
+        }
+        if let Some(c) = &caller {
+            prop_assert_eq!(&serves, c);
+            prop_assert!(pod_serves(&p, true, c));
+        }
+    }
 }

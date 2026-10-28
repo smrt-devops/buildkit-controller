@@ -608,6 +608,108 @@ fn prepare(work: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok((ctx, mp))
 }
 
+/// How many build records `docker buildx history ls` listed between the
+/// markers. The listing runs after the build, in the same allocation.
+fn history_records(out: &str) -> Result<usize> {
+    let start = out
+        .find("HISTORY-START")
+        .context("history listing did not run")?;
+    let end = out.find("HISTORY-END").context("history listing failed")?;
+    Ok(out[start..end]
+        .lines()
+        .skip(1)
+        .filter(|l| l.trim_start().starts_with('{'))
+        .count())
+}
+
+/// Scenario k: cache scopes and build history on `cache-local` (one slot).
+fn scopes(c: &Client, host_pool: &str, oidc: &str) -> Result<()> {
+    let sa = &c.sa_token()?;
+    let local_pool = format!("{POOL_NS}/cache-local");
+    let build = "docker buildx build --builder \"$BUILDER\" --progress=plain -o type=cacheonly $CACHE_ARGS .";
+    let script = format!(
+        "{build} && echo HISTORY-START && docker buildx history ls --builder \"$BUILDER\" --format json && echo HISTORY-END"
+    );
+    let go = |pool: &str, token: &str| {
+        let mut cmd = c.recipe(pool, token, &script);
+        if pool == local_pool {
+            cmd.env("CACHE_KEY", "e2e-local").env("CACHE", "local");
+        }
+        output(&mut cmd)
+    };
+    let binding = || {
+        c.env.kubectl(&[
+            "get",
+            "pvc",
+            "-n",
+            POOL_NS,
+            "cache-local-cache-0",
+            "-o",
+            "jsonpath={.metadata.annotations.buildkit\\.smrt-devops\\.net/cache-scope}",
+        ])
+    };
+    c.wait_warm("cache-local-0", "e2e-local")?;
+    let owner = binding()?;
+    ensure!(
+        owner.contains('@'),
+        "the volume has no owner after g: {owner:?}"
+    );
+
+    // History works through the edge on a pool without cache.local.
+    let control = go(host_pool, sa)?;
+    let n = history_records(&control)?;
+    ensure!(n >= 1, "no build record on {host_pool}:\n{control}");
+
+    // Another identity: a fresh volume, no cache, no history.
+    let other = go(&local_pool, sa)?;
+    ensure!(
+        !other.contains("local hit"),
+        "the ServiceAccount hit the OIDC caller's volume:\n{other}"
+    );
+    let cached = other.matches("CACHED").count();
+    ensure!(
+        cached == 0,
+        "the ServiceAccount got {cached} CACHED steps from another identity's volume:\n{other}"
+    );
+    let records = history_records(&other)?;
+    ensure!(
+        records == 0,
+        "{records} build records readable on a cache pool:\n{other}"
+    );
+    let result = other
+        .lines()
+        .find_map(|l| l.strip_prefix("cache: key e2e-local, local "))
+        .unwrap_or("?")
+        .to_owned();
+    let now = binding()?;
+    ensure!(now != owner, "the volume binding did not change: {now:?}");
+
+    // The same identity hits its own cache on the next pod.
+    c.wait_warm("cache-local-0", "e2e-local")?;
+    let again = go(&local_pool, sa)?;
+    let hits = again.matches("CACHED").count();
+    ensure!(
+        again.contains("cache: key e2e-local, local hit") && hits >= 3,
+        "the ServiceAccount did not hit its own cache ({hits} CACHED):\n{again}"
+    );
+    ensure!(
+        history_records(&again)? == 0,
+        "build records readable on a cache pool:\n{again}"
+    );
+
+    // The OIDC caller's volume was taken over, so it starts empty too.
+    c.wait_warm("cache-local-0", "e2e-local")?;
+    let back = go(&local_pool, oidc)?;
+    ensure!(
+        !back.contains("local hit") && back.matches("CACHED").count() == 0,
+        "the OIDC caller got the ServiceAccount's cache:\n{back}"
+    );
+    println!(
+        "PASS k: another identity gets an empty volume (local {result}, 0 CACHED, 0 build records; {n} on {host_pool}); the same identity then hits ({hits} CACHED); the first identity starts empty again"
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines, reason = "one linear scenario script")]
 fn run(env: &Env, work: &Path) -> Result<()> {
     let issuer = Issuer::new(OIDC_HOST)?;
@@ -836,6 +938,11 @@ fn run(env: &Env, work: &Path) -> Result<()> {
     println!(
         "PASS h: two overlapping e2e-spill builds both succeed; A local hit on {holder}, B local spill on {other}"
     );
+
+    // k. Cache scopes. After g, the only volume of cache-local belongs to the OIDC
+    // caller. A caller of another identity (the ServiceAccount) neither gets its
+    // cache nor reads any build history through the edge, then hits its own cache.
+    scopes(&c, &pool, &oidc)?;
 
     long.finish()?;
 
