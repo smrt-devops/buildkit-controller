@@ -128,23 +128,53 @@ fn signal_group(pgid: u32, sig: Option<Signal>) -> bool {
     }
 }
 
+/// Whether the group `pgid`, whose leader `Spawned` still holds unreaped, has
+/// nothing left to wait for. A leader that exited on SIGTERM stays a zombie
+/// while the caller holds the [`GROUPS`] lock, and a zombie keeps the group
+/// visible to `kill(-pgid, 0)`, so the leader is checked with `waitid` without
+/// reaping it, and the other members with `ps`, which marks zombies `Z`.
+fn group_done(pgid: u32) -> bool {
+    if !signal_group(pgid, None) {
+        return true;
+    }
+    let Some(leader) = i32::try_from(pgid).ok().and_then(Pid::from_raw) else {
+        return true;
+    };
+    let opts = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
+    if !matches!(waitid(WaitId::Pid(leader), opts), Ok(Some(_))) {
+        return false;
+    }
+    let Ok(ps) = Command::new("ps")
+        .args(["-A", "-o", "pgid=,stat="])
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    !String::from_utf8_lossy(&ps.stdout).lines().any(|l| {
+        let mut f = l.split_whitespace();
+        f.next().and_then(|g| g.parse::<u32>().ok()) == Some(pgid)
+            && f.next().is_some_and(|s| !s.starts_with('Z'))
+    })
+}
+
 /// SIGTERM to every group in `pgids`, then SIGKILL to any still alive after 5 s,
 /// so no child outlives the task. A controller replica drains on SIGTERM and
 /// could otherwise keep running after its cluster is gone. The caller holds
-/// the [`GROUPS`] lock, so none of these leaders is reaped meanwhile.
+/// the [`GROUPS`] lock, so none of these leaders is reaped meanwhile; the wait
+/// ends as soon as every group is [`group_done`].
 fn stop_groups(pgids: &[u32]) {
     for pgid in pgids {
         signal_group(*pgid, Some(Signal::TERM));
     }
     let deadline = Instant::now() + Duration::from_secs(5);
-    while pgids.iter().any(|p| signal_group(*p, None)) && Instant::now() < deadline {
+    while !pgids.iter().all(|p| group_done(*p)) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
     }
     for pgid in pgids {
         signal_group(*pgid, Some(Signal::KILL));
     }
 }
-
 /// Runs `c` in its own process group, like [`Command::output`]: stdin empty,
 /// stdout and stderr captured. SIGINT or SIGTERM to the task stops it too.
 pub(crate) fn run(c: &mut Command) -> Result<Output> {
@@ -382,6 +412,23 @@ mod tests {
         assert_eq!(s.wait().unwrap(), st);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Leaders that exit on SIGTERM stay unreaped zombies here, as in the signal
+    /// handler. The wait must end at once, not run to the 5 s cap.
+    #[test]
+    fn stop_groups_returns_promptly_when_every_child_exits() {
+        let kids: Vec<Spawned> = (0..3)
+            .map(|_| Spawned::spawn(Command::new("sleep").arg("60")).unwrap())
+            .collect();
+        let ids: Vec<u32> = kids.iter().map(Spawned::id).collect();
+        let start = Instant::now();
+        stop_groups(&ids);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     /// A grandchild holding the pipe open does not keep `run` waiting.
