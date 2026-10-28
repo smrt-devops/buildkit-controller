@@ -44,6 +44,11 @@ spec:
           cp -L /lib/ld-musl-*.so.1 /lib/libc.musl-*.so.1 /work/small/lib/
           printf 'FROM scratch\nCOPY lib/ /lib/\nCOPY bin/ /bin/\n' > /work/small/Dockerfile
           echo 'RUN ["/bin/busybox", "sh", "-c", "/bin/busybox echo built-through-edge > /ok; /bin/busybox cat /ok"]' >> /work/small/Dockerfile
+          # The client key pair (the curl image has no openssl). Only the public
+          # half is sent, as JSON string content with escaped newlines.
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out /work/key.pem
+          openssl pkey -in /work/key.pem -pubout -out /work/pub.pem
+          sed 's/$/\\n/' /work/pub.pem | tr -d '\n' > /work/pub.json
       securityContext: &sc
         allowPrivilegeEscalation: false
         capabilities: {drop: [ALL]}

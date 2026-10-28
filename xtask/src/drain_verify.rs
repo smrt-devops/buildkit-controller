@@ -371,12 +371,16 @@ impl Client<'_> {
         Ok(c)
     }
 
-    /// POST an allocation. Returns the curl command writing headers, body and
-    /// the status code into `<work>/<tag>.{hdr,body,code}`.
+    /// POST an allocation with the public half of a fresh client key pair.
+    /// Returns the curl command writing headers, body and the status code into
+    /// `<work>/<tag>.{hdr,body,code}`.
     fn allocate(&self, tag: &str, queue_secs: u64) -> Result<Command> {
-        let body = format!(
-            r#"{{"namespace":"{POOL_NS}","pool":"{POOL}","ttlSeconds":900,"queueTimeoutSeconds":{queue_secs}}}"#
-        );
+        let key = rcgen::KeyPair::generate()?.public_key_pem();
+        let body = serde_json::json!({
+            "namespace": POOL_NS, "pool": POOL, "ttlSeconds": 900,
+            "queueTimeoutSeconds": queue_secs, "publicKey": key,
+        })
+        .to_string();
         let mut c = self.curl()?;
         c.arg("-D")
             .arg(self.work.join(format!("{tag}.hdr")))

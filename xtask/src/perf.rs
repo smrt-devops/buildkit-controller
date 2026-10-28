@@ -134,6 +134,11 @@ spec:
           mkdir -p /work/big
           head -c {BIG} /dev/urandom > /work/big/big
           printf 'FROM scratch\\nCOPY big /big\\n' > /work/big/Dockerfile
+          # The client key pair: only the public half is sent, as JSON string
+          # content (newlines escaped).
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out /work/key.pem
+          openssl pkey -in /work/key.pem -pubout -out /work/pub.pem
+          sed 's/$/\\\\n/' /work/pub.pem | tr -d '\\n' > /work/pub.json
       securityContext: &sc
         allowPrivilegeEscalation: false
         capabilities: {{drop: [ALL]}}
@@ -289,7 +294,7 @@ impl Perf {
             "curl -s -o {out} -w '{fmt}' --cacert /trust/ca.crt \
              -H \"Authorization: Bearer $(cat /var/run/secrets/bk/token)\" \
              -H 'Content-Type: application/json' \
-             -d '{{\"namespace\":\"{NS}\",\"pool\":\"{POOL}\",\"ttlSeconds\":{ttl}}}' {API}/v1/allocations"
+             -d '{{\"namespace\":\"{NS}\",\"pool\":\"{POOL}\",\"ttlSeconds\":{ttl},\"publicKey\":\"'\"$(cat /work/pub.json)\"'\"}}' {API}/v1/allocations"
         )
     }
 
@@ -605,7 +610,7 @@ pub(crate) fn perf(batches: usize, idle_secs: u64) -> Result<()> {
         NS,
         &format!(
             "set -e\n{FIELD}{} >/dev/null\nfield clientCert /work/e.json > /work/e.crt\n\
-             field clientKey /work/e.json > /work/e.key\n{{ field caCert /work/e.json; cat /trust/ca.crt; }} > /work/e.ca\n\
+             cp /work/key.pem /work/e.key\n{{ field caCert /work/e.json; cat /trust/ca.crt; }} > /work/e.ca\n\
              field id /work/e.json",
             Perf::post(1800, "/work/e.json", "%{http_code}")
         ),
@@ -795,6 +800,20 @@ pub(crate) fn perf(batches: usize, idle_secs: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The client makes its own key and sends only the public half, as JSON
+    /// string content. These are the exact shell lines checked in the worker image.
+    #[test]
+    fn client_sends_its_own_public_key() {
+        let pod = pool_client();
+        assert!(pod.contains("openssl pkey -in /work/key.pem -pubout -out /work/pub.pem\n"));
+        assert!(pod.contains("sed 's/$/\\\\n/' /work/pub.pem | tr -d '\\n' > /work/pub.json\n"));
+        let post = Perf::post(120, "/work/a.json", "%{http_code}");
+        assert!(
+            post.contains(r#""ttlSeconds":120,"publicKey":"'"$(cat /work/pub.json)"'"}'"#),
+            "{post}"
+        );
+    }
 
     #[test]
     fn percentile_is_nearest_rank() {

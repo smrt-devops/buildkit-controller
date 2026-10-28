@@ -1237,33 +1237,66 @@ async fn volume_create_conflict_goes_on_and_other_errors_fail_the_create() {
 
 #[tokio::test]
 async fn current_volume_passes_its_cache_key_to_the_pod() {
+    use crate::render::{KEY_CACHE_GENERATION, KEY_CACHE_KEYS, KEY_CACHE_SCOPE, pod_cache_keys};
+    let ann = |p: &Pod, k: &str| {
+        p.metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(k).cloned())
+    };
     let (p, ca) = (cached_pool(), valid_ca());
-    let fake = Fake::default();
-    seed_pvc(&fake, &p, 0, |v| {
-        v.metadata.annotations.get_or_insert_default().insert(
-            crate::render::KEY_CACHE_KEYS.into(),
-            "repo-main,repo-dev".into(),
+    // (PVC cache-scope, expected P cache-scope, P cache-generation, keys copied)
+    let cases = [
+        // Bound: the warm pod serves the owner and keeps the generation and keys.
+        (Some("s1@g1"), "s1", Some("g1"), true),
+        // Never bound (or a volume from before scopes): serves any scope, emptied.
+        (None, "", None, false),
+        // Unbound by a recycle.
+        (Some(""), "", None, false),
+        // Malformed: treated as unbound.
+        (Some("s1"), "", None, false),
+    ];
+    for (binding, scope, generation, keys) in cases {
+        let fake = Fake::default();
+        seed_pvc(&fake, &p, 0, |v| {
+            let a = v.metadata.annotations.get_or_insert_default();
+            a.insert(KEY_CACHE_KEYS.into(), "repo-main,repo-dev".into());
+            if let Some(b) = binding {
+                a.insert(KEY_CACHE_SCOPE.into(), b.into());
+            }
+        });
+        let r = execute(
+            &fake,
+            &CaGuard::default(),
+            &env(&p, &ca, None, 0),
+            &plan(vec![create(0)]),
+        )
+        .await;
+        assert_eq!(
+            fake.calls_n(),
+            [
+                "get_pvc:p-cache-0",
+                "create:p-0",
+                "secret_create:p-0-N:Pod/uid-p-0",
+            ]
         );
-    });
-    let r = execute(
-        &fake,
-        &CaGuard::default(),
-        &env(&p, &ca, None, 0),
-        &plan(vec![create(0)]),
-    )
-    .await;
-    assert_eq!(
-        fake.calls_n(),
-        [
-            "get_pvc:p-cache-0",
-            "create:p-0",
-            "secret_create:p-0-N:Pod/uid-p-0",
-        ]
-    );
-    assert_eq!(
-        crate::render::pod_cache_keys(&r.created[0]),
-        Some("repo-main,repo-dev")
-    );
+        let pod = &r.created[0];
+        assert_eq!(
+            ann(pod, KEY_CACHE_SCOPE).as_deref(),
+            Some(scope),
+            "{binding:?}"
+        );
+        assert_eq!(
+            ann(pod, KEY_CACHE_GENERATION).as_deref(),
+            generation,
+            "{binding:?}"
+        );
+        assert_eq!(
+            pod_cache_keys(pod),
+            keys.then_some("repo-main,repo-dev"),
+            "{binding:?}"
+        );
+    }
 }
 
 #[tokio::test]

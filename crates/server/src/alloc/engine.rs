@@ -7,7 +7,6 @@ use buildkit_controller_api::dto::{AllocationResponse, CreateAllocationRequest};
 use buildkit_controller_api::v1alpha1::{self as crd, BuildKitPool};
 use k8s_openapi::api::core::v1::Pod;
 use kube::runtime::reflector::{ObjectRef, Store};
-use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -19,8 +18,8 @@ use super::certs::CertSource;
 use super::error::AllocError;
 use super::metrics::AllocMetrics;
 use super::pods::{
-    CERT_MARGIN, MAX_TRIES, Want, ann, claim_patch, extend_patch, fmt_ts, free_slots, is_candidate,
-    is_ready, new_alloc_id, of_pool, retire_patch, whole_seconds,
+    CERT_MARGIN, FREE, MAX_TRIES, Want, ann, claim_patch, extend_patch, fmt_ts, free_slots,
+    is_candidate, is_ready, new_alloc_id, of_pool, retire_patch, whole_seconds,
 };
 use super::queue::{PoolKey, Queues};
 use crate::auth::{AccessRule, AccessRules, Identity};
@@ -236,6 +235,8 @@ struct Won {
     claimed_until: OffsetDateTime,
     /// `P cache-keys` of the slot before this claim.
     keys_before: Option<String>,
+    /// Created for this request on a volume another scope owned.
+    wiped: bool,
 }
 
 /// What every attempt of one request shares.
@@ -252,6 +253,9 @@ struct Req<'a> {
     affinity: Option<(String, usize)>,
     /// Whether the local layer applies. Without it, uncached slots go first.
     local: bool,
+    /// The caller's cache scope id when the pool has `cache.local`. A pod in a
+    /// cached slot serves only its own scope.
+    scope: Option<String>,
 }
 
 /// The `expires-at` a claim is written with: [`COMMIT_WINDOW`] past now
@@ -413,6 +417,7 @@ impl Engine {
         }
     }
 
+    #[allow(clippy::too_many_lines, reason = "one linear request flow")]
     async fn allocate_in(
         &self,
         who: &Identity,
@@ -468,6 +473,7 @@ impl Engine {
             ttl: time::Duration::seconds(i64::try_from(ttl).map_err(|_| AllocError::Internal)?),
             affinity: plan.as_ref().and_then(|p| Some((p.key.clone(), p.soft?))),
             local: plan.as_ref().is_some_and(|p| p.local),
+            scope: cache::scope(pool, who),
         };
         let mut won = self.acquire(&r, Duration::from_secs(qt)).await?;
         let path = if won.cold.is_some() { "cold" } else { "warm" };
@@ -573,10 +579,20 @@ impl Engine {
                 keys,
             );
         }
+        if let Some(scope) = &r.scope {
+            cache::bind_detached(
+                Arc::clone(&self.backend),
+                self.metrics.clone(),
+                pool,
+                &won.pod,
+                scope,
+            );
+        }
         let p = plan?;
         if !p.local {
             // The slot's state dir still applies without the layer.
-            return cache::cached(pool, &won.pod).then_some("reused");
+            let reused = if won.wiped { "wiped" } else { "reused" };
+            return cache::cached(pool, &won.pod).then_some(reused);
         }
         let (ns, name) = (&r.key.0, &r.key.1);
         let pods: Vec<Arc<Pod>> = self
@@ -590,13 +606,18 @@ impl Engine {
             pool,
             &won.pod,
             before,
-            won.cold.is_some(),
+            won.cold.is_some().then_some(won.wiped),
+            r.scope.as_deref(),
             &p.key,
             &pods,
         ))
     }
 
-    /// Warm, cold, then the queue.
+    /// Warm, cold, then the queue. The queue is FIFO per pool on this replica:
+    /// a request that finds others waiting for the pool makes no attempt of
+    /// its own and goes behind them. Its arrival wakes the head, which makes
+    /// the attempt in its place, so a newcomer never takes a pod a waiter could
+    /// have had. Across replicas the order is best effort.
     async fn acquire(&self, r: &Req<'_>, qt: Duration) -> Result<Won, AllocError> {
         // Shutdown is checked only before an attempt, so a request is never
         // refused after its claim was sent.
@@ -604,8 +625,15 @@ impl Engine {
         if self.stopping.is_cancelled() {
             return Err(AllocError::ShuttingDown);
         }
-        if let Some(w) = self.attempt(r).await? {
-            return Ok(w);
+        // The wake version of the last attempt; `None` until this request made one.
+        let mut tried = None;
+        if self.queues.is_waiting(&r.key) {
+            self.queues.wake(&r.key);
+        } else {
+            if let Some(w) = self.attempt(r).await? {
+                return Ok(w);
+            }
+            tried = Some(snapshot);
         }
         let exhausted = || AllocError::PoolExhausted(format!("{}/{}", r.key.0, r.key.1));
         if qt.is_zero() {
@@ -622,15 +650,14 @@ impl Engine {
             result: "cancelled",
         };
         let deadline = rec.since + qt;
-        let mut tried = snapshot;
         loop {
             if self.stopping.is_cancelled() {
                 rec.result = "shutting_down";
                 return Err(AllocError::ShuttingDown);
             }
             let v = ticket.seen();
-            if v != tried && ticket.is_head() {
-                tried = v;
+            if tried != Some(v) && ticket.is_head() {
+                tried = Some(v);
                 if let Some(w) = self.attempt(r).await? {
                     rec.result = "ok";
                     return Ok(w);
@@ -700,7 +727,11 @@ impl Engine {
             .into_iter()
             .filter(|p| of_pool(p, ns, name, pool_uid))
             .collect();
-        let mut cands: Vec<&Arc<Pod>> = pods.iter().filter(|p| is_candidate(p, &want)).collect();
+        // A pod in a cached slot that serves another cache scope is never offered.
+        let (mut cands, foreign): (Vec<&Arc<Pod>>, Vec<&Arc<Pod>>) = pods
+            .iter()
+            .filter(|p| is_candidate(p, &want))
+            .partition(|p| cache::serves(&pool, p, r.scope.as_deref()));
         cache::order_warm(
             &pool,
             &mut cands,
@@ -715,12 +746,14 @@ impl Engine {
             let before = rnd::pod_cache_keys(pod).map(str::to_owned);
             let claimed_until = claim_until(expires_at, time::Duration::ZERO);
             let mut patch = claim_patch(uid, id, &r.owner, &now_s, &fmt_ts(claimed_until));
-            if let (Some((k, cap)), Value::Array(ops)) = (&r.affinity, &mut patch)
-                && cache::cached(&pool, pod)
-            {
-                let keys = rnd::push_key(before.as_deref(), k, *cap);
-                ops.push(json!({"op": "add", "path": format!("/metadata/annotations/{}", rnd::KEY_CACHE_KEYS.replace('/', "~1")), "value": keys}));
-            }
+            cache::claim_ops(
+                &pool,
+                pod,
+                before.as_deref(),
+                r.affinity.as_ref(),
+                r.scope.as_deref(),
+                &mut patch,
+            );
             // Arm the guard first, because a cancelled send may still land.
             let mut guard = self.guard(r, pname, Some(uid), grace_of(pod));
             match self.backend.patch_pod(ns, pname, patch).await {
@@ -744,6 +777,7 @@ impl Engine {
                         expires_at,
                         claimed_until,
                         keys_before: before,
+                        wiped: false,
                     }));
                 }
                 PatchOutcome::Lost => {
@@ -759,7 +793,11 @@ impl Engine {
                 }
             }
         }
-        self.cold(r, &pool, &pods, &ca, now_s, expires_at).await
+        let won = self.cold(r, &pool, &pods, &ca, now_s, expires_at).await?;
+        if won.is_none() {
+            self.recycle(r, &pool, &pods, &foreign).await;
+        }
+        Ok(won)
     }
 
     async fn cold(
@@ -785,12 +823,12 @@ impl Engine {
         cache::order_cold(pool, &mut slots, r.local);
         let id = r.alloc_id.as_str();
         for slot in slots.into_iter().take(MAX_TRIES) {
-            let before =
-                match cache::ensure_volume(&*self.backend, &self.metrics, pool, slot).await? {
-                    Volume::Ready(keys) => keys,
-                    Volume::Skip => continue,
-                    Volume::Quota => return Ok(None),
-                };
+            let have = match cache::ensure_volume(&*self.backend, &self.metrics, pool, slot).await?
+            {
+                Volume::Ready(have) => have,
+                Volume::Skip => continue,
+                Volume::Quota => return Ok(None),
+            };
             let claimed_until = claim_until(expires_at, start);
             let claim = Claim {
                 alloc_id: id.to_owned(),
@@ -809,6 +847,16 @@ impl Engine {
             if worker.not_after < expires_at + CERT_MARGIN {
                 // The internal CA ends before the allocation would.
                 return Ok(None);
+            }
+            // The pod serves the caller's scope. Its volume is kept only when that
+            // scope owns it; otherwise its init container empties it.
+            let (mut before, mut wiped) = (None, false);
+            if rnd::is_cached_slot(pool, slot) {
+                match rnd::bind_pod(&mut worker.pod, have.binding.as_ref(), r.scope.as_deref()) {
+                    rnd::Bound::Kept => before = have.keys,
+                    rnd::Bound::Wiped => wiped = true,
+                    rnd::Bound::Fresh => {}
+                }
             }
             if let Some((k, cap)) = &r.affinity
                 && rnd::is_cached_slot(pool, slot)
@@ -841,6 +889,7 @@ impl Engine {
                         expires_at,
                         claimed_until,
                         keys_before: before,
+                        wiped,
                     }));
                 }
                 CreateOutcome::Exists => {}
@@ -853,6 +902,40 @@ impl Engine {
             }
         }
         Ok(None)
+    }
+
+    /// When a request found no pod and no slot, retire one warm pod of a
+    /// cached slot that serves another cache scope ([`cache::recycle_pick`]).
+    /// Its volume is unbound first, so the slot's next pod serves any scope.
+    /// Without this, warm pods of other scopes could hold every slot for good.
+    async fn recycle(
+        &self,
+        r: &Req<'_>,
+        pool: &BuildKitPool,
+        pods: &[Arc<Pod>],
+        foreign: &[&Arc<Pod>],
+    ) {
+        let (ns, name) = (&r.key.0, &r.key.1);
+        let max = u32::try_from(pool.spec.scaling.max).unwrap_or(0);
+        let free = free_slots(
+            pods.iter().filter_map(|p| p.metadata.name.as_deref()),
+            name,
+            max,
+        )
+        .len();
+        let Some(pod) = cache::recycle_pick(pool, pods, free, foreign) else {
+            return;
+        };
+        let (Some(pname), Some(uid)) = (&pod.metadata.name, &pod.metadata.uid) else {
+            return;
+        };
+        if !cache::unbind(&*self.backend, &self.metrics, pool, pod).await {
+            return;
+        }
+        if retire(&*self.backend, ns, pname, Some(uid), FREE, grace_of(pod)).await == Retired::Yes {
+            self.metrics.release(ns, name, "cache_scope");
+            info!(namespace = %ns, pool = %name, pod = %pname, reason = "cache_scope", "retired a warm pod of another cache scope");
+        }
     }
 
     /// Runs [`spawn::spawn`] (pod, then its Secret) in its own task, so a

@@ -430,15 +430,26 @@ fn base(api: SocketAddr) -> String {
     format!("https://{SERVER_NAME}:{}", api.port())
 }
 
+/// POST an allocation as a client does: with the public half of a key pair it
+/// generated, so the response carries no private key.
 async fn post(
     c: &reqwest::Client,
     api: SocketAddr,
     token: Option<&str>,
     pool: &str,
 ) -> (StatusCode, Value) {
-    let mut r = c
-        .post(format!("{}/v1/allocations", base(api)))
-        .json(&json!({"namespace": NS, "pool": pool, "queueTimeoutSeconds": 90}));
+    let key = rcgen::KeyPair::generate().unwrap().public_key_pem();
+    let body = json!({"namespace": NS, "pool": pool, "queueTimeoutSeconds": 90, "publicKey": key});
+    post_body(c, api, token, &body).await
+}
+
+async fn post_body(
+    c: &reqwest::Client,
+    api: SocketAddr,
+    token: Option<&str>,
+    body: &Value,
+) -> (StatusCode, Value) {
+    let mut r = c.post(format!("{}/v1/allocations", base(api))).json(body);
     if let Some(t) = token {
         r = r.bearer_auth(t);
     }
@@ -448,6 +459,10 @@ async fn post(
 }
 
 fn check_grant(v: &Value, ca: &str) {
+    assert!(
+        v.get("clientKey").is_none(),
+        "the server sent a private key: {v}"
+    );
     assert!(
         v["clientCert"]
             .as_str()
@@ -600,6 +615,25 @@ async fn api_verify() {
     assert_eq!(v1, v2, "no access is identical to a missing pool");
     println!("e. 401 none/forged/wrong-aud (OIDC and SA), 404 pool_not_found identical: PASS");
 
+    // h. The HTTP API never generates a private key: no publicKey is a 400.
+    let (st, v) = post_body(
+        &c,
+        api,
+        Some(&alice),
+        &json!({"namespace": NS, "pool": POOL}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"]["code"], "invalid_request");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("publicKey is required"),
+        "{v}"
+    );
+    println!("h. POST without publicKey 400 invalid_request, nothing allocated: PASS");
+
     // g. One counter for service outcomes and HTTP-layer rejections.
     let text = metrics.render();
     let total = |result: &str, ns: &str, pool: &str| {
@@ -614,6 +648,7 @@ async fn api_verify() {
     assert_eq!(total("ok", NS, POOL), 3, "{text}");
     // Missing and inaccessible pools look alike here too and get empty labels.
     assert_eq!(total("pool_not_found", "", ""), 2, "{text}");
+    assert_eq!(total("invalid_request", "", ""), 1, "{text}");
     println!("g. buildkit_allocations_total counts service and HTTP rejections: PASS");
     for l in text
         .lines()

@@ -798,6 +798,112 @@ async fn queue_is_fifo_and_woken_by_pod_events() {
     }
 }
 
+/// A request that finds a waiter goes behind it, so a pod freed while
+/// someone is queued goes to the waiter even when the newcomer runs first.
+#[tokio::test(start_paused = true)]
+async fn a_newcomer_never_takes_a_pod_from_a_queued_request() {
+    let e = env_with(4, false, 10);
+    let _stop = e.spawn_drive();
+    let engine = Arc::clone(&e.engine);
+    let first = tokio::spawn(async move {
+        engine
+            .allocate(&sa("first"), &req(60))
+            .await
+            .map(super::Allocation::commit)
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let key = (NS.to_owned(), POOL.to_owned());
+    assert_eq!(e.engine.queues.lengths(), vec![(key, 1)]);
+    // The newcomer runs before the pod event wakes the queue head.
+    let p0 = e.warm(0);
+    let t = tokio::time::Instant::now();
+    assert!(matches!(
+        e.engine.allocate(&sa("late"), &req(0)).await,
+        Err(AllocError::PoolExhausted(_))
+    ));
+    assert_eq!(t.elapsed(), Duration::ZERO);
+    let engine = Arc::clone(&e.engine);
+    let second = tokio::spawn(async move {
+        engine
+            .allocate(&sa("second"), &req(60))
+            .await
+            .map(super::Allocation::commit)
+    });
+    let p1 = e.warm(1);
+    assert_eq!(
+        first.await.unwrap().unwrap().owner,
+        format!("sa:{NS}/first")
+    );
+    assert_eq!(
+        second.await.unwrap().unwrap().owner,
+        format!("sa:{NS}/second")
+    );
+    // Either waiter may claim either pod; the newcomer got neither.
+    let mut owners: Vec<String> = [p0, p1]
+        .iter()
+        .map(|p| ann(&e.fake.get(p).unwrap(), ANN_OWNER).unwrap().to_owned())
+        .collect();
+    owners.sort();
+    assert_eq!(
+        owners,
+        [format!("sa:{NS}/first"), format!("sa:{NS}/second")]
+    );
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(128))]
+
+    /// FIFO on one replica: whatever the interleaving of arrivals and freed
+    /// pods, the requests that got a pod are exactly the earliest arrivals.
+    #[test]
+    fn requests_are_served_in_arrival_order(
+        events in proptest::collection::vec((proptest::bool::ANY, 0..4_usize), 1..20),
+    ) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let (served, want) = rt.block_on(async {
+            let e = env_with(64, false, 64);
+            let _stop = e.spawn_drive();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            let (mut handles, mut freed) = (Vec::new(), 0_u32);
+            for (arrive, yields) in events {
+                if arrive {
+                    let engine = Arc::clone(&e.engine);
+                    let who = sa(&format!("a{}", handles.len()));
+                    handles.push(tokio::spawn(async move {
+                        engine
+                            .allocate(&who, &req(600))
+                            .await
+                            .map(super::Allocation::commit)
+                    }));
+                } else {
+                    e.warm(freed);
+                    freed += 1;
+                }
+                for _ in 0..yields {
+                    tokio::task::yield_now().await;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let want: Vec<usize> = (0..handles.len().min(freed as usize)).collect();
+            let mut served = Vec::new();
+            for (i, h) in handles.iter().enumerate() {
+                if h.is_finished() {
+                    served.push(i);
+                }
+            }
+            for h in handles.into_iter().filter(tokio::task::JoinHandle::is_finished) {
+                assert!(h.await.unwrap().is_ok());
+            }
+            (served, want)
+        });
+        proptest::prop_assert_eq!(served, want);
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn release_is_owner_only() {
     let e = env_with(4, false, 10);
@@ -1477,7 +1583,13 @@ async fn cache_none_prefers_an_uncached_slot_and_reports_reuse_otherwise() {
         Some("x")
     );
     settle().await;
-    assert!(!e.fake.calls().iter().any(|c| c.starts_with("annotate_pvc")));
+    // Only the volume's scope binding is written, never its keys.
+    assert!(
+        !e.fake
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("annotate_pvc") && !c.contains('@'))
+    );
     let mut reg = prometheus_client::registry::Registry::default();
     e.metrics.register(&mut reg);
     let mut m = String::new();
@@ -1719,4 +1831,313 @@ async fn every_commit_moves_expires_at_even_for_the_shortest_ttl() {
         time::Duration::seconds(60)
     );
     let _ = a.commit();
+}
+
+// Cache scopes: a volume never reaches a caller of another scope with its contents.
+
+fn oidc(issuer: &str, subject: &str, claims: Value) -> Identity {
+    let Value::Object(claims) = claims else {
+        panic!("claims must be an object")
+    };
+    Identity::Oidc {
+        issuer: issuer.into(),
+        subject: subject.into(),
+        claims,
+    }
+}
+
+#[test]
+fn cache_scope_follows_the_caller_trust_boundary() {
+    use buildkit_controller_api::v1alpha1::CacheScope::{Identity as Id, Pool};
+
+    use super::cache::scope_name;
+    const GH: &str = "https://token.actions.githubusercontent.com";
+    let gh = |sub: &str, claims: Value| scope_name(Id, &oidc(GH, sub, claims));
+    let main = gh(
+        "repo:o/r:ref:refs/heads/main",
+        json!({"repository_id": "42", "repository": "o/r", "run_id": "1"}),
+    );
+    // Every run, ref and event of one repository shares its cache.
+    assert_eq!(
+        main,
+        gh(
+            "repo:o/r:pull_request",
+            json!({"repository_id": "42", "repository": "o/r", "run_id": "2"})
+        )
+    );
+    // A numeric id is the same id.
+    assert_eq!(main, gh("x", json!({"repository_id": 42})));
+    // A renamed or recreated repository is told apart by its id.
+    assert_ne!(
+        main,
+        gh("x", json!({"repository_id": "43", "repository": "o/r"}))
+    );
+    // Without the id, the name; without either, the subject.
+    let by_name = gh("x", json!({"repository": "o/r"}));
+    assert_ne!(by_name, main);
+    assert_eq!(
+        by_name,
+        gh("y", json!({"repository": "o/r", "repository_id": ""}))
+    );
+    assert_ne!(gh("a", json!({})), gh("b", json!({})));
+    assert_eq!(gh("a", json!({})), gh("a", json!({"run_id": "9"})));
+    // The issuer is part of the scope, so another issuer cannot claim the same repository.
+    assert_ne!(
+        main,
+        scope_name(
+            Id,
+            &oidc("https://evil.example", "x", json!({"repository_id": "42"}))
+        )
+    );
+    // A subject that looks like a repository claim is still a subject.
+    assert_ne!(gh("42", json!({})), main);
+    // ServiceAccounts by namespace and name, claims by namespace.
+    let sa_in = |ns: &str, name: &str| Identity::ServiceAccount {
+        namespace: ns.into(),
+        name: name.into(),
+        uid: "u".into(),
+    };
+    assert_ne!(
+        scope_name(Id, &sa_in("a", "b")),
+        scope_name(Id, &sa_in("a", "c"))
+    );
+    assert_ne!(
+        scope_name(Id, &sa_in("a", "b")),
+        scope_name(Id, &sa_in("b", "b"))
+    );
+    assert_eq!(
+        scope_name(Id, &sa_in("a", "b")),
+        scope_name(
+            Id,
+            &Identity::ServiceAccount {
+                namespace: "a".into(),
+                name: "b".into(),
+                uid: "other".into(),
+            }
+        )
+    );
+    let claim = |ns: &str, name: &str| Identity::Claim {
+        namespace: ns.into(),
+        name: name.into(),
+        uid: name.into(),
+    };
+    assert_eq!(
+        scope_name(Id, &claim("ci", "b1")),
+        scope_name(Id, &claim("ci", "b2"))
+    );
+    assert_ne!(
+        scope_name(Id, &claim("ci", "b1")),
+        scope_name(Id, &claim("cd", "b1"))
+    );
+    // Kinds never collide, even with the same strings.
+    assert_ne!(
+        scope_name(Id, &sa_in("ci", "x")),
+        scope_name(Id, &claim("ci", "x"))
+    );
+    // `scope: pool` is one scope for every caller.
+    assert_eq!(
+        scope_name(Pool, &sa_in("a", "b")),
+        scope_name(Pool, &claim("c", "d"))
+    );
+}
+
+proptest::proptest! {
+    /// Two OIDC callers share a scope exactly when they share issuer and
+    /// repository id.
+    #[test]
+    fn scope_ids_separate_repositories(
+        a in "[0-9]{1,6}", b in "[0-9]{1,6}", ia in "[ab]", ib in "[ab]",
+    ) {
+        use buildkit_controller_api::v1alpha1::CacheScope::Identity as Id;
+        let s = |i: &str, r: &str| crate::render::scope_id(&super::cache::scope_name(
+            Id, &oidc(i, "s", json!({"repository_id": r}))));
+        proptest::prop_assert_eq!(s(&ia, &a) == s(&ib, &b), ia == ib && a == b);
+        proptest::prop_assert_eq!(s(&ia, &a).len(), 32);
+    }
+}
+
+impl Env {
+    fn scope(&self, who: &Identity) -> String {
+        super::cache::scope(&self.pool, who).unwrap()
+    }
+
+    /// Bind a warm pod to `scope`, keeping generation `generation`.
+    fn bind(&self, name: &str, scope: &str, generation: &str) {
+        let mut p = self.fake.get(name).unwrap();
+        let a = p.metadata.annotations.get_or_insert_default();
+        a.insert(crate::render::KEY_CACHE_SCOPE.into(), scope.into());
+        a.insert(
+            crate::render::KEY_CACHE_GENERATION.into(),
+            generation.into(),
+        );
+        self.fake.put(p);
+    }
+
+    /// Seed the volume of `slot`, bound to `binding` with `keys`.
+    fn seed_volume(&self, slot: u32, binding: &str, keys: &str) {
+        let mut pvc = crate::render::cache_volume(&self.pool, slot)
+            .unwrap()
+            .unwrap();
+        let name = pvc.metadata.name.clone().unwrap();
+        pvc.metadata.uid = Some(format!("pvc-{name}"));
+        let a = pvc.metadata.annotations.get_or_insert_default();
+        a.insert(crate::render::KEY_CACHE_SCOPE.into(), binding.into());
+        a.insert(crate::render::KEY_CACHE_KEYS.into(), keys.into());
+        self.fake.w.lock().unwrap().pvcs.insert(name, pvc);
+    }
+
+    fn volume_binding(&self, slot: u32) -> Option<String> {
+        let w = self.fake.w.lock().unwrap();
+        let pvc = w.pvcs.get(&format!("{POOL}-cache-{slot}"))?;
+        pvc.metadata
+            .annotations
+            .as_ref()?
+            .get(crate::render::KEY_CACHE_SCOPE)
+            .cloned()
+    }
+
+    /// Allocate on the cold path: wait for the create, then make the pod ready.
+    async fn allocate_cold(
+        &self,
+        who: Identity,
+        r: CreateAllocationRequest,
+    ) -> (String, Pod, String) {
+        let before = self.fake.calls().len();
+        let engine = Arc::clone(&self.engine);
+        let h = tokio::spawn(async move { engine.allocate(&who, &r).await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let created = self.fake.calls()[before..]
+            .iter()
+            .find_map(|c| c.strip_prefix("create ").map(str::to_owned))
+            .unwrap();
+        self.fake.set_ready(&created);
+        let a = h.await.unwrap().unwrap();
+        let pod = self.fake.get(&created).unwrap();
+        let result = a.commit().cache.unwrap().local.unwrap().result;
+        (created, pod, result)
+    }
+}
+
+fn pann<'a>(p: &'a Pod, k: &str) -> Option<&'a str> {
+    ann(p, k)
+}
+
+#[tokio::test(start_paused = true)]
+async fn warm_pods_of_another_scope_are_never_offered() {
+    // maxVolumes 2 of max 3: slots 0 and 1 are cached, slot 2 is not.
+    let e = env_full(3, false, 10, true);
+    let (a, b) = (e.scope(&sa("a")), e.scope(&sa("b")));
+    let (p0, p2) = (e.warm(0), e.warm(2));
+    e.bind(&p0, &a, "g0");
+    e.set_keys(&p0, "k");
+    // `b` asks for `a`'s key: it gets the uncached pod, never `a`'s volume.
+    let r = e.engine.allocate(&sa("b"), &keyed_req("k")).await.unwrap();
+    assert_eq!(r.pod().0, p2);
+    assert_eq!(r.commit().cache.unwrap().local.unwrap().result, "uncached");
+    // With nothing else free, `b` is refused rather than given `a`'s volume.
+    assert!(matches!(
+        e.engine.allocate(&sa("b"), &keyed_req("k")).await,
+        Err(AllocError::PoolExhausted(_))
+    ));
+    // `a` itself still hits, and its binding is left as it is.
+    let r = e.engine.allocate(&sa("a"), &keyed_req("k")).await.unwrap();
+    assert_eq!(r.pod().0, p0);
+    assert_eq!(r.commit().cache.unwrap().local.unwrap().result, "hit");
+    settle().await;
+    assert!(!e.fake.calls().iter().any(|c| c.contains(&format!("{a}@"))));
+    // A pod that started on an emptied volume serves any scope, and the win binds the volume.
+    let p1 = e.warm(1);
+    e.seed_volume(1, "", "");
+    let r = e.engine.allocate(&sa("b"), &keyed_req("k")).await.unwrap();
+    assert_eq!(r.pod().0, p1);
+    assert_eq!(r.commit().cache.unwrap().local.unwrap().result, "miss");
+    settle().await;
+    let uid = e.fake.get(&p1).unwrap().metadata.uid.unwrap();
+    assert_eq!(e.volume_binding(1), Some(format!("{b}@{uid}")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn cold_path_wipes_a_volume_of_another_scope_and_keeps_its_own() {
+    // max 2, maxVolumes 2: both slots cached, both volumes owned by `a`.
+    let e = env_full(2, true, 10, true);
+    let (a, b) = (e.scope(&sa("a")), e.scope(&sa("b")));
+    e.seed_volume(0, &format!("{a}@g0"), "k");
+    e.seed_volume(1, &format!("{a}@g1"), "k");
+    let (name, pod, result) = e.allocate_cold(sa("b"), keyed_req("k")).await;
+    assert_eq!(result, "wiped");
+    // Bound to `b` with no generation to keep, so the init step empties the volume.
+    assert_eq!(pann(&pod, crate::render::KEY_CACHE_SCOPE), Some(b.as_str()));
+    assert_eq!(pann(&pod, crate::render::KEY_CACHE_GENERATION), None);
+    // `a`'s keys are not carried over.
+    assert_eq!(crate::render::pod_cache_keys(&pod), Some("k"));
+    settle().await;
+    let slot: u32 = name.rsplit('-').next().unwrap().parse().unwrap();
+    let uid = pod.metadata.uid.clone().unwrap();
+    assert_eq!(e.volume_binding(slot), Some(format!("{b}@{uid}")));
+    // `a` gets the other volume and keeps it.
+    let (_, pod, result) = e.allocate_cold(sa("a"), keyed_req("k")).await;
+    assert_eq!(result, "cold");
+    let other = format!("g{}", 1 - slot);
+    assert_eq!(pann(&pod, crate::render::KEY_CACHE_SCOPE), Some(a.as_str()));
+    assert_eq!(
+        pann(&pod, crate::render::KEY_CACHE_GENERATION),
+        Some(other.as_str())
+    );
+    assert_eq!(crate::render::pod_cache_keys(&pod), Some("k"));
+    settle().await;
+    assert_eq!(e.volume_binding(1 - slot), Some(format!("{a}@{other}")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn cache_none_on_a_volume_of_another_scope_reports_wiped() {
+    let e = env_full(1, true, 10, true);
+    let a = e.scope(&sa("a"));
+    e.seed_volume(0, &format!("{a}@g0"), "k");
+    let (_, pod, result) = e.allocate_cold(sa("b"), choice_req("none")).await;
+    assert_eq!(result, "wiped");
+    assert_eq!(pann(&pod, crate::render::KEY_CACHE_GENERATION), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn warm_pods_of_another_scope_are_recycled_when_nothing_else_is_left() {
+    // max 2, both slots cached and held by warm pods of `a`; creates hit quota.
+    let e = env_full(2, false, 10, true);
+    let a = e.scope(&sa("a"));
+    for slot in 0..2 {
+        let p = e.warm(slot);
+        e.bind(&p, &a, &format!("g{slot}"));
+        e.seed_volume(slot, &format!("{a}@g{slot}"), "");
+    }
+    assert!(matches!(
+        e.engine.allocate(&sa("b"), &req(0)).await,
+        Err(AllocError::PoolExhausted(_))
+    ));
+    let calls = e.fake.calls();
+    let retired: Vec<&String> = calls.iter().filter(|c| c.ends_with(" draining")).collect();
+    assert_eq!(retired.len(), 1, "{calls:?}");
+    let name = retired[0].split(' ').nth(1).unwrap();
+    let slot: u32 = name.rsplit('-').next().unwrap().parse().unwrap();
+    // Unbound first, so the slot's next pod serves any scope.
+    let unbind = calls
+        .iter()
+        .position(|c| c == &format!("annotate_pvc {POOL}-cache-{slot} "))
+        .unwrap();
+    assert!(unbind < calls.iter().position(|c| c.ends_with(" draining")).unwrap());
+    assert_eq!(e.volume_binding(slot).as_deref(), Some(""));
+    assert_eq!(
+        e.volume_binding(1 - slot),
+        Some(format!("{a}@g{}", 1 - slot))
+    );
+    // The next request finds a free slot and recycles nothing more.
+    let _ = e.engine.allocate(&sa("b"), &req(0)).await;
+    let n = e
+        .fake
+        .calls()
+        .iter()
+        .filter(|c| c.ends_with(" draining"))
+        .count();
+    assert_eq!(n, 1);
+    // `a` is never recycled for: it still has its own pod.
+    let r = e.engine.allocate(&sa("a"), &req(0)).await.unwrap();
+    assert_eq!(r.pod().0, format!("{POOL}-{}", 1 - slot));
 }

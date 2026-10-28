@@ -24,13 +24,15 @@ use buildkit_controller_api::v1alpha1::{BuildKitPool, GROUP, VERSION};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 
 pub use cache::{
-    CACHE_VOLUME_NAME, KEY_CACHE_KEYS, LABEL_VOLUME_HASH, buildkitd_config, cache_limit,
-    cache_volume, cache_volume_name, cache_volume_slot, gc_keep_bytes, is_cached_slot,
-    keys_contain, pod_cache_keys, push_key, quantity_bytes, set_pod_cache_keys, volume_hash,
+    Binding, Bound, CACHE_VOLUME_NAME, GENERATION_FILE, KEY_CACHE_GENERATION, KEY_CACHE_KEYS,
+    KEY_CACHE_SCOPE, LABEL_VOLUME_HASH, bind_pod, buildkitd_config, cache_limit, cache_volume,
+    cache_volume_name, cache_volume_slot, gc_keep_bytes, is_cached_slot, keys_contain,
+    pod_cache_keys, pod_serves, push_key, quantity_bytes, scope_id, set_pod_cache_keys,
+    volume_hash, won_binding,
 };
 pub use hash::{config_hash, template_hash};
 pub use objects::{ca_bundle_config_map, network_policy, service_account, worker_secret};
-pub use pod::{pod_spec, worker_pod};
+pub use pod::{CACHE_INIT_NAME, pod_spec, worker_pod};
 pub use validate::{Conflict, validate_template};
 
 pub use crate::pki::worker_secret_name;

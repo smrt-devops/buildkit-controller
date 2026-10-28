@@ -11,6 +11,12 @@ CM=https://kubernetes.default.svc/api/v1/namespaces/buildkit-system/configmaps/b
 SA=/var/run/secrets/kubernetes.io/serviceaccount
 R=/work/run
 mkdir -p "$R"
+# The client key pair, made by the init container (the curl image has no openssl).
+# Only the public half is sent; /work/pub.json is it as JSON string content.
+if [ ! -s /work/key.pem ] || [ ! -s /work/pub.json ]; then
+  echo "no client key pair in /work" >&2
+  exit 1
+fi
 
 # String field $1 of the JSON in file $2, with JSON escapes for \n undone.
 field() {
@@ -37,7 +43,8 @@ once() {
     code=$(curl -s --max-time 200 --cacert "$R/trust.pem" -o "$R/resp.json" -D "$R/hdr" \
       -w '%{http_code}' -H "Authorization: Bearer $(cat /var/run/secrets/bk/token)" \
       -H 'Content-Type: application/json' \
-      -d '{"namespace":"bk-soak","pool":"soak","ttlSeconds":60}' "$API/v1/allocations")
+      -d '{"namespace":"bk-soak","pool":"soak","ttlSeconds":60,"publicKey":"'"$(cat /work/pub.json)"'"}' \
+      "$API/v1/allocations")
     rc=$?
     case "$rc" in
       6|7|35|60) ;;            # DNS, connect, TLS handshake and verify failures mean nothing was sent
@@ -57,7 +64,7 @@ once() {
   got=$(date +%s)  # the 201 arrived, so the allocation exists from here
   id=$(field id "$R/resp.json")
   field clientCert "$R/resp.json" > "$R/cert.pem"
-  field clientKey "$R/resp.json" > "$R/key.pem"
+  cp /work/key.pem "$R/key.pem"
   { field caCert "$R/resp.json"; cat "$R/trust.pem"; } > "$R/ca.pem"
   ep=$(field endpoint "$R/resp.json")
   sn=$(field serverName "$R/resp.json")
