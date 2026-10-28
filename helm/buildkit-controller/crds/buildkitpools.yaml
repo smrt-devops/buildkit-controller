@@ -196,8 +196,8 @@ spec:
                           registry or proxy), so they apply to every pool, not just under `Deny`. The controller
                           refuses (`Ready=False/InvalidSpec`) an entry of `0.0.0.0/0` or `::/0`, or one
                           that overlaps link-local (`169.254.0.0/16`, `fe80::/10`), `168.63.129.16/32`,
-                          loopback or the cluster's own ranges, unless the operator lists a range holding it in
-                          `workerNetwork.permittedCIDRs`.
+                          loopback, the cluster's own ranges or the operator's `workerNetwork.extraDeniedCIDRs`,
+                          unless the operator lists a range holding it in `workerNetwork.permittedCIDRs`.
                         items:
                           maxLength: 64
                           type: string

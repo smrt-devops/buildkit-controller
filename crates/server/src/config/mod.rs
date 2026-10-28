@@ -425,7 +425,7 @@ pub struct WorkerNetwork {
     #[serde(rename = "clusterCIDRs")]
     pub cluster_cidrs: Vec<String>,
     /// Ranges a pool's `allowCIDRs` may open although they overlap the link-local,
-    /// metadata, loopback or cluster ranges.
+    /// metadata, loopback, cluster or extra denied ranges.
     #[serde(rename = "permittedCIDRs")]
     pub permitted_cidrs: Vec<String>,
     /// DNS allowance.

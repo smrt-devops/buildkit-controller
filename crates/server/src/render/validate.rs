@@ -300,7 +300,8 @@ fn first_overlap<'s>(list: impl IntoIterator<Item = &'s str>, e: Net) -> Option<
 ///
 /// An entry is refused when it is not a CIDR range, when it spans a whole
 /// address family, or when it overlaps (holds or lies inside) a
-/// [`PROTECTED_CIDRS`] range or one of `net.cluster_cidrs`, unless a
+/// [`PROTECTED_CIDRS`] range, one of `net.cluster_cidrs` or one of
+/// `net.extra_denied_cidrs` (the operator's explicit deny), unless a
 /// `net.permitted_cidrs` range holds the whole entry. The whole-family check
 /// has no exception.
 #[must_use]
@@ -321,10 +322,15 @@ pub fn refused_allow_cidr(entry: &str, net: &WorkerNetwork) -> Option<String> {
     }
     let protected = first_overlap(PROTECTED_CIDRS, e)
         .map(|c| ("the link-local, metadata or loopback range", c));
-    let (what, c) = protected.or_else(|| {
-        first_overlap(net.cluster_cidrs.iter().map(String::as_str), e)
-            .map(|c| ("the cluster range", c))
-    })?;
+    let (what, c) = protected
+        .or_else(|| {
+            first_overlap(net.cluster_cidrs.iter().map(String::as_str), e)
+                .map(|c| ("the cluster range", c))
+        })
+        .or_else(|| {
+            first_overlap(net.extra_denied_cidrs.iter().map(String::as_str), e)
+                .map(|c| ("the operator-denied range", c))
+        })?;
     Some(format!(
         "overlaps {what} {c}; an operator can permit it in workerNetwork.permittedCIDRs"
     ))

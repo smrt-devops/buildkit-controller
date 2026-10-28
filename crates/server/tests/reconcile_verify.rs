@@ -667,7 +667,7 @@ async fn reconcile_verify() {
             "m",
             &PatchParams::default(),
             &Patch::Merge(json!({"spec": {"network": {"egress": {
-                "allowCIDRs": ["192.0.2.0/24", "169.254.169.254/32"]}}}})),
+                "allowCIDRs": ["192.0.2.0/24", "169.254.169.254/32", "203.0.113.128/25"]}}}})),
         )
         .await
         .unwrap();
@@ -687,6 +687,7 @@ async fn reconcile_verify() {
     assert!(
         message.contains("spec.network.egress.allowCIDRs[1]")
             && message.contains("169.254.169.254/32")
+            && message.contains("allowCIDRs[2]: `203.0.113.128/25` overlaps the operator-denied range 203.0.113.0/24")
             && !message.contains("allowCIDRs[0]"),
         "{message}"
     );
@@ -694,7 +695,9 @@ async fn reconcile_verify() {
     tokio::time::sleep(Duration::from_secs(5)).await;
     let after = nps.get(&np_name).await.unwrap();
     assert!(
-        !blocks(&after).iter().any(|c| c.starts_with("169.254.")),
+        !blocks(&after)
+            .iter()
+            .any(|c| c.starts_with("169.254.") || c.starts_with("203.0.113.")),
         "NetworkPolicy widened: {:?}",
         blocks(&after)
     );
@@ -705,7 +708,7 @@ async fn reconcile_verify() {
     assert!(h.list("m").await.is_empty(), "no pods of m");
     h.pools.delete("m", &DeleteParams::default()).await.unwrap();
     summary.push(format!(
-        "S13 PASS: allowCIDRs 169.254.169.254/32 -> Ready=False/InvalidSpec ({message}); NetworkPolicy unchanged {:?}",
+        "S13 PASS: allowCIDRs 169.254.169.254/32 and 203.0.113.128/25 (extraDeniedCIDRs) -> Ready=False/InvalidSpec ({message}); NetworkPolicy unchanged {:?}",
         blocks(&after)
     ));
 

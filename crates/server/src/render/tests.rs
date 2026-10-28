@@ -1031,3 +1031,29 @@ fn network_policy_refuses_instead_of_widening() {
         vec!["192.0.2.10/32", "169.254.169.254/32", "10.244.0.0/24"]
     );
 }
+
+#[test]
+fn allow_cidr_overlapping_extra_denied_cidrs_is_refused() {
+    let mut net = WorkerNetwork {
+        extra_denied_cidrs: vec!["203.0.113.0/24".into(), "2001:db8:5::/48".into()],
+        ..WorkerNetwork::default()
+    };
+    for (entry, hit) in [
+        ("203.0.113.7/32", "203.0.113.0/24"),
+        ("203.0.0.0/16", "203.0.113.0/24"),
+        ("::ffff:203.0.113.7/128", "203.0.113.0/24"),
+        ("2001:db8:5:1::/64", "2001:db8:5::/48"),
+        ("2001:db8::/32", "2001:db8:5::/48"),
+    ] {
+        let why = refused_allow_cidr(entry, &net).unwrap_or_else(|| panic!("{entry} allowed"));
+        assert!(
+            why.starts_with(&format!("overlaps the operator-denied range {hit};")),
+            "{entry}: {why}"
+        );
+    }
+    assert_eq!(refused_allow_cidr("203.0.114.0/24", &net), None);
+    // The operator can permit a range inside its own deny.
+    net.permitted_cidrs = vec!["203.0.113.7/32".into()];
+    assert_eq!(refused_allow_cidr("203.0.113.7/32", &net), None);
+    assert!(refused_allow_cidr("203.0.113.8/32", &net).is_some());
+}

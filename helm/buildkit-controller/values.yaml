@@ -74,8 +74,8 @@ workerNetwork:
   # closed until an IPv6 range is listed here.
   clusterCIDRs: []
   # Ranges a pool's allowCIDRs may open although they overlap link-local, metadata,
-  # loopback or clusterCIDRs. An allowCIDRs entry passes only inside one of these.
-  # Never 0.0.0.0/0 or ::/0.
+  # loopback, clusterCIDRs or extraDeniedCIDRs. An allowCIDRs entry passes only
+  # inside one of these. Never 0.0.0.0/0 or ::/0.
   permittedCIDRs: []
   dns:
     namespace: kube-system

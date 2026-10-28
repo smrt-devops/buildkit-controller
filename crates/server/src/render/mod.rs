@@ -157,7 +157,7 @@ pub struct WorkerNetwork {
     /// unicast on IPv6 clusters) from the internet, so IPv6 egress stays closed.
     pub cluster_cidrs: Vec<String>,
     /// Ranges a pool's `allowCIDRs` may open although they overlap the link-local,
-    /// metadata, loopback or cluster ranges. An entry must lie wholly inside one.
+    /// metadata, loopback, cluster or extra denied ranges. An entry must lie wholly inside one.
     pub permitted_cidrs: Vec<String>,
     /// Where workers may resolve names.
     pub dns: WorkerDns,
