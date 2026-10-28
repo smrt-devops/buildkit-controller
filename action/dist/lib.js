@@ -226,6 +226,16 @@ function retryBudgetMs(queueTimeoutSeconds) {
   return (q + 60) * 1000;
 }
 
+/**
+ * Queue timeout for an attempt that starts with `remainingMs` of the retry budget left: the requested
+ * value, cut so that a full queue wait still ends inside the budget (budget minus 60 s of slack).
+ * Undefined stays undefined: the pool default is unknown, so it is not overridden.
+ */
+function queueTimeoutFor(queueTimeoutSeconds, remainingMs) {
+  if (queueTimeoutSeconds === undefined) return undefined;
+  return Math.max(0, Math.min(queueTimeoutSeconds, Math.floor((remainingMs - 60000) / 1000)));
+}
+
 const MIN_WAIT_MS = 1000;
 const MAX_WAIT_MS = 30000;
 // Errors raised while connecting, before any byte of the request was written.
@@ -255,6 +265,8 @@ function isPreSendError(err) {
  * connection errors raised before the request was sent. Everything else returns or throws at once.
  * `getToken` runs for every attempt (OIDC tokens are short-lived). Stops retrying when the next wait
  * would pass `budgetMs` from the first attempt, returning the last 503 or throwing the last error.
+ * `opts` may be a function of `{remainingMs}` (budget left at the start of the attempt) so a retry can
+ * shrink its queue timeout and socket timeout; a retry must not queue for a full timeout again.
  * `what` labels the log line; `log`, `sleep` and `now` are injectable for tests.
  */
 async function requestWithRetry(url, opts, { what, getToken, budgetMs, log = () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now } = {}) {
@@ -263,9 +275,10 @@ async function requestWithRetry(url, opts, { what, getToken, budgetMs, log = () 
     let wait;
     let why;
     try {
-      const headers = { ...(opts.headers || {}) };
+      const headers = {};
       if (getToken) headers.Authorization = `Bearer ${await getToken()}`;
-      const res = await request(url, { ...opts, headers });
+      const o = typeof opts === 'function' ? opts({ remainingMs: budgetMs - (now() - start) }) : opts;
+      const res = await request(url, { ...o, headers: { ...(o.headers || {}), ...headers } });
       if (res.status !== 503) return res;
       wait = retryAfterMs(res.headers, now());
       if (wait === undefined) return res;
@@ -300,5 +313,5 @@ async function fetchOidcToken(audience, setSecret) {
 module.exports = {
   parseList, parsePool, postTimeoutMs, parseDuration, generateKey, allocationBody,
   validatePools, buildxCommands, parseCacheInputs, cacheFlags, checkAllocationId, createBuilder, writeMaterial, request, apiError,
-  retryBudgetMs, retryAfterMs, isPreSendError, requestWithRetry, fetchOidcToken,
+  retryBudgetMs, queueTimeoutFor, retryAfterMs, isPreSendError, requestWithRetry, fetchOidcToken,
 };

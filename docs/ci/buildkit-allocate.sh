@@ -84,19 +84,31 @@ openssl pkey -in "$D/key.pem" -pubout -out "$D/pub.pem"
 # curl failing to resolve or connect (exit 6 or 7). A reset after sending, a timeout and every other
 # status end the run. Retries stop once the next wait would pass queue timeout + 60 s.
 # The client timeout covers queue timeout + startTimeout ceiling (1800) + 10 s.
-MAX_TIME=$(( ${QUEUE_TIMEOUT:-3600} + 1800 + 10 ))
+# A retry queues only for what is left of the budget (QUEUE_TIMEOUT less the time already spent), so
+# a busy pool, which answers 503 after the full queue timeout, does not double the total wait.
+# Without QUEUE_TIMEOUT the pool default applies and is not overridden.
+write_body() { # write_body QUEUE_TIMEOUT_OR_EMPTY
 jq -n --arg ns "$NS" --arg pool "$NAME" --rawfile pk "$D/pub.pem" \
-      --arg ttl "${TTL:-}" --arg qt "${QUEUE_TIMEOUT:-}" \
+      --arg ttl "${TTL:-}" --arg qt "$1" \
       --arg ck "${CACHE_KEY:-}" --arg cache "${CACHE:-auto}" \
   '{namespace:$ns,pool:$pool,publicKey:$pk}
    + (if $ttl != "" then {ttlSeconds:($ttl|tonumber)} else {} end)
    + (if $qt != "" then {queueTimeoutSeconds:($qt|tonumber)} else {} end)
    + (if $ck != "" then {cacheKey:$ck} else {} end)
    + (if $cache != "auto" then {cache:$cache} else {} end)' > "$D/req.json"
+}
 start=$(date +%s)
 attempt=1
 backoff=1
 while :; do
+  qt=${QUEUE_TIMEOUT:-}
+  if [ -n "$qt" ]; then
+    qt=$(( QUEUE_TIMEOUT - ( $(date +%s) - start ) ))
+    [ "$qt" -ge 0 ] || qt=0
+    [ "$qt" -le "$QUEUE_TIMEOUT" ] || qt=$QUEUE_TIMEOUT
+  fi
+  write_body "$qt"
+  MAX_TIME=$(( ${qt:-3600} + 1800 + 10 ))
   rc=0
   curl_api --max-time "$MAX_TIME" -H @"$D/auth" -D "$D/hdr" -o "$D/alloc.json" -w '%{http_code}' \
     -H 'Content-Type: application/json' --data-binary @"$D/req.json" "$API/v1/allocations" > "$D/status" || rc=$?
