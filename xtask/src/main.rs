@@ -10,6 +10,7 @@ mod alloc_verify;
 mod api_verify;
 mod claim_verify;
 mod docs;
+mod drain_verify;
 mod e2e;
 mod e2e_issuer;
 mod edge_verify;
@@ -26,6 +27,7 @@ use alloc_verify::alloc_verify;
 use api_verify::api_verify;
 use claim_verify::claim_verify;
 use docs::docs;
+use drain_verify::drain_verify;
 use e2e::{e2e, e2e_up};
 use edge_verify::edge_verify;
 use helm_test::helm_test;
@@ -95,6 +97,8 @@ enum Task {
     },
     /// Install the chart on a throwaway kind cluster with one pool and check the replicas, the leader, the pool and readiness.
     HelmVerify,
+    /// Install the chart with two replicas on a throwaway kind cluster and check that stopping a replica never cuts a live build: a long build survives a rollout, the Lease moves within seconds, and a queued request gets 503 `shutting_down`.
+    DrainVerify,
     /// Install the chart with claims on a throwaway kind cluster and check the claim lifecycle, a real build through a claim Secret, refusal, expiry and a lost worker.
     ClaimVerify,
     /// Soak the certificate lifecycle on a throwaway kind cluster. Runs continuous builds through leaf renewals, a serving certificate swap, a leader failover, and deletion and corruption of the CA Secret.
@@ -325,6 +329,7 @@ fn main() -> Result<()> {
         Task::ReconcileVerify => reconcile_verify(),
         Task::HelmTest { update } => helm_test(update),
         Task::HelmVerify => helm_verify(),
+        Task::DrainVerify => drain_verify(),
         Task::ClaimVerify => claim_verify(),
         Task::Soak => soak(),
         Task::Docs => docs(),
@@ -359,6 +364,7 @@ mod tests {
         assert!(Cli::try_parse_from(["xtask", "runtime-verify"]).is_ok());
         assert!(Cli::try_parse_from(["xtask", "reconcile-verify"]).is_ok());
         assert!(Cli::try_parse_from(["xtask", "soak"]).is_ok());
+        assert!(Cli::try_parse_from(["xtask", "drain-verify"]).is_ok());
         assert!(Cli::try_parse_from(["xtask", "perf", "--idle-secs", "60"]).is_ok());
     }
 }
