@@ -31,7 +31,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 
-use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -97,7 +96,7 @@ impl Component for EdgeComponent {
                 info!(trusted = ?proxy_protocol.trusted(), "edge reads PROXY protocol v2 from trusted sources");
             }
             let addr = ctx.config().listen.edge;
-            let listener = TcpListener::bind(addr).await?;
+            let listener = crate::runtime::listen::bind(addr)?;
             let (tx, rx) = watch::channel(None);
             let proxy = ProxyHandler::new(
                 PodView {
