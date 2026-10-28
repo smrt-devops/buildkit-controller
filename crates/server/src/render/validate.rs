@@ -1,5 +1,7 @@
-//! Controller-side re-check of the template rules of `spec.template`
-//! (defence against schema drift or an older stored object).
+//! Controller-side re-check of the CEL rules the rendered pod relies on
+//! (defence against schema drift, or an older stored object that CRD
+//! validation ratcheting lets keep a value a newer rule refuses), plus the
+//! check only the controller can make: that it can edit `buildkitdConfig`.
 
 use buildkit_controller_api::v1alpha1::{
     BuildKitPoolSpec, CONTAINER_NAME, RESERVED_ENV_PREFIXES, RESERVED_KEY_PREFIX,
@@ -7,6 +9,7 @@ use buildkit_controller_api::v1alpha1::{
 };
 use serde_json::Value;
 
+use super::cache::with_cache_settings;
 use super::{RenderError, TemplateConflictField, WorkerNetwork};
 
 /// Re-exported name of a single offending field.
@@ -32,6 +35,11 @@ fn is_normalised(p: &str) -> bool {
         rest.split('/')
             .all(|s| !s.is_empty() && s != "." && s != "..")
     })
+}
+
+/// A C0 control character or DEL (the CEL rule on `volumeMounts`).
+fn has_control(s: &str) -> bool {
+    s.bytes().any(|b| b < 0x20 || b == 0x7f)
 }
 
 /// The architecture of a single declared platform (`linux/arm64/v8` gives `arm64`).
@@ -76,9 +84,32 @@ pub fn validate_template(spec: &BuildKitPoolSpec) -> Vec<Conflict> {
             "disagrees with the declared platform",
         );
     }
+    if t.spec
+        .priority_class_name
+        .as_deref()
+        .is_some_and(|n| n.starts_with("system-"))
+    {
+        conflict(
+            &mut out,
+            "spec.template.spec.priorityClassName".into(),
+            "must not start with system-",
+        );
+    }
     volumes(spec, &mut out);
     containers(spec, &mut out);
+    local_cache(spec, &mut out);
     out
+}
+
+/// With `cache.local`: `buildkitdConfig` must take the cache settings.
+fn local_cache(spec: &BuildKitPoolSpec, out: &mut Vec<Conflict>) {
+    if spec.workers.cache.local.is_none() {
+        return;
+    }
+    // The bound's value does not change whether the config can take it.
+    if let Err(why) = with_cache_settings(&spec.workers.buildkitd_config, 0) {
+        conflict(out, "spec.workers.buildkitdConfig".into(), &why);
+    }
 }
 
 fn volumes(spec: &BuildKitPoolSpec, out: &mut Vec<Conflict>) {
@@ -106,6 +137,13 @@ fn volumes(spec: &BuildKitPoolSpec, out: &mut Vec<Conflict>) {
             .and_then(|p| p.get("sources"))
             .and_then(Value::as_array);
         for (j, s) in sources.into_iter().flatten().enumerate() {
+            if s.as_object().is_none_or(|o| o.len() != 1) {
+                conflict(
+                    out,
+                    format!("{at}.projected.sources[{j}]"),
+                    "must set exactly one of configMap, secret or downwardAPI",
+                );
+            }
             for k in s
                 .as_object()
                 .into_iter()
@@ -157,9 +195,15 @@ fn containers(spec: &BuildKitPoolSpec, out: &mut Vec<Conflict>) {
         let Ok(Value::Object(m)) = serde_json::to_value(e) else {
             continue;
         };
-        for k in m
-            .get("valueFrom")
-            .and_then(Value::as_object)
+        let value_from = m.get("valueFrom").and_then(Value::as_object);
+        if value_from.is_some_and(|v| v.len() != 1) {
+            conflict(
+                out,
+                format!("{at}.env[{i}].valueFrom"),
+                "must set exactly one of configMapKeyRef, secretKeyRef or fieldRef",
+            );
+        }
+        for k in value_from
             .into_iter()
             .flat_map(serde_json::Map::keys)
             .filter(|k| !ENV_VALUE_FROM_KEYS.contains(&k.as_str()))
@@ -173,6 +217,27 @@ fn containers(spec: &BuildKitPoolSpec, out: &mut Vec<Conflict>) {
     }
     for (i, m) in c.volume_mounts.iter().enumerate() {
         let path = &m.mount_path;
+        if has_control(path) {
+            conflict(
+                out,
+                format!("{at}.volumeMounts[{i}].mountPath"),
+                "must not contain control characters",
+            );
+        }
+        if m.sub_path.as_deref().is_some_and(has_control) {
+            conflict(
+                out,
+                format!("{at}.volumeMounts[{i}].subPath"),
+                "must not contain control characters",
+            );
+        }
+        if m.mount_propagation.as_deref() == Some("Bidirectional") {
+            conflict(
+                out,
+                format!("{at}.volumeMounts[{i}].mountPropagation"),
+                "Bidirectional needs a privileged container",
+            );
+        }
         if !is_normalised(path) {
             conflict(
                 out,
@@ -211,13 +276,26 @@ pub(super) fn check(spec: &BuildKitPoolSpec) -> Result<(), RenderError> {
 }
 
 /// Ranges no `allowCIDRs` entry may overlap unless the operator permits it:
-/// link-local (with the cloud metadata endpoints), the Azure wire server and loopback.
-pub const PROTECTED_CIDRS: [&str; 5] = [
+/// link-local and loopback, the cloud metadata endpoints outside link-local,
+/// and the NAT64 local-use prefix.
+pub const PROTECTED_CIDRS: [&str; 10] = [
     "169.254.0.0/16",
-    "168.63.129.16/32",
     "fe80::/10",
     "127.0.0.0/8",
     "::1/128",
+    // Azure wire server.
+    "168.63.129.16/32",
+    // Alibaba Cloud metadata.
+    "100.100.100.200/32",
+    // AWS IMDS over IPv6.
+    "fd00:ec2::254/128",
+    // GCE metadata over IPv6.
+    "fd20:ce::254/128",
+    // Akamai (Linode) metadata over IPv6.
+    "fd00:a9fe:a9fe::1/128",
+    // RFC 8215 local-use NAT64: the operator picks where the IPv4 address
+    // sits inside it, so its entries cannot be checked as IPv4.
+    "64:ff9b:1::/48",
 ];
 
 /// One address range, IPv4 or IPv6, with host bits cleared.
@@ -227,8 +305,12 @@ enum Net {
     V6(u128, u32),
 }
 
-/// `::ffff:0:0/96`, the IPv4-mapped IPv6 block.
-const MAPPED: (u128, u32) = (0xffff_0000_0000, 96);
+/// IPv6 /96 blocks whose last 32 bits are an IPv4 address that the block
+/// reaches: `::ffff:0:0/96` (IPv4-mapped) and `64:ff9b::/96` (the RFC 6052
+/// NAT64 well-known prefix).
+const EMBEDS_V4: [u128; 2] = [0xffff_0000_0000, 0x0064_ff9b << 96];
+/// Prefix length of the [`EMBEDS_V4`] blocks.
+const EMBED_PREFIX: u32 = 96;
 
 fn mask32(a: u32, p: u32) -> u32 {
     a.checked_shr(32 - p)
@@ -241,8 +323,8 @@ fn mask128(a: u128, p: u32) -> u128 {
 }
 
 impl Net {
-    /// Parses `addr/prefix`. An IPv4-mapped IPv6 range of prefix 96 or more is
-    /// read as the IPv4 range it maps, since it names the same hosts.
+    /// Parses `addr/prefix`. A range inside an [`EMBEDS_V4`] block (prefix 96
+    /// or more) is read as the IPv4 range it embeds, since it reaches the same hosts.
     fn parse(s: &str) -> Option<Self> {
         let (addr, prefix) = s.split_once('/')?;
         if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_digit()) {
@@ -256,11 +338,11 @@ impl Net {
                     return None;
                 }
                 let bits = mask128(u128::from(a), p);
-                if p >= MAPPED.1 && mask128(bits, MAPPED.1) == MAPPED.0 {
+                if p >= EMBED_PREFIX && EMBEDS_V4.contains(&mask128(bits, EMBED_PREFIX)) {
                     // The low 32 bits are the IPv4 address.
                     #[allow(clippy::cast_possible_truncation, reason = "low 32 bits")]
                     let v4 = bits as u32;
-                    return Some(Self::V4(v4, p - MAPPED.1));
+                    return Some(Self::V4(v4, p - EMBED_PREFIX));
                 }
                 Some(Self::V6(bits, p))
             }
@@ -278,8 +360,10 @@ impl Net {
         match (self, other) {
             (Self::V4(a, p), Self::V4(b, q)) => p <= q && mask32(b, p) == a,
             (Self::V6(a, p), Self::V6(b, q)) => p <= q && mask128(b, p) == a,
-            // A short IPv6 prefix can hold the whole IPv4-mapped block.
-            (Self::V6(a, p), Self::V4(..)) => p <= MAPPED.1 && mask128(MAPPED.0, p) == a,
+            // A short IPv6 prefix can hold a whole block that embeds IPv4.
+            (Self::V6(a, p), Self::V4(..)) => {
+                p <= EMBED_PREFIX && EMBEDS_V4.iter().any(|b| mask128(*b, p) == a)
+            }
             (Self::V4(..), Self::V6(..)) => false,
         }
     }
@@ -321,7 +405,7 @@ pub fn refused_allow_cidr(entry: &str, net: &WorkerNetwork) -> Option<String> {
         return None;
     }
     let protected = first_overlap(PROTECTED_CIDRS, e)
-        .map(|c| ("the link-local, metadata or loopback range", c));
+        .map(|c| ("the link-local, metadata, loopback or NAT64 range", c));
     let (what, c) = protected
         .or_else(|| {
             first_overlap(net.cluster_cidrs.iter().map(String::as_str), e)

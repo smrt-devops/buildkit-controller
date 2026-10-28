@@ -72,10 +72,19 @@ pub fn template_hash(pool: &BuildKitPool) -> Result<String, RenderError> {
         "annotations": pool.spec.template.metadata.annotations,
         "configHash": config_hash(&super::buildkitd_config(pool)),
     });
-    // Only when set, so pools without cache.local keep their hash.
+    // Only when set, so pools without cache.local keep their hash. Only the
+    // fields that shape the pod or its volume: `affinity` and `keysPerVolume`
+    // steer the allocator alone, and `gcKeepStorage` is in `configHash`.
     if let (Some(lc), Some(m)) = (&pool.spec.workers.cache.local, doc.as_object_mut()) {
-        let v = serde_json::to_value(lc).map_err(|e| RenderError::Serialize(e.to_string()))?;
-        m.insert("cacheLocal".to_owned(), v);
+        m.insert(
+            "cacheLocal".to_owned(),
+            json!({
+                "size": lc.size,
+                "storageClass": lc.storage_class,
+                "maxVolumes": lc.max_volumes,
+                "scope": lc.scope,
+            }),
+        );
     }
     let mut s = String::new();
     canonical(&doc, &mut s);

@@ -10,6 +10,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde_json::json;
+use toml_edit::{DocumentMut, InlineTable, Item, Table, TomlError, Value};
 
 use super::hash::sha256_hex;
 use super::{
@@ -350,52 +351,76 @@ pub fn gc_keep_bytes(lc: &LocalCache) -> Option<u64> {
 /// `[worker.oci] maxUsedSpace` and `gc = true` (unless the pool's config
 /// already sets `maxUsedSpace`), and `[history] maxEntries = 0`, which turns
 /// build history off: a volume outlives the allocation, and build records
-/// (logs, build arguments) must not reach a later one. Text-level, so the
-/// rest of the config stays byte for byte.
+/// (logs, build arguments) must not reach a later one. The rest of the config
+/// keeps its formatting.
+///
+/// A config that [`with_cache_settings`] refuses is returned unchanged:
+/// `validate_template` reports it, so no pod is rendered from it.
 #[must_use]
 pub fn buildkitd_config(pool: &BuildKitPool) -> String {
     let cfg = &pool.spec.workers.buildkitd_config;
-    let Some(lc) = pool.spec.workers.cache.local.as_ref() else {
-        return cfg.clone();
-    };
-    let mut out = cfg.clone();
-    if let Some(bytes) = gc_keep_bytes(lc)
-        && !cfg.contains("maxUsedSpace")
-    {
-        let lines = format!("  maxUsedSpace = \"{bytes}\"\n  gc = true\n");
-        out = set_in_section(&out, "worker.oci", &lines, "gc");
-    }
-    set_in_section(&out, "history", "  maxEntries = 0\n", "maxEntries")
+    pool.spec
+        .workers
+        .cache
+        .local
+        .as_ref()
+        .and_then(gc_keep_bytes)
+        .and_then(|bytes| with_cache_settings(cfg, bytes).ok())
+        .unwrap_or_else(|| cfg.clone())
 }
 
-/// `cfg` with `lines` placed at the top of table `[section]`, which is
-/// appended when missing. TOML forbids a duplicate key, so a `drop` key the
-/// table already has is removed.
-fn set_in_section(cfg: &str, section: &str, lines: &str, drop: &str) -> String {
-    let header = format!("[{section}]");
-    let is_header = |l: &str| l.split_whitespace().collect::<String>() == header;
-    if cfg.lines().any(is_header) {
-        let is_drop = |l: &str| l.split_once('=').is_some_and(|(k, _)| k.trim() == drop);
-        let mut out = String::with_capacity(cfg.len() + lines.len());
-        let mut inside = false;
-        for l in cfg.lines() {
-            if l.trim_start().starts_with('[') {
-                inside = is_header(l);
-            } else if inside && is_drop(l) {
-                continue;
-            }
-            out.push_str(l);
-            out.push('\n');
-            if is_header(l) {
-                out.push_str(lines);
-            }
-        }
-        return out;
+/// `cfg` with the `cache.local` settings of [`buildkitd_config`] and a GC
+/// bound of `bytes`, or why `cfg` cannot take them: it is not TOML, or
+/// `worker`, `worker.oci` or `history` is not a table.
+pub(super) fn with_cache_settings(cfg: &str, bytes: u64) -> Result<String, String> {
+    let mut doc: DocumentMut = cfg
+        .parse()
+        .map_err(|e: TomlError| format!("is not valid TOML: {}", e.message()))?;
+    let not_table = |key: &str| format!("sets `{key}` to something other than a table");
+    let worker = child(doc.as_item_mut(), "worker").ok_or_else(|| not_table("worker"))?;
+    let oci = child(worker, "oci").ok_or_else(|| not_table("worker.oci"))?;
+    if oci.get("maxUsedSpace").is_none() {
+        set(oci, "maxUsedSpace", bytes.to_string().into());
+        set(oci, "gc", true.into());
     }
-    let sep = if cfg.is_empty() || cfg.ends_with('\n') {
-        ""
-    } else {
-        "\n"
+    let history = child(doc.as_item_mut(), "history").ok_or_else(|| not_table("history"))?;
+    set(history, "maxEntries", 0_i64.into());
+    Ok(doc.to_string())
+}
+
+/// The table `key` of table `parent`, created (as a table of the same kind)
+/// when missing. `None` when either is not a table.
+fn child<'a>(parent: &'a mut Item, key: &str) -> Option<&'a mut Item> {
+    match parent {
+        Item::Table(t) => {
+            let item = t.entry(key).or_insert_with(|| {
+                let mut new = Table::new();
+                new.set_implicit(true);
+                Item::Table(new)
+            });
+            item.is_table_like().then_some(item)
+        }
+        Item::Value(Value::InlineTable(t)) => {
+            if !t.contains_key(key) {
+                t.insert(key, Value::InlineTable(InlineTable::new()));
+            }
+            let (_, item) = t.get_key_value_mut(key)?;
+            item.is_table_like().then_some(item)
+        }
+        _ => None,
+    }
+}
+
+/// Set `key` of the table `item` (a table [`child`] returned) to `v`, keeping
+/// the formatting of a value it replaces.
+fn set(item: &mut Item, key: &str, mut v: Value) {
+    let Some(t) = item.as_table_like_mut() else {
+        return;
     };
-    format!("{cfg}{sep}{header}\n{lines}")
+    if let Some(old) = t.get_mut(key).and_then(Item::as_value_mut) {
+        *v.decor_mut() = old.decor().clone();
+        *old = v;
+    } else {
+        t.insert(key, Item::Value(v));
+    }
 }

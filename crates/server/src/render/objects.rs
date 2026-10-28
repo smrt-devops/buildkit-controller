@@ -157,7 +157,7 @@ pub fn network_policy(
             .partition(|c| c.contains(':'));
         let except = |v: Vec<&String>| (!v.is_empty()).then(|| v.into_iter().cloned().collect());
         egress.push(to(vec![block("0.0.0.0/0", except(v4))], None));
-        // IPv6 opens only once the operator names the cluster.s IPv6 ranges (see WorkerNetwork::cluster_cidrs).
+        // IPv6 opens only once the operator names the cluster's IPv6 ranges (see WorkerNetwork::cluster_cidrs).
         if net.cluster_cidrs.iter().any(|c| c.contains(':')) {
             egress.push(to(vec![block("::/0", except(v6))], None));
         }

@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use buildkit_controller_api::v1alpha1::{BuildKitPool, CONTAINER_NAME};
+use buildkit_controller_api::v1alpha1::{BuildKitPool, BuildkitdContainer, CONTAINER_NAME};
 use k8s_openapi::api::core::v1::{
     AppArmorProfile, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource,
     ExecAction, KeyToPath, ObjectFieldSelector, Pod, PodSecurityContext, PodSpec, Probe,
@@ -16,8 +16,8 @@ use super::{
     ANN_ALLOC, ANN_ALLOCATED_AT, ANN_EXPIRES_AT, ANN_INTERNAL_CA, ANN_OWNER,
     ANN_WORKER_CERT_NOT_AFTER, ANN_WORKER_NONCE, BUILDKIT_PORT, CONTROLLER, INTERNAL_CA_LABEL_LEN,
     LABEL_MANAGED_BY, LABEL_NAME, LABEL_POOL, LABEL_STATE, LABEL_TEMPLATE_HASH, PodInputs,
-    RenderError, WORKER_NAME, owner_ref, pool_identity, template_hash, worker_object_name,
-    worker_pod_name, worker_secret_name,
+    RenderError, TemplateConflictField, WORKER_NAME, owner_ref, pool_identity, template_hash,
+    worker_object_name, worker_pod_name, worker_secret_name,
 };
 
 const SOCKET: &str = "unix:///run/user/1000/buildkit/buildkitd.sock";
@@ -28,6 +28,9 @@ use super::cache::{
 };
 
 const STATE_DIR: &str = "/home/user/.local/share/buildkit";
+/// Failed startup probes (one a second) before kubelet gives up: past the
+/// longest `startTimeout` (30m), so the reconciler retires a slow pod first.
+const STARTUP_PROBE_LIMIT: i32 = 31 * 60;
 /// Name of the init container that prepares a cache volume.
 pub const CACHE_INIT_NAME: &str = "cache-init";
 
@@ -60,14 +63,7 @@ fn buildkitd_args() -> Vec<String> {
     .to_vec()
 }
 
-fn container(pool: &BuildKitPool) -> Result<Container, RenderError> {
-    let user = pool
-        .spec
-        .template
-        .spec
-        .containers
-        .first()
-        .ok_or_else(|| RenderError::Serialize("no container".into()))?;
+fn container(user: &BuildkitdContainer) -> Container {
     let mut mounts = vec![
         VolumeMount {
             read_only: Some(true),
@@ -81,10 +77,17 @@ fn container(pool: &BuildKitPool) -> Result<Container, RenderError> {
         mount(STATE_VOLUME, STATE_DIR),
     ];
     mounts.extend(user.volume_mounts.iter().cloned());
-    Ok(Container {
+    let workers = || ExecAction {
+        command: Some(
+            ["buildctl", "--addr", SOCKET, "debug", "workers"]
+                .map(s)
+                .to_vec(),
+        ),
+    };
+    Container {
         name: s(CONTAINER_NAME),
         image: Some(user.image.clone()),
-        image_pull_policy: Some(format!("{:?}", user.image_pull_policy)),
+        image_pull_policy: Some(s(user.image_pull_policy.as_str())),
         command: None,
         args: Some(buildkitd_args()),
         ports: Some(vec![ContainerPort {
@@ -97,15 +100,19 @@ fn container(pool: &BuildKitPool) -> Result<Container, RenderError> {
             privileged: Some(false),
             ..SecurityContext::default()
         }),
-        readiness_probe: Some(Probe {
-            exec: Some(ExecAction {
-                command: Some(
-                    ["buildctl", "--addr", SOCKET, "debug", "workers"]
-                        .map(s)
-                        .to_vec(),
-                ),
-            }),
+        // Probed every second until the first success, so a cold start is
+        // quick, and slowly after that: an exec probe costs a process start,
+        // and an allocated pod no longer needs its readiness.
+        startup_probe: Some(Probe {
+            exec: Some(workers()),
             period_seconds: Some(1),
+            timeout_seconds: Some(5),
+            failure_threshold: Some(STARTUP_PROBE_LIMIT),
+            ..Probe::default()
+        }),
+        readiness_probe: Some(Probe {
+            exec: Some(workers()),
+            period_seconds: Some(10),
             timeout_seconds: Some(5),
             failure_threshold: Some(3),
             ..Probe::default()
@@ -114,7 +121,7 @@ fn container(pool: &BuildKitPool) -> Result<Container, RenderError> {
         env: non_empty(user.env.clone()),
         volume_mounts: Some(mounts),
         ..Container::default()
-    })
+    }
 }
 
 /// With `cache.local`: the init container that empties the state dir unless it
@@ -207,7 +214,12 @@ pub fn pod_spec(pool: &BuildKitPool) -> Result<PodSpec, RenderError> {
             .or_insert_with(|| s(arch));
     }
     let unconfined = || s("Unconfined");
-    let main = container(pool)?;
+    let main = container(t.containers.first().ok_or_else(|| {
+        RenderError::TemplateConflict(vec![TemplateConflictField {
+            field: s("spec.template.spec.containers"),
+            reason: s("must be exactly one container named buildkitd"),
+        }])
+    })?);
     Ok(PodSpec {
         service_account_name: Some(worker_object_name(name)),
         automount_service_account_token: Some(false),

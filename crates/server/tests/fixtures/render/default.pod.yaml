@@ -11,7 +11,7 @@ metadata:
     app.kubernetes.io/name: buildkitd
     buildkit.smrt-devops.net/pool: default
     buildkit.smrt-devops.net/state: free
-    buildkit.smrt-devops.net/template-hash: a1d23d0c22
+    buildkit.smrt-devops.net/template-hash: 53cedc554e
   name: default-0
   namespace: render-verify
   ownerReferences:
@@ -47,7 +47,7 @@ spec:
         - debug
         - workers
       failureThreshold: 3
-      periodSeconds: 1
+      periodSeconds: 10
       timeoutSeconds: 5
     resources:
       limits:
@@ -59,6 +59,17 @@ spec:
         memory: 1Gi
     securityContext:
       privileged: false
+    startupProbe:
+      exec:
+        command:
+        - buildctl
+        - --addr
+        - unix:///run/user/1000/buildkit/buildkitd.sock
+        - debug
+        - workers
+      failureThreshold: 1860
+      periodSeconds: 1
+      timeoutSeconds: 5
     volumeMounts:
     - mountPath: /certs
       name: certs
