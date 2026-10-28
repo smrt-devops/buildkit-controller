@@ -10,7 +10,7 @@ Long-lived BuildKit daemons share caches and CPU between unrelated jobs, and a c
 
 - Each build gets its own worker pod. No other build runs on it, and the controller deletes the pod when the allocation ends.
 - A pool keeps `scaling.min` warm pods (zero by default, or a time-of-day schedule) and grows to `scaling.max`. When the pool is full, requests queue up to the pool's `queueTimeout`.
-- One install serves any number of pools in the namespaces you list in `watchNamespaces`, so amd64, arm64 and per-team pools live side by side. Outside them and its own namespace the controller can write nothing.
+- One install serves any number of pools in the namespaces you list in `watchNamespaces`, so amd64, arm64 and per-team pools live side by side. Outside them, its own namespace and `claims.namespaces` the controller can write nothing.
 - The GitHub Action allocates builders for one or more pools and releases them when the job finishes, even after a failure.
 - Build cache comes in two layers, both off by default. The registry layer gives each cache key a registry ref, and the controller returns the `--cache-from` and `--cache-to` values for it. Local volumes keep a worker's state directory on a PVC per cached slot. Each volume belongs to one cache scope, by default the caller's repository, ServiceAccount or claim namespace, and is emptied before a caller of another scope gets it. Pools with local volumes run buildkitd with build history off, so `buildx history` shows nothing there ([details](docs/architecture.md#build-cache)).
 
@@ -41,7 +41,7 @@ helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
 # 2. Create a namespace and a pool that accepts your GitHub organization.
 #    Edit the access rules in the example first: set repository_owner_id to your
 #    organization's id (gh api orgs/<org> --jq .id) and replace the sample repository. The
-#    first rule allows the main branch only; drop its `ref` claim to allow pull requests.
+#    first rule allows the main branch only; to allow pull requests, replace its `ref` and `event_name` claims with `event_name: pull_request`.
 kubectl create namespace ci
 kubectl label namespace ci pod-security.kubernetes.io/enforce=privileged
 kubectl apply -f examples/pool-github-oidc.yaml
@@ -80,7 +80,7 @@ kubectl -n buildkit-system get configmap buildkit-controller-ca-bundle -o 'jsonp
 ## Security model
 
 - Callers authenticate with a GitHub OIDC token or a Kubernetes ServiceAccount token. Each pool's `spec.access.rules` decides who may use it, and a pool with no rules denies everyone.
-- Every allocation gets a client certificate valid for at most `maxTTL` (24 hours by default). The client generates the key and sends only the public half, so the private key never leaves the CI job.
+- Every allocation gets a client certificate valid for at most `maxTTL` (24 hours by default). The client generates the key and sends only the public half, so the private key never leaves the CI job. A BuildKitClaim is the exception: the controller generates its key and writes it to the claim's Secret in the claim's namespace.
 - Each allocation gets its own pod. The pod runs rootless BuildKit behind a deny-by-default NetworkPolicy (enforced only by a NetworkPolicy-aware CNI), and the controller retires it when the allocation ends. Without `cache.local`, nothing of the pod outlives it.
 - With `cache.local`, the pod's state directory is a PVC that outlives the pod. Builds of the same cache scope (by default one repository, ServiceAccount or claim namespace) read what earlier builds of that scope left there: cache records, layers and built images. Before a pod of another scope starts on the volume, an init step deletes everything on it. These pools record no BuildKit build history, so no build logs or build arguments reach a later allocation. `cache.local.scope: pool` shares the volumes among every caller the pool admits.
 - The registry cache layer is shared by every caller the pool admits and by anyone who can push to its repository. Enable it only on pools that admit one trust domain.

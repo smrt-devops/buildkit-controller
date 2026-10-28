@@ -223,7 +223,9 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 | `gateway.envoy.*` | `enabled` (false), `connectTimeout`, `tcpKeepalive`, `proxyProtocol` (false; PROXY protocol v2 to the listeners that read it): Envoy Gateway BackendTrafficPolicies |
 | `gateway.extraManifests` | extra objects (or `tpl` strings) for other implementations |
 | `metrics.port`, `metrics.serviceMonitor.enabled` | ops port (`/healthz`, `/readyz`, `/metrics`) on its own Service; ServiceMonitor `true`, `false` or `auto` (only when the CRD exists) |
-| `pools` | list of `{name, namespace, spec}`, one BuildKitPool each; `namespace` is required unless `watchNamespaces` has one entry, must be in `watchNamespaces` when that is set, and must not be the release namespace (the chart fails to render otherwise); namespaces are not created |
+| `claims.enabled`, `claims.namespaces` | `BuildKitClaim` support, off by default. `namespaces` (required when enabled) lists the namespaces whose claims the controller serves, and it gets Secret get, create and delete there only. See [operations.md](../docs/operations.md#in-cluster-claims) |
+| `cacheDefaults.registry.repository` | registry cache repository that goes into every pool that sets none |
+| `pools` | list of `{name, namespace, spec, cache}`, one BuildKitPool each; `namespace` is required unless `watchNamespaces` has one entry, must be in `watchNamespaces` when that is set, and must not be the release namespace (the chart fails to render otherwise); namespaces are not created |
 
 ## Load balancer idle timeout
 

@@ -17,3 +17,4 @@ spec:
           issuer: https://token.actions.githubusercontent.com
           claims:
             repository_owner_id: "12345678"   # the org's numeric id (gh api orgs/<org> --jq .id); names can be re-registered
+            event_name: push   # pull_request_target runs can run fork code, so admit pushes only

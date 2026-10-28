@@ -54,7 +54,8 @@ API URL (HTTPS) through the Gateway, {{ ternary "TLS terminated at the gateway (
 Point DNS for {{ join ", " $plan.apiHostnames }} at the Gateway address. Check the route:
   kubectl -n {{ .Release.Namespace }} get {{ ternary "httproute,backendtlspolicy" "tlsroute" (eq $gw.api.mode "terminate") }} {{ $fn }}-api -o yaml
 {{- if eq $gw.api.mode "terminate" }}
-Clients trust the gateway's certificate; with a publicly trusted one they need no CA.
+Clients trust the gateway's certificate; with a publicly trusted one they need no CA, and with a
+private CA they need that CA.
 {{- end }}
 {{- else if eq .Values.service.type "LoadBalancer" }}
 
@@ -67,14 +68,18 @@ API URL (HTTPS) on a node port:
   kubectl -n {{ .Release.Namespace }} get svc {{ $fn }}   # <node address>:<api nodePort>
 {{- else }}
 
-API URL (HTTPS), in-cluster only:
+API URL (HTTPS), in-cluster only (the Service is ClusterIP):
   https://{{ $fn }}.{{ .Release.Namespace }}.svc:{{ .Values.service.ports.api }}
-  or: kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $fn }} {{ .Values.service.ports.api }}:{{ .Values.service.ports.api }}
+From outside the cluster, forward both the API and the edge port, because a build needs both:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $fn }} {{ .Values.service.ports.api }}:{{ .Values.service.ports.api }} {{ .Values.service.ports.edge }}:{{ .Values.service.ports.edge }}
+Then the API URL is https://localhost:{{ .Values.service.ports.api }}, and edge.endpoint must point at the forwarded edge port
+(tcp://localhost:{{ .Values.service.ports.edge }}, with edge.serverName set to localhost).
 {{- end }}
 {{- if not (and $plan.apiRefs (eq $gw.api.mode "terminate")) }}
 The API serves the controller's certificate. Unless edge.tls.secretName is publicly trusted,
 clients need its CA (the Action's ca-cert, the recipe's API_CA):
   {{ $ca }}
+The edge needs no CA setup: each allocation response carries the CA for it.
 {{- end }}
 
 The edge endpoint returned to clients is {{ .Values.edge.endpoint }}.
@@ -91,8 +96,15 @@ caps (edge.maxHandshakesPerIp {{ .Values.edge.maxHandshakesPerIp }}, api.maxConn
 auth.serviceAccount.maxReviewsPerIp {{ .Values.auth.serviceAccount.maxReviewsPerIp }}) apply to all clients together. Raise them or set 0,
 or turn on PROXY protocol (api.proxyProtocol, edge.proxyProtocol) so they count clients.
 {{- end }}
+{{- else if eq .Values.service.type "LoadBalancer" }}
+Reach the edge on the same load balancer, port {{ .Values.service.ports.edge }}. Point DNS for {{ .Values.edge.serverName }}
+at the load balancer address; that name and port must match edge.endpoint.
+{{- else if eq .Values.service.type "NodePort" }}
+Reach the edge on its node port (kubectl -n {{ .Release.Namespace }} get svc {{ $fn }}). Point DNS for
+{{ .Values.edge.serverName }} at a node address; that name and port must match edge.endpoint.
 {{- else }}
-Point DNS for {{ .Values.edge.serverName }} at the Service's edge port ({{ .Values.service.ports.edge }}).
+The edge is on the Service's port {{ .Values.service.ports.edge }}, in-cluster only. Port-forward it together with the API
+(see above) and set edge.endpoint to the forwarded address.
 {{- end }}
 {{- if .Values.auth.oidc }}
 
@@ -131,7 +143,7 @@ watchNamespace is deprecated; set watchNamespaces: [{{ .Values.watchNamespace }}
 The chart created no pools. Add them under `pools:` in values, or apply BuildKitPool objects separately.
 {{- end }}
 
-Requirements for the build sandbox (see "Requirements" in the chart README):
+Requirements for the build sandbox (see "Requirements" in the chart README, helm/buildkit-controller/README.md):
   - The CNI must enforce NetworkPolicy. On one that ignores it (kindnet, the default
     EKS VPC CNI) builds reach every pod and the cloud metadata endpoint.
   - Each pool namespace must allow privileged pods:
