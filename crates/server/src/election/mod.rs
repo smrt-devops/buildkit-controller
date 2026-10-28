@@ -76,6 +76,9 @@ pub enum ApiError {
     /// HTTP 409, someone else wrote first (or the object already exists).
     #[error("conflict")]
     Conflict,
+    /// HTTP 404: the Lease is gone (a replace), or its namespace is.
+    #[error("not found")]
+    NotFound,
     /// Anything else.
     #[error("{0}")]
     Other(String),
@@ -336,7 +339,9 @@ impl<A: LeaseApi, C: Clock> Elector<A, C> {
             }
             Ok(Err(ApiError::Conflict)) => self.known = false,
             Ok(Err(e)) => {
+                // The Lease may have been deleted or replaced meanwhile: read it again.
                 warn!(error = %e, "lease acquire failed");
+                self.known = false;
                 self.wait(retry(start), events, shutdown).await;
             }
             Err(_) => {
@@ -380,6 +385,14 @@ impl<A: LeaseApi, C: Clock> Elector<A, C> {
                 self.refresh(budget.min(left)).await;
                 return;
             }
+            Ok(Err(ApiError::NotFound)) => {
+                // Someone deleted the Lease. Stop leading; as a follower this
+                // replica creates it again (or sees who did).
+                warn!(identity = %self.identity, "lease deleted while leading");
+                self.observe(None);
+                self.set_leading(false, "lease deleted");
+                return;
+            }
             Ok(Err(e)) => warn!(error = %e, "lease renew failed"),
             Err(_) => warn!("lease renew timed out"),
         }
@@ -395,13 +408,24 @@ impl<A: LeaseApi, C: Clock> Elector<A, C> {
         if !self.holder_is_me() {
             return;
         }
-        let Some(o) = &self.observed else { return };
-        let mut spec = o.snap.spec.clone();
-        spec.holder_identity = None;
-        match timeout(self.t.request_timeout, self.api.replace(&o.snap, spec)).await {
-            Ok(Ok(_)) => info!(identity = %self.identity, "lease released"),
-            Ok(Err(e)) => warn!(error = %e, "lease release failed"),
-            Err(_) => warn!("lease release timed out"),
+        // A renew that timed out here may still have committed, leaving our
+        // resourceVersion stale. On a conflict, read the Lease and try once more.
+        for retry in [true, false] {
+            let Some(o) = &self.observed else { return };
+            let mut spec = o.snap.spec.clone();
+            spec.holder_identity = None;
+            match timeout(self.t.request_timeout, self.api.replace(&o.snap, spec)).await {
+                Ok(Ok(_)) => info!(identity = %self.identity, "lease released"),
+                Ok(Err(ApiError::Conflict)) if retry => {
+                    if self.refresh(self.t.request_timeout).await && self.holder_is_me() {
+                        continue;
+                    }
+                }
+                Ok(Err(ApiError::NotFound)) => info!("lease already gone"),
+                Ok(Err(e)) => warn!(error = %e, "lease release failed"),
+                Err(_) => warn!("lease release timed out"),
+            }
+            return;
         }
     }
 }
