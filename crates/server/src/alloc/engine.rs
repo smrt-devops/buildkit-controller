@@ -19,8 +19,8 @@ use super::certs::CertSource;
 use super::error::AllocError;
 use super::metrics::AllocMetrics;
 use super::pods::{
-    CERT_MARGIN, MAX_TRIES, Want, ann, claim_patch, fmt_ts, free_slots, is_candidate, is_ready,
-    new_alloc_id, of_pool, retire_patch, whole_seconds,
+    CERT_MARGIN, MAX_TRIES, Want, ann, claim_patch, extend_patch, fmt_ts, free_slots, is_candidate,
+    is_ready, new_alloc_id, of_pool, retire_patch, whole_seconds,
 };
 use super::queue::{PoolKey, Queues};
 use crate::auth::{AccessRule, AccessRules, Identity};
@@ -38,6 +38,13 @@ pub const RELEASE_WAIT: Duration = Duration::from_secs(2);
 /// a Pod broadcast receiver, so unknown ids must not pile up without limit.
 pub const RELEASE_WAITERS: usize = 64;
 const MIN_TTL: u64 = 60;
+/// How long a claim outlives the moment its pod can be ready (the claim for
+/// a warm pod, the end of `workers.startTimeout` for a cold one) before the
+/// allocation commits. A claim is written with this short `expires-at` and
+/// extended to the real expiry just before the response exists, so a
+/// replica that dies in between (SIGKILL, OOM, shutdown abort) leaves a
+/// claim the leader retires within this bound, not at `maxTTL`.
+pub const COMMIT_WINDOW: time::Duration = time::Duration::seconds(60);
 
 /// Static inputs from the config file.
 #[derive(Debug, Clone)]
@@ -225,6 +232,8 @@ struct Won {
     pod: Pod,
     cold: Option<PodSubscription>,
     expires_at: OffsetDateTime,
+    /// The `expires-at` the claim was written with, see [`COMMIT_WINDOW`].
+    claimed_until: OffsetDateTime,
     /// `P cache-keys` of the slot before this claim.
     keys_before: Option<String>,
 }
@@ -243,6 +252,12 @@ struct Req<'a> {
     affinity: Option<(String, usize)>,
     /// Whether the local layer applies. Without it, uncached slots go first.
     local: bool,
+}
+
+/// The `expires-at` a claim is written with: [`COMMIT_WINDOW`] past now
+/// plus `start`, never past the allocation's own expiry.
+fn claim_until(expires_at: OffsetDateTime, start: time::Duration) -> OffsetDateTime {
+    (whole_seconds(OffsetDateTime::now_utc()) + start + COMMIT_WINDOW).min(expires_at)
 }
 
 fn grace_of(pod: &Pod) -> Option<u32> {
@@ -458,11 +473,10 @@ impl Engine {
             let start = Duration::from_secs(seconds(&pool.spec.workers.start_timeout)?);
             self.await_ready(&mut won, sub, start).await?;
         }
-        let uid = won.uid.clone();
         let id = AllocationId {
             namespace: req.namespace.parse().map_err(|_| AllocError::Internal)?,
             pool: req.pool.parse().map_err(|_| AllocError::Internal)?,
-            pod_uid: uid.parse().map_err(|_| AllocError::Internal)?,
+            pod_uid: won.uid.parse().map_err(|_| AllocError::Internal)?,
             alloc_id: alloc_id.clone(),
         };
         let cert = won
@@ -472,6 +486,7 @@ impl Engine {
                 error!(error = %e, "issuing allocation cert");
                 AllocError::Internal
             })?;
+        self.extend(&mut won).await?;
         self.metrics.duration(
             &req.namespace,
             &req.pool,
@@ -499,9 +514,41 @@ impl Engine {
         Ok(Allocation {
             response,
             pod_name: won.pod.metadata.name.clone().unwrap_or_default(),
-            pod_uid: uid,
+            pod_uid: won.uid,
             guard: won.guard,
         })
+    }
+
+    /// Commits the claim on the cluster: `expires-at` goes from the claim value
+    /// to the allocation's expiry. It is the last step of an allocation that
+    /// can fail. A failure fails the request and the orphan guard retires the
+    /// pod, so no client holds an allocation the leader is about to reap at
+    /// the claim value.
+    async fn extend(&self, won: &mut Won) -> Result<(), AllocError> {
+        if won.claimed_until >= won.expires_at {
+            return Ok(());
+        }
+        let (ns, name) = (won.guard.ns.clone(), won.guard.name.clone());
+        let patch = extend_patch(
+            &won.uid,
+            &won.guard.alloc_id,
+            &fmt_ts(won.claimed_until),
+            &fmt_ts(won.expires_at),
+        );
+        match self.backend.patch_pod(&ns, &name, patch).await {
+            PatchOutcome::Applied(_) => Ok(()),
+            // The leader retired the pod at the claim value, or it is gone.
+            PatchOutcome::Lost => {
+                won.guard.reason = "pod_lost";
+                Err(AllocError::PodLost)
+            }
+            // Landed or not, `alloc` is still this id, so the guard's retire applies.
+            PatchOutcome::Unknown => Err(AllocError::UpstreamError),
+            PatchOutcome::Failed(error) => {
+                error!(namespace = %ns, pod = %name, error, "commit patch");
+                Err(AllocError::Internal)
+            }
+        }
     }
 
     /// Record the key on a won cached slot and return the cache result when the
@@ -660,13 +707,14 @@ impl Engine {
             r.affinity.as_ref().map(|a| a.0.as_str()),
             r.local,
         );
-        let (now_s, exp_s, id) = (fmt_ts(now), fmt_ts(expires_at), r.alloc_id.as_str());
+        let (now_s, id) = (fmt_ts(now), r.alloc_id.as_str());
         for pod in cands.into_iter().take(MAX_TRIES) {
             let (Some(pname), Some(uid)) = (&pod.metadata.name, &pod.metadata.uid) else {
                 continue;
             };
             let before = rnd::pod_cache_keys(pod).map(str::to_owned);
-            let mut patch = claim_patch(uid, id, &r.owner, &now_s, &exp_s);
+            let claimed_until = claim_until(expires_at, time::Duration::ZERO);
+            let mut patch = claim_patch(uid, id, &r.owner, &now_s, &fmt_ts(claimed_until));
             if let (Some((k, cap)), Value::Array(ops)) = (&r.affinity, &mut patch)
                 && cache::cached(&pool, pod)
             {
@@ -694,6 +742,7 @@ impl Engine {
                         pod: *p,
                         cold: None,
                         expires_at,
+                        claimed_until,
                         keys_before: before,
                     }));
                 }
@@ -710,11 +759,9 @@ impl Engine {
                 }
             }
         }
-        self.cold(r, &pool, &pods, &ca, now_s, exp_s, expires_at)
-            .await
+        self.cold(r, &pool, &pods, &ca, now_s, expires_at).await
     }
 
-    #[allow(clippy::too_many_arguments, reason = "one attempt's state")]
     async fn cold(
         &self,
         r: &Req<'_>,
@@ -722,11 +769,13 @@ impl Engine {
         pods: &[Arc<Pod>],
         ca: &Arc<CaBundle>,
         now_s: String,
-        exp_s: String,
         expires_at: OffsetDateTime,
     ) -> Result<Option<Won>, AllocError> {
         let (ns, name) = (&r.key.0, &r.key.1);
         let now = expires_at - r.ttl;
+        let start = i64::try_from(seconds(&pool.spec.workers.start_timeout)?)
+            .map(time::Duration::seconds)
+            .map_err(|_| AllocError::Internal)?;
         let max = u32::try_from(pool.spec.scaling.max).unwrap_or(0);
         let mut slots = free_slots(
             pods.iter().filter_map(|p| p.metadata.name.as_deref()),
@@ -742,11 +791,12 @@ impl Engine {
                     Volume::Skip => continue,
                     Volume::Quota => return Ok(None),
                 };
+            let claimed_until = claim_until(expires_at, start);
             let claim = Claim {
                 alloc_id: id.to_owned(),
                 owner: r.owner.clone(),
                 allocated_at: now_s.clone(),
-                expires_at: exp_s.clone(),
+                expires_at: fmt_ts(claimed_until),
             };
             // The pod is single-use and retired when the allocation ends, so its
             // cert only has to outlive the allocation.
@@ -771,12 +821,8 @@ impl Engine {
             let pname = worker.pod.metadata.name.clone().unwrap_or_default();
             // Subscribe before the create so no event about the new pod is missed.
             let sub = (self.subscribe)();
-            // Arm the guard first, by name (no uid yet), for the undo patch.
-            let mut guard = self.guard(r, &pname, None, None);
-            let backend = &self.backend;
-            let created = spawn::spawn(&**backend, worker, |pod| backend.create_pod(ns, pod)).await;
+            let (guard, created) = self.create_detached(r, worker, &pname).await?;
             let created = created.map_err(|e| {
-                guard.armed = false;
                 error!(namespace = %ns, pool = %name, pod = %pname, error = %e, "creating the worker Secret");
                 AllocError::Internal
             })?;
@@ -785,9 +831,6 @@ impl Engine {
                     let Some(uid) = p.metadata.uid.clone() else {
                         return Err(AllocError::Internal);
                     };
-                    guard.uid = Some(uid.clone());
-                    guard.grace = grace_of(&p);
-                    guard.confirmed = true;
                     return Ok(Some(Won {
                         guard,
                         uid,
@@ -795,23 +838,62 @@ impl Engine {
                         pod: *p,
                         cold: Some(sub),
                         expires_at,
+                        claimed_until,
                         keys_before: before,
                     }));
                 }
-                CreateOutcome::Exists => guard.armed = false,
-                CreateOutcome::Quota => {
-                    guard.armed = false;
-                    return Ok(None);
-                }
+                CreateOutcome::Exists => {}
+                CreateOutcome::Quota => return Ok(None),
                 CreateOutcome::Unknown => return Err(AllocError::UpstreamError),
                 CreateOutcome::Failed(error) => {
-                    guard.armed = false;
                     error!(namespace = %ns, pool = %name, pod = %pname, error, "creating worker pod");
                     return Err(AllocError::Internal);
                 }
             }
         }
         Ok(None)
+    }
+
+    /// Runs the create sequence of [`spawn::spawn`] (Secret, pod, Secret
+    /// re-own) in its own task, so a cancelled request cannot stop it halfway
+    /// and leave the worker Secret, with its private key, owned by the pool.
+    /// The task holds the orphan guard until the outcome is known and hands it
+    /// back; if the request is gone by then, the guard drops in the task and
+    /// retires the pod.
+    async fn create_detached(
+        &self,
+        r: &Req<'_>,
+        worker: spawn::Worker,
+        pname: &str,
+    ) -> Result<(OrphanGuard, Result<CreateOutcome, String>), AllocError> {
+        // Armed first, by name (no uid yet), because the create may land
+        // although its answer is lost.
+        let mut guard = self.guard(r, pname, None, None);
+        let backend = Arc::clone(&self.backend);
+        let ns = r.key.0.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let created = spawn::spawn(&*backend, worker, |pod| backend.create_pod(&ns, pod)).await;
+            match &created {
+                Ok(CreateOutcome::Created(p)) => {
+                    if let Some(uid) = &p.metadata.uid {
+                        guard.uid = Some(uid.clone());
+                        guard.grace = grace_of(p);
+                        guard.confirmed = true;
+                    }
+                }
+                // The pod may exist, so the undo stays armed.
+                Ok(CreateOutcome::Unknown) => {}
+                Ok(CreateOutcome::Exists | CreateOutcome::Quota | CreateOutcome::Failed(_))
+                | Err(_) => guard.armed = false,
+            }
+            // A send to a dropped request returns the guard, which drops here.
+            drop(tx.send((guard, created)));
+        });
+        rx.await.map_err(|_| {
+            error!(pod = %pname, "the cold create task ended without an outcome");
+            AllocError::Internal
+        })
     }
 
     /// Wait for a cold pod to be Ready (store + broadcast, no polling).

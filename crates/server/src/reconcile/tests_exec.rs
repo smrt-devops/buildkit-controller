@@ -94,8 +94,12 @@ impl KubeOps for Fake {
         pod: &str,
         _uid: &str,
         expected: &str,
+        expires_at: Option<&str>,
     ) -> OpResult<Option<String>> {
-        self.call(format!("retire:{pod}:{expected}"))?;
+        match expires_at {
+            Some(e) => self.call(format!("retire:{pod}:{expected}:{e}"))?,
+            None => self.call(format!("retire:{pod}:{expected}"))?,
+        }
         Ok(Some("rv-7".into()))
     }
     async fn delete_pod(
@@ -241,6 +245,7 @@ fn full_pass() -> Vec<Action> {
             pod: "p-3".into(),
             uid: "u3".into(),
             alloc_id: "a3".into(),
+            expires_at: Some("2026-01-01T00:00:00Z".into()),
             reason: RetireReason::Expired,
         },
         Action::CreatePod {
@@ -285,7 +290,7 @@ async fn actions_run_in_plan_order() {
             "delete:p-5",
             "retire:p-2:free",
             "delete:p-2",
-            "retire:p-3:a3",
+            "retire:p-3:a3:2026-01-01T00:00:00Z",
             "delete:p-3",
             "secret_create:p-0-N",
             "create:p-0",
@@ -885,7 +890,14 @@ impl KubeOps for Hang {
     async fn create_pod(&self, _ns: &str, _pod: &Pod) -> OpResult<Pod> {
         self.hang("create").await
     }
-    async fn retire(&self, _: &str, _: &str, _: &str, _: &str) -> OpResult<Option<String>> {
+    async fn retire(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+    ) -> OpResult<Option<String>> {
         self.hang("retire").await
     }
     async fn delete_pod(

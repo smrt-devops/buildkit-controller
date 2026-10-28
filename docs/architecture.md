@@ -22,6 +22,8 @@ A separate ops port (8080, plain HTTP, on its own ClusterIP Service) serves `/he
 
 There is no worker CRD and no gateway. The reconciler creates plain pods named `<pool>-<slot>` and owns them by label. A pod is `free`, `allocated` or `draining`. Claiming a free pod is one JSON patch with a test on its labels, so two replicas cannot claim the same pod. If no pod is free, the API creates a pre-claimed pod while the pool is under `scaling.max`, and otherwise queues the request. Retiring a pod is also a patch, followed by deletion. The pod template is yours, but the controller owns the security context, TLS mounts, command and labels. The API server rejects a template that sets those.
 
+A claim first holds the pod only briefly. Its `expires-at` is 60 seconds past the moment the pod can be ready: the claim itself for a free pod, the end of `workers.startTimeout` for a created one. Just before the API answers, it moves `expires-at` to the allocation's real expiry with a patch that tests the short value. If that patch fails, the request fails and the pod is retired. A replica killed between the claim and the answer therefore holds the pod for at most `startTimeout` plus 60 seconds, after which the reconciler retires it as expired. The reconciler's expiry retire tests the `expires-at` it judged expired, so it cannot reap an allocation that committed in the meantime.
+
 ## Data path
 
 ```mermaid

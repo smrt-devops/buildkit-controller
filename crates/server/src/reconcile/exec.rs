@@ -224,7 +224,7 @@ pub async fn execute<O: KubeOps>(ops: &O, guard: &CaGuard, env: &Env<'_>, plan: 
             }
             Action::RetireFree { pod, uid, reason } => {
                 r.trace.push(format!("retire:{pod}"));
-                if retire(ops, &ns, pod, uid, "free", &mut r).await {
+                if retire(ops, &ns, pod, uid, "free", None, &mut r).await {
                     super::cache::reap_after_failure(ops, env.pool, pod, *reason, &mut r).await;
                 }
             }
@@ -232,10 +232,12 @@ pub async fn execute<O: KubeOps>(ops: &O, guard: &CaGuard, env: &Env<'_>, plan: 
                 pod,
                 uid,
                 alloc_id,
+                expires_at,
                 reason,
             } => {
                 r.trace.push(format!("retire:{pod}"));
-                if retire(ops, &ns, pod, uid, alloc_id, &mut r).await {
+                let exp = expires_at.as_deref();
+                if retire(ops, &ns, pod, uid, alloc_id, exp, &mut r).await {
                     super::cache::reap_after_failure(ops, env.pool, pod, *reason, &mut r).await;
                     r.releases.push(match reason.label() {
                         "ca_rotated" => "ca_replaced",
@@ -326,9 +328,10 @@ async fn retire<O: KubeOps>(
     pod: &str,
     uid: &str,
     expected: &str,
+    expires_at: Option<&str>,
     r: &mut Report,
 ) -> bool {
-    match ops.retire(ns, pod, uid, expected).await {
+    match ops.retire(ns, pod, uid, expected, expires_at).await {
         Ok(rv) => {
             r.pod_ops.push(("retire", "ok"));
             let res = ops.delete_pod(ns, pod, uid, rv, None).await;

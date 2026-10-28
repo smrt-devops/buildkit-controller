@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,7 @@ use buildkit_controller::render::{
 };
 use buildkit_controller_api::v1alpha1::BuildKitPool;
 use futures::StreamExt;
+use k8s_openapi::api::authentication::v1::TokenRequest;
 use k8s_openapi::api::core::v1::{Namespace, Pod, Secret, ServiceAccount};
 use k8s_openapi::api::events::v1::Event;
 use k8s_openapi::api::networking::v1::NetworkPolicy;
@@ -359,6 +360,128 @@ fn cond(p: &BuildKitPool, t: &str) -> Option<(String, String)> {
         .flat_map(|s| &s.conditions)
         .find(|c| c.type_ == t)
         .map(|c| (c.status.clone(), c.reason.clone()))
+}
+
+/// Like [`until`], polling every 50 ms, for a state that lasts only seconds.
+async fn soon<F, Fut>(what: &str, secs: u64, mut f: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(secs) {
+        if f().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out after {secs}s waiting for {what}");
+}
+
+/// A second controller replica, started and killed by the scenarios. It runs
+/// the same binary and identity as the first, on its own loopback ports.
+struct Replica {
+    child: Child,
+    /// `listen.api`.
+    api: String,
+}
+
+impl Replica {
+    async fn start(name: &str) -> Self {
+        let config = std::path::PathBuf::from(env("RV_CONFIG"));
+        let dir = config.parent().unwrap().to_owned();
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        // Every listen address gets a fresh port.
+        let mut at = 0;
+        let mut api = String::new();
+        while let Some(i) = text[at..].find("127.0.0.1:") {
+            let start = at + i;
+            let end = start
+                + "127.0.0.1:".len()
+                + text[start + "127.0.0.1:".len()..]
+                    .bytes()
+                    .take_while(u8::is_ascii_digit)
+                    .count();
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let addr = format!("127.0.0.1:{port}");
+            if text[..start].ends_with("api: ") {
+                api.clone_from(&addr);
+            }
+            text.replace_range(start..end, &addr);
+            at = start + addr.len();
+        }
+        let ops = text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("ops: "))
+            .unwrap()
+            .to_owned();
+        assert!(!api.is_empty(), "no listen.api in {text}");
+        let path = dir.join(format!("{name}.yaml"));
+        std::fs::write(&path, &text).unwrap();
+        let log = std::fs::File::create(dir.join(format!("{name}.log"))).unwrap();
+        let child = Command::new(env("RV_BIN"))
+            .arg("--config")
+            .arg(&path)
+            .env("KUBECONFIG", env("RV_CTRL_KUBECONFIG"))
+            .env("POD_NAME", name)
+            .env("POD_NAMESPACE", env("RV_NAMESPACE"))
+            .env("LOG_LEVEL", "info,buildkit_controller=debug")
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap();
+        until(&format!("{name} ready"), 60, || {
+            let url = format!("http://{ops}/readyz");
+            async move {
+                reqwest::get(url)
+                    .await
+                    .is_ok_and(|r| r.status().is_success())
+            }
+        })
+        .await;
+        Self { child, api }
+    }
+
+    /// SIGKILL: no orphan guard runs, nothing is cleaned up.
+    fn kill(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+    }
+}
+
+impl Drop for Replica {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A token for the `ServiceAccount` `name` in [`NS`], created if missing,
+/// with the audience the controller accepts by default.
+async fn sa_token(client: &Client, name: &str) -> String {
+    let sas = Api::<ServiceAccount>::namespaced(client.clone(), NS);
+    let sa = serde_json::from_value(json!({"metadata": {"name": name}})).unwrap();
+    if let Err(e) = sas.create(&PostParams::default(), &sa).await {
+        assert!(e.to_string().contains("AlreadyExists"), "{e}");
+    }
+    let tr: TokenRequest = serde_json::from_value(
+        json!({"spec": {"audiences": ["buildkit-controller"], "expirationSeconds": 3600}}),
+    )
+    .unwrap();
+    sas.create_token_request(name, &PostParams::default(), &tr)
+        .await
+        .unwrap()
+        .status
+        .unwrap()
+        .token
+}
+
+fn ts(p: &Pod, key: &str) -> jiff::Timestamp {
+    p.annotations()[key].parse().unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -796,6 +919,152 @@ async fn reconcile_verify() {
     );
     summary.push(format!(
         "S9 PASS: 60s idle: {renewals} lease renewals (<= 35), {watches} watch completions (<= 8), no other request; all: {idle:?}"
+    ));
+
+    // 10 and 11 run a second replica, which serves the API, against pool `r`.
+    // The pool keeps no warm pods, so each allocation creates its pod.
+    let start_timeout = 20;
+    let mut pool_r = pool_json("r", &h.image, 0, 1, "Allow");
+    pool_r.spec.workers.start_timeout =
+        serde_json::from_value(json!(format!("{start_timeout}s"))).unwrap();
+    h.pools
+        .create(&PostParams::default(), &pool_r)
+        .await
+        .unwrap();
+    until("r Ready", 60, || async {
+        cond(&h.pool("r").await, "Ready").is_some_and(|c| c.0 == "True")
+    })
+    .await;
+    let mut replica = Replica::start("rv-1").await;
+    let token = sa_token(&client, "builder").await;
+    let http = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let allocate = || {
+        let req = http
+            .post(format!("https://{}/v1/allocations", replica.api))
+            .bearer_auth(&token)
+            .json(&json!({"namespace": NS, "pool": "r", "ttlSeconds": 3600, "queueTimeoutSeconds": 0}));
+        tokio::spawn(req.send())
+    };
+    let r_secrets = || async {
+        Api::<Secret>::namespaced(client.clone(), NS)
+            .list(&ListParams::default().labels(&format!("{LABEL_POOL}=r")))
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|s| s.name_any())
+            .collect::<Vec<_>>()
+    };
+    let claimed = |p: &Pod| !matches!(alloc(p), "" | "free" | "draining");
+
+    // 10. A client that gives up mid cold start (a cancelled CI job) leaves
+    // neither the pod nor its worker Secret behind.
+    let mark = h.mark();
+    let inflight = allocate();
+    soon("r-0 created", 60, || async {
+        h.pods.get_opt("r-0").await.unwrap().is_some()
+    })
+    .await;
+    inflight.abort();
+    let pre = h.pods.get("r-0").await.unwrap();
+    assert!(
+        claimed(&pre) && !ready(&pre),
+        "r-0 not mid cold start: {pre:?}"
+    );
+    let took = until(
+        "r-0 retired and its worker Secret collected",
+        120,
+        || async { h.list("r").await.is_empty() && r_secrets().await.is_empty() },
+    )
+    .await;
+    let seq: Vec<String> = rec.lock().unwrap().pods[mark..]
+        .iter()
+        .filter(|e| e.1 == "r-0")
+        .map(|e| format!("{}:{}", e.2, if e.3.len() == 26 { "<id>" } else { &e.3 }))
+        .collect();
+    assert!(seq.contains(&"apply:draining".to_owned()), "{seq:?}");
+    summary.push(format!(
+        "S10 PASS: client cancelled mid cold start; r-0 retired and no worker Secret of r left after {}s; sequence {seq:?}",
+        took.as_secs()
+    ));
+
+    // 11. A replica killed (SIGKILL) between the claim and the response
+    // holds the pod only until the claim's short expiry, at most
+    // startTimeout + 60 s, and the leader then retires it.
+    let mark = h.mark();
+    let inflight = allocate();
+    soon("r-0 created pre-claimed", 60, || async {
+        h.pods
+            .get_opt("r-0")
+            .await
+            .unwrap()
+            .is_some_and(|p| claimed(&p))
+    })
+    .await;
+    replica.kill();
+    inflight.abort();
+    let pre = h.pods.get("r-0").await.unwrap();
+    assert!(
+        !ready(&pre),
+        "r-0 was Ready before the kill, so it may have committed"
+    );
+    let id = alloc(&pre).to_owned();
+    let (allocated, expires) = (ts(&pre, ANN_ALLOCATED_AT), ts(&pre, ANN_EXPIRES_AT));
+    let bound = jiff::SignedDuration::from_secs(start_timeout + 60);
+    let window = expires.duration_since(allocated);
+    assert!(
+        window >= bound && window <= bound + jiff::SignedDuration::from_secs(1),
+        "claim window {window:?}, want startTimeout + 60 s"
+    );
+    // The pod starts, so no start timeout applies: only the expiry can free it.
+    until("r-0 Running with an IP", 60, || async {
+        h.pods
+            .get("r-0")
+            .await
+            .unwrap()
+            .status
+            .is_some_and(|s| s.phase.as_deref() == Some("Running") && s.pod_ip.is_some())
+    })
+    .await;
+    let check_at = expires - jiff::SignedDuration::from_secs(2);
+    tokio::time::sleep(
+        check_at
+            .duration_since(jiff::Timestamp::now())
+            .unsigned_abs(),
+    )
+    .await;
+    assert!(jiff::Timestamp::now() < expires);
+    assert_eq!(
+        alloc(&h.pods.get("r-0").await.unwrap()),
+        id,
+        "r-0 retired early"
+    );
+    until("r-0 deleted", 90, || async {
+        h.deletes_since(mark, "r").contains(&"r-0".to_owned())
+    })
+    .await;
+    let first_drain = rec.lock().unwrap().pods[mark..]
+        .iter()
+        .find(|e| e.1 == "r-0" && e.3 == "draining")
+        .map(|e| e.4)
+        .expect("draining seen");
+    let late = first_drain.duration_since(expires);
+    assert!(
+        late >= jiff::SignedDuration::ZERO && late <= jiff::SignedDuration::from_secs(5),
+        "first draining {late:?} after the claim's expires-at (want 0..=5 s)"
+    );
+    until("r's worker Secret collected", 60, || async {
+        r_secrets().await.is_empty()
+    })
+    .await;
+    summary.push(format!(
+        "S11 PASS: replica SIGKILLed mid cold start; claim expires-at = allocated-at + {}s; leader retired r-0 {:.1}s after it ({:.0}s after the claim), Secret collected",
+        window.as_secs(),
+        late.as_secs_f64(),
+        first_drain.duration_since(allocated).as_secs_f64()
     ));
 
     // Every controller request the API server rejected over the whole run.

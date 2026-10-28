@@ -5,9 +5,11 @@
 //! The Secret is created owned by the pool, so it never outlives the pool.
 //! Once the pod exists its ownerReferences are replaced by the pod alone, and
 //! the garbage collector removes it with the pod. A pod create that certainly
-//! failed deletes the Secret by name. A crash between the two steps, or a
-//! create whose outcome is unknown, leaves the Secret owned by the pool until
-//! the pool is deleted; the controller never lists Secrets in pool namespaces.
+//! failed deletes the Secret by name. The API's cold path runs [`spawn`] in
+//! its own task, so a cancelled request does not stop it between the steps.
+//! A crash between the two steps, or a create whose outcome is unknown, still
+//! leaves the Secret owned by the pool until the pool is deleted; the
+//! controller never lists Secrets in pool namespaces.
 
 use std::future::Future;
 
