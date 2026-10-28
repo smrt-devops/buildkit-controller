@@ -1,0 +1,10 @@
+# expect: the API and edge TLSRoutes would both match SNI bk.example.com
+# One Gateway in the release namespace, named explicitly by the API ref and implied
+# by the bare edge ref: the same listener, so the shared-SNI check must catch it.
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+gateway:
+  api:
+    mode: passthrough
+    parentRefs: [{name: shared, namespace: buildkit-system, sectionName: tls}]
+  edge:
+    parentRefs: [{name: shared, sectionName: tls}]

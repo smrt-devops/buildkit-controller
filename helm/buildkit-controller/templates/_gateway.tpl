@@ -33,7 +33,7 @@ passthrough mode when both TLSRoutes could match one SNI on one listener.
   {{- if eq $gw.api.mode "passthrough" -}}
     {{- range $a := $apiRefs -}}
       {{- range $e := $edgeRefs -}}
-        {{- $same := and (eq $a.name $e.name) (eq (default "" $a.namespace) (default "" $e.namespace)) (eq (default "Gateway" $a.kind) (default "Gateway" $e.kind)) -}}
+        {{- $same := and (eq $a.name $e.name) (eq (default $.Release.Namespace $a.namespace) (default $.Release.Namespace $e.namespace)) (eq (default "Gateway" $a.kind) (default "Gateway" $e.kind)) -}}
         {{- $sameSection := or (not $a.sectionName) (not $e.sectionName) (eq $a.sectionName $e.sectionName) -}}
         {{- $samePort := or (not $a.port) (not $e.port) (eq (int $a.port) (int $e.port)) -}}
         {{- if and $same $sameSection $samePort -}}
