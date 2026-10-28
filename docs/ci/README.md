@@ -36,11 +36,12 @@ token review is unavailable, or a replica is shutting down (`shutting_down`). Ot
 an unavailable CA, carry no `Retry-After` and are not retried. The Action retries `POST /v1/allocations` on
 exactly that, and on connection errors raised before the request was sent (connection refused, DNS
 failure). It waits the `Retry-After` seconds (at least 1, at most 30), logs each retry, and fetches a
-fresh OIDC token for every attempt. Retries stop after `queue-timeout` plus 60 seconds (the controller's
-default queue timeout, 1 hour, if unset) and the step then fails with the last error. A pool that was
-exhausted answered only after the full queue timeout, so each retry asks for just the time left in that
-bound (`queue-timeout` less the time already spent) and the total does not double. With no
-`queue-timeout` the pool default is sent unchanged on every attempt.
+fresh OIDC token for every attempt. Retries stop after the queue timeout plus 60 seconds and the step then fails with the last error. The
+queue timeout is `queue-timeout`, or, when that is unset, the pool's default `queueTimeoutSeconds` from
+`GET /v1/pools`. A pool that was exhausted answered only after the full queue timeout, so each retry asks
+for just the time left in that bound (the queue timeout less the time already spent) and the total does
+not double. A controller too old to report the pool default gets no `queueTimeoutSeconds` from the
+Action, and the bound is then 1 hour (the largest queue timeout a pool allows) plus 60 seconds.
 
 Nothing else is retried: other statuses, a 503 without `Retry-After`, a connection reset after the request
 was sent and a timeout waiting for the response all fail the step, because the controller may have
@@ -111,7 +112,8 @@ sh docs/ci/buildkit-allocate.sh sh -c 'docker buildx build --builder "$BUILDER" 
 Optional variables are `TTL` and `QUEUE_TIMEOUT` (seconds), `API_CA` (PEM file for the API listener, needed under the same conditions as the Action's `ca-cert`),
 `CACHE_KEY` and `CACHE` (the Action's `cache-key` and `cache` inputs). The script retries the allocation
 under the same rules and limits as the Action (see Retries above): a 503 with `Retry-After`, or a curl
-failure to resolve or connect, for at most `QUEUE_TIMEOUT` plus 60 seconds, shrinking the queue timeout it sends on each retry. It reuses `TOKEN` for every
+failure to resolve or connect, for at most the queue timeout plus 60 seconds, shrinking the queue timeout it sends on each retry.
+Without `QUEUE_TIMEOUT` it reads the pool default from `GET /v1/pools` first, as the Action does. It reuses `TOKEN` for every
 attempt, so give it a token that outlives that window. The script prints the registry cache
 flags to stderr and exports them to the command as `$CACHE_ARGS`:
 

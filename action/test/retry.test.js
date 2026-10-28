@@ -197,3 +197,62 @@ test('queueTimeoutFor', () => {
   assert.equal(L.queueTimeoutFor(300, 30000), 0);
   assert.equal(L.queueTimeoutFor(undefined, 100000), undefined);
 });
+
+test('effectiveQueueTimeout: the input wins, else the pool default, else unknown', () => {
+  const pool = { namespace: 'ci', name: 'amd64', queueTimeoutSeconds: 120 };
+  assert.equal(L.effectiveQueueTimeout(300, pool), 300);
+  assert.equal(L.effectiveQueueTimeout(0, pool), 0);
+  assert.equal(L.effectiveQueueTimeout(undefined, pool), 120);
+  assert.equal(L.effectiveQueueTimeout(undefined, { ...pool, queueTimeoutSeconds: 0 }), 0);
+  // A server that predates the field, or a value that is not a whole number of seconds.
+  assert.equal(L.effectiveQueueTimeout(undefined, { namespace: 'ci', name: 'amd64' }), undefined);
+  assert.equal(L.effectiveQueueTimeout(undefined, { queueTimeoutSeconds: '120' }), undefined);
+  assert.equal(L.effectiveQueueTimeout(undefined, undefined), undefined);
+});
+
+/**
+ * Drive the allocate retry loop the way main.js does against a pool that stays busy: each attempt
+ * holds the request for its whole queue timeout (the server's own default when the body has none),
+ * then answers 503 pool_exhausted with Retry-After. Returns the queue timeouts sent and the total time.
+ */
+async function busyPool(inputQt, pool, serverDefault) {
+  let t = 0;
+  const sent = [];
+  const pqt = L.effectiveQueueTimeout(inputQt, pool);
+  const budgetMs = L.retryBudgetMs(pqt);
+  const busy = {
+    status: 503, headers: { 'Retry-After': '5' },
+    onRequest: () => { const q = sent[sent.length - 1]; t += (q === undefined ? serverDefault : q) * 1000; },
+  };
+  const s = await serve([busy]);
+  const h = harness({ budgetMs, now: () => t, sleep: async (ms) => { h.waits.push(ms); t += ms; } });
+  const opts = ({ remainingMs }) => {
+    const q = L.queueTimeoutFor(pqt, remainingMs);
+    sent.push(q);
+    return { ...post, body: L.allocationBody({ namespace: 'ci', pool: 'amd64' }, 'pk', undefined, q), timeoutMs: L.postTimeoutMs(q) };
+  };
+  const res = await L.requestWithRetry(s.url, opts, h.opts);
+  s.close();
+  assert.equal(res.status, 503);
+  assert.deepEqual(s.seen.map((r) => r.body.queueTimeoutSeconds), sent);
+  return { sent, t };
+}
+
+test('without queue-timeout, the pool default bounds the retries', async () => {
+  const { sent, t } = await busyPool(undefined, { queueTimeoutSeconds: 120 }, 120);
+  assert.equal(sent[0], 120, 'the first attempt queues for the pool default');
+  assert.ok(sent.length > 1 && sent.slice(1).every((q) => q < 120), `${sent}`);
+  assert.ok(t <= 180000, `total ${t} ms stays inside the pool default + 60 s`);
+});
+
+test('an explicit queue-timeout still wins over the pool default', async () => {
+  const { sent, t } = await busyPool(30, { queueTimeoutSeconds: 120 }, 120);
+  assert.equal(sent[0], 30);
+  assert.ok(t <= 90000, `total ${t} ms stays inside queue-timeout + 60 s`);
+});
+
+test('a server that reports no pool default keeps the 1 h budget', async () => {
+  const { sent } = await busyPool(undefined, {}, 120);
+  assert.ok(sent.every((q) => q === undefined), 'the server default is not overridden');
+  assert.equal(L.retryBudgetMs(L.effectiveQueueTimeout(undefined, {})), 3660000);
+});

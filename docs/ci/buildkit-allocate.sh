@@ -23,9 +23,6 @@ case $POOL in */*) ;; *) echo "POOL must be <namespace>/<pool>" >&2; exit 2 ;; e
 case $API in https://*) ;; *) echo "API must be https://" >&2; exit 2 ;; esac
 case ${CACHE:-auto} in auto|registry|local|none) ;; *) echo "CACHE must be auto, registry, local or none" >&2; exit 2 ;; esac
 
-# Total time for retries: queue timeout (server default 1 h if unset) + 60 s.
-RETRY_BUDGET=$(( ${QUEUE_TIMEOUT:-3600} + 60 ))
-
 D=$(mktemp -d)
 chmod 700 "$D"
 # Header file keeps the token out of curl's argv (visible in ps); needs curl >= 7.55
@@ -76,6 +73,17 @@ trap release EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Without QUEUE_TIMEOUT, the pool default from GET /v1/pools takes its place, so the retries below
+# stay inside the default + 60 s. A server that does not report it leaves QUEUE_TIMEOUT unset.
+if [ -z "${QUEUE_TIMEOUT:-}" ]; then
+  QUEUE_TIMEOUT=$(curl_api --max-time 30 -H @"$D/auth" "$API/v1/pools" 2>/dev/null |
+    jq -r --arg ns "$NS" --arg name "$NAME" \
+      '.pools[]? | select(.namespace == $ns and .name == $name) | .queueTimeoutSeconds // empty' 2>/dev/null || :)
+  case $QUEUE_TIMEOUT in *[!0-9]*) QUEUE_TIMEOUT= ;; esac
+fi
+# Total time for retries: queue timeout (1 h, the largest allowed, if unknown) + 60 s.
+RETRY_BUDGET=$(( ${QUEUE_TIMEOUT:-3600} + 60 ))
+
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$D/key.pem" 2>/dev/null
 openssl pkey -in "$D/key.pem" -pubout -out "$D/pub.pem"
 
@@ -86,7 +94,7 @@ openssl pkey -in "$D/key.pem" -pubout -out "$D/pub.pem"
 # The client timeout covers queue timeout + startTimeout ceiling (1800) + 10 s.
 # A retry queues only for what is left of the budget (QUEUE_TIMEOUT less the time already spent), so
 # a busy pool, which answers 503 after the full queue timeout, does not double the total wait.
-# Without QUEUE_TIMEOUT the pool default applies and is not overridden.
+# QUEUE_TIMEOUT stays unset only when the server reports no pool default; the server default then applies.
 write_body() { # write_body QUEUE_TIMEOUT_OR_EMPTY
 jq -n --arg ns "$NS" --arg pool "$NAME" --rawfile pk "$D/pub.pem" \
       --arg ttl "${TTL:-}" --arg qt "$1" \
