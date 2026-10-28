@@ -535,3 +535,87 @@ fn request_timeout_must_be_below_the_read_timeout() {
         "{errors:?}"
     );
 }
+
+#[test]
+fn zero_edge_timeouts_are_refused() {
+    for key in ["handshakeTimeout", "upstreamConnectTimeout"] {
+        let v = errs(&format!(
+            "edge:\n  endpoint: tcp://bk.example.com:8444\n  serverName: bk.example.com\n  {key}: 0s\n"
+        ));
+        assert!(
+            v.iter()
+                .any(|m| m.contains(&format!("edge.{key} must be positive"))),
+            "{v:?}"
+        );
+    }
+}
+
+#[test]
+fn lease_name_must_be_an_object_name() {
+    for bad in ["", "Leader", "lead_er", "-lead", "a..b", "lead."] {
+        let v = errs(&format!("{MIN}leaderElection:\n  leaseName: \"{bad}\"\n"));
+        assert!(
+            v.iter().any(|m| m.contains("leaderElection.leaseName")),
+            "{bad}: {v:?}"
+        );
+    }
+    let c =
+        Config::from_yaml(&format!("{MIN}leaderElection:\n  leaseName: bk.leader-1\n")).unwrap();
+    assert_eq!(c.leader_election.lease_name, "bk.leader-1");
+}
+
+#[test]
+fn claim_namespaces_are_names_listed_once() {
+    let v = errs(&format!(
+        "{MIN}claims:\n  enabled: true\n  namespaces: [ci, Bad_ns, ci]\n"
+    ));
+    assert!(
+        v.iter()
+            .any(|m| m.contains("claims.namespaces: `Bad_ns` is not a namespace name")),
+        "{v:?}"
+    );
+    assert!(
+        v.iter()
+            .any(|m| m.contains("claims.namespaces: `ci` is listed twice")),
+        "{v:?}"
+    );
+}
+
+#[test]
+fn oidc_url_without_query_or_fragment() {
+    for bad in [
+        "https://issuer.example.com/?a=b",
+        "https://issuer.example.com/#x",
+    ] {
+        let v = errs(&format!(
+            "{MIN}auth:\n  oidc:\n  - url: \"{bad}\"\n    audiences: [bk]\n"
+        ));
+        assert!(
+            v.iter().any(|m| m.contains("query or fragment")),
+            "{bad}: {v:?}"
+        );
+    }
+}
+
+#[test]
+fn empty_cluster_cidrs_warn_at_startup() {
+    let c = Config::from_yaml(MIN).unwrap();
+    assert!(c.worker_network.cluster_cidrs.is_empty());
+    assert!(c.warn_unchecked_cluster_ranges());
+    let c = Config::from_yaml(&format!(
+        "{MIN}workerNetwork:\n  clusterCIDRs: [10.0.0.0/8]\n"
+    ))
+    .unwrap();
+    assert!(!c.warn_unchecked_cluster_ranges());
+}
+
+#[test]
+fn edge_max_connections_defaults_to_the_chart_value_everywhere() {
+    let c = Config::from_yaml(MIN).unwrap();
+    assert_eq!(c.edge.max_connections, 2000);
+    assert_eq!(
+        crate::edge::ListenerOptions::default().max_connections,
+        2000,
+        "the edge listener's own default follows the config one"
+    );
+}

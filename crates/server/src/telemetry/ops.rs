@@ -2,14 +2,23 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
+use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tracing::debug;
 
+use crate::runtime::listen;
 use crate::runtime::metrics::Metrics;
 use crate::runtime::readiness::Readiness;
 
@@ -33,13 +42,19 @@ pub fn router(state: OpsState) -> Router {
 
 async fn readyz(State(s): State<OpsState>) -> impl IntoResponse {
     let failing = s.readiness.failing();
-    if failing.is_empty() {
+    let degraded = s.readiness.degraded();
+    let (code, head) = if failing.is_empty() {
         (StatusCode::OK, "ok\n".to_owned())
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             format!("not ready: {}\n", failing.join(", ")),
         )
+    };
+    if degraded.is_empty() {
+        (code, head)
+    } else {
+        (code, format!("{head}degraded: {}\n", degraded.join(", ")))
     }
 }
 
@@ -53,23 +68,70 @@ async fn metrics(State(s): State<OpsState>) -> impl IntoResponse {
     )
 }
 
-/// Bind the ops listener, so a bind failure surfaces at startup.
-pub async fn bind(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
-    tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("binding ops listener {addr}: {e}"))
+/// Bind the ops listener, so a bind failure surfaces at startup. `0.0.0.0`
+/// listens on both families (see [`listen::bind`]).
+pub fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
+    listen::bind(addr).map_err(|e| anyhow::anyhow!("binding ops listener {addr}: {e}"))
 }
 
-/// Serve on `listener` until `stop` fires.
+/// Open ops connections; more are closed on accept. Probes and a few scrapers
+/// need a handful, and the cap keeps idle sockets from exhausting descriptors.
+const MAX_CONNECTIONS: usize = 64;
+/// Longest wait for a request head, also the keep-alive idle bound.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long open connections may finish after `stop` before they are dropped.
+pub const STOP_GRACE: Duration = Duration::from_secs(2);
+
+/// Serve on `listener` until `stop` fires. Open connections then get
+/// [`STOP_GRACE`] to finish their request, and the rest are dropped.
 pub async fn serve(
-    listener: tokio::net::TcpListener,
+    listener: TcpListener,
     state: OpsState,
     stop: CancellationToken,
 ) -> anyhow::Result<()> {
     tracing::info!(addr = ?listener.local_addr().ok(), "ops server listening");
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(async move { stop.cancelled().await })
-        .await?;
+    let app = router(state);
+    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let mut conns = JoinSet::new();
+    loop {
+        tokio::select! {
+            () = stop.cancelled() => break,
+            Some(_) = conns.join_next(), if !conns.is_empty() => {}
+            accepted = listener.accept() => {
+                let tcp = match accepted {
+                    Ok((tcp, _)) => tcp,
+                    Err(e) => {
+                        debug!(error = %e, "ops accept");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
+                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    debug!("ops connection limit reached; closing");
+                    continue;
+                };
+                let svc = TowerToHyperService::new(app.clone());
+                let stop = stop.clone();
+                conns.spawn(async move {
+                    let conn = http1::Builder::new()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(HEADER_TIMEOUT)
+                        .serve_connection(TokioIo::new(tcp), svc);
+                    tokio::pin!(conn);
+                    tokio::select! {
+                        r = conn.as_mut() => if let Err(e) = r { debug!(error = %e, "ops connection") },
+                        () = stop.cancelled() => {
+                            conn.as_mut().graceful_shutdown();
+                            let _ = tokio::time::timeout(STOP_GRACE, conn).await;
+                        }
+                    }
+                    drop(permit);
+                });
+            }
+        }
+    }
+    drop(listener);
+    while conns.join_next().await.is_some() {}
     Ok(())
 }
 
@@ -106,6 +168,13 @@ mod tests {
         assert!(body.contains("pod_store"), "{body}");
         pods.set();
         assert_eq!(get_path(&app, "/readyz").await.0, StatusCode::OK);
+        // A namespace a watch gave up on is listed, but keeps the replica ready.
+        readiness.set_degraded("pod_store/team-b", true);
+        let (code, body) = get_path(&app, "/readyz").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body, "ok\ndegraded: pod_store/team-b\n");
+        readiness.set_degraded("pod_store/team-b", false);
+        assert_eq!(get_path(&app, "/readyz").await.1, "ok\n");
         readiness.set_shutting_down();
         let (code, body) = get_path(&app, "/readyz").await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
@@ -128,5 +197,77 @@ mod tests {
             body.contains("buildkit_watch_errors_total{kind=\"pod\"} 1"),
             "{body}"
         );
+    }
+
+    fn state() -> OpsState {
+        OpsState {
+            metrics: Arc::new(Metrics::new()),
+            readiness: Arc::new(Readiness::default()),
+        }
+    }
+
+    fn start() -> (
+        SocketAddr,
+        CancellationToken,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let l = bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = l.local_addr().unwrap();
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(serve(l, state(), stop.clone()));
+        (addr, stop, task)
+    }
+
+    /// Read until the server closes; true when it did (EOF or reset).
+    async fn closed(s: &mut tokio::net::TcpStream) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 1024];
+        loop {
+            match s.read(&mut buf).await {
+                Ok(0) | Err(_) => return true,
+                Ok(_) => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_request_cannot_hold_the_stop() {
+        use tokio::io::AsyncWriteExt;
+        let (addr, stop, task) = start();
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET /metrics HTTP/1.1\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.cancel();
+        tokio::time::timeout(STOP_GRACE * 2, task)
+            .await
+            .expect("ops server outlived its grace")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_head_that_never_ends_is_cut() {
+        use tokio::io::AsyncWriteExt;
+        let (addr, _stop, _task) = start();
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET /metrics HTTP/1.1\r\n").await.unwrap();
+        tokio::time::timeout(HEADER_TIMEOUT * 2, closed(&mut s))
+            .await
+            .expect("closed by the header read timeout");
+    }
+
+    #[tokio::test]
+    async fn connections_past_the_cap_are_closed() {
+        let (addr, _stop, _task) = start();
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            held.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut extra = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), closed(&mut extra))
+            .await
+            .expect("closed at accept");
+        drop(held);
     }
 }

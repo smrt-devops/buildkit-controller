@@ -27,6 +27,7 @@ use axum::http::{HeaderValue, header};
 use super::api::Peer;
 use crate::edge::{PerPeer, tune_socket};
 use crate::net::ProxyProtocol;
+use crate::runtime::listen::canonical;
 
 /// Request extension that fires when the replica starts shutting down.
 #[derive(Clone, Debug)]
@@ -156,7 +157,7 @@ pub async fn serve_with_proxy(
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
             accepted = listener.accept() => {
                 let (tcp, peer) = match accepted {
-                    Ok(a) => a,
+                    Ok((tcp, peer)) => (tcp, canonical(peer)),
                     Err(e) => {
                         debug!(error = %e, "accept");
                         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -325,10 +326,11 @@ impl Drop for Active {
 /// the server drops it. This function never bounds an open request, because a
 /// POST may wait in the queue.
 ///
-/// On `shutdown` an HTTP/2 connection gets GOAWAY at once. An HTTP/1 connection
-/// keeps running, its responses carry `Connection: close` from then on, and the
-/// idle bound closes it if no request comes. So a request already on the wire
-/// gets an answer (503 `shutting_down` for an allocation), not a reset.
+/// On `shutdown` an HTTP/2 connection gets GOAWAY at once, and is dropped once
+/// it has had no request open for `idle_timeout`. An HTTP/1 connection keeps
+/// running, its responses carry `Connection: close` from then on, and the idle
+/// bound closes it if no request comes. So a request already on the wire gets
+/// an answer (503 `shutting_down` for an allocation), not a reset.
 async fn drive<C>(
     conn: C,
     peer: SocketAddr,
@@ -373,12 +375,14 @@ async fn drive<C>(
                 deadline.as_mut().reset(Instant::now() + limits.idle_timeout);
             }
             () = shutdown.cancelled(), if !stopped => {
-                if h2 {
-                    conn.as_mut().graceful_shutdown();
-                    let _ = conn.await;
-                    return;
-                }
                 stopped = true;
+                if h2 && !closing {
+                    // GOAWAY, then the idle bound drops the connection, so a
+                    // response body the peer never reads cannot hold it open.
+                    conn.as_mut().graceful_shutdown();
+                    closing = true;
+                    deadline.as_mut().reset(Instant::now() + limits.idle_timeout);
+                }
             }
         }
     }
@@ -391,6 +395,57 @@ mod tests {
     use std::task::Poll;
 
     use super::*;
+
+    /// After shutdown an HTTP/2 stream whose response body the peer never
+    /// accepts (a zero flow-control window) cannot hold the connection open.
+    #[tokio::test]
+    async fn shutdown_drops_an_h2_connection_stuck_on_a_response_body() {
+        let idle = Duration::from_millis(100);
+        let limits = Limits {
+            idle_timeout: idle,
+            ..Limits::default()
+        };
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        let flight = Arc::new(InFlight::default());
+        let svc = {
+            let flight = Arc::clone(&flight);
+            service_fn(move |_: hyper::Request<hyper::body::Incoming>| {
+                let active = InFlight::start(&flight);
+                async move {
+                    drop(active);
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new("x".repeat(4096)))
+                }
+            })
+        };
+        let conn = http2::Builder::new(TokioExecutor::new())
+            .timer(TokioTimer::new())
+            .serve_connection(TokioIo::new(server), svc);
+        let peer: SocketAddr = ([127, 0, 0, 1], 1).into();
+        let stop = CancellationToken::new();
+        let driven = tokio::spawn({
+            let (flight, stop) = (Arc::clone(&flight), stop.clone());
+            async move { drive(conn, peer, &flight, limits, stop, true).await }
+        });
+
+        let (mut send, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .initial_stream_window_size(0)
+            .handshake::<_, String>(TokioIo::new(client))
+            .await
+            .unwrap();
+        tokio::spawn(async move { drop(conn.await) });
+        let resp = send
+            .send_request(hyper::Request::new(String::new()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+
+        stop.cancel();
+        tokio::time::timeout(idle * 20, driven)
+            .await
+            .expect("the connection outlived shutdown")
+            .unwrap();
+        drop(resp);
+    }
 
     /// A request that resolves just as the idle deadline elapses must re-arm
     /// the deadline, not lose the race to it and close the connection. `drive`

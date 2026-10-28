@@ -25,12 +25,12 @@ use serde::de::DeserializeOwned;
 use tokio::sync::{broadcast, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use buildkit_controller_api::v1alpha1::BuildKitPool;
 
 use super::metrics::Metrics;
-use super::readiness::ReadyFlag;
+use super::readiness::{Readiness, ReadyFlag};
 use crate::render::{CONTROLLER, LABEL_MANAGED_BY, LABEL_POOL};
 
 /// Capacity of the pod event broadcast.
@@ -103,13 +103,58 @@ const RESTART_MAX: Duration = Duration::from_secs(30);
 /// different pod and nonce.
 pub const STALE_AFTER: Duration = Duration::from_mins(1);
 
-/// Drive a store from `watch()`. It applies events, taps them, and sets `ready`
-/// at each `InitDone`.
+/// Restart `watch()` after each error: yield the error, wait a backoff, then
+/// start a new watch (a full relist), because kube's watcher resumes a failed
+/// watch without a relist and so never reports when the stream caught up. The
+/// backoff starts at [`RESTART_MIN`], doubles to [`RESTART_MAX`] and resets at
+/// each `InitDone`.
 ///
-/// A watch error starts a new watch (a full relist) after a backoff, because
-/// kube's watcher resumes a failed watch without a relist and so never reports
-/// when the store caught up. The reflector writer buffers the relist and swaps
-/// it in at `InitDone`, so the store keeps its last list meanwhile.
+/// Ends when a watch ends (only test streams do).
+pub fn restarting<K, S>(
+    watch: impl FnMut() -> S + Send + 'static,
+) -> impl Stream<Item = watcher::Result<watcher::Event<K>>> + Send + 'static
+where
+    K: Send + 'static,
+    S: Stream<Item = watcher::Result<watcher::Event<K>>> + Send + 'static,
+{
+    struct State<F, S> {
+        watch: F,
+        events: Option<std::pin::Pin<Box<S>>>,
+        gap: Duration,
+        /// Wait this long before the next watch.
+        pause: Option<Duration>,
+    }
+    let state = State {
+        watch,
+        events: None,
+        gap: RESTART_MIN,
+        pause: None,
+    };
+    stream::unfold(state, |mut st| async move {
+        if let Some(p) = st.pause.take() {
+            tokio::time::sleep(p).await;
+        }
+        let events = st.events.get_or_insert_with(|| Box::pin((st.watch)()));
+        let item = events.next().await?;
+        match &item {
+            Ok(watcher::Event::InitDone) => st.gap = RESTART_MIN,
+            Err(_) => {
+                st.events = None;
+                st.pause = Some(st.gap);
+                st.gap = (st.gap * 2).min(RESTART_MAX);
+            }
+            Ok(_) => {}
+        }
+        Some((item, st))
+    })
+}
+
+/// Drive a store from `events`, a watch that restarts itself after an error
+/// (see [`restarting`] and [`tolerant_watch`]). It applies events, taps them,
+/// and sets `ready` at each `InitDone`.
+///
+/// The reflector writer buffers a relist and swaps it in at `InitDone`, so
+/// the store keeps its last list meanwhile.
 ///
 /// `ready` means the store is usable for decisions:
 /// - It is false until the first `InitDone`, with no grace period.
@@ -123,10 +168,10 @@ pub const STALE_AFTER: Duration = Duration::from_mins(1);
 /// a stall clears `ready` at most `READ_TIMEOUT + STALE_AFTER` after the API
 /// server last sent anything.
 ///
-/// Returns when a stream ends (only test streams do).
+/// Returns when `events` ends (only test streams do).
 pub async fn drive<K, S>(
     mut writer: reflector::store::Writer<K>,
-    mut watch: impl FnMut() -> S,
+    events: S,
     ready: ReadyFlag,
     on_error: impl Fn(&watcher::Error),
     mut tap: impl FnMut(&watcher::Event<K>),
@@ -135,36 +180,27 @@ pub async fn drive<K, S>(
     K::DynamicType: Clone + Eq + std::hash::Hash + Default,
     S: Stream<Item = watcher::Result<watcher::Event<K>>>,
 {
-    let mut gap = RESTART_MIN;
     // When the store last stopped being known current; `None` while the
     // latest watch has listed and not failed since.
     let mut failed_at: Option<Instant> = None;
+    futures::pin_mut!(events);
     loop {
-        let events = watch();
-        futures::pin_mut!(events);
-        loop {
-            let stale_at = failed_at.map(|t| t + STALE_AFTER);
-            match clear_at(events.next(), stale_at, &ready).await {
-                None => return,
-                Some(Ok(ev)) => {
-                    writer.apply_watcher_event(&ev);
-                    if matches!(ev, watcher::Event::InitDone) {
-                        ready.set();
-                        failed_at = None;
-                        gap = RESTART_MIN;
-                    }
-                    tap(&ev);
+        let stale_at = failed_at.map(|t| t + STALE_AFTER);
+        match clear_at(events.next(), stale_at, &ready).await {
+            None => return,
+            Some(Ok(ev)) => {
+                writer.apply_watcher_event(&ev);
+                if matches!(ev, watcher::Event::InitDone) {
+                    ready.set();
+                    failed_at = None;
                 }
-                Some(Err(e)) => {
-                    on_error(&e);
-                    failed_at.get_or_insert_with(Instant::now);
-                    break;
-                }
+                tap(&ev);
+            }
+            Some(Err(e)) => {
+                on_error(&e);
+                failed_at.get_or_insert_with(Instant::now);
             }
         }
-        let stale_at = failed_at.map(|t| t + STALE_AFTER);
-        clear_at(tokio::time::sleep(gap), stale_at, &ready).await;
-        gap = (gap * 2).min(RESTART_MAX);
     }
 }
 
@@ -285,15 +321,19 @@ pub struct StoreSpec<'a> {
     pub serving_secret_name: &'a str,
     /// Metrics.
     pub metrics: Arc<Metrics>,
-    /// `pool_store` flag.
-    pub pools_ready: ReadyFlag,
-    /// `pod_store` flag.
-    pub pods_ready: ReadyFlag,
+    /// Readiness: the `pool_store` and `pod_store` checks, and the namespaces
+    /// the watches gave up on.
+    pub readiness: Arc<Readiness>,
 }
 
 /// A watch of `K` in `namespaces`, `[]` = all namespaces. More than one
 /// namespace runs one watcher per namespace, merged by [`merge_namespaces`];
 /// `store` is the reader of the store the events are applied to.
+///
+/// The merged watch completes its first list only once every namespace has
+/// listed, so one namespace that cannot be listed holds it forever. Use it
+/// where acting on a partial list is unsafe (the claim sweep releases workers
+/// of claims missing from its store); elsewhere use [`tolerant_watch`].
 #[must_use]
 pub fn scoped_watch<K>(
     client: Client,
@@ -325,6 +365,118 @@ where
     }
 }
 
+/// How long a namespace of a [`tolerant_watch`] may fail without a completed
+/// list before the watch carries on without it. Below [`STALE_AFTER`], so the
+/// store is whole again before an error in that namespace clears its
+/// readiness; the restart backoff fits five relists in it.
+pub const GIVE_UP_AFTER: Duration = Duration::from_secs(30);
+
+/// Where a [`tolerant_watch`] reports a namespace it gave up on, and its return.
+#[derive(Clone)]
+pub struct NamespaceReport {
+    kind: &'static str,
+    metrics: Option<Arc<Metrics>>,
+    readiness: Option<Arc<Readiness>>,
+}
+
+impl NamespaceReport {
+    /// Log only; `kind` names the watch in the log.
+    #[must_use]
+    pub fn log(kind: &'static str) -> Self {
+        Self {
+            kind,
+            metrics: None,
+            readiness: None,
+        }
+    }
+
+    /// Log, set `buildkit_watch_namespace_unlisted{kind,namespace}`, and list
+    /// `<kind>_store/<namespace>` as degraded on `/readyz`.
+    #[must_use]
+    pub fn full(kind: &'static str, metrics: Arc<Metrics>, readiness: Arc<Readiness>) -> Self {
+        Self {
+            kind,
+            metrics: Some(metrics),
+            readiness: Some(readiness),
+        }
+    }
+
+    fn set(&self, namespace: &str, unlisted: bool) {
+        if let Some(m) = &self.metrics {
+            m.set_namespace_unlisted(self.kind, namespace, unlisted);
+        }
+        if let Some(r) = &self.readiness {
+            r.set_degraded(&format!("{}_store/{namespace}", self.kind), unlisted);
+        }
+    }
+
+    fn unlisted(&self, namespace: &str, error: &str) {
+        warn!(
+            kind = self.kind,
+            namespace, error, "namespace cannot be listed; serving the other namespaces without it"
+        );
+        self.set(namespace, true);
+    }
+
+    fn listed(&self, namespace: &str) {
+        info!(kind = self.kind, namespace, "namespace listed again");
+        self.set(namespace, false);
+    }
+}
+
+/// A watch of `K` in `namespaces`, `[]` = all namespaces, that restarts itself
+/// after an error (see [`restarting`]). With more than one namespace each one
+/// restarts on its own, and a namespace that fails for [`GIVE_UP_AFTER`]
+/// without completing a list no longer holds the others:
+///
+/// - The first list completes once every namespace has listed or been given
+///   up, and at least one listed. Until then the store stays not ready.
+/// - The errors of a namespace given up are dropped (logged at debug), so they
+///   do not count against the store's readiness, and `report` is told.
+/// - Objects of a namespace given up stay in the store as last listed. Dropping
+///   them would show the reconciler a pool without its pods whenever the Pool
+///   and Pod watches lose or regain the namespace at different times.
+/// - When it lists again it is merged back and `report` is told.
+///
+/// Whenever every namespace is current or given up again, the stream sends
+/// the whole store as a fresh list (`Init` .. `InitDone`), so the store's
+/// readiness follows the namespaces that can be listed.
+#[must_use]
+pub fn tolerant_watch<K>(
+    client: Client,
+    namespaces: &[String],
+    cfg: &watcher::Config,
+    store: Store<K>,
+    report: NamespaceReport,
+) -> BoxStream<'static, watcher::Result<watcher::Event<K>>>
+where
+    K: Resource<Scope = NamespaceResourceScope>
+        + Clone
+        + DeserializeOwned
+        + Debug
+        + Send
+        + Sync
+        + 'static,
+    K::DynamicType: Default + Clone + Eq + Hash,
+{
+    let one = |api: Api<K>, cfg: &watcher::Config| {
+        let cfg = cfg.clone();
+        restarting(move || watcher(api.clone(), cfg.clone()))
+    };
+    match namespaces {
+        [] => one(Api::all(client), cfg).boxed(),
+        [ns] => one(Api::namespaced(client, ns), cfg).boxed(),
+        many => {
+            let tagged = stream::select_all(many.iter().enumerate().map(|(i, ns)| {
+                one(Api::namespaced(client.clone(), ns), cfg)
+                    .map(move |ev| (i, ev))
+                    .boxed()
+            }));
+            merge_tolerant(tagged.boxed(), many.to_vec(), store, report).boxed()
+        }
+    }
+}
+
 /// Merge watch streams of single namespaces into one stream that a single
 /// reflector writer can apply. Each item is tagged with its index in
 /// `namespaces`.
@@ -344,23 +496,39 @@ where
     K: Resource + Clone + Send + Sync + 'static,
     K::DynamicType: Default + Clone + Eq + Hash,
 {
-    let merge = Merge {
-        listing: vec![None; namespaces.len()],
-        listed: vec![false; namespaces.len()],
-        initial: Some(Vec::new()),
-        namespaces,
-        store,
-        out: VecDeque::new(),
-    };
-    stream::unfold((tagged, merge), |(mut tagged, mut m)| async move {
-        loop {
-            if let Some(ev) = m.out.pop_front() {
-                return Some((ev, (tagged, m)));
-            }
-            let (i, item) = tagged.next().await?;
-            m.handle(i, item);
-        }
-    })
+    Merge::new(namespaces, store, None).run(tagged)
+}
+
+/// [`merge_namespaces`] that gives up on a namespace failing for
+/// [`GIVE_UP_AFTER`]; see [`tolerant_watch`]. Each tagged stream must restart
+/// itself after an error.
+pub fn merge_tolerant<K>(
+    tagged: BoxStream<'static, (usize, watcher::Result<watcher::Event<K>>)>,
+    namespaces: Vec<String>,
+    store: Store<K>,
+    report: NamespaceReport,
+) -> impl Stream<Item = watcher::Result<watcher::Event<K>>> + Send + 'static
+where
+    K: Resource + Clone + Send + Sync + 'static,
+    K::DynamicType: Default + Clone + Eq + Hash,
+{
+    Merge::new(namespaces, store, Some(report)).run(tagged)
+}
+
+/// One namespace of a merged watch.
+struct Namespace<K> {
+    name: String,
+    /// The objects of a list in progress.
+    listing: Option<Vec<K>>,
+    /// Its first list completed.
+    listed: bool,
+    /// Listed, and no error since.
+    current: bool,
+    /// The first error since it was last current.
+    failing_since: Option<Instant>,
+    last_error: String,
+    /// Left out of the store's readiness (tolerant merges only).
+    given_up: bool,
 }
 
 struct Merge<K>
@@ -368,15 +536,13 @@ where
     K: Resource + 'static,
     K::DynamicType: Hash + Eq,
 {
-    namespaces: Vec<String>,
-    /// Per namespace: the objects of a list in progress.
-    listing: Vec<Option<Vec<K>>>,
-    /// Per namespace: its first list completed.
-    listed: Vec<bool>,
-    /// Objects held until every namespace listed; `None` afterwards.
+    ns: Vec<Namespace<K>>,
+    /// Objects held until the first list completes; `None` afterwards.
     initial: Option<Vec<K>>,
     store: Store<K>,
     out: VecDeque<watcher::Result<watcher::Event<K>>>,
+    /// `Some` for a tolerant merge.
+    report: Option<NamespaceReport>,
 }
 
 fn same<K: Resource>(a: &K, b: &K) -> bool {
@@ -385,38 +551,97 @@ fn same<K: Resource>(a: &K, b: &K) -> bool {
 
 impl<K> Merge<K>
 where
-    K: Resource + Clone + 'static,
+    K: Resource + Clone + Send + Sync + 'static,
     K::DynamicType: Default + Clone + Eq + Hash,
 {
+    fn new(namespaces: Vec<String>, store: Store<K>, report: Option<NamespaceReport>) -> Self {
+        Self {
+            ns: namespaces
+                .into_iter()
+                .map(|name| Namespace {
+                    name,
+                    listing: None,
+                    listed: false,
+                    current: false,
+                    failing_since: None,
+                    last_error: String::new(),
+                    given_up: false,
+                })
+                .collect(),
+            initial: Some(Vec::new()),
+            store,
+            out: VecDeque::new(),
+            report,
+        }
+    }
+
+    fn run(
+        self,
+        tagged: BoxStream<'static, (usize, watcher::Result<watcher::Event<K>>)>,
+    ) -> impl Stream<Item = watcher::Result<watcher::Event<K>>> + Send + 'static {
+        stream::unfold((tagged, self), |(mut tagged, mut m)| async move {
+            loop {
+                if let Some(ev) = m.out.pop_front() {
+                    return Some((ev, (tagged, m)));
+                }
+                let give_up = m.next_give_up();
+                tokio::select! {
+                    item = tagged.next() => {
+                        let (i, item) = item?;
+                        m.handle(i, item);
+                    }
+                    () = sleep_until(give_up) => m.give_up(Instant::now()),
+                }
+            }
+        })
+    }
+
     fn handle(&mut self, i: usize, item: watcher::Result<watcher::Event<K>>) {
         let ev = match item {
             Ok(ev) => ev,
             Err(e) => {
-                self.out.push_back(Err(e));
+                self.failed(i, e);
                 return;
             }
         };
         match ev {
             watcher::Event::Init => {
-                if let Some(l) = self.listing.get_mut(i) {
-                    *l = Some(Vec::new());
+                if let Some(n) = self.ns.get_mut(i) {
+                    n.listing = Some(Vec::new());
                 }
             }
-            watcher::Event::InitApply(o) => match self.listing.get_mut(i) {
-                Some(Some(l)) => l.push(o),
+            watcher::Event::InitApply(o) => match self.ns.get_mut(i) {
+                Some(Namespace {
+                    listing: Some(l), ..
+                }) => l.push(o),
                 _ => self.apply(o),
             },
             watcher::Event::InitDone => {
                 let objs = self
-                    .listing
+                    .ns
                     .get_mut(i)
-                    .and_then(Option::take)
+                    .and_then(|n| n.listing.take())
                     .unwrap_or_default();
                 self.list_done(i, objs);
             }
             watcher::Event::Apply(o) => self.apply(o),
             watcher::Event::Delete(o) => self.delete(o),
         }
+    }
+
+    fn failed(&mut self, i: usize, e: watcher::Error) {
+        let tolerant = self.report.is_some();
+        let Some(n) = self.ns.get_mut(i) else {
+            return;
+        };
+        n.current = false;
+        if tolerant && n.given_up {
+            debug!(namespace = %n.name, error = %e, "watch error in a namespace given up");
+            return;
+        }
+        n.failing_since.get_or_insert_with(Instant::now);
+        n.last_error = e.to_string();
+        self.out.push_back(Err(e));
     }
 
     fn apply(&mut self, o: K) {
@@ -436,24 +661,39 @@ where
         }
     }
 
+    /// Every namespace is current or given up, and one is current.
+    fn whole(&self) -> bool {
+        self.ns.iter().all(|n| n.current || n.given_up) && self.ns.iter().any(|n| n.current)
+    }
+
     fn list_done(&mut self, i: usize, objs: Vec<K>) {
-        let Some(ns) = self.namespaces.get(i) else {
+        let Some(n) = self.ns.get_mut(i) else {
             return;
         };
+        n.listed = true;
+        n.current = true;
+        n.failing_since = None;
+        if std::mem::take(&mut n.given_up)
+            && let Some(r) = &self.report
+        {
+            r.listed(&n.name);
+        }
+        let ns = n.name.clone();
         if let Some(held) = &mut self.initial {
-            held.retain(|x| x.meta().namespace.as_ref() != Some(ns));
+            held.retain(|x| x.meta().namespace.as_ref() != Some(&ns));
             held.extend(objs);
-            if let Some(l) = self.listed.get_mut(i) {
-                *l = true;
-            }
-            if self.listed.iter().all(|l| *l)
-                && let Some(all) = self.initial.take()
-            {
-                self.out.push_back(Ok(watcher::Event::Init));
-                self.out
-                    .extend(all.into_iter().map(|o| Ok(watcher::Event::InitApply(o))));
-                self.out.push_back(Ok(watcher::Event::InitDone));
-            }
+            self.release();
+            return;
+        }
+        if self.report.is_some() && self.whole() {
+            let others = self
+                .store
+                .state()
+                .into_iter()
+                .filter(|s| s.meta().namespace.as_ref() != Some(&ns))
+                .map(|s| K::clone(&s));
+            let all: Vec<K> = others.chain(objs).collect();
+            self.relist(all);
             return;
         }
         let names: HashSet<&str> = objs
@@ -465,7 +705,7 @@ where
             .state()
             .iter()
             .filter(|s| {
-                s.meta().namespace.as_ref() == Some(ns)
+                s.meta().namespace.as_ref() == Some(&ns)
                     && !s.meta().name.as_deref().is_some_and(|n| names.contains(n))
             })
             .map(|s| K::clone(s))
@@ -475,7 +715,69 @@ where
         self.out
             .extend(stale.into_iter().map(|o| Ok(watcher::Event::Delete(o))));
     }
+
+    /// Send the held objects as the first list once every namespace listed
+    /// (or, when tolerant, was given up, with at least one listed).
+    fn release(&mut self) {
+        let ready =
+            self.ns.iter().all(|n| n.listed || n.given_up) && self.ns.iter().any(|n| !n.given_up);
+        if ready && let Some(all) = self.initial.take() {
+            self.relist(all);
+        }
+    }
+
+    /// `objs` as one full list.
+    fn relist(&mut self, objs: Vec<K>) {
+        self.out.push_back(Ok(watcher::Event::Init));
+        self.out
+            .extend(objs.into_iter().map(|o| Ok(watcher::Event::InitApply(o))));
+        self.out.push_back(Ok(watcher::Event::InitDone));
+    }
+
+    /// The earliest time a failing namespace is given up (tolerant only).
+    fn next_give_up(&self) -> Option<Instant> {
+        self.report.as_ref()?;
+        self.ns
+            .iter()
+            .filter(|n| !n.given_up)
+            .filter_map(|n| n.failing_since)
+            .min()
+            .map(|t| t + GIVE_UP_AFTER)
+    }
+
+    fn give_up(&mut self, now: Instant) {
+        let Some(report) = &self.report else {
+            return;
+        };
+        let mut any = false;
+        for n in &mut self.ns {
+            if !n.given_up && n.failing_since.is_some_and(|t| t + GIVE_UP_AFTER <= now) {
+                n.given_up = true;
+                n.listing = None;
+                report.unlisted(&n.name, &n.last_error);
+                any = true;
+            }
+        }
+        if !any {
+            return;
+        }
+        if self.initial.is_some() {
+            self.release();
+        } else if self.whole() {
+            let all = self.store.state().iter().map(|s| K::clone(s)).collect();
+            self.relist(all);
+        }
+    }
 }
+
+/// Sleep until `at`; never when `None`.
+async fn sleep_until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
 fn secret_watch(
     client: Client,
     ns: &str,
@@ -526,26 +828,27 @@ impl Stores {
             ca_secret_name,
             serving_secret_name,
             metrics,
-            pools_ready,
-            pods_ready,
+            readiness,
         } = spec;
+        let report =
+            |kind| NamespaceReport::full(kind, Arc::clone(&metrics), Arc::clone(&readiness));
 
         let (pool_store, pool_writer) = reflector::store::<BuildKitPool>();
-        let (c, scope, s) = (
+        let events = tolerant_watch(
             client.clone(),
-            watch_namespaces.to_vec(),
+            watch_namespaces,
+            &watcher::Config::default(),
             pool_store.clone(),
-        );
+            report("pool"),
+        )
+        .modify(strip);
         let m = Arc::clone(&metrics);
-        let events = move || {
-            scoped_watch(c.clone(), &scope, &watcher::Config::default(), s.clone()).modify(strip)
-        };
         spawn_until(
             shutdown.clone(),
             drive(
                 pool_writer,
                 events,
-                pools_ready,
+                readiness.register("pool_store"),
                 move |e| {
                     warn!(error = %e, kind = "pool", "watch error");
                     m.watch_error("pool");
@@ -556,10 +859,16 @@ impl Stores {
 
         let (pod_store, pod_writer) = reflector::store::<Pod>();
         let (tx, _) = broadcast::channel(POD_EVENT_CAPACITY);
-        let (c, scope, s) = (client.clone(), watch_namespaces.to_vec(), pod_store.clone());
         let cfg = watcher::Config::default()
             .labels(&format!("{LABEL_MANAGED_BY}={CONTROLLER},{LABEL_POOL}"));
-        let events = move || scoped_watch(c.clone(), &scope, &cfg, s.clone()).modify(strip);
+        let events = tolerant_watch(
+            client.clone(),
+            watch_namespaces,
+            &cfg,
+            pod_store.clone(),
+            report("pod"),
+        )
+        .modify(strip);
         let m = Arc::clone(&metrics);
         let ptx = tx.clone();
         spawn_until(
@@ -567,7 +876,7 @@ impl Stores {
             drive(
                 pod_writer,
                 events,
-                pods_ready,
+                readiness.register("pod_store"),
                 move |e| {
                     warn!(error = %e, kind = "pod", "watch error");
                     m.watch_error("pod");

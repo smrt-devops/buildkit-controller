@@ -1,6 +1,6 @@
 //! Named readiness checks behind `/readyz`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -32,6 +32,7 @@ impl ReadyFlag {
 #[derive(Debug, Default)]
 pub struct Readiness {
     checks: Mutex<BTreeMap<String, watch::Sender<bool>>>,
+    degraded: Mutex<BTreeSet<String>>,
     shutting_down: AtomicBool,
 }
 
@@ -87,6 +88,29 @@ impl Readiness {
             out.push("shutting_down".into());
         }
         out
+    }
+
+    /// Mark `name` degraded or not: listed on `/readyz` without failing it.
+    pub fn set_degraded(&self, name: &str, degraded: bool) {
+        let mut d = self
+            .degraded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if degraded {
+            d.insert(name.to_owned());
+        } else {
+            d.remove(name);
+        }
+    }
+
+    /// What is degraded, sorted.
+    pub fn degraded(&self) -> Vec<String> {
+        self.degraded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Resolve when every named check passes. An unknown name is a check that

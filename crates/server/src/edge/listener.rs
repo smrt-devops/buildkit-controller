@@ -41,7 +41,8 @@ impl Default for ListenerOptions {
     fn default() -> Self {
         Self {
             handshake_timeout: Duration::from_secs(10),
-            max_connections: 10_000,
+            max_connections: usize::try_from(crate::config::EDGE_MAX_CONNECTIONS)
+                .unwrap_or(usize::MAX),
             max_handshakes: 1024,
             max_handshakes_per_ip: 32,
         }
@@ -256,12 +257,13 @@ impl Drop for Draining {
 /// How often a draining edge logs its open connection count.
 const DRAIN_LOG_EVERY: Duration = Duration::from_mins(1);
 
-/// The next connection; accept errors (e.g. `EMFILE`) are logged and retried
+/// The next connection, its peer an IPv4 address when it came as an
+/// IPv4-mapped one (a dual-stack listener). Accept errors (e.g. `EMFILE`) are logged and retried
 /// after a short pause.
 async fn accept(listener: &TcpListener) -> (TcpStream, SocketAddr) {
     loop {
         match listener.accept().await {
-            Ok(a) => return a,
+            Ok((tcp, peer)) => return (tcp, crate::runtime::listen::canonical(peer)),
             Err(e) => {
                 warn!(error = %e, "edge accept failed");
                 tokio::time::sleep(Duration::from_millis(50)).await;
