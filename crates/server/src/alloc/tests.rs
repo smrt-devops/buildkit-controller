@@ -63,6 +63,8 @@ struct World {
     secret_err: Option<String>,
     /// Every `get_pvc` fails with this.
     pvc_get_err: Option<String>,
+    /// Answer every claim patch `Unknown` after this long, unapplied (sustained throttling).
+    unknown_claims: Option<Duration>,
 }
 
 struct Fake {
@@ -114,6 +116,20 @@ impl Backend for Fake {
             if let (true, Some(out)) = (commit, w.extend.clone()) {
                 return Box::pin(async move { out });
             }
+        }
+        let (throttle, sent) = {
+            let w = self.w.lock().unwrap();
+            (w.unknown_claims, w.patches.len())
+        };
+        if let (false, Some(d)) = (first_replace == DRAINING, throttle) {
+            // A retry storm ends the request instead of running forever.
+            if sent > 400 {
+                return Box::pin(async { PatchOutcome::Failed("retry storm".into()) });
+            }
+            return Box::pin(async move {
+                tokio::time::sleep(d).await;
+                PatchOutcome::Unknown
+            });
         }
         if first_replace == DRAINING {
             let mut w = self.w.lock().unwrap();
@@ -337,6 +353,7 @@ fn env_full(max: i32, cold: bool, queue_cap: usize, cache: bool) -> Env {
             lost_creates: None,
             secret_err: None,
             pvc_get_err: None,
+            unknown_claims: None,
         }),
         tx: tx.clone(),
     });
@@ -2438,4 +2455,37 @@ async fn an_internal_ca_ending_before_the_allocation_is_ca_unavailable() {
     let got = e.engine.allocate(&sa("b"), &req(0)).await.err();
     assert_eq!(got, Some(AllocError::CaUnavailable));
     assert!(!e.fake.calls().iter().any(|c| c.starts_with("create ")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn throttled_claims_of_several_scope_heads_retry_once_a_second_each() {
+    // Two cached slots with warm pods any scope may take; every claim is throttled.
+    let e = env_full(2, false, 10, true);
+    e.warm(0);
+    e.warm(1);
+    e.fake.w.lock().unwrap().unknown_claims = Some(Duration::from_millis(300));
+    // `b` arrives 300 ms after `a`, so their retries do not line up.
+    let heads: Vec<_> = [("a", 0), ("b", 300)]
+        .into_iter()
+        .map(|(who, after)| {
+            let engine = Arc::clone(&e.engine);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(after)).await;
+                engine.allocate(&sa(who), &req(10)).await.map(|_| ())
+            })
+        })
+        .collect();
+    for h in heads {
+        assert!(matches!(
+            h.await.unwrap(),
+            Err(AllocError::PoolExhausted(_))
+        ));
+    }
+    let claims = (e.fake.calls().iter())
+        .filter(|c| c.starts_with("patch ") && !c.ends_with(" draining"))
+        .count();
+    // Each head tries both pods (0.6 s), then waits 1 s: about 7 attempts in
+    // 10 s, 2 heads x 2 pods x 7. With a shared wake per contended attempt each
+    // head re-attempts back to back instead (about 17 attempts each).
+    assert!((8..=40).contains(&claims), "{claims} claim patches");
 }

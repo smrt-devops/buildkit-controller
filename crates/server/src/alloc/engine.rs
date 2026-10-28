@@ -50,8 +50,7 @@ pub const COMMIT_WINDOW: time::Duration = time::Duration::seconds(60);
 /// sign the cert and send the commit. A pod not Ready by then is a start timeout.
 const READY_MARGIN: time::Duration = time::Duration::seconds(5);
 /// After a claim lost to another writer (or with an unknown outcome), the
-/// queue is woken again after this long. The loss means this replica's pod
-/// store lags, and no pod event will wake the queue for the pod it lost.
+/// request tries again after this long, at most once per contended attempt.
 const CONFLICT_RETRY: Duration = Duration::from_secs(1);
 
 /// Static inputs from the config file.
@@ -229,6 +228,18 @@ async fn retire(
             Retired::Failed
         }
     }
+}
+
+/// What one attempt found.
+enum Attempt {
+    Won(Box<Won>),
+    /// Nothing to claim: queue. `retry` when a claim was lost to another writer
+    /// or its outcome is unknown: the pod store lags, and no pod event will
+    /// wake the queue for that pod, so the request tries again after
+    /// [`CONFLICT_RETRY`].
+    Wait {
+        retry: bool,
+    },
 }
 
 /// A pod won by claim or create, guarded.
@@ -642,12 +653,17 @@ impl Engine {
         }
         // The wake version of the last attempt; `None` until this request made one.
         let mut tried = None;
+        // When this request tries again on its own, after a contended attempt.
+        let mut retry_at = None;
         let scope = r.scope.as_deref();
         if self.queues.is_waiting(&r.key, scope) {
             self.queues.wake(&r.key);
         } else {
-            if let Some(w) = self.attempt(r).await? {
-                return Ok(w);
+            match self.attempt(r).await? {
+                Attempt::Won(w) => return Ok(*w),
+                Attempt::Wait { retry } => {
+                    retry_at = retry.then(|| Instant::now() + CONFLICT_RETRY);
+                }
             }
             tried = Some(snapshot);
         }
@@ -675,11 +691,14 @@ impl Engine {
             if tried != Some(v) && ticket.is_head() {
                 tried = Some(v);
                 match self.attempt(r).await {
-                    Ok(Some(w)) => {
+                    Ok(Attempt::Won(w)) => {
                         rec.result = "ok";
-                        return Ok(w);
+                        return Ok(*w);
                     }
-                    Ok(None) => continue,
+                    Ok(Attempt::Wait { retry }) => {
+                        retry_at = retry.then(|| Instant::now() + CONFLICT_RETRY);
+                        continue;
+                    }
                     Err(e) => {
                         rec.result = "error";
                         return Err(e);
@@ -690,6 +709,12 @@ impl Engine {
                 r = tokio::time::timeout_at(deadline, ticket.changed()) => if r.is_err() {
                     rec.result = "timeout";
                     return Err(exhausted());
+                },
+                // Only this request's own retry: a shared wake would make every
+                // head of the pool retry, and each of them wake all again.
+                () = tokio::time::sleep_until(retry_at.unwrap_or(deadline)), if retry_at.is_some() => {
+                    retry_at = None;
+                    tried = None;
                 },
                 () = self.stopping.cancelled() => {}
             }
@@ -713,9 +738,9 @@ impl Engine {
         }
     }
 
-    /// One pass over the warm path, then the cold path; `Ok(None)` means queue.
+    /// One pass over the warm path, then the cold path.
     #[allow(clippy::too_many_lines, reason = "one pass over both paths")]
-    async fn attempt(&self, r: &Req<'_>) -> Result<Option<Won>, AllocError> {
+    async fn attempt(&self, r: &Req<'_>) -> Result<Attempt, AllocError> {
         let (ns, name) = (&r.key.0, &r.key.1);
         let pool = self
             .pools
@@ -793,7 +818,7 @@ impl Engine {
                         drop(guard);
                         continue;
                     }
-                    return Ok(Some(Won {
+                    return Ok(Attempt::Won(Box::new(Won {
                         guard,
                         uid: uid.clone(),
                         ca: Arc::clone(&ca),
@@ -803,7 +828,7 @@ impl Engine {
                         claimed_until,
                         keys_before: before,
                         wiped: false,
-                    }));
+                    })));
                 }
                 PatchOutcome::Lost => {
                     guard.armed = false;
@@ -822,14 +847,11 @@ impl Engine {
                 }
             }
         }
-        let won = self.cold(r, &pool, &pods, &ca, now, expires_at).await?;
-        if won.is_none() {
-            self.recycle(r, &pool, &pods, &foreign).await;
-            if contended {
-                self.wake_later(&r.key);
-            }
+        if let Some(won) = self.cold(r, &pool, &pods, &ca, now, expires_at).await? {
+            return Ok(Attempt::Won(Box::new(won)));
         }
-        Ok(won)
+        self.recycle(r, &pool, &pods, &foreign).await;
+        Ok(Attempt::Wait { retry: contended })
     }
 
     async fn cold(
@@ -943,16 +965,6 @@ impl Engine {
             }));
         }
         Ok(None)
-    }
-
-    /// Wakes the queue of `key` after [`CONFLICT_RETRY`], so its head tries
-    /// again with a fresher pod store.
-    fn wake_later(&self, key: &PoolKey) {
-        let (queues, key) = (Arc::clone(&self.queues), key.clone());
-        tokio::spawn(async move {
-            tokio::time::sleep(CONFLICT_RETRY).await;
-            queues.wake(&key);
-        });
     }
 
     /// When a request found no pod and no slot, retire one warm pod of a
