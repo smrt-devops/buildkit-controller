@@ -1,0 +1,5 @@
+# expect: at '/gateway/api/mode'
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+gateway:
+  parentRefs: [{name: shared, namespace: gateway-system}]
+  api: {mode: reencrypt}

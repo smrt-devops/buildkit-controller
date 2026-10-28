@@ -1,0 +1,598 @@
+---
+# Source: buildkit-controller/templates/gateway.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bk-from-gateway
+  namespace: buildkit-system
+spec:
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: envoy-gateway-system
+    ports:
+    - port: 8443
+    - port: 8444
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: buildkit-controller
+  policyTypes:
+  - Ingress
+
+---
+# Source: buildkit-controller/templates/extras.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: buildkit-controller
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: buildkit-controller
+      app.kubernetes.io/instance: bk
+
+---
+# Source: buildkit-controller/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: buildkit-controller
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+
+---
+# Source: buildkit-controller/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: buildkit-controller-config
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+data:
+  config.yaml: |
+    api:
+      maxConnections: 4096
+      maxConnectionsPerIp: 0
+    auth:
+      oidc: []
+      serviceAccount:
+        audiences:
+        - buildkit-controller
+        enabled: true
+        maxConcurrentReviews: 32
+        maxReviewsPerIp: 0
+        recentSubjectTtl: 10m
+        reservedReviews: 8
+    claims:
+      enabled: false
+      namespaces: []
+    edge:
+      allocationDomain: alloc.bk.example.com
+      endpoint: tcp://bk.example.com:8444
+      extraNames: []
+      handshakeTimeout: 10s
+      maxConnections: 10000
+      maxHandshakes: 1024
+      maxHandshakesPerIp: 0
+      serverName: bk.example.com
+      serviceName: buildkit-controller
+      tls:
+        secretName: bk-public
+    leaderElection:
+      leaseName: buildkit-controller-leader
+    listen:
+      api: 0.0.0.0:8443
+      edge: 0.0.0.0:8444
+      ops: 0.0.0.0:8080
+    pki:
+      caSecretName: buildkit-controller-ca
+    shutdown:
+      delay: 5s
+    watchNamespace: ""
+    workerNetwork:
+      clusterCIDRs: []
+      deniedCIDRs:
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+      - 100.64.0.0/10
+      - 169.254.0.0/16
+      - 127.0.0.0/8
+      - 168.63.129.16/32
+      - fc00::/7
+      - fe80::/10
+      - 64:ff9b::/96
+      - 64:ff9b:1::/48
+      dns:
+        cidrs: []
+        namespace: kube-system
+        podLabels:
+          k8s-app: kube-dns
+      extraDeniedCIDRs: []
+
+---
+# Source: buildkit-controller/templates/gateway.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: buildkit-controller-exposure
+  namespace: buildkit-system
+data: {mode: envoy}
+
+
+---
+# Source: buildkit-controller/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: buildkit-controller-buildkit-system-tokenreview
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+rules:
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+
+---
+# Source: buildkit-controller/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: buildkit-controller-buildkit-system-workload
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+rules:
+  - apiGroups:
+    - buildkit.smrt-devops.net
+    resources:
+    - buildkitpools
+    verbs:
+    - get
+    - list
+    - watch
+  - apiGroups:
+    - buildkit.smrt-devops.net
+    resources:
+    - buildkitpools/status
+    verbs:
+    - patch
+  - apiGroups:
+    - ""
+    resources:
+    - pods
+    verbs:
+    - get
+    - list
+    - watch
+    - create
+    - patch
+    - delete
+  - apiGroups:
+    - ""
+    resources:
+    - secrets
+    verbs:
+    - create
+    - patch
+    - delete
+  - apiGroups:
+    - ""
+    resources:
+    - serviceaccounts
+    verbs:
+    - create
+    - patch
+  - apiGroups:
+    - ""
+    resources:
+    - persistentvolumeclaims
+    verbs:
+    - get
+    - list
+    - create
+    - patch
+    - delete
+  - apiGroups:
+    - networking.k8s.io
+    resources:
+    - networkpolicies
+    verbs:
+    - create
+    - patch
+
+---
+# Source: buildkit-controller/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: buildkit-controller-buildkit-system-tokenreview
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: buildkit-controller-buildkit-system-tokenreview}
+subjects:
+  - kind: ServiceAccount
+    name: buildkit-controller
+    namespace: buildkit-system
+
+---
+# Source: buildkit-controller/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: buildkit-controller-buildkit-system-workload
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: buildkit-controller-buildkit-system-workload}
+subjects:
+  - kind: ServiceAccount
+    name: buildkit-controller
+    namespace: buildkit-system
+
+---
+# Source: buildkit-controller/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: buildkit-controller
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [buildkit-controller-leader]
+    verbs: [get, list, watch, update]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [buildkit-controller-ca]
+    verbs: [get, list, watch, update]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: ["bk-public"]
+    verbs: [get, list, watch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [buildkit-controller-ca-bundle]
+    verbs: [patch]
+
+---
+# Source: buildkit-controller/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: buildkit-controller
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: buildkit-controller}
+subjects:
+  - kind: ServiceAccount
+    name: buildkit-controller
+    namespace: buildkit-system
+
+---
+# Source: buildkit-controller/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildkit-controller
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+  ports:
+    - name: api
+      port: 8443
+      targetPort: api
+    - name: edge
+      port: 8444
+      targetPort: edge
+
+---
+# Source: buildkit-controller/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildkit-controller-metrics
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+    app.kubernetes.io/component: metrics
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+  ports:
+    - {name: metrics, port: 8080, targetPort: ops}
+
+---
+# Source: buildkit-controller/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: buildkit-controller
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: buildkit-controller
+      app.kubernetes.io/instance: bk
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: buildkit-controller
+        app.kubernetes.io/instance: bk
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/version: "0.1.0"
+        helm.sh/chart: buildkit-controller-0.1.0
+      annotations:
+        checksum/config: d0f320e87d1f2a1da557ad3fc1fff5a91cc9e3f31048310887790c83e838c1ad
+    spec:
+      serviceAccountName: buildkit-controller
+      terminationGracePeriodSeconds: 86715
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: controller
+          image: "ghcr.io/smrt-devops/buildkit-controller:0.1.0"
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: [ALL]}
+          env:
+            - {name: LOG_LEVEL, value: "info"}
+            - {name: LOG_FORMAT, value: "json"}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          ports:
+            - {name: api, containerPort: 8443}
+            - {name: edge, containerPort: 8444}
+            - {name: ops, containerPort: 8080}
+          startupProbe:
+            httpGet: {path: /healthz, port: ops}
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: {path: /healthz, port: ops}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: ops}
+            periodSeconds: 5
+          resources:
+            limits:
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          volumeMounts:
+            - {name: config, mountPath: /etc/buildkit-controller, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: buildkit-controller-config}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: buildkit-controller
+                    app.kubernetes.io/instance: bk
+
+---
+# Source: buildkit-controller/templates/gateway.yaml
+# The gateway re-encrypts to the controller's API port and checks its serving certificate.
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: buildkit-controller-api
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+    exposure: gateway
+  annotations:
+    example.com/owner: ci
+spec:
+  targetRefs:
+    - {group: "", kind: Service, name: buildkit-controller, sectionName: api}
+  validation:
+    hostname: bk.example.com
+    wellKnownCACertificates: System
+
+---
+# Source: buildkit-controller/templates/gateway.yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: buildkit-controller-api
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+    exposure: gateway
+  annotations:
+    example.com/owner: ci
+spec:
+  targetRefs:
+    - {group: gateway.networking.k8s.io, kind: HTTPRoute, name: buildkit-controller-api}
+  tcpKeepalive:
+    idleTime: 60s
+    interval: 15s
+    probes: 4
+  timeout:
+    tcp: {connectTimeout: 5s}
+    http: {streamIdleTimeout: 1h40m}
+
+---
+# Source: buildkit-controller/templates/gateway.yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: buildkit-controller-edge
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+    exposure: gateway
+  annotations:
+    example.com/owner: ci
+spec:
+  targetRefs:
+    - {group: gateway.networking.k8s.io, kind: TLSRoute, name: buildkit-controller-edge}
+  tcpKeepalive:
+    idleTime: 60s
+    interval: 15s
+    probes: 4
+  timeout:
+    tcp: {connectTimeout: 5s}
+
+---
+# Source: buildkit-controller/templates/gateway.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: buildkit-controller-api
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+    exposure: gateway
+  annotations:
+    example.com/owner: ci
+spec:
+  parentRefs:
+    - name: eg
+      namespace: envoy-gateway-system
+  hostnames:
+    - bk.example.com
+    - buildkit.example.com
+  rules:
+    - backendRefs:
+        - {name: buildkit-controller, port: 8443}
+      timeouts:
+        backendRequest: 1h40m
+        request: 1h40m
+
+---
+# Source: buildkit-controller/templates/gateway.yaml
+# The edge is TLS passthrough only: the controller authenticates the client certificate.
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata:
+  name: buildkit-controller-edge
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-controller
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+    exposure: gateway
+  annotations:
+    example.com/owner: ci
+spec:
+  parentRefs:
+    - name: eg
+      namespace: envoy-gateway-system
+  hostnames:
+    - bk.example.com
+    - '*.alloc.bk.example.com'
+  rules:
+    - backendRefs:
+        - {name: buildkit-controller, port: 8444}

@@ -483,7 +483,10 @@ pub struct Cache {
 /// A volume holds the whole buildkitd state: the content store, the cache records and
 /// any image built on it. Each volume belongs to one cache scope (`scope`). A pod whose
 /// caller is in another scope never gets the volume as it is: the volume is emptied
-/// before buildkitd starts. Build history is not recorded on these pools.
+/// before buildkitd starts. buildkitd runs with build history off
+/// (`[history] maxEntries = 0`) and `history.db` is deleted at every start, so no
+/// build logs or build arguments reach a later allocation and `buildx history`
+/// shows nothing on these pools.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 #[schemars(extend("x-kubernetes-validations" = [{"rule": "!has(self.gcKeepStorage) || quantity(string(self.gcKeepStorage)).compareTo(quantity(string(self.size))) <= 0", "message": "gcKeepStorage must not exceed size"}]))]

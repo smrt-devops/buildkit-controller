@@ -1,5 +1,5 @@
-# Host ports 18443/18444 reach the chart's NodePorts 30443/30444 (API, edge).
-# Host ports 18443 and 18444 reach the chart's NodePorts 30443 and 30444 (API and edge).
+# Host ports 18443 and 18444 reach the NodePorts 30443 and 30444 of the Envoy
+# Gateway Service (API and edge listeners), set in xtask/fixtures/gateway/gateway.yaml.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:

@@ -12,7 +12,7 @@ Long-lived BuildKit daemons share caches and CPU between unrelated jobs, and a c
 - A pool keeps `scaling.min` warm pods (zero by default, or a time-of-day schedule) and grows to `scaling.max`. When the pool is full, requests queue up to the pool's `queueTimeout`.
 - One install serves any number of pools in the namespaces you list in `watchNamespaces`, so amd64, arm64 and per-team pools live side by side. Outside them and its own namespace the controller can write nothing.
 - The GitHub Action allocates builders for one or more pools and releases them when the job finishes, even after a failure.
-- Build cache comes in two layers, both off by default. The registry layer gives each cache key a registry ref, and the controller returns the `--cache-from` and `--cache-to` values for it. Local volumes keep a worker's state directory on a PVC per cached slot. Each volume belongs to one cache scope, by default the caller's repository, ServiceAccount or claim namespace, and is emptied before a caller of another scope gets it ([details](docs/architecture.md#build-cache)).
+- Build cache comes in two layers, both off by default. The registry layer gives each cache key a registry ref, and the controller returns the `--cache-from` and `--cache-to` values for it. Local volumes keep a worker's state directory on a PVC per cached slot. Each volume belongs to one cache scope, by default the caller's repository, ServiceAccount or claim namespace, and is emptied before a caller of another scope gets it. Pools with local volumes run buildkitd with build history off, so `buildx history` shows nothing there ([details](docs/architecture.md#build-cache)).
 
 How the layers behave under concurrency: the registry cache is shared, so ten builds of one key at once all import the same ref, and the last export to finish becomes the ref. A local volume serves one build at a time and speeds up only the build that lands on its slot. When builds of one key overlap, the allocator sends the second build to another slot and reports `spill`, and that build still gets the registry cache. A pool that runs concurrent builds of one repository should set the registry layer.
 
@@ -26,12 +26,14 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 
 ## Quickstart
 
-You need a cluster that meets the requirements above, `helm`, and a GitHub repository that can run Actions. [docs/quickstart.md](docs/quickstart.md) has the kind version.
+You need a cluster that meets the requirements above, `helm`, and a GitHub repository that can run Actions. The chart exposes the controller through a Gateway API Gateway you run: an HTTPS listener for the API and a TLS passthrough listener for the edge, with the Gateway API v1.5.0 or later CRDs ([helm/README.md](helm/README.md#exposure) has an example and the implementations that support it). Without one, add `--set service.type=LoadBalancer`. [docs/quickstart.md](docs/quickstart.md) has the kind version.
 
 ```sh
-# 1. Install the controller and its CRD.
+# 1. Install the controller and its CRD, attached to the Gateway bk in gateway-system.
 helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
   --set edge.endpoint=tcp://bk.example.com:8444 --set edge.serverName=bk.example.com \
+  --set-json 'gateway.api.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"api"}]' \
+  --set-json 'gateway.edge.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"edge"}]' \
   --set 'watchNamespaces={ci}' \
   --set 'auth.oidc[0].url=https://token.actions.githubusercontent.com' \
   --set 'auth.oidc[0].audiences={buildkit-controller}'
@@ -61,13 +63,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: smrt-devops/buildkit-controller/action@v0
         with:
-          url: https://bk.example.com:8443
+          url: https://bk.example.com
           pools: ci/amd64
-          ca-cert: ${{ vars.BK_CA }}
       - run: docker buildx build --platform linux/amd64 .
 ```
 
-Replace `bk.example.com` with a DNS name that points at the Service load balancer. Unless you give the edge a certificate from a public CA (`edge.tls.secretName`), it serves one issued by the controller, and the Action must trust that CA. Store it in a repository or organization variable named `BK_CA`:
+Replace `bk.example.com` with a DNS name that points at the Gateway, and use the port of its HTTPS listener in `url` if it is not 443. The Gateway terminates the API's TLS with its own certificate, so with a publicly trusted one the Action needs no `ca-cert`. The edge passes through to the controller, and the Action takes its CA from each allocation.
+
+With `service.type=LoadBalancer`, the API URL is `https://bk.example.com:8443` and the controller serves its own certificate on it. Unless you give it a certificate from a public CA (`edge.tls.secretName`), the Action must trust the controller's CA through `ca-cert: ${{ vars.BK_CA }}`. Store it in a repository or organization variable named `BK_CA`:
 
 ```sh
 kubectl -n buildkit-system get configmap buildkit-controller-ca-bundle -o 'jsonpath={.data.ca\.crt}' \

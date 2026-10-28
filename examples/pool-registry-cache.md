@@ -1,7 +1,8 @@
 # Registry cache
 
 Each allocation gets a new worker pod, so cache comes from a registry or from
-the pool's local volumes, which are kept per cache scope. [pool-cache.yaml](pool-cache.yaml) turns both on. The controller
+the pool's local volumes, which are kept per cache scope.
+[pool-cache.yaml](pool-cache.yaml) turns both on. The controller
 returns the registry flags in each allocation response, and the GitHub Action
 writes them to its `cache-from`, `cache-to` and `cache-args` outputs
 ([docs/ci/README.md](../docs/ci/README.md)).

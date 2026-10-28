@@ -1,2 +1,4 @@
+# expect: set namespace to a dedicated pool namespace other than the release namespace
 edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
 pools: [{name: same, namespace: buildkit-system, spec: {}}]
+gateway: {enabled: false}

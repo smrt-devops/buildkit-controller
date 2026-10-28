@@ -93,6 +93,75 @@
         }
       }
     },
+    "gateway": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "parentRefs": {"$ref": "#/definitions/parentRefs"},
+        "annotations": {"type": "object"},
+        "labels": {"type": "object"},
+        "api": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "mode": {"enum": ["terminate", "passthrough"]},
+            "parentRefs": {"$ref": "#/definitions/parentRefs"},
+            "hostnames": {"type": "array", "items": {"$ref": "#/definitions/gatewayHostname"}},
+            "timeouts": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "request": {"$ref": "#/definitions/gatewayDuration"},
+                "backendRequest": {"$ref": "#/definitions/gatewayDuration"}
+              }
+            },
+            "backendTLS": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "hostname": {"type": "string"},
+                "caCertificateRefs": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {"group": {"type": "string"}, "kind": {"type": "string"}, "name": {"type": "string", "minLength": 1}}
+                  }
+                },
+                "wellKnownCACertificates": {"enum": ["", "System"]}
+              }
+            }
+          }
+        },
+        "edge": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "parentRefs": {"$ref": "#/definitions/parentRefs"}
+          }
+        },
+        "envoy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "connectTimeout": {"$ref": "#/definitions/gatewayDuration"},
+            "tcpKeepalive": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "idleTime": {"$ref": "#/definitions/gatewayDuration"},
+                "interval": {"$ref": "#/definitions/gatewayDuration"},
+                "probes": {"type": "integer", "minimum": 1}
+              }
+            }
+          }
+        },
+        "extraManifests": {"type": "array", "items": {"type": ["object", "string"]}}
+      }
+    },
+
     "claims": {
       "type": "object",
       "additionalProperties": false,
@@ -148,6 +217,24 @@
     }
   },
   "definitions": {
+    "parentRefs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "additionalProperties": false,
+        "properties": {
+          "group": {"type": "string"},
+          "kind": {"type": "string"},
+          "name": {"type": "string", "minLength": 1},
+          "namespace": {"type": "string"},
+          "sectionName": {"type": "string"},
+          "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+        }
+      }
+    },
+    "gatewayHostname": {"type": "string", "pattern": "^(\\*\\.)?[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", "maxLength": 253},
+    "gatewayDuration": {"type": "string", "pattern": "^([0-9]{1,5}(h|m|s|ms)){1,4}$"},
     "quantity": {"type": ["string", "integer"]},
     "registryCache": {
       "type": "object",

@@ -7,8 +7,23 @@ per `pools` entry. `values.yaml` documents every value and
 
 ```sh
 helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
-  --set edge.endpoint=tcp://bk.example.com:8444 --set edge.serverName=bk.example.com
+  --set edge.endpoint=tcp://bk.example.com:8444 --set edge.serverName=bk.example.com \
+  --set-json 'gateway.api.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"api"}]' \
+  --set-json 'gateway.edge.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"edge"}]'
 ```
+
+## Exposure
+
+By default the Service is ClusterIP and the chart attaches Gateway API routes to
+the Gateway listeners in `gateway.api.parentRefs` and `gateway.edge.parentRefs`: an HTTPRoute with a BackendTLSPolicy for the
+API (`gateway.api.mode: passthrough` makes it a TLSRoute) and a TLS passthrough
+TLSRoute for the edge. They need the Gateway API v1.5.0 or later standard-channel
+CRDs. Without `gateway.parentRefs` the chart fails to render, unless
+`service.type: LoadBalancer` exposes the Service directly or `gateway.enabled: false`
+keeps the install in-cluster. `gateway.envoy.enabled` adds Envoy Gateway policies,
+and `gateway.extraManifests` takes objects for other implementations. Modes,
+listeners, timeouts and supported implementations are in
+[helm/README.md](../README.md#exposure).
 
 ## Pools
 
