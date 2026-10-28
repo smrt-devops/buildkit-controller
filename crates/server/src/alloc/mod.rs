@@ -178,7 +178,11 @@ fn key_of(p: &k8s_openapi::api::core::v1::Pod) -> Option<PoolKey> {
     Some((p.metadata.namespace.clone()?, pool.clone()))
 }
 
-/// Keeps this replica's `status.waiters` entries current until `stop`.
+/// Keeps this replica's `status.waiters` entries current until `stop`, then
+/// sets every entry it wrote back to 0. The requests it counted have been
+/// refused by then and retry on another replica, which counts them again; a
+/// stale count here would make the leader start surplus workers until the entry
+/// ages out.
 async fn write_waiters(
     mut writer: WaitersWriter,
     queues: Arc<Queues>,
@@ -194,6 +198,7 @@ async fn write_waiters(
         }
     })
     .await;
+    writer.clear(&*backend).await;
 }
 
 /// Wakes queue heads on pod events and keeps `status.waiters` current, until
@@ -204,7 +209,7 @@ pub async fn drive(engine: &Engine, replica: String, shutdown: CancellationToken
     // hold back pod events and queue wakes.
     let writer_stop = shutdown.child_token();
     let _writer_guard = writer_stop.clone().drop_guard();
-    tokio::spawn(write_waiters(
+    let writer = tokio::spawn(write_waiters(
         WaitersWriter::new(replica, engine.pools.clone()),
         Arc::clone(&engine.queues),
         Arc::clone(&engine.backend),
@@ -212,7 +217,11 @@ pub async fn drive(engine: &Engine, replica: String, shutdown: CancellationToken
     ));
     loop {
         tokio::select! {
-            () = shutdown.cancelled() => return,
+            () = shutdown.cancelled() => {
+                // The final zero write must land before the replica exits.
+                let _ = writer.await;
+                return;
+            }
             ev = sub.recv() => match ev {
                 None => return,
                 Some(PodEvent::Resync) => engine.queues.wake_all(),

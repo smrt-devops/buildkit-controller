@@ -815,6 +815,25 @@ async fn waiters_status_written_on_change_heartbeat_and_zero() {
     assert_eq!(e.fake.w.lock().unwrap().waiters, vec![1, 1, 0]);
 }
 
+/// On shutdown the queued requests are refused and `drive` returns only after
+/// this replica's `status.waiters` entry is back at 0, so the leader does not
+/// count them twice while they retry elsewhere.
+#[tokio::test(start_paused = true)]
+async fn shutdown_sets_status_waiters_back_to_zero_before_drive_returns() {
+    let e = env_with(4, false, 10);
+    let stop = e.stopping.clone();
+    let engine = Arc::clone(&e.engine);
+    let drive = tokio::spawn(async move { drive(&engine, "r1".into(), stop).await });
+    let engine = Arc::clone(&e.engine);
+    let queued = tokio::spawn(async move { engine.allocate(&sa("w"), &req(600)).await.err() });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(e.fake.w.lock().unwrap().waiters, vec![1]);
+    e.stopping.cancel();
+    drive.await.unwrap();
+    assert_eq!(e.fake.w.lock().unwrap().waiters, vec![1, 0]);
+    assert_eq!(queued.await.unwrap(), Some(AllocError::ShuttingDown));
+}
+
 #[tokio::test(start_paused = true)]
 async fn claim_landing_after_cancellation_is_retired() {
     let e = env_with(4, false, 10);

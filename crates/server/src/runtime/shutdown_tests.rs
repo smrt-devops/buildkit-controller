@@ -84,3 +84,52 @@ async fn an_early_exit_is_reported_with_its_name() {
         "{e}"
     );
 }
+
+/// The Lease is released only after the reconciler and every leader-gated
+/// component (the claim controller) have stopped.
+#[tokio::test(start_paused = true)]
+async fn step_down_releases_the_lease_after_all_leader_work_stopped() {
+    let log = Log::default();
+    let mut leader = Stages::new(&["leader"]);
+    leader.spawn(
+        0,
+        "claims",
+        component(&log, "claims", Duration::from_secs(3)),
+    );
+    let release = CancellationToken::new();
+    let elector = tokio::spawn({
+        let (log, release) = (Arc::clone(&log), release.clone());
+        async move {
+            release.cancelled().await;
+            push(&log, "lease released");
+        }
+    });
+    let reconciler = {
+        let log = Arc::clone(&log);
+        async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            push(&log, "reconciler done");
+        }
+    };
+    let start = Instant::now();
+    step_down(
+        reconciler,
+        leader,
+        start + Duration::from_secs(30),
+        release,
+        elector,
+    )
+    .await;
+    assert_eq!(start.elapsed(), Duration::from_secs(3));
+    let log = log.lock().unwrap().clone();
+    assert_eq!(
+        log,
+        [
+            "claims stop",
+            "reconciler done",
+            "claims done",
+            "lease released"
+        ],
+        "{log:?}"
+    );
+}

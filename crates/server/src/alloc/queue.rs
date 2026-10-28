@@ -191,6 +191,34 @@ impl WaitersWriter {
         }
     }
 
+    /// Sets every entry this writer last wrote with a non-zero count back to 0
+    /// (shutdown). The applies run concurrently, each bounded by the backend's
+    /// request timeout.
+    pub async fn clear(&mut self, backend: &dyn Backend) {
+        let ts = fmt_ts(time::OffsetDateTime::now_utc());
+        let keys: Vec<PoolKey> = self
+            .last
+            .iter()
+            .filter(|(_, (n, _))| *n > 0)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let applies = keys
+            .iter()
+            .map(|(ns, pool)| backend.apply_waiters(ns, pool, &self.replica, 0, &ts));
+        let results = futures::future::join_all(applies).await;
+        let now = Instant::now();
+        for (key, result) in keys.into_iter().zip(results) {
+            match result {
+                Ok(()) => {
+                    self.last.insert(key, (0, now));
+                }
+                Err(error) => {
+                    warn!(namespace = %key.0, pool = %key.1, error, "clearing status.waiters");
+                }
+            }
+        }
+    }
+
     /// One pass; call about once a second. The due applies run concurrently,
     /// so one slow pool does not hold back another pool's heartbeat.
     pub async fn tick(&mut self, queues: &Queues, backend: &dyn Backend) {

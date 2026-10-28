@@ -3,13 +3,15 @@
 //! Components run in stages. [`Stages::stop`] stops one stage at a time and
 //! waits for every component in it to return before it stops the next, so a
 //! later stage keeps serving what an earlier one still needs. `main` uses three:
-//! the API (alloc, http, claims), then the edge, whose open connections drain
-//! until each ends on its own, then the certificate loader they depend on.
+//! the API (alloc, http), then the edge, whose open connections drain until each
+//! ends on its own, then the certificate loader they depend on. Leader-gated
+//! components (the claim controller) are stopped earlier, by [`step_down`],
+//! before the Lease is released.
 
 use std::future::Future;
 
 use futures::future::select_all;
-use tokio::task::{JoinError, JoinSet};
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -123,6 +125,23 @@ impl Stages {
         }
         false
     }
+}
+
+/// Hand leadership over: wait for `reconciler` (the caller has already told the
+/// reconciler supervisor to stop) and stop every leader-gated component in
+/// `leader` (aborted at `deadline`), and only then cancel `release`, the
+/// elector's token, and wait for the elector to give up the Lease. No leader
+/// work of this replica can overlap the next leader's.
+pub async fn step_down(
+    reconciler: impl Future<Output = ()>,
+    leader: Stages,
+    deadline: Instant,
+    release: CancellationToken,
+    elector: JoinHandle<()>,
+) {
+    let ((), _) = tokio::join!(reconciler, leader.stop(deadline));
+    release.cancel();
+    let _ = elector.await;
 }
 
 fn exit_error(done: Result<Exit, JoinError>) -> anyhow::Error {

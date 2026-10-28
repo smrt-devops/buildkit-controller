@@ -33,7 +33,7 @@ use buildkit_controller::runtime::hooks::{Component, Hooks, LeaderWork};
 use buildkit_controller::runtime::leader::supervise;
 use buildkit_controller::runtime::metrics::Metrics;
 use buildkit_controller::runtime::readiness::Readiness;
-use buildkit_controller::runtime::shutdown::Stages;
+use buildkit_controller::runtime::shutdown::{Stages, step_down};
 use buildkit_controller::telemetry::{logs, ops};
 
 fn main() -> ExitCode {
@@ -181,8 +181,14 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
     // queued ones get 503), then the edge (open connections drain until each
     // ends), then the certificate loader. The Pod and Secret watches stop last.
     let mut stages = Stages::new(&["api", "edge", "pki"]);
-    for c in [&hooks.alloc, &hooks.http].into_iter().chain(&hooks.extra) {
+    for c in [&hooks.alloc, &hooks.http] {
         spawn(&mut stages, API_STAGE, c, &ctx);
+    }
+    // Leader-gated components (the claim controller) stop with the reconciler,
+    // before the Lease is released.
+    let mut leader = Stages::new(&["leader"]);
+    for c in &hooks.extra {
+        spawn(&mut leader, 0, c, &ctx);
     }
     spawn(&mut stages, EDGE_STAGE, &hooks.edge, &ctx);
     spawn(&mut stages, PKI_STAGE, &hooks.pki, &ctx);
@@ -193,6 +199,10 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
     tokio::select! {
         r = signal() => r?,
         e = stages.exited() => {
+            error!(error = format!("{e:#}"), "component stopped, shutting down");
+            failed = Some(e);
+        }
+        e = leader.exited() => {
             error!(error = format!("{e:#}"), "component stopped, shutting down");
             failed = Some(e);
         }
@@ -221,13 +231,15 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
     info!("shutting down");
     readiness.set_shutting_down();
     // Leadership goes first, so another replica leads within seconds however
-    // long this one drains. Leader work stops before the Lease is released.
+    // long this one drains. All leader work stops before the Lease is released.
     leader_stop.cancel();
-    if !leader_done {
-        let _ = leader_task.await;
-    }
-    elect_stop.cancel();
-    let _ = elect_task.await;
+    let reconciler = async {
+        if !leader_done {
+            let _ = leader_task.await;
+        }
+    };
+    let bound = Instant::now() + ctx.config().request_timeout();
+    step_down(reconciler, leader, bound, elect_stop, elect_task).await;
     info!("leadership released");
     tokio::time::sleep(ctx.config().shutdown_delay()).await;
     let budget = ctx.config().drain_budget();
