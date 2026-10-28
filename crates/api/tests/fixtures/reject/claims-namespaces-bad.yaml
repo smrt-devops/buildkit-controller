@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: claims-namespaces-bad, namespace: default}
+spec:
+  access: {rules: [{claims: {namespaces: [Bad_NS]}}]}

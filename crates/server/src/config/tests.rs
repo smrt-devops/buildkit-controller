@@ -109,18 +109,11 @@ fn drain_timeout_when_set_is_a_hard_cap() {
 /// `maxTTL` cap plus the cert margin past the allocation's expiry.
 #[test]
 fn max_connection_lifetime_matches_the_ttl_cap_and_cert_margin() {
-    use buildkit_controller_api::v1alpha1::BuildKitPoolSpec;
-    let spec = |ttl: &str| {
-        let mut s: BuildKitPoolSpec = serde_json::from_value(serde_json::json!(
-            {"access": {"rules": [{"serviceAccount": {"name": "builder"}}]}}
-        ))
-        .unwrap();
-        s.allocation.max_ttl = CrdDuration::new(ttl);
-        s.validate()
-    };
-    assert!(spec("24h").is_ok());
-    assert!(
-        spec("24h0m1s").is_err(),
+    let crd = serde_json::to_value(buildkit_controller_api::v1alpha1::crd()).unwrap();
+    let max_ttl = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+        ["allocation"]["properties"]["maxTTL"];
+    assert_eq!(
+        max_ttl["x-kubernetes-validations"][0]["rule"], "duration(self) <= duration('24h')",
         "the CRD cap moved; update MAX_CONNECTION_LIFETIME"
     );
     let margin = Duration::from_secs(

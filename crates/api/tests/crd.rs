@@ -29,7 +29,6 @@ fn pool(spec: &Value) -> BuildKitPool {
 #[test]
 fn minimal_pool_fills_defaults() {
     let p: BuildKitPool = serde_saphyr::from_str(MINIMAL).unwrap();
-    p.validate().unwrap();
     let s = &p.spec;
     let c = &s.template.spec.containers[0];
     assert_eq!(c.name, "buildkitd");
@@ -135,173 +134,6 @@ fn schema_defaults_equal_rust_defaults() {
 }
 
 #[test]
-fn defaults_validate() {
-    BuildKitPoolSpec::default().validate().unwrap();
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn tmpl(t: Value) -> Value {
-    json!({"template": t})
-}
-
-fn mount(path: &str) -> Value {
-    tmpl(
-        json!({"spec": {"volumes": [{"name": "v", "emptyDir": {}}], "containers": [{"name": "buildkitd", "volumeMounts": [{"name": "v", "mountPath": path}]}]}}),
-    )
-}
-
-fn invalid(spec: &Value) -> String {
-    let p = pool(spec);
-    p.validate()
-        .expect_err(&format!("{spec} should be invalid"))
-        .to_string()
-}
-
-#[test]
-#[allow(clippy::too_many_lines)]
-fn validation_rejects_every_listed_case() {
-    let oidc = |issuer: &str, claims: &Value| json!({"access": {"rules": [{"oidc": {"issuer": issuer, "claims": claims}}]}});
-    let win = |s: &str, e: &str, m: i32| json!({"scaling": {"schedule": [{"start": s, "end": e, "min": m}]}});
-    let cases = [
-        json!({"workers": {"buildkitdConfig": "x".repeat(65537)}}),
-        json!({"workers": {"startTimeout": "9s"}}),
-        json!({"workers": {"startTimeout": "31m"}}),
-        json!({"workers": {"startTimeout": "5x"}}),
-        json!({"workers": {"startTimeout": ""}}),
-        json!({"scaling": {"min": -1}}),
-        json!({"scaling": {"min": 501, "max": 501}}),
-        json!({"scaling": {"max": 0}}),
-        json!({"scaling": {"min": 5, "max": 4}}),
-        json!({"scaling": {"idleTimeout": "59s"}}),
-        json!({"scaling": {"idleTimeout": "25h"}}),
-        json!({"scaling": {"timeZone": "x".repeat(65)}}),
-        win("8:00", "18:00", 1),
-        win("24:00", "18:00", 1),
-        win("08:60", "18:00", 1),
-        win("08:00", "08:00", 1),
-        win("08:00", "18:00", 11),
-        win("08:00", "18:00", -1),
-        win("08:00", "18:00:00", 1),
-        tmpl(
-            json!({"spec": {"containers": [{"name": "buildkitd", "env": [{"name": "A", "valueFrom": {"resourceFieldRef": {"resource": "limits.memory"}}}]}]}}),
-        ),
-        tmpl(
-            json!({"spec": {"containers": [{"name": "buildkitd", "env": [{"name": "A", "valueFrom": {"fileKeyRef": {"volumeName": "v", "path": "p", "key": "k"}}}]}]}}),
-        ),
-        tmpl(
-            json!({"spec": {"containers": [{"name": "buildkitd", "env": [{"name": "N".repeat(129), "value": "x"}]}]}}),
-        ),
-        tmpl(
-            json!({"spec": {"containers": [{"name": "buildkitd", "env": (0..33).map(|i| json!({"name": format!("E{i}"), "value": "x"})).collect::<Vec<_>>()}]}}),
-        ),
-        tmpl(
-            json!({"spec": {"volumes": (0..17).map(|i| json!({"name": format!("v{i}"), "emptyDir": {}})).collect::<Vec<_>>()}}),
-        ),
-        tmpl(json!({"spec": {"volumes": [{"name": "v".repeat(64), "emptyDir": {}}]}})),
-        mount("//certs"),
-        mount("/data/../etc/buildkit"),
-        mount("/.."),
-        mount("data"),
-        mount("/data/"),
-        mount("/data//x"),
-        mount(&format!("/{}", "p".repeat(256))),
-        json!({"scaling": {"schedule": (0..33).map(|_| json!({"start": "01:00", "end": "02:00", "min": 0})).collect::<Vec<_>>()}}),
-        json!({"scaling": {"schedule": [{"days": ["Mon", "Mon"], "start": "01:00", "end": "02:00", "min": 0}]}}),
-        json!({"access": {"rules": [{}]}}),
-        json!({"access": {"rules": [{"oidc": {"issuer": "https://a", "claims": {"a": "b"}}, "serviceAccount": {}}]}}),
-        json!({"access": {"rules": [{"serviceAccount": {}, "claims": {"namespaces": ["ci"]}}]}}),
-        json!({"access": {"rules": [{"claims": {"namespaces": []}}]}}),
-        json!({"access": {"rules": [{"claims": {"namespaces": ["Bad_NS"]}}]}}),
-        json!({"access": {"rules": [{"claims": {"namespaces": (0..33).map(|i| format!("n{i}")).collect::<Vec<_>>()}}]}}),
-        oidc("http://a", &json!({"a": "b"})),
-        oidc("https://a", &json!({})),
-        oidc("https://a", &json!({"a": "*"})),
-        oidc("https://a", &json!({"a": "x".repeat(257)})),
-        oidc(
-            "https://a",
-            &(0..17)
-                .map(|i| (format!("c{i}"), json!("v")))
-                .collect::<serde_json::Map<_, _>>()
-                .into(),
-        ),
-        json!({"access": {"rules": [{"serviceAccount": {"namespace": "Bad_NS"}}]}}),
-        json!({"access": {"rules": [{"serviceAccount": {"name": "-bad"}}]}}),
-        json!({"access": {"rules": (0..65).map(|_| json!({"serviceAccount": {}})).collect::<Vec<_>>()}}),
-        json!({"allocation": {"defaultTTL": "59s"}}),
-        json!({"allocation": {"maxTTL": "25h"}}),
-        json!({"allocation": {"defaultTTL": "3h", "maxTTL": "2h"}}),
-        json!({"allocation": {"queueTimeout": "11m"}}),
-        json!({"allocation": {"maxQueueTimeout": "2h", "queueTimeout": "1m"}}),
-        json!({"platforms": ["linux/amd64", "linux/amd64"]}),
-        json!({"platforms": ["Linux/amd64"]}),
-        json!({"platforms": ["linux"]}),
-        json!({"platforms": (0..9).map(|i| format!("linux/a{i}")).collect::<Vec<_>>()}),
-        json!({"network": {"egress": {"allowCIDRs": ["10.0.0.0"]}}}),
-        json!({"network": {"egress": {"allowCIDRs": ["10.0.0.0/33"]}}}),
-        json!({"network": {"egress": {"allowCIDRs": ["10.1.2.3/16"]}}}),
-        json!({"network": {"egress": {"allowCIDRs": ["10.0.0.0/08"]}}}),
-        json!({"network": {"egress": {"allowCIDRs": ["0.0.0.0/00"]}}}),
-        json!({"network": {"egress": {"allowCIDRs": ["fd00::1/8"]}}}),
-        json!({"network": {"egress": {"allowCIDRs": ["::ffff:10.0.0.0/104"]}}}),
-        tmpl(json!({"spec": {"priorityClassName": "system-node-critical"}})),
-        tmpl(
-            json!({"spec": {"containers": [{"name": "buildkitd", "env": [{"name": "A", "valueFrom": {}}]}]}}),
-        ),
-        tmpl(
-            json!({"spec": {"containers": [{"name": "buildkitd", "env": [{"name": "A", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}, "secretKeyRef": {"name": "s", "key": "k"}}}]}]}}),
-        ),
-        tmpl(json!({"spec": {"volumes": [{"name": "v", "projected": {"sources": [{}]}}]}})),
-        mount("/certs\u{0}"),
-        mount("/data\u{7f}"),
-        tmpl(
-            json!({"spec": {"volumes": [{"name": "v", "emptyDir": {}}], "containers": [{"name": "buildkitd", "volumeMounts": [{"name": "v", "mountPath": "/data", "subPath": "a\nb"}]}]}}),
-        ),
-        tmpl(
-            json!({"spec": {"volumes": [{"name": "v", "emptyDir": {}}], "containers": [{"name": "buildkitd", "volumeMounts": [{"name": "v", "mountPath": "/data", "mountPropagation": "Bidirectional"}]}]}}),
-        ),
-        json!({"network": {"egress": {"allowCIDRs": (0..33).map(|i| format!("10.0.{i}.0/24")).collect::<Vec<_>>()}}}),
-        tmpl(json!({"metadata": {"labels": {"app.kubernetes.io/name": "x"}}})),
-        tmpl(json!({"metadata": {"labels": {"buildkit.smrt-devops.net/slot": "x"}}})),
-        tmpl(json!({"metadata": {"annotations": {"buildkit.smrt-devops.net/a": "x"}}})),
-        tmpl(json!({"spec": {"volumes": [{"name": "certs", "emptyDir": {}}]}})),
-        tmpl(json!({"spec": {"containers": []}})),
-        tmpl(json!({"spec": {"containers": [{"name": "other"}]}})),
-        tmpl(json!({"spec": {"containers": [{"name": "buildkitd"}, {"name": "buildkitd"}]}})),
-        tmpl(json!({"spec": {"runtimeClassName": "Bad_Name"}})),
-        tmpl(
-            json!({"spec": {"containers": [{"name": "buildkitd", "resources": {"limits": {"memory": "1Gi"}}}]}}),
-        ),
-        tmpl(
-            json!({"spec": {"containers": [{"name": "buildkitd", "env": [{"name": "BUILDKITD_FLAGS", "value": "x"}]}]}}),
-        ),
-        tmpl(
-            json!({"spec": {"containers": [{"name": "buildkitd", "env": [{"name": "ROOTLESSKIT_X", "value": "x"}]}]}}),
-        ),
-        tmpl(
-            json!({"spec": {"containers": [{"name": "buildkitd", "volumeMounts": [{"name": "nope", "mountPath": "/data"}]}]}}),
-        ),
-        tmpl(
-            json!({"spec": {"volumes": [{"name": "v", "emptyDir": {}}], "containers": [{"name": "buildkitd", "volumeMounts": [{"name": "v", "mountPath": "/certs/x"}]}]}}),
-        ),
-        tmpl(
-            json!({"spec": {"volumes": [{"name": "v", "emptyDir": {}}], "containers": [{"name": "buildkitd", "volumeMounts": [{"name": "v", "mountPath": "/run/user/1000"}]}]}}),
-        ),
-    ];
-    for c in &cases {
-        let _ = invalid(c);
-    }
-}
-
-#[test]
-fn long_pool_name_rejected() {
-    let mut p = pool(&json!({}));
-    p.metadata.name = Some("x".repeat(53));
-    assert!(p.validate().is_err());
-    p.metadata.name = Some("x".repeat(52));
-    p.validate().unwrap();
-}
-
-#[test]
 fn duration_grammar() {
     use buildkit_controller_api::v1alpha1::Duration;
     assert_eq!(Duration::new("1h30m5s").seconds().unwrap(), 5405);
@@ -395,7 +227,6 @@ fn template_defaults_and_valid_overrides() {
         },
         "allocation": {"queueTimeout": "0s"}
     }));
-    p.validate().unwrap();
     assert_eq!(p.spec.network.egress.internet, Internet::Deny);
     let out = serde_json::to_value(&p.spec).unwrap();
     assert_eq!(out["network"]["egress"]["allowCIDRs"][1], "fd00::/8");
@@ -507,80 +338,6 @@ fn condition_names_match_spec() {
 }
 
 #[test]
-fn mount_path_rule_is_structural() {
-    for p in [
-        "/./certs",
-        "/.",
-        "/etc/./buildkit",
-        "/home/user/.local/share/./buildkit",
-        "/data/.",
-        "/./data",
-        "//certs",
-        "/a/../certs",
-        "/..",
-        "/data/",
-        "/",
-        "",
-        "relative",
-        "./data",
-    ] {
-        invalid(&mount(p));
-    }
-    for p in [
-        "/data",
-        "/home/user/.cache",
-        "/scratch/tmp",
-        "/a/.b/..c/...",
-        "/certsx",
-        "/etc/buildkitx",
-    ] {
-        let spec = mount(p);
-        pool(&spec)
-            .validate()
-            .unwrap_or_else(|e| panic!("{p} should be valid: {e}"));
-    }
-}
-
-#[test]
-fn mount_path_length_counts_characters_not_bytes() {
-    // The CRD maxLength counts characters. "é" is 2 bytes but 1 character.
-    let at_limit = format!("/{}", "é".repeat(200));
-    assert!(pool(&mount(&at_limit)).validate().is_ok());
-    let over_limit = format!("/{}", "é".repeat(256));
-    assert!(pool(&mount(&over_limit)).validate().is_err());
-}
-
-#[test]
-fn multibyte_lengths_count_characters_not_bytes() {
-    // buildkitdConfig: 65536 characters of 2-byte "é" is 131072 bytes.
-    let config = |s: String| pool(&json!({"workers": {"buildkitdConfig": s}}));
-    assert!(config("é".repeat(65536)).validate().is_ok());
-    assert!(config("é".repeat(65537)).validate().is_err());
-
-    // oidc issuer: "https://" (8 chars) plus 504 "é" is exactly 512 characters.
-    let issuer = |rest: usize| {
-        pool(&json!({"access": {"rules": [{"oidc": {
-            "issuer": format!("https://{}", "é".repeat(rest)),
-            "claims": {"repository_owner": "smrt-devops"}
-        }}]}}))
-    };
-    assert!(issuer(504).validate().is_ok());
-    assert!(issuer(505).validate().is_err());
-
-    // timeZone (64 characters) and image (512 characters).
-    let zone = |n: usize| pool(&json!({"scaling": {"timeZone": "é".repeat(n)}}));
-    assert!(zone(64).validate().is_ok());
-    assert!(zone(65).validate().is_err());
-    let image = |n: usize| {
-        pool(
-            &json!({"template": {"spec": {"containers": [{"name": "buildkitd", "image": "é".repeat(n)}]}}}),
-        )
-    };
-    assert!(image(512).validate().is_ok());
-    assert!(image(513).validate().is_err());
-}
-
-#[test]
 fn canonical_cidrs_only() {
     use buildkit_controller_api::v1alpha1::is_canonical_cidr;
     for ok in [
@@ -610,28 +367,6 @@ fn canonical_cidrs_only() {
 }
 
 #[test]
-fn hardened_template_fields_still_accept_valid_values() {
-    let p = pool(&json!({
-        "network": {"egress": {"allowCIDRs": ["10.2.0.0/16", "2001:db8::/32"]}},
-        "template": {"spec": {
-            "priorityClassName": "builds-low",
-            "volumes": [{"name": "v", "projected": {"sources": [{"secret": {"name": "s"}}, {"configMap": {"name": "c"}}]}}],
-            "containers": [{"name": "buildkitd",
-                "env": [{"name": "A", "valueFrom": {"secretKeyRef": {"name": "s", "key": "k"}}}],
-                "volumeMounts": [{"name": "v", "mountPath": "/data", "subPath": "x", "mountPropagation": "HostToContainer"}]}]
-        }}
-    }));
-    p.validate().expect("valid pool");
-}
-
-#[test]
-fn claims_rule_validates() {
-    pool(&json!({"access": {"rules": [{"claims": {"namespaces": ["ci", "release"]}}]}}))
-        .validate()
-        .unwrap();
-}
-
-#[test]
 fn cache_local_is_off_by_default_and_its_defaults_match() {
     use buildkit_controller_api::v1alpha1::LocalCache;
     assert!(BuildKitPoolSpec::default().workers.cache.local.is_none());
@@ -654,9 +389,6 @@ fn cache_local_is_off_by_default_and_its_defaults_match() {
     // An empty block turns the feature on with every default.
     let p = pool(&json!({"workers": {"cache": {"local": {}}}}));
     assert_eq!(p.spec.workers.cache.local, Some(LocalCache::default()));
-    p.spec.validate().unwrap();
-    let p = pool(&json!({"workers": {"cache": {"local": {"maxVolumes": 0}}}}));
-    assert!(p.spec.validate().is_err());
 }
 
 #[test]
@@ -671,15 +403,12 @@ fn cache_local_size_is_not_nullable() {
 
 #[test]
 #[allow(clippy::many_single_char_names)]
-fn cache_registry_defaults_resolve_and_validate() {
-    use buildkit_controller_api::v1alpha1::{
-        CacheAffinity, CacheMode, is_image_name, is_image_ref,
-    };
+fn cache_registry_defaults_resolve() {
+    use buildkit_controller_api::v1alpha1::{CacheAffinity, CacheMode};
     let p = pool(&json!({"workers": {"cache": {
         "registry": {"repository": "ghcr.io/org/cache", "importFrom": ["trunk", "ghcr.io/org/base:main", "trunk"]},
         "local": {}
     }}}));
-    p.spec.validate().unwrap();
     let c = &p.spec.workers.cache;
     let r = c.registry_enabled().expect("enabled by default");
     assert_eq!(
@@ -708,36 +437,17 @@ fn cache_registry_defaults_resolve_and_validate() {
     let p = pool(&json!({"workers": {"cache": {"registry": {
         "repository": "localhost:5000/c", "ref": "{repository}:{pool}-{cacheKey}", "defaultKey": "dflt", "enabled": false
     }}}}));
-    p.spec.validate().unwrap();
     assert!(p.spec.workers.cache.registry_enabled().is_none());
     assert_eq!(p.spec.workers.cache.default_key("app"), "dflt");
+}
 
-    for bad in [
-        json!({"repository": "ghcr.io/org/cache:tag"}),
-        json!({"repository": "Ghcr.io/x"}),
-        json!({"repository": "r.io/x", "ref": "{repository}:{branch}"}),
-        json!({"repository": "r.io/x", "ref": "{repository}::{cacheKey}"}),
-        json!({"repository": "r.io/x", "defaultKey": "a/b"}),
-        json!({"repository": "r.io/x", "importFrom": ["not a key"]}),
-        json!({"repository": "r.io/x", "importFrom": ["a","b","c","d","e","f","g","h","i"]}),
+#[test]
+fn pull_policy_strings_are_the_wire_values() {
+    for p in [
+        PullPolicy::Always,
+        PullPolicy::IfNotPresent,
+        PullPolicy::Never,
     ] {
-        let p = pool(&json!({"workers": {"cache": {"registry": bad}}}));
-        assert!(p.spec.validate().is_err(), "{bad} must be rejected");
-    }
-    let p = pool(&json!({"workers": {"cache": {"local": {"keysPerVolume": 33}}}}));
-    assert!(p.spec.validate().is_err());
-    for ok in ["localhost:5000/a/b", "r.io/x", "cache", "a-b.c_d/e"] {
-        assert!(is_image_name(ok), "{ok}");
-    }
-    for ok in [
-        "r.io/x:t",
-        "cache:main",
-        "localhost:5000/x:v1.2",
-        "r.io/x@sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    ] {
-        assert!(is_image_ref(ok), "{ok}");
-    }
-    for no in ["r.io/x:", "r.io//x", "-a/b", "r.io/x:t@sha1:00"] {
-        assert!(!is_image_ref(no), "{no}");
+        assert_eq!(serde_json::to_value(p).unwrap(), p.as_str());
     }
 }

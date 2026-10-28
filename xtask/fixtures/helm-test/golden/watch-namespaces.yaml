@@ -172,7 +172,7 @@ spec:
                 maxLength: 63
                 minLength: 1
                 nullable: true
-                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                pattern: ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$
                 type: string
               poolRef:
                 description: The pool to allocate from.
