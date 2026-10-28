@@ -105,7 +105,7 @@ pub fn free_slots<'a>(names: impl Iterator<Item = &'a str>, pool: &str, max: u32
 }
 
 /// JSON pointer for a metadata key (`/` becomes `~1`).
-fn ptr(section: &str, key: &str) -> String {
+pub(super) fn ptr(section: &str, key: &str) -> String {
     format!(
         "/metadata/{section}/{}",
         key.replace('~', "~0").replace('/', "~1")

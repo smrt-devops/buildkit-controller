@@ -1,4 +1,4 @@
-//! The allocation flow: authenticate, claim a warm pod or create one, queue, release.
+//! The allocation flow: claim a warm pod or create one, queue, release.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,8 +42,17 @@ const MIN_TTL: u64 = 60;
 /// allocation commits. A claim is written with this short `expires-at` and
 /// extended to the real expiry just before the response exists, so a
 /// replica that dies in between (SIGKILL, OOM, shutdown abort) leaves a
-/// claim the leader retires within this bound, not at `maxTTL`.
+/// claim the leader retires within this bound, not at `maxTTL`. The bound
+/// ends at the commit: a replica that dies after it but before the response
+/// is written leaves an allocation no client knows, held until its expiry.
 pub const COMMIT_WINDOW: time::Duration = time::Duration::seconds(60);
+/// Time left between a cold pod turning Ready and the end of its claim, to
+/// sign the cert and send the commit. A pod not Ready by then is a start timeout.
+const READY_MARGIN: time::Duration = time::Duration::seconds(5);
+/// After a claim lost to another writer (or with an unknown outcome), the
+/// queue is woken again after this long. The loss means this replica's pod
+/// store lags, and no pod event will wake the queue for the pod it lost.
+const CONFLICT_RETRY: Duration = Duration::from_secs(1);
 
 /// Static inputs from the config file.
 #[derive(Debug, Clone)]
@@ -476,12 +485,15 @@ impl Engine {
             scope: cache::scope(pool, who),
         };
         let mut won = self.acquire(&r, Duration::from_secs(qt)).await?;
-        let path = if won.cold.is_some() { "cold" } else { "warm" };
-        let local = self.local_cache(&r, pool, plan.as_ref(), &won);
+        let cold = won.cold.is_some();
         if let Some(sub) = won.cold.take() {
             let start = Duration::from_secs(seconds(&pool.spec.workers.start_timeout)?);
             self.await_ready(&mut won, sub, start).await?;
         }
+        // Only now: a cold pod's init container has run, so the volume holds
+        // what the binding will say.
+        let local = self.local_cache(&r, pool, plan.as_ref(), &won, cold);
+        let path = if cold { "cold" } else { "warm" };
         let id = AllocationId {
             namespace: req.namespace.parse().map_err(|_| AllocError::Internal)?,
             pool: req.pool.parse().map_err(|_| AllocError::Internal)?,
@@ -559,13 +571,14 @@ impl Engine {
 
     /// Record the key on a won cached slot and return the cache result when the
     /// local layer applies, or `reused` when it does not and the slot is
-    /// cached.
+    /// cached. `cold` when the pod was created for this request.
     fn local_cache(
         &self,
         r: &Req<'_>,
         pool: &BuildKitPool,
         plan: Option<&cache::Plan>,
         won: &Won,
+        cold: bool,
     ) -> Option<&'static str> {
         if let Some((k, cap)) = &r.affinity
             && cache::cached(pool, &won.pod)
@@ -606,18 +619,20 @@ impl Engine {
             pool,
             &won.pod,
             before,
-            won.cold.is_some().then_some(won.wiped),
+            cold.then_some(won.wiped),
             r.scope.as_deref(),
             &p.key,
             &pods,
         ))
     }
 
-    /// Warm, cold, then the queue. The queue is FIFO per pool on this replica:
-    /// a request that finds others waiting for the pool makes no attempt of
-    /// its own and goes behind them. Its arrival wakes the head, which makes
-    /// the attempt in its place, so a newcomer never takes a pod a waiter could
-    /// have had. Across replicas the order is best effort.
+    /// Warm, cold, then the queue. The queue is FIFO per pool and cache scope
+    /// on this replica: a request that finds others of its scope waiting for
+    /// the pool makes no attempt of its own and goes behind them. Its arrival
+    /// wakes the head, which makes the attempt in its place, so a newcomer
+    /// never takes a pod a waiter of its scope could have had. Waiters of
+    /// different scopes do not wait for each other, since the pods one can use
+    /// may be of no use to the other. Across replicas the order is best effort.
     async fn acquire(&self, r: &Req<'_>, qt: Duration) -> Result<Won, AllocError> {
         // Shutdown is checked only before an attempt, so a request is never
         // refused after its claim was sent.
@@ -627,7 +642,8 @@ impl Engine {
         }
         // The wake version of the last attempt; `None` until this request made one.
         let mut tried = None;
-        if self.queues.is_waiting(&r.key) {
+        let scope = r.scope.as_deref();
+        if self.queues.is_waiting(&r.key, scope) {
             self.queues.wake(&r.key);
         } else {
             if let Some(w) = self.attempt(r).await? {
@@ -639,7 +655,7 @@ impl Engine {
         if qt.is_zero() {
             return Err(exhausted());
         }
-        let Some(mut ticket) = self.queues.enqueue(&r.key) else {
+        let Some(mut ticket) = self.queues.enqueue(&r.key, scope) else {
             self.metrics.queue_wait(&r.key.0, &r.key.1, "full", 0.0);
             return Err(exhausted());
         };
@@ -658,11 +674,17 @@ impl Engine {
             let v = ticket.seen();
             if tried != Some(v) && ticket.is_head() {
                 tried = Some(v);
-                if let Some(w) = self.attempt(r).await? {
-                    rec.result = "ok";
-                    return Ok(w);
+                match self.attempt(r).await {
+                    Ok(Some(w)) => {
+                        rec.result = "ok";
+                        return Ok(w);
+                    }
+                    Ok(None) => continue,
+                    Err(e) => {
+                        rec.result = "error";
+                        return Err(e);
+                    }
                 }
-                continue;
             }
             tokio::select! {
                 r = tokio::time::timeout_at(deadline, ticket.changed()) => if r.is_err() {
@@ -692,6 +714,7 @@ impl Engine {
     }
 
     /// One pass over the warm path, then the cold path; `Ok(None)` means queue.
+    #[allow(clippy::too_many_lines, reason = "one pass over both paths")]
     async fn attempt(&self, r: &Req<'_>) -> Result<Option<Won>, AllocError> {
         let (ns, name) = (&r.key.0, &r.key.1);
         let pool = self
@@ -739,6 +762,8 @@ impl Engine {
             r.local,
         );
         let (now_s, id) = (fmt_ts(now), r.alloc_id.as_str());
+        // A claim lost to another writer, or with an unknown outcome.
+        let mut contended = false;
         for pod in cands.into_iter().take(MAX_TRIES) {
             let (Some(pname), Some(uid)) = (&pod.metadata.name, &pod.metadata.uid) else {
                 continue;
@@ -783,9 +808,13 @@ impl Engine {
                 PatchOutcome::Lost => {
                     guard.armed = false;
                     self.metrics.conflict(ns, name);
+                    contended = true;
                 }
                 // The outcome is unknown, so the dropped guard sends the undo (retire) patch.
-                PatchOutcome::Unknown => drop(guard),
+                PatchOutcome::Unknown => {
+                    drop(guard);
+                    contended = true;
+                }
                 PatchOutcome::Failed(error) => {
                     guard.armed = false;
                     error!(namespace = %ns, pool = %name, pod = %pname, error, "claim patch");
@@ -793,9 +822,12 @@ impl Engine {
                 }
             }
         }
-        let won = self.cold(r, &pool, &pods, &ca, now_s, expires_at).await?;
+        let won = self.cold(r, &pool, &pods, &ca, now, expires_at).await?;
         if won.is_none() {
             self.recycle(r, &pool, &pods, &foreign).await;
+            if contended {
+                self.wake_later(&r.key);
+            }
         }
         Ok(won)
     }
@@ -806,11 +838,11 @@ impl Engine {
         pool: &BuildKitPool,
         pods: &[Arc<Pod>],
         ca: &Arc<CaBundle>,
-        now_s: String,
+        now: OffsetDateTime,
         expires_at: OffsetDateTime,
     ) -> Result<Option<Won>, AllocError> {
         let (ns, name) = (&r.key.0, &r.key.1);
-        let now = expires_at - r.ttl;
+        let now_s = fmt_ts(now);
         let start = i64::try_from(seconds(&pool.spec.workers.start_timeout)?)
             .map(time::Duration::seconds)
             .map_err(|_| AllocError::Internal)?;
@@ -845,8 +877,9 @@ impl Engine {
                     AllocError::Internal
                 })?;
             if worker.not_after < expires_at + CERT_MARGIN {
-                // The internal CA ends before the allocation would.
-                return Ok(None);
+                // Waiting would not help: every slot gets a cert from the same CA.
+                warn!(namespace = %ns, pool = %name, "the internal CA ends before the allocation would");
+                return Err(AllocError::CaUnavailable);
             }
             // The pod serves the caller's scope. Its volume is kept only when that
             // scope owns it; otherwise its init container empties it.
@@ -869,39 +902,57 @@ impl Engine {
             let pname = worker.pod.metadata.name.clone().unwrap_or_default();
             // Subscribe before the create so no event about the new pod is missed.
             let sub = (self.subscribe)();
-            let (guard, s) = self.create_detached(r, worker, &pname).await?;
+            let rendered = Box::new(worker.pod.clone());
+            let (mut guard, s) = self.create_detached(r, worker, &pname).await?;
             if let Err(e) = &s.secret {
                 // The pod cannot start without it; the guard retires it now.
                 error!(namespace = %ns, pool = %name, pod = %pname, error = %e, "creating the worker Secret");
                 return Err(AllocError::Internal);
             }
-            match s.out {
-                CreateOutcome::Created(p) => {
-                    let Some(uid) = p.metadata.uid.clone() else {
-                        return Err(AllocError::Internal);
-                    };
-                    return Ok(Some(Won {
-                        guard,
-                        uid,
-                        ca: Arc::clone(ca),
-                        pod: *p,
-                        cold: Some(sub),
-                        expires_at,
-                        claimed_until,
-                        keys_before: before,
-                        wiped,
-                    }));
+            let pod = match (s.out, s.pod) {
+                (CreateOutcome::Created(p), _) => *p,
+                // The answer was lost, but the read-back found the pod this
+                // create made (by its nonce), and its Secret was created.
+                (CreateOutcome::Unknown, spawn::PodCreated::Yes { uid, .. }) => {
+                    let mut p = *rendered;
+                    p.metadata.uid = Some(uid);
+                    guard.grace = grace_of(&p);
+                    p
                 }
-                CreateOutcome::Exists => {}
-                CreateOutcome::Quota => return Ok(None),
-                CreateOutcome::Unknown => return Err(AllocError::UpstreamError),
-                CreateOutcome::Failed(error) => {
+                (CreateOutcome::Unknown, _) => return Err(AllocError::UpstreamError),
+                (CreateOutcome::Exists, _) => continue,
+                (CreateOutcome::Quota, _) => return Ok(None),
+                (CreateOutcome::Failed(error), _) => {
                     error!(namespace = %ns, pool = %name, pod = %pname, error, "creating worker pod");
                     return Err(AllocError::Internal);
                 }
-            }
+            };
+            let Some(uid) = pod.metadata.uid.clone() else {
+                return Err(AllocError::Internal);
+            };
+            return Ok(Some(Won {
+                guard,
+                uid,
+                ca: Arc::clone(ca),
+                pod,
+                cold: Some(sub),
+                expires_at,
+                claimed_until,
+                keys_before: before,
+                wiped,
+            }));
         }
         Ok(None)
+    }
+
+    /// Wakes the queue of `key` after [`CONFLICT_RETRY`], so its head tries
+    /// again with a fresher pod store.
+    fn wake_later(&self, key: &PoolKey) {
+        let (queues, key) = (Arc::clone(&self.queues), key.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(CONFLICT_RETRY).await;
+            queues.wake(&key);
+        });
     }
 
     /// When a request found no pod and no slot, retire one warm pod of a
@@ -978,14 +1029,18 @@ impl Engine {
         })
     }
 
-    /// Wait for a cold pod to be Ready (store + broadcast, no polling).
+    /// Wait for a cold pod to be Ready (store + broadcast, no polling), for
+    /// `start`, but never past [`READY_MARGIN`] before the claim ends: the
+    /// leader retires the pod at the claim value, so a later Ready could only
+    /// end in `pod_lost`.
     async fn await_ready(
         &self,
         won: &mut Won,
         mut sub: PodSubscription,
         start: Duration,
     ) -> Result<(), AllocError> {
-        let deadline = Instant::now() + start;
+        let left = won.claimed_until - READY_MARGIN - OffsetDateTime::now_utc();
+        let deadline = Instant::now() + start.min(left.try_into().unwrap_or(Duration::ZERO));
         let oref = ObjectRef::new(&won.guard.name).within(&won.guard.ns);
         let mut seen = false;
         loop {
@@ -1022,7 +1077,7 @@ impl Engine {
         }
     }
 
-    /// The pods claimed for `id`, among pods of a cached pool only: the
+    /// The pods claimed for `id`, among pods of a pool in the watch store: the
     /// managed-by label, the pool label and namespace, and a controller
     /// ownerReference to that pool's uid. The id is public, so a pod outside
     /// a pool must never match.
@@ -1030,11 +1085,11 @@ impl Engine {
         self.pods
             .state()
             .into_iter()
-            .filter(|p| ann(p, ANN_ALLOC) == Some(id) && self.in_cached_pool(p))
+            .filter(|p| ann(p, ANN_ALLOC) == Some(id) && self.in_known_pool(p))
             .collect()
     }
 
-    fn in_cached_pool(&self, pod: &Pod) -> bool {
+    fn in_known_pool(&self, pod: &Pod) -> bool {
         let labels = pod.metadata.labels.as_ref();
         let (Some(ns), Some(pool)) = (
             pod.metadata.namespace.as_deref(),
