@@ -38,12 +38,16 @@ pub struct PoolMemory {
     uid: Option<String>,
     slot_holds: BTreeMap<u32, Timestamp>,
     recent_creates: Vec<CreateOutcome>,
-    sandbox_generation: Option<i64>,
+    /// Generation and time of the last successful sandbox apply.
+    sandbox_applied: Option<(i64, Timestamp)>,
     /// Generation whose above-limit volume reap completed in this term.
     volume_generation: Option<i64>,
-    previous_pod_failure: bool,
     create_backoff: Option<(Timestamp, SignedDuration)>,
     ready: BTreeSet<String>,
+    /// Uids seen up (see [`WorkerPod::up`]) in this term.
+    seen_up: BTreeSet<String>,
+    /// [`Observed::down_since`].
+    down_since: BTreeMap<String, Timestamp>,
     /// [`Observed::waiters_seen`], kept for the entries still in the status.
     waiters_seen: BTreeMap<(String, Timestamp), Timestamp>,
     /// 201 responses not yet in the store, with their create time.
@@ -61,6 +65,22 @@ impl PoolMemory {
                 uid: Some(uid.to_owned()),
                 ..Self::default()
             };
+        }
+    }
+
+    /// Tracks which pods came up and since when those went down again, for
+    /// [`Observed::down_since`]. Forgets pods that left.
+    pub(super) fn observe_up(&mut self, pods: &[WorkerPod], now: Timestamp) {
+        let uids: BTreeSet<&str> = pods.iter().map(|p| p.uid.as_str()).collect();
+        self.seen_up.retain(|u| uids.contains(u.as_str()));
+        self.down_since.retain(|u, _| uids.contains(u.as_str()));
+        for p in pods {
+            if p.up() {
+                self.seen_up.insert(p.uid.clone());
+                self.down_since.remove(&p.uid);
+            } else if self.seen_up.contains(&p.uid) {
+                self.down_since.entry(p.uid.clone()).or_insert(now);
+            }
         }
     }
 }
@@ -93,8 +113,6 @@ pub struct Settings {
 /// Result of a pass.
 #[derive(Debug)]
 pub struct Outcome {
-    /// The plan that ran.
-    pub plan: Plan,
     /// What ran.
     pub report: Report,
     /// When to reconcile the pool again without an event; `None` = wait.
@@ -135,7 +153,7 @@ pub async fn ca_pass<O: KubeOps>(
         )
     });
     let loaded = load_ca(ca, now);
-    let actions = super::plan::ca_actions(&loaded, guard.bundle_current(ca.epoch));
+    let actions = super::plan::ca_actions(&loaded, guard.bundle_current(ca.epoch, now));
     let env = Env {
         pool: &NO_POOL,
         ca: &loaded,
@@ -145,7 +163,6 @@ pub async fn ca_pass<O: KubeOps>(
         render: &settings.render,
         worker_cert_validity: settings.worker_cert_validity,
         replica: &settings.replica,
-        config_hash: "",
         now,
     };
     let plan = Plan {
@@ -174,7 +191,6 @@ pub async fn run<O: KubeOps>(
     let name = pool.name_any();
     let uid = pool.uid().unwrap_or_default();
     mem.adopt(&uid);
-    let config_hash = render::config_hash(&render::buildkitd_config(pool));
 
     // A created pod counts until the store has its name, so the pass reads its own writes.
     let in_store: BTreeSet<&str> = store_pods
@@ -191,18 +207,19 @@ pub async fn run<O: KubeOps>(
     });
     let mut pods: Vec<WorkerPod> = store_pods
         .iter()
-        .filter_map(|p| WorkerPod::from_pod(p, &name, &uid))
+        .filter_map(|p| WorkerPod::from_pod(p, &ns, &name, &uid))
         .collect();
     pods.extend(
         mem.pending
             .iter()
-            .filter_map(|(p, _)| WorkerPod::from_pod(p, &name, &uid)),
+            .filter_map(|(p, _)| WorkerPod::from_pod(p, &ns, &name, &uid)),
     );
     let ready_now: BTreeSet<String> = pods
         .iter()
         .filter(|p| p.ready)
         .map(|p| p.uid.clone())
         .collect();
+    mem.observe_up(&pods, now);
     // A changed `(replica, updatedAt)` is a new observation, as for the Lease.
     let waiters_seen: BTreeMap<(String, Timestamp), Timestamp> = pool
         .status
@@ -219,13 +236,11 @@ pub async fn run<O: KubeOps>(
         time_zone: TimeZone::get(&pool.spec.scaling.time_zone).ok(),
         template: template_check(pool),
         network: &settings.render.worker_network,
-        config_hash: config_hash.clone(),
         platforms: platforms(pool),
         ca: &loaded,
-        ca_bundle_current: guard.bundle_current(ca.epoch),
+        ca_bundle_current: guard.bundle_current(ca.epoch, now),
         pods,
-        sandbox_applied_generation: mem.sandbox_generation,
-        previous_pod_failure: mem.previous_pod_failure,
+        sandbox_applied: mem.sandbox_applied,
         recent_creates: std::mem::take(&mut mem.recent_creates),
         create_backoff_until: mem.create_backoff.map(|(t, _)| t),
         unknown_issuer: unknown_issuer(pool, &settings.issuers),
@@ -236,6 +251,7 @@ pub async fn run<O: KubeOps>(
         slot_holds: std::mem::take(&mut mem.slot_holds),
         became_ready: ready_now.difference(&mem.ready).cloned().collect(),
         waiters_seen,
+        down_since: mem.down_since.clone(),
     };
     mem.waiters_seen = observed.waiters_seen.clone();
     let plan = plan(&observed, now, &settings.plan);
@@ -248,17 +264,12 @@ pub async fn run<O: KubeOps>(
         render: &settings.render,
         worker_cert_validity: settings.worker_cert_validity,
         replica: &settings.replica,
-        config_hash: &config_hash,
         now,
     };
     let mut report = execute(ops, guard, &env, &plan).await;
     reap_volumes(ops, mem, pool, &observed.pods, &mut report).await;
     let requeue = remember(mem, pool, &plan, &report, ready_now, now);
-    Outcome {
-        plan,
-        report,
-        requeue,
-    }
+    Outcome { report, requeue }
 }
 
 /// The above-limit volume reap: on the first pass of a
@@ -303,9 +314,8 @@ pub(super) fn remember(
     mem.slot_holds.clone_from(&plan.slot_holds);
     mem.recent_creates.clone_from(&report.creates);
     if report.sandbox_applied {
-        mem.sandbox_generation = pool.metadata.generation;
+        mem.sandbox_applied = Some((pool.metadata.generation.unwrap_or_default(), now));
     }
-    mem.previous_pod_failure = plan.backoff == BackoffSignal::Bump;
     mem.create_backoff = match plan.backoff {
         BackoffSignal::Bump => {
             let step = mem
@@ -320,6 +330,15 @@ pub(super) fn remember(
     mem.pending
         .extend(report.created.iter().map(|p| (p.clone(), now)));
 
+    // The plan deadline and the end of a running create backoff. A lapsed
+    // backoff is kept until a pod turns Ready, but it is no longer a deadline.
+    let backoff_until = mem.create_backoff.map(|(t, _)| t).filter(|t| *t > now);
+    let deadline = [plan.requeue_at, backoff_until]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|t| t.duration_since(now).try_into().unwrap_or(Duration::ZERO));
+
     let failed = !report.errors.is_empty()
         || Plan::requeue_after_outcomes(&report.creates) == Requeue::ErrorBackoff;
     if failed {
@@ -327,17 +346,14 @@ pub(super) fn remember(
             .error_backoff
             .map_or(ERROR_BACKOFF_MIN, |d| (d * 2).min(ERROR_BACKOFF_MAX));
         mem.error_backoff = Some(next);
-        return Some(next);
+        // A failing call must not delay an expiry or timeout due sooner.
+        return Some(deadline.map_or(next, |d| d.min(next)));
     }
     mem.error_backoff = None;
     if Plan::requeue_after_outcomes(&report.creates) == Requeue::Immediately {
         return Some(Duration::ZERO);
     }
-    let mut at = plan.requeue_at;
-    if let Some((until, _)) = mem.create_backoff {
-        at = Some(at.map_or(until, |t| t.min(until)));
-    }
-    at.map(|t| t.duration_since(now).try_into().unwrap_or(Duration::ZERO))
+    deadline
 }
 
 fn template_check(pool: &BuildKitPool) -> TemplateCheck {
@@ -424,19 +440,71 @@ mod tests {
             BTreeSet::from(["u".into()]),
             now,
         );
-        assert_eq!(mem.sandbox_generation, Some(1));
+        assert_eq!(mem.sandbox_applied, Some((1, now)));
         assert!(mem.create_backoff.is_some() && mem.error_backoff.is_some());
         // With the same uid the entry is kept.
         mem.adopt("uid-old");
-        assert_eq!(mem.sandbox_generation, Some(1));
+        assert_eq!(mem.sandbox_applied, Some((1, now)));
         assert_eq!(mem.slot_holds.len(), 1);
         // A pool recreated under the same name carries nothing over, so the new
         // pool gets its SA and NetworkPolicy applied again.
         mem.adopt("uid-new");
         assert_eq!(mem.uid.as_deref(), Some("uid-new"));
-        assert_eq!(mem.sandbox_generation, None);
+        assert_eq!(mem.sandbox_applied, None);
         assert!(mem.slot_holds.is_empty() && mem.recent_creates.is_empty());
         assert!(mem.create_backoff.is_none() && mem.error_backoff.is_none());
-        assert!(!mem.previous_pod_failure && mem.ready.is_empty() && mem.pending.is_empty());
+        assert!(mem.ready.is_empty() && mem.pending.is_empty());
+    }
+
+    /// RECON-1: a pod counts as down only once it was seen up in this term;
+    /// it keeps the time it was first seen down until it comes back or leaves.
+    #[test]
+    fn down_since_tracks_pods_that_were_up() {
+        use crate::reconcile::tests::pod;
+        let t0 = Timestamp::from_second(1_790_000_000).unwrap();
+        let t = |s| t0 + SignedDuration::from_secs(s);
+        let unready = |slot| crate::reconcile::pods::WorkerPod {
+            ready: false,
+            ..pod(slot)
+        };
+        let mut mem = PoolMemory::default();
+        // p-0 is up, p-1 never was.
+        mem.observe_up(&[pod(0), unready(1)], t(0));
+        assert!(mem.down_since.is_empty());
+        mem.observe_up(&[unready(0), unready(1)], t(10));
+        mem.observe_up(&[unready(0), unready(1)], t(20));
+        assert_eq!(mem.down_since, [("uid-0".to_owned(), t(10))].into());
+        // Back up clears it; gone forgets it.
+        mem.observe_up(&[pod(0)], t(30));
+        assert!(mem.down_since.is_empty());
+        mem.observe_up(&[], t(40));
+        assert!(mem.seen_up.is_empty());
+    }
+
+    /// A create backoff that has run out is kept until a pod turns Ready, but
+    /// it is no deadline: it used to requeue the pool at once, every pass.
+    #[test]
+    fn a_lapsed_create_backoff_does_not_requeue_at_once() {
+        let now = Timestamp::from_second(1_790_000_000).unwrap();
+        let pool = fixtures::pool("p", serde_json::json!({})).unwrap();
+        let plan = Plan {
+            actions: Vec::new(),
+            requeue_at: None,
+            backoff: BackoffSignal::Keep,
+            slot_holds: std::collections::BTreeMap::new(),
+        };
+        let mut mem = PoolMemory {
+            create_backoff: Some((
+                now - SignedDuration::from_secs(1),
+                SignedDuration::from_secs(10),
+            )),
+            ..PoolMemory::default()
+        };
+        let report = Report::default();
+        assert_eq!(
+            remember(&mut mem, &pool, &plan, &report, BTreeSet::new(), now),
+            None
+        );
+        assert!(mem.create_backoff.is_some());
     }
 }

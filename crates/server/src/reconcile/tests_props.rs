@@ -199,9 +199,14 @@ proptest! {
                     prop_assert!(reason_holds(w, *reason, max_u, ca_valid, conflict), "{:?} {:?}", w, reason);
                     prop_assert!(w.deletion.is_none() && retired.insert(uid.clone()));
                 }
-                Action::DeleteDraining { pod, .. } | Action::ForceDelete { pod, .. } => {
+                Action::DeleteDraining { pod, .. } => {
                     let w = pods.iter().find(|w| &w.name == pod).unwrap();
                     prop_assert_eq!(&w.alloc, &Alloc::Draining);
+                }
+                // Any owned terminating pod may be forced, never one with an unknown `P alloc`.
+                Action::ForceDelete { pod, .. } => {
+                    let w = pods.iter().find(|w| &w.name == pod).unwrap();
+                    prop_assert!(w.deletion.is_some() && w.alloc != Alloc::Unknown);
                 }
                 _ => {}
             }
