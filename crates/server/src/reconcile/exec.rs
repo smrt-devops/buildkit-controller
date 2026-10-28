@@ -16,7 +16,7 @@ use time::OffsetDateTime;
 use tokio::time::Instant;
 
 use super::ops::{KubeOps, OpError, OpResult};
-use super::plan::{Action, CaEvent, CreateOutcome, CreateResult, Plan};
+use super::plan::{Action, CaEvent, CreateOutcome, CreateResult, Plan, REAPPLY_AFTER};
 use super::spawn::{self, PodCreated, PodOutcome};
 use crate::pki::{CaBundle, LoadOutcome};
 use crate::render::{self, CONTROLLER, LABEL_MANAGED_BY, RenderConfig};
@@ -34,10 +34,13 @@ pub struct CaGuard(std::sync::Mutex<CaDone>);
 struct CaDone {
     /// Epoch whose create/replace already ran, lost a race, or is in flight.
     replaced: Option<u64>,
-    /// Epoch whose bundle `ConfigMap` was applied.
-    bundle: Option<u64>,
+    /// Epoch whose bundle `ConfigMap` was applied, and when.
+    bundle: Option<(u64, Timestamp)>,
     /// Epoch whose bundle apply is in flight.
     bundle_inflight: Option<u64>,
+    /// Highest epoch whose bundle apply started. An older epoch's apply is
+    /// skipped, and one that lands after it started is applied again.
+    bundle_newest: u64,
     /// When each recent CA create or replace succeeded (self-heal rate limit).
     heals: VecDeque<Instant>,
 }
@@ -63,14 +66,22 @@ enum Claim {
     Paused { heals: usize },
 }
 
+impl CaDone {
+    fn bundle_current(&self, epoch: u64, now: Timestamp) -> bool {
+        self.bundle
+            .is_some_and(|(e, at)| e == epoch && at + REAPPLY_AFTER > now)
+    }
+}
+
 impl CaGuard {
     fn done(&self) -> std::sync::MutexGuard<'_, CaDone> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The bundle `ConfigMap` matches the CA of `epoch`.
-    pub fn bundle_current(&self, epoch: u64) -> bool {
-        self.done().bundle == Some(epoch)
+    /// The bundle `ConfigMap` was applied for the CA of `epoch` less than
+    /// [`REAPPLY_AFTER`] before `now`.
+    pub fn bundle_current(&self, epoch: u64, now: Timestamp) -> bool {
+        self.done().bundle_current(epoch, now)
     }
 
     fn claim_heal(&self, epoch: u64) -> Claim {
@@ -127,8 +138,6 @@ pub struct Env<'a> {
     pub worker_cert_validity: time::Duration,
     /// `POD_NAME`, the Event `reportingInstance`.
     pub replica: &'a str,
-    /// `config_hash(buildkitdConfig)`.
-    pub config_hash: &'a str,
     /// Clock of the pass.
     pub now: Timestamp,
 }
@@ -278,6 +287,21 @@ pub async fn execute<O: KubeOps>(ops: &O, guard: &CaGuard, env: &Env<'_>, plan: 
                     }
                 }
             }
+        }
+    }
+    // The planner patches the status only when it changed, so a failed apply
+    // under an unchanged status would leave `Ready=True` standing.
+    if let (Some(why), None) = (&apply_failed, &r.status_sent) {
+        let mut status = env.pool.status.clone().unwrap_or_default();
+        status.waiters.clear();
+        let planned = status.clone();
+        downgrade_ready(&mut status, env, reason::SANDBOX_PENDING, why);
+        if status != planned {
+            r.trace.push("patch_status".into());
+            if let Err(e) = ops.patch_status(&ns, &pool, &status).await {
+                r.errors.push(format!("status: {e}"));
+            }
+            r.status_sent = Some(status);
         }
     }
     r.sandbox_applied = sa_ok == Some(true) && np_ok == Some(true);
@@ -564,27 +588,40 @@ async fn apply_bundle<O: KubeOps>(ops: &O, guard: &CaGuard, env: &Env<'_>, r: &m
     let LoadOutcome::Valid(ca) = env.ca else {
         return false;
     };
+    let epoch = env.ca_epoch;
     {
         let mut d = guard.done();
-        if d.bundle == Some(env.ca_epoch) {
+        if d.bundle_current(epoch, env.now) {
             return true;
         }
-        // Another pass is applying it for this epoch.
-        if d.bundle_inflight == Some(env.ca_epoch) {
+        // Another pass is applying it for this epoch, or this pass read a CA
+        // that a newer epoch replaced.
+        if d.bundle_inflight == Some(epoch) || d.bundle_newest > epoch {
             return false;
         }
-        d.bundle_inflight = Some(env.ca_epoch);
+        d.bundle_inflight = Some(epoch);
+        d.bundle_newest = epoch;
     }
     let cm =
         render::ca_bundle_config_map(env.ca_secret_name, env.render, ca.client_ca().cert_pem());
     let res = ops.apply(&cm).await;
     let mut d = guard.done();
-    if d.bundle_inflight == Some(env.ca_epoch) {
+    if d.bundle_inflight == Some(epoch) {
         d.bundle_inflight = None;
     }
     match res {
+        // A newer epoch's apply started meanwhile and may have landed first,
+        // so the ConfigMap may hold the old CA. Forget the record so the
+        // newest CA is applied again; the error requeues the pass.
+        Ok(()) if d.bundle_newest > epoch => {
+            d.bundle = None;
+            r.errors.push(format!(
+                "applied the CA bundle of replaced epoch {epoch}; applying the current one again"
+            ));
+            false
+        }
         Ok(()) => {
-            d.bundle = Some(env.ca_epoch);
+            d.bundle = Some((epoch, env.now));
             true
         }
         Err(e) => {

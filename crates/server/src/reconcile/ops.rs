@@ -384,7 +384,8 @@ impl<O: KubeOps> Timed<O> {
     }
 
     /// The wrapped ops.
-    pub fn inner(&self) -> &O {
+    #[cfg(test)]
+    pub(super) fn inner(&self) -> &O {
         &self.inner
     }
 
