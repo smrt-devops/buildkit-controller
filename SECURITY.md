@@ -13,7 +13,7 @@ Do not open a public issue. Email security@smrt-devops.net with the affected ver
 - Callers authenticate with an OIDC token from a configured issuer or a Kubernetes ServiceAccount token with the controller's audience. A pool's `spec.access.rules` then authorizes them, and an empty list denies everyone.
 - An allocation certificate lasts as long as the allocation, at most 24 hours. The caller generates the key. A BuildKitClaim is the exception: the controller generates its key and writes it to the claim's Secret in the claim's namespace.
 - Each worker pod serves one allocation. The pod runs rootless buildkitd as a non-root user, has its own ServiceAccount with no token mounted, and sits behind a NetworkPolicy that denies private, link-local and cloud-metadata ranges by default (`workerNetwork.deniedCIDRs`).
-- Workers accept only mTLS connections from the controller's edge. The edge accepts only certificates signed by the controller's client CA for a live allocation.
+- Workers accept only mTLS connections from the controller's edge. The edge accepts only certificates signed by the controller's client CA for a live allocation. The edge checks that the certificate's pod exists and still holds the allocation while it verifies the certificate, and rustls does that before it checks the client's proof of the private key. Someone with a copy of an allocation certificate but not its key can therefore learn from the TLS alert whether that allocation is still live, and can add to its refusal metrics. The handshake still fails without the key, so this gives no access.
 - Tokens, private keys, certificate PEMs and Secret data are never logged.
 
 The two CAs and the per-pod worker identity are described in [docs/architecture.md](docs/architecture.md#two-cas).
