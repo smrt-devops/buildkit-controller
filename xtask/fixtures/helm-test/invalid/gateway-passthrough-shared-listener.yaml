@@ -1,0 +1,7 @@
+# expect: the API and edge TLSRoutes would both match SNI bk.example.com
+# Passthrough API and edge on the same listener with the same SNI: the gateway could
+# send edge (mTLS) connections to the API port.
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+gateway:
+  parentRefs: [{name: shared, namespace: gateway-system}]
+  api: {mode: passthrough}

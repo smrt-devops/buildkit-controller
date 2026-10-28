@@ -56,3 +56,4 @@ priorityClassName: system-cluster-critical
 claims:
   enabled: true
   namespaces: [ci, team-b]
+gateway: {enabled: false}

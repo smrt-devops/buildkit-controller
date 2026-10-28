@@ -7,6 +7,9 @@ logFormat: text
 service:
   type: NodePort
   nodePorts: {api: 30443, edge: 30444}
+# Straight to the controller's NodePorts, so the test sees each replica drain its own
+# connections. A gateway in between would hold the client side open.
+gateway: {enabled: false}
 # Long enough that a Lease move inside it shows the Lease went before the listeners.
 shutdown: {delay: 10s}
 edge:

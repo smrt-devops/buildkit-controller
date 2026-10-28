@@ -1,7 +1,13 @@
 //! `cargo xtask helm-test` runs `helm lint` and compares `helm template` output
 //! with golden files for each values file under `xtask/fixtures/helm-test`. It
 //! also checks that the chart rejects every file under `invalid/`, through
-//! `values.schema.json` or `required`. `--update` rewrites the goldens.
+//! `values.schema.json`, `required` or `fail`. An invalid file whose first line
+//! is `# expect: <text>` must fail with an error that contains that text, so it
+//! cannot pass by failing for another reason. `--update` rewrites the goldens.
+//!
+//! `helm template` runs as if the cluster served the Gateway API and Envoy
+//! Gateway kinds the chart renders only when they exist ([`API_VERSIONS`]), so
+//! the goldens show them. `helm lint` takes no API versions and skips them.
 
 use std::path::Path;
 
@@ -11,12 +17,32 @@ use crate::{root, yaml_files};
 
 const CHART: &str = "helm/buildkit-controller";
 const FIXTURES: &str = "xtask/fixtures/helm-test";
+/// Kinds the chart renders only when the cluster serves them.
+const API_VERSIONS: [&str; 4] = [
+    "gateway.networking.k8s.io/v1/HTTPRoute",
+    "gateway.networking.k8s.io/v1/BackendTLSPolicy",
+    "gateway.networking.k8s.io/v1/TLSRoute",
+    "gateway.envoyproxy.io/v1alpha1/BackendTrafficPolicy",
+];
+
+/// The text after `# expect:` on the first line of `values`, if any.
+fn expected_error(values: &Path) -> Result<Option<String>> {
+    let text = std::fs::read_to_string(values).with_context(|| values.display().to_string())?;
+    Ok(text
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("# expect:"))
+        .map(|s| s.trim().to_owned()))
+}
 
 fn helm(root: &Path, sub: &str, values: &Path) -> Result<std::process::Output> {
     let mut c = crate::kube::helm(&crate::kube::sandbox());
     c.current_dir(root).arg(sub);
     if sub == "template" {
         c.args(["bk", CHART, "--namespace", "buildkit-system"]);
+        for v in API_VERSIONS {
+            c.args(["--api-versions", v]);
+        }
     } else {
         c.arg(CHART);
     }
@@ -63,8 +89,15 @@ pub(crate) fn helm_test(update: bool) -> Result<()> {
             .file_stem()
             .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
         let out = helm(&root, "template", &values)?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
         if out.status.success() {
             failures.push(format!("invalid/{name}: was accepted"));
+        } else if let Some(want) = expected_error(&values)?
+            && !stderr.contains(&want)
+        {
+            failures.push(format!(
+                "invalid/{name}: rejected without {want:?}: {stderr}"
+            ));
         } else {
             println!("PASS invalid/{name} rejected");
             passed += 1;

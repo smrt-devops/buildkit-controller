@@ -1,0 +1,3 @@
+# expect: gateway.parentRefs is required
+# The default exposure is a Gateway, and no parentRefs and no LoadBalancer leaves nothing to attach to.
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}

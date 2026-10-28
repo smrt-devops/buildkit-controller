@@ -10,3 +10,4 @@ pools:
   - name: small
     namespace: ci-builders
     spec: {}
+gateway: {enabled: false}

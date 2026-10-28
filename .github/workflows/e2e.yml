@@ -29,7 +29,8 @@ jobs:
       - run: cargo xtask e2e
 
   # The real GitHub Action with this job's OIDC token, against a kind install
-  # that trusts GitHub's issuer for this repository only.
+  # that trusts GitHub's issuer for this repository only. The install sits behind
+  # Envoy Gateway; target/e2e/api-ca.pem is the Gateway's self-signed certificate.
   action:
     if: >-
       github.event_name != 'schedule' &&
@@ -77,6 +78,8 @@ jobs:
         run: |
           kubectl --kubeconfig target/e2e/kubeconfig get pods -A
           kubectl --kubeconfig target/e2e/kubeconfig -n bk-system logs deploy/buildkit-controller --tail=100
+          kubectl --kubeconfig target/e2e/kubeconfig get gateway,httproute,tlsroute,backendtlspolicy -A -o yaml
+          kubectl --kubeconfig target/e2e/kubeconfig -n envoy-gateway-system logs deploy/envoy-gateway --tail=100
 
   # Cert-lifecycle soak (cargo xtask soak). Long: nightly and on demand only.
   soak:

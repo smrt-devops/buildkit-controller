@@ -13,22 +13,30 @@ This page installs the controller, creates a pool and runs one build with the Gi
 
 ### On a real cluster
 
-Pick a DNS name for the load balancer, install, then point the name at the Service address.
+The chart exposes the controller through a Gateway API Gateway: an HTTPRoute for the API and a TLS passthrough TLSRoute for the edge. You need the Gateway API v1.5.0 or later standard-channel CRDs, an implementation that supports TLSRoute, and a Gateway with two listeners: HTTPS for the API, with a certificate for your DNS name, and TLS in Passthrough mode for the edge. [helm/README.md](../helm/README.md#exposure) has an Envoy Gateway example and the list of implementations. This page assumes a Gateway `bk` in namespace `gateway-system` with the API on 443 and the edge on 8444.
+
+Pick a DNS name, install, then point the name at the Gateway's address.
 
 ```sh
 helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
   --set edge.endpoint=tcp://bk.example.com:8444 --set edge.serverName=bk.example.com \
+  --set-json 'gateway.api.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"api"}]' \
+  --set-json 'gateway.edge.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"edge"}]' \
   --set 'watchNamespaces={ci}' \
   --set 'auth.oidc[0].url=https://token.actions.githubusercontent.com' \
   --set 'auth.oidc[0].audiences={buildkit-controller}'
-kubectl get svc -n buildkit-system
+kubectl get httproute,tlsroute -n buildkit-system
 ```
 
-`watchNamespaces` lists the namespaces that hold pools (`ci`, created in step 2). The chart grants the controller pod and Secret access in those namespaces only, and the controller ignores pools anywhere else. Leave it out and the controller serves every namespace through a ClusterRole that can create pods and Secrets anywhere, kube-system included. The chart refuses to render without `edge.endpoint` and `edge.serverName`. The API listens on 8443 and the edge on 8444. Without `auth.oidc`, only ServiceAccount tokens authenticate. Some load balancers need a higher idle timeout. See [helm/README.md](../helm/README.md).
+`watchNamespaces` lists the namespaces that hold pools (`ci`, created in step 2). The chart grants the controller pod and Secret access in those namespaces only, and the controller ignores pools anywhere else. Leave it out and the controller serves every namespace through a ClusterRole that can create pods and Secrets anywhere, kube-system included. The chart refuses to render without `edge.endpoint`, `edge.serverName` and `gateway.parentRefs`. The API URL is `https://bk.example.com`, and `edge.endpoint` must be the Gateway's edge listener. Without `auth.oidc`, only ServiceAccount tokens authenticate.
+
+Behind a gateway every client reaches the controller from the gateway's addresses, so the per-address caps apply to all clients together. Raise `edge.maxHandshakesPerIp`, `api.maxConnectionsPerIp` and `auth.serviceAccount.maxReviewsPerIp`, or set them to 0, before many jobs start at once (see [operations.md](operations.md#exposure)).
+
+Without a Gateway, or where the managed gateway has no TLS passthrough (GKE's managed Gateway, the AWS Load Balancer Controller), use a load balancer instead: replace the two `parentRefs` flags with `--set service.type=LoadBalancer`, point the DNS name at the Service address from `kubectl get svc -n buildkit-system`, and use `https://bk.example.com:8443` as the API URL. Some load balancers need a higher idle timeout. See [helm/README.md](../helm/README.md#load-balancer-idle-timeout).
 
 ### On kind
 
-kind has no load balancer, so use a port-forward and a local name. kind's default CNI, kindnet, does not enforce NetworkPolicy, so this cluster suits a trial with trusted builds only.
+kind has no load balancer, so this installs without exposure and uses a port-forward and a local name. kind's default CNI, kindnet, does not enforce NetworkPolicy, so this cluster suits a trial with trusted builds only.
 
 ```sh
 kind create cluster --name bk
@@ -36,7 +44,7 @@ cargo xtask image --tag buildkit-controller:dev --load-kind bk
 helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
   --set fullnameOverride=buildkit-controller \
   --set image.repository=buildkit-controller --set image.tag=dev \
-  --set service.type=ClusterIP --set replicaCount=1 \
+  --set gateway.enabled=false --set replicaCount=1 \
   --set 'watchNamespaces={ci}' \
   --set edge.endpoint=tcp://localhost:8444 --set edge.serverName=localhost
 kubectl -n buildkit-system port-forward svc/buildkit-controller 8443:8443 8444:8444 &
@@ -79,22 +87,24 @@ steps:
   - uses: actions/checkout@v4
   - uses: smrt-devops/buildkit-controller/action@v0
     with:
-      url: https://bk.example.com:8443
+      url: https://bk.example.com   # https://bk.example.com:8443 with a LoadBalancer
       pools: ci/amd64
-      ca-cert: ${{ vars.BK_CA }}   # the controller's CA; see below
+      # ca-cert: ${{ vars.BK_CA }}   # only when the API certificate is not publicly trusted; see below
   - run: docker buildx build .
 ```
 
 Inputs are `url`, `pools` (one `namespace/pool` per entry), `ttl`, `queue-timeout`, `audience` (default `buildkit-controller`), `builder-name` and `ca-cert`. The outputs are `builder`, `platforms` and `allocation-ids`. The post step removes the builder and releases every allocation even when the job fails.
 
-By default the edge serves a certificate issued by the controller's client CA. To trust it, read the CA from the ConfigMap the leader maintains and store it in the `BK_CA` variable that the workflow passes as `ca-cert`.
+Behind the Gateway, the API presents the Gateway's certificate. When that certificate is publicly trusted, the Action needs no `ca-cert`. The edge always passes through to the controller, and the Action trusts the CA that comes with each allocation.
+
+With a LoadBalancer, or `gateway.api.mode: passthrough`, the API serves the controller's own certificate, issued by its client CA. To trust it, read the CA from the ConfigMap the leader maintains and store it in the `BK_CA` variable that the workflow passes as `ca-cert`.
 
 ```sh
 kubectl -n buildkit-system get configmap buildkit-controller-ca-bundle -o 'jsonpath={.data.ca\.crt}' \
   | gh variable set BK_CA --repo <owner>/<repo>
 ```
 
-Use a certificate from a public CA, through `edge.tls.secretName`, to skip this step.
+To skip this step, give the controller a certificate from a public CA through `edge.tls.secretName`. If the Gateway's own certificate comes from a private CA, store that CA in `BK_CA` instead.
 
 ## 4. First build with curl
 
@@ -104,7 +114,8 @@ On a cluster, a ServiceAccount token is the simplest credential. The pool above 
 
 ```sh
 export TOKEN=$(kubectl -n ci create token builder --audience buildkit-controller)
-export API=https://bk.example.com:8443 POOL=ci/dev   # https://localhost:8443 on kind
+export API=https://bk.example.com POOL=ci/dev   # :8443 with a LoadBalancer, https://localhost:8443 on kind
+# Only when the API serves the controller's certificate (LoadBalancer, passthrough, kind):
 kubectl -n buildkit-system get configmap buildkit-controller-ca-bundle -o 'jsonpath={.data.ca\.crt}' > /tmp/bk-ca.pem
 export API_CA=/tmp/bk-ca.pem
 sh docs/ci/buildkit-allocate.sh sh -c 'docker buildx build --builder "$BUILDER" .'

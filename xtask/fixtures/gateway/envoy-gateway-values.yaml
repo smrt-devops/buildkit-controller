@@ -1,0 +1,11 @@
+# Envoy Gateway on kind for the e2e tests (`xtask/src/gateway.rs` pins the chart).
+# The harness loads the images into kind (gateway.yaml names the Envoy image), so
+# nothing is pulled in the cluster. It also applies the Gateway API standard-channel
+# CRDs itself, so the chart's CRDs are off.
+global:
+  images:
+    envoyGateway:
+      image: docker.io/envoyproxy/gateway:v1.9.3
+      pullPolicy: IfNotPresent
+crds:
+  enabled: false

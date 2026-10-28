@@ -1,0 +1,12 @@
+# API by TLS passthrough (TLSRoute), each route on its own listener.
+edge:
+  endpoint: tcp://bk.example.com:443
+  serverName: bk.example.com
+  allocationDomain: alloc.bk.example.com
+gateway:
+  api:
+    mode: passthrough
+    parentRefs: [{name: shared, namespace: gateway-system, sectionName: bk-api}]
+    hostnames: [api.bk.example.com]
+  edge:
+    parentRefs: [{name: shared, namespace: gateway-system, sectionName: bk-edge}]

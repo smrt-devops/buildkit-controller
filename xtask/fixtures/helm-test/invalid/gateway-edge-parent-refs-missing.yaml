@@ -1,0 +1,4 @@
+# expect: gateway.edge.parentRefs (or gateway.parentRefs) is required
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+gateway:
+  api: {parentRefs: [{name: shared, namespace: gateway-system, sectionName: https}]}

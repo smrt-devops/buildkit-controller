@@ -1,8 +1,9 @@
 # Values for `cargo xtask helm-verify`. It installs the real chart on kind,
-# scoped to two pool namespaces, with claims served from one more.
+# scoped to two pool namespaces, with claims served from one more. It covers the
+# LoadBalancer exposure: no gateway.parentRefs, so the chart renders no routes.
 image: {repository: buildkit-controller, tag: dev, pullPolicy: Never}
 replicaCount: 2
-service: {type: ClusterIP}
+service: {type: LoadBalancer}
 shutdown: {delay: 0s, drainTimeout: 30s}
 logFormat: text
 edge:

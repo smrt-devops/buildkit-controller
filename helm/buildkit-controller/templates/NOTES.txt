@@ -1,18 +1,70 @@
 buildkit-controller {{ .Chart.AppVersion }} installed in {{ .Release.Namespace }}.
+{{- $fn := include "bkc.fullname" . }}
+{{- $gw := .Values.gateway }}
+{{- $plan := include "bkc.gateway" . | fromJson }}
+{{- $ca := printf "kubectl -n %s get configmap %s-ca-bundle -o 'jsonpath={.data.ca\\.crt}' > bk-ca.pem" .Release.Namespace $fn }}
+{{- if $plan.missing }}
 
-API URL (HTTPS, port {{ .Values.service.ports.api }}):
-{{- if eq .Values.service.type "LoadBalancer" }}
-  export HOST=$(kubectl -n {{ .Release.Namespace }} get svc {{ include "bkc.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}')
+WARNING: this cluster does not serve gateway.networking.k8s.io/v1 {{ join ", " $plan.missing }},
+so the chart rendered no route that needs it and the controller is not reachable through
+the Gateway. HTTPRoute is in Gateway API v1.0+, BackendTLSPolicy in v1.4+ and TLSRoute in
+v1.5+, all in the standard channel. Install the Gateway API CRDs your implementation
+supports, then run helm upgrade. With helm template, pass them with --api-versions, e.g.
+--api-versions gateway.networking.k8s.io/v1/TLSRoute.
+{{- end }}
+{{- if $plan.apiUnpinned }}
+
+WARNING: a gateway.api.parentRefs entry (or gateway.parentRefs) names no sectionName or
+port, so the HTTPRoute attaches to every HTTP and HTTPS listener of that Gateway that
+admits it. On a plain HTTP listener the API, and the bearer tokens clients send to it,
+would travel in cleartext. Set sectionName to the HTTPS listener.
+{{- end }}
+{{- if $plan.envoyMissing }}
+
+WARNING: gateway.envoy.enabled is set, but this cluster does not serve
+gateway.envoyproxy.io/v1alpha1 BackendTrafficPolicy, so the chart rendered no Envoy policies.
+{{- end }}
+{{- if $plan.apiRefs }}
+
+API URL (HTTPS) through the Gateway, {{ ternary "TLS terminated at the gateway (HTTPRoute)" "TLS passthrough (TLSRoute)" (eq $gw.api.mode "terminate") }}:
+  https://{{ first $plan.apiHostnames }}:<listener port>
+Point DNS for {{ join ", " $plan.apiHostnames }} at the Gateway address. Check the route:
+  kubectl -n {{ .Release.Namespace }} get {{ ternary "httproute,backendtlspolicy" "tlsroute" (eq $gw.api.mode "terminate") }} {{ $fn }}-api -o yaml
+{{- if eq $gw.api.mode "terminate" }}
+Clients trust the gateway's certificate; with a publicly trusted one they need no CA.
+{{- end }}
+{{- else if eq .Values.service.type "LoadBalancer" }}
+
+API URL (HTTPS, port {{ .Values.service.ports.api }}) on the Service load balancer:
+  export HOST=$(kubectl -n {{ .Release.Namespace }} get svc {{ $fn }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}')
   echo "https://$HOST:{{ .Values.service.ports.api }}"
 {{- else if eq .Values.service.type "NodePort" }}
-  kubectl -n {{ .Release.Namespace }} get svc {{ include "bkc.fullname" . }}   # <node address>:<api nodePort>
+
+API URL (HTTPS) on a node port:
+  kubectl -n {{ .Release.Namespace }} get svc {{ $fn }}   # <node address>:<api nodePort>
 {{- else }}
-  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "bkc.fullname" . }} {{ .Values.service.ports.api }}:{{ .Values.service.ports.api }}
-  # then https://localhost:{{ .Values.service.ports.api }}
+
+API URL (HTTPS), in-cluster only:
+  https://{{ $fn }}.{{ .Release.Namespace }}.svc:{{ .Values.service.ports.api }}
+  or: kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $fn }} {{ .Values.service.ports.api }}:{{ .Values.service.ports.api }}
+{{- end }}
+{{- if not (and $plan.apiRefs (eq $gw.api.mode "terminate")) }}
+The API serves the controller's certificate. Unless edge.tls.secretName is publicly trusted,
+clients need its CA (the Action's ca-cert, the recipe's API_CA):
+  {{ $ca }}
 {{- end }}
 
-The edge endpoint returned to clients is {{ .Values.edge.endpoint }}; point DNS for
-{{ .Values.edge.serverName }} at the Service's edge port ({{ .Values.service.ports.edge }}).
+The edge endpoint returned to clients is {{ .Values.edge.endpoint }}.
+{{- if $plan.edgeRefs }}
+Point DNS for {{ join ", " $plan.edgeHostnames }} at the Gateway's TLS passthrough listener; that
+address and port must match edge.endpoint. Check the route:
+  kubectl -n {{ .Release.Namespace }} get tlsroute {{ $fn }}-edge -o yaml
+Every client now reaches the controller from the gateway's addresses, so the per-address
+caps (edge.maxHandshakesPerIp {{ .Values.edge.maxHandshakesPerIp }}, api.maxConnectionsPerIp {{ .Values.api.maxConnectionsPerIp }},
+auth.serviceAccount.maxReviewsPerIp {{ .Values.auth.serviceAccount.maxReviewsPerIp }}) apply to all clients together. Raise them or set 0.
+{{- else }}
+Point DNS for {{ .Values.edge.serverName }} at the Service's edge port ({{ .Values.service.ports.edge }}).
+{{- end }}
 {{- if .Values.auth.oidc }}
 
 OIDC issuers configured:

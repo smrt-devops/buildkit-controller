@@ -1,0 +1,40 @@
+# Envoy Gateway extras, a public edge certificate trusted through the system
+# roots, and extra manifests as an object and as a template string.
+edge:
+  endpoint: tcp://bk.example.com:8444
+  serverName: bk.example.com
+  allocationDomain: alloc.bk.example.com
+  tls: {secretName: bk-public}
+  maxHandshakesPerIp: 0
+api: {maxConnectionsPerIp: 0}
+auth:
+  serviceAccount: {maxReviewsPerIp: 0}
+gateway:
+  parentRefs: [{name: eg, namespace: envoy-gateway-system}]
+  annotations: {example.com/owner: ci}
+  labels: {exposure: gateway}
+  api:
+    hostnames: [bk.example.com, buildkit.example.com]
+    timeouts: {request: 1h40m, backendRequest: 1h40m}
+    backendTLS: {wellKnownCACertificates: System}
+  envoy:
+    enabled: true
+    connectTimeout: 5s
+    tcpKeepalive: {idleTime: 60s, interval: 15s, probes: 4}
+  extraManifests:
+    - apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata: {name: bk-from-gateway, namespace: buildkit-system}
+      spec:
+        podSelector: {matchLabels: {app.kubernetes.io/name: buildkit-controller}}
+        policyTypes: [Ingress]
+        ingress:
+          - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: envoy-gateway-system}}}]
+            ports: [{port: 8443}, {port: 8444}]
+    - |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ include "bkc.fullname" . }}-exposure
+        namespace: {{ .Release.Namespace }}
+      data: {mode: envoy}

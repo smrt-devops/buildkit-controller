@@ -1,11 +1,13 @@
 //! `cargo xtask helm-verify` installs the chart on a throwaway kind cluster
-//! with `watchNamespaces` set to two pool namespaces and checks that both
-//! replicas are Ready, exactly one is the leader, and `/readyz` returns 200 on
-//! every replica. It then checks that the pool in each watched namespace is
-//! Ready with its warm pod and binds a claim, that a pool in a third namespace
-//! is ignored, that the controller cannot create pods or Secrets in that
-//! namespace or in kube-system, and that its logs show no RBAC denial. The
-//! controller namespace enforces `PodSecurity` "restricted".
+//! with `watchNamespaces` set to two pool namespaces and the `LoadBalancer`
+//! exposure. It checks that the Service is a load balancer and the release has
+//! no Gateway API routes, that both replicas are Ready, exactly one is the
+//! leader, and `/readyz` returns 200 on every replica. It then checks that the
+//! pool in each watched namespace is Ready with its warm pod and binds a claim,
+//! that a pool in a third namespace is ignored, that the controller cannot
+//! create pods or Secrets in that namespace or in kube-system, and that its logs
+//! show no RBAC denial. The controller namespace enforces `PodSecurity`
+//! "restricted".
 //!
 //! The cluster name is `bk-helm-verify`, plus `-$BK_KIND_SUFFIX` when that is set.
 //! Every kind, kubectl and helm call uses the private kubeconfig under
@@ -187,6 +189,27 @@ fn verify(env: &Env) -> Result<()> {
         ],
     )?;
     println!("installed chart");
+
+    // LoadBalancer exposure: the Service is the load balancer and no route is rendered.
+    let svc_type = env.kubectl(&[
+        "get",
+        "svc",
+        "buildkit-controller",
+        "-n",
+        NS,
+        "-o",
+        "jsonpath={.spec.type}",
+    ])?;
+    ensure!(
+        svc_type == "LoadBalancer",
+        "Service type {svc_type}, want LoadBalancer"
+    );
+    let manifest = env.tool("helm", &["get", "manifest", "bk", "-n", NS])?;
+    ensure!(
+        !manifest.contains("gateway.networking.k8s.io"),
+        "LoadBalancer mode rendered Gateway API objects:\n{manifest}"
+    );
+    println!("PASS LoadBalancer exposure: Service type LoadBalancer, no Gateway API objects");
 
     let pods = until("two Ready replicas", Duration::from_mins(2), || {
         let names = env.kubectl(&[
