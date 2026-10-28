@@ -21,7 +21,10 @@ pub struct CreateAllocationRequest {
     /// Longest time to wait in the queue. Defaults to the pool's `allocation.queueTimeout` and may not exceed `maxQueueTimeout`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_timeout_seconds: Option<u64>,
-    /// PEM SPKI ECDSA P-256 public key. When set, the server returns no private key.
+    /// PEM SPKI ECDSA P-256 public key of a key pair the client generated. Required on the
+    /// HTTP API (400 `invalid_request` without it), so the private key never leaves the
+    /// client. Only the in-cluster `BuildKitClaim` controller allocates without one, and the
+    /// server then generates the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
     /// Cache key of both cache layers. Defaults to the pool's `registry.defaultKey`, else its name.
@@ -128,7 +131,8 @@ pub struct AllocationResponse {
     pub ca_cert: Option<String>,
     /// Allocation client certificate (PEM, no chain).
     pub client_cert: String,
-    /// PKCS#8 PEM private key. The server omits it when the request carried a `publicKey`.
+    /// PKCS#8 PEM private key the server generated. Never present on the HTTP API, which
+    /// requires a `publicKey`; only the `BuildKitClaim` path fills it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_key: Option<String>,
     /// RFC 3339 UTC expiry.
@@ -195,7 +199,7 @@ pub struct PoolList {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
-    /// HTTP 400 for bad JSON, an unknown field, a TTL out of range or a bad `publicKey`.
+    /// HTTP 400 for bad JSON, an unknown field, a TTL out of range, or a missing or bad `publicKey`.
     InvalidRequest,
     /// HTTP 401 for a missing or invalid token.
     Unauthenticated,

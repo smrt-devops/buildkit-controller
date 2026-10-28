@@ -495,7 +495,7 @@ async fn no_access_is_identical_to_a_missing_pool() {
         post(
             Some(ALICE),
             "application/json",
-            r#"{"namespace":"render-verify","pool":"zz"}"#,
+            r#"{"namespace":"render-verify","pool":"zz","publicKey":"pk"}"#,
         ),
     )
     .await;
@@ -991,6 +991,11 @@ async fn pre_allocate_refusals_are_counted_once_each() {
             "application/json",
             r#"{"namespace":"a","pool":"b","x":1}"#,
         ),
+        post(
+            Some(ALICE),
+            "application/json",
+            r#"{"namespace":"render-verify","pool":"a"}"#,
+        ),
         // Reaches the allocator, which counts its own outcome.
         post(Some(ALICE), "application/json", OK_BODY),
     ] {
@@ -1002,6 +1007,7 @@ async fn pre_allocate_refusals_are_counted_once_each() {
             ErrorCode::Unauthenticated,
             ErrorCode::UnsupportedMediaType,
             ErrorCode::PayloadTooLarge,
+            ErrorCode::InvalidRequest,
             ErrorCode::InvalidRequest,
             ErrorCode::InvalidRequest,
         ]
@@ -1318,4 +1324,43 @@ impl crate::reconcile::spawn::WorkerSecrets for NoBackend {
     ) -> BoxFuture<'static, Result<Option<k8s_openapi::api::core::v1::Pod>, String>> {
         Box::pin(async { Err("no backend".into()) })
     }
+}
+
+/// The HTTP API never generates a private key: a request without
+/// `publicKey` is a 400 before the allocator runs.
+#[tokio::test]
+async fn a_request_without_public_key_is_400_and_never_allocates() {
+    let fake = Fake::new(Next::Grant);
+    let rejected = Arc::clone(&fake.rejected);
+    let state = state(fake, &Metrics::new());
+    let app = router(Arc::clone(&state));
+    for body in [
+        r#"{"namespace":"render-verify","pool":"a"}"#,
+        r#"{"namespace":"render-verify","pool":"a","publicKey":null}"#,
+    ] {
+        let (st, h, body) = call(&app, post(Some(ALICE), "application/json", body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(h.get(header::RETRY_AFTER), None);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v,
+            json!({"error": {"code": "invalid_request", "message": super::api::PUBLIC_KEY_REQUIRED}})
+        );
+    }
+    assert!(state.alloc.seen.lock().unwrap().is_empty(), "allocator ran");
+    assert_eq!(
+        *rejected.lock().unwrap(),
+        [ErrorCode::InvalidRequest, ErrorCode::InvalidRequest]
+    );
+    // An unauthenticated request still gets 401, not the body error.
+    let (st, _, _) = call(
+        &app,
+        post(
+            None,
+            "application/json",
+            r#"{"namespace":"render-verify","pool":"a"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
