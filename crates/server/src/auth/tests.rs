@@ -1584,3 +1584,26 @@ async fn verified_token_owner_carries_run_claims() {
         )
     );
 }
+
+/// The issuer is escaped like `sub`, so an issuer containing `#` cannot
+/// collide with another issuer's owner.
+#[test]
+fn issuer_hash_cannot_forge_another_issuers_owner() {
+    let owner = |iss: &str, sub: &str, claims: Value| {
+        let Value::Object(claims) = claims else {
+            panic!("object")
+        };
+        Identity::Oidc {
+            issuer: iss.into(),
+            subject: sub.into(),
+            claims,
+        }
+        .owner()
+    };
+    // Unescaped, both were `oidc:https://a#x#run_id=1`.
+    let forged = owner("https://a#x", "run_id=1", json!({}));
+    let real = owner("https://a", "x", json!({"run_id": "1"}));
+    assert_eq!(real, "oidc:https://a#x#run_id=1");
+    assert_eq!(forged, "oidc:https://a%23x#run_id=1");
+    assert_eq!(owner(GH, "s", json!({})), format!("oidc:{GH}#s"));
+}

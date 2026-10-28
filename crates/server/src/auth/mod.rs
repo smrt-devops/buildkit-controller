@@ -81,10 +81,11 @@ impl Identity {
 pub const RUN_CLAIMS: [&str; 3] = ["run_id", "run_attempt", "job_workflow_ref"];
 
 /// The OIDC owner string: `oidc:<iss>#<sub>`, then each present [`RUN_CLAIMS`]
-/// claim as `#<name>=<value>` in the order of [`RUN_CLAIMS`]. `sub` and every
-/// value have `%` and `#` percent-encoded in both forms, so no two callers
-/// produce the same string: without the escape in the plain form, sub
-/// `x#run_id=1` with no run claims would equal sub `x` with `run_id` 1.
+/// claim as `#<name>=<value>` in the order of [`RUN_CLAIMS`]. The issuer, `sub`
+/// and every value have `%` and `#` percent-encoded in both forms, so no two
+/// callers produce the same string: without the escape in the plain form, sub
+/// `x#run_id=1` with no run claims would equal sub `x` with `run_id` 1. Real
+/// issuers contain neither character, so their owners read unchanged.
 fn oidc_owner(issuer: &str, subject: &str, claims: &Map<String, Value>) -> String {
     let run: Vec<(&str, String)> = RUN_CLAIMS
         .iter()
@@ -98,7 +99,7 @@ fn oidc_owner(issuer: &str, subject: &str, claims: &Map<String, Value>) -> Strin
         })
         .collect();
     let esc = |s: &str| s.replace('%', "%25").replace('#', "%23");
-    let mut owner = format!("oidc:{issuer}#{}", esc(subject));
+    let mut owner = format!("oidc:{}#{}", esc(issuer), esc(subject));
     for (name, v) in run {
         owner.push('#');
         owner.push_str(name);
