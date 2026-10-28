@@ -22,6 +22,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 
 use crate::helm_verify::{Env, until};
+use crate::image::WORKER_IMAGE;
 use crate::root;
 
 const NS: &str = "bk-claim";
@@ -29,8 +30,6 @@ const POOL_NS: &str = "bk-claim-pool";
 const OK_NS: &str = "claim-ok";
 const DENIED_NS: &str = "claim-denied";
 const UNLISTED_NS: &str = "claim-unlisted";
-const WORKER_IMAGE: &str = "moby/buildkit:v0.34.0-rootless";
-const LOCAL_BUILDKIT: &str = "moby/buildkit:rootless";
 const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const ANN_OWNER: &str = "buildkit.smrt-devops.net/owner";
 const ANN_ALLOC: &str = "buildkit.smrt-devops.net/alloc";
@@ -151,7 +150,7 @@ fn verify(env: &Env, cluster: &str) -> Result<()> {
         );
         Ok(())
     };
-    ok(Command::new("docker").args(["tag", LOCAL_BUILDKIT, WORKER_IMAGE]))?;
+    crate::image::ensure_worker()?;
     ok(&mut crate::kube::kind_load(WORKER_IMAGE, cluster))?;
     for ns in [NS, POOL_NS, OK_NS, DENIED_NS, UNLISTED_NS] {
         env.kubectl(&["create", "namespace", ns])?;

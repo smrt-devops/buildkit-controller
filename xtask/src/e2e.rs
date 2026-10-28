@@ -22,6 +22,7 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::e2e_issuer::Issuer;
 use crate::helm_verify::{Env, until};
+use crate::image::WORKER_IMAGE;
 use crate::root;
 
 static CLUSTER: std::sync::LazyLock<String> =
@@ -31,8 +32,6 @@ const POOL_NS: &str = "ci";
 const OIDC_HOST: &str = "mock-oidc.bk-oidc.svc";
 const SOCAT_IMAGE: &str = "alpine/socat:latest";
 const API: &str = "https://localhost:18443";
-const WORKER_IMAGE: &str = "moby/buildkit:v0.34.0-rootless";
-const LOCAL_BUILDKIT: &str = "moby/buildkit:rootless";
 const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const REGISTRY_IMAGE: &str = "registry:2";
 const REG: &str = "registry.e2e-reg.svc.cluster.local:5000";
@@ -78,21 +77,6 @@ fn output(c: &mut Command) -> Result<String> {
     );
     ensure!(o.status.success(), "{c:?} failed:\n{text}");
     Ok(text)
-}
-
-fn have_image(image: &str) -> bool {
-    Command::new("docker")
-        .args(["image", "inspect", image])
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
-/// Make `image` present locally, pulling when it is not.
-fn ensure_image(image: &str) -> Result<()> {
-    if !have_image(image) {
-        status(Command::new("docker").args(["pull", image]))?;
-    }
-    Ok(())
 }
 
 /// The pool platform of this host.
@@ -199,18 +183,12 @@ fn install(env: &Env, work: &Path, mode: &Mode) -> Result<PathBuf> {
     )?;
 
     crate::image::image(CONTROLLER_IMAGE, Some(CLUSTER.as_str()))?;
-    if !have_image(WORKER_IMAGE) {
-        if have_image(LOCAL_BUILDKIT) {
-            status(Command::new("docker").args(["tag", LOCAL_BUILDKIT, WORKER_IMAGE]))?;
-        } else {
-            ensure_image(WORKER_IMAGE)?;
-        }
-    }
+    crate::image::ensure_worker()?;
     let mut images = vec![WORKER_IMAGE];
     if matches!(mode, Mode::Mock(_)) {
-        ensure_image(REGISTRY_IMAGE)?;
+        crate::image::ensure(REGISTRY_IMAGE)?;
         images.push(REGISTRY_IMAGE);
-        ensure_image(SOCAT_IMAGE)?;
+        crate::image::ensure(SOCAT_IMAGE)?;
         images.push(SOCAT_IMAGE);
     }
     for image in images {

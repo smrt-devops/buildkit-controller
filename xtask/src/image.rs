@@ -235,6 +235,40 @@ pub(crate) fn image(tag: &str, load_kind: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// The rootless `BuildKit` image the cluster harnesses run workers on.
+pub(crate) const WORKER_IMAGE: &str = "moby/buildkit:v0.34.0-rootless";
+/// A locally built `BuildKit` image that stands in for [`WORKER_IMAGE`] when the
+/// pinned tag is absent and Docker Hub is unreachable.
+const LOCAL_BUILDKIT: &str = "moby/buildkit:rootless";
+
+/// Whether the local Docker daemon has `image`.
+pub(crate) fn have(image: &str) -> bool {
+    Command::new("docker")
+        .args(["image", "inspect", image])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Make `image` present locally, pulling it when it is not.
+pub(crate) fn ensure(image: &str) -> Result<()> {
+    if !have(image) {
+        run(Command::new("docker").args(["pull", image]))?;
+    }
+    Ok(())
+}
+
+/// Make [`WORKER_IMAGE`] present locally: the pinned tag if Docker has it, else
+/// [`LOCAL_BUILDKIT`] retagged, else a pull. A fresh CI runner has neither.
+pub(crate) fn ensure_worker() -> Result<()> {
+    if have(WORKER_IMAGE) {
+        return Ok(());
+    }
+    if have(LOCAL_BUILDKIT) {
+        return run(Command::new("docker").args(["tag", LOCAL_BUILDKIT, WORKER_IMAGE]));
+    }
+    ensure(WORKER_IMAGE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

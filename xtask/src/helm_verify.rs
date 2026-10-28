@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 
+use crate::image::WORKER_IMAGE;
 use crate::root;
 
 fn cluster() -> String {
@@ -23,8 +24,6 @@ fn cluster() -> String {
 }
 const NS: &str = "bk-helm";
 const POOL_NS: &str = "bk-helm-pool";
-const WORKER_IMAGE: &str = "moby/buildkit:v0.34.0-rootless";
-const LOCAL_BUILDKIT: &str = "moby/buildkit:rootless";
 const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const LEASE: &str = "buildkit-controller-leader";
 
@@ -138,7 +137,7 @@ fn verify(env: &Env) -> Result<()> {
         );
         Ok(())
     };
-    ok(Command::new("docker").args(["tag", LOCAL_BUILDKIT, WORKER_IMAGE]))?;
+    crate::image::ensure_worker()?;
     ok(&mut crate::kube::kind_load(
         WORKER_IMAGE,
         cluster().as_str(),

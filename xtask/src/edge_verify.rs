@@ -32,6 +32,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::{CRD_PATH, root};
+use crate::image::WORKER_IMAGE;
 
 static CLUSTER: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| super::kind_cluster("bk-edge-verify"));
@@ -40,10 +41,6 @@ const NS: &str = "bk-edge";
 const POOL: &str = "edge";
 /// The worker pod's nonce; the edge dials `<NONCE>.<pod>.<pool>.<ns>`.
 const NONCE: &str = "0123456789abcdef";
-/// The image the rendered worker pod names. The task loads the local rootless
-/// image under that name because Docker Hub DNS inside kind is broken on this host.
-const WORKER_IMAGE: &str = "moby/buildkit:v0.34.0-rootless";
-const LOCAL_BUILDKIT: &str = "moby/buildkit:rootless";
 const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const ALLOC: &str = "mfrggzdfmztwq2lknnwg23tpoa";
 const OTHER_ALLOC: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -314,7 +311,7 @@ pub(crate) fn edge_verify() -> Result<()> {
     );
 
     super::image::image(CONTROLLER_IMAGE, Some(CLUSTER.as_str()))?;
-    run_ok(Command::new("docker").args(["tag", LOCAL_BUILDKIT, WORKER_IMAGE]))?;
+    crate::image::ensure_worker()?;
     run_ok(&mut crate::kube::kind_load(WORKER_IMAGE, CLUSTER.as_str()))?;
 
     let crd = root.join(CRD_PATH).to_string_lossy().into_owned();

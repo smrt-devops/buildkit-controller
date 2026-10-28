@@ -32,14 +32,13 @@ use time::OffsetDateTime;
 use super::edge_verify::{Env, run_ok, secret_from_files};
 use super::reconcile_verify::KIND_CONFIG;
 use super::{CRD_PATH, root};
+use crate::image::WORKER_IMAGE;
 
 static CLUSTER: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| super::kind_cluster("bk-perf"));
 const SYSTEM_NS: &str = "buildkit-system";
 const NS: &str = "bk-perf";
 const POOL: &str = "perf";
-const WORKER_IMAGE: &str = "moby/buildkit:v0.34.0-rootless";
-const LOCAL_BUILDKIT: &str = "moby/buildkit:rootless";
 const CURL_IMAGE: &str = "curlimages/curl:8.11.1";
 const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const SERVER_NAME: &str = "bk.example.com";
@@ -412,14 +411,8 @@ impl Drop for Cleanup {
 #[allow(clippy::too_many_lines, reason = "one linear setup script")]
 fn setup(p: &Perf, work: &std::path::Path) -> Result<CaBundle> {
     super::image::image(CONTROLLER_IMAGE, Some(CLUSTER.as_str()))?;
-    run_ok(Command::new("docker").args(["tag", LOCAL_BUILDKIT, WORKER_IMAGE]))?;
-    let have_curl = Command::new("docker")
-        .args(["image", "inspect", CURL_IMAGE])
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !have_curl {
-        run_ok(Command::new("docker").args(["pull", CURL_IMAGE]))?;
-    }
+    crate::image::ensure_worker()?;
+    crate::image::ensure(CURL_IMAGE)?;
     for img in [WORKER_IMAGE, CURL_IMAGE] {
         run_ok(&mut crate::kube::kind_load(img, CLUSTER.as_str()))?;
     }
