@@ -103,7 +103,7 @@ pub fn classify(e: &AllocError) -> Disposition {
 
 /// How long after creation a claim waits for its pool to appear in the pool
 /// store, or for a rule admitting it, before `PoolNotFound` is terminal.
-pub const POOL_GRACE: Duration = Duration::from_mins(1);
+pub const POOL_GRACE: Duration = Duration::from_secs(30);
 
 /// [`classify`] for this claim at `now`: `PoolNotFound` is retried in the
 /// claim's first [`POOL_GRACE`], since a pool applied with the claim, or an
@@ -697,7 +697,7 @@ mod tests {
         let created = |c: &mut BuildKitClaim, ts: &str| {
             c.metadata.creation_timestamp = Some(Time(ts.parse().unwrap()));
         };
-        created(&mut c, "2026-10-21T11:59:30Z");
+        created(&mut c, "2026-10-21T11:59:45Z");
         assert_eq!(
             dispose(&c, &AllocError::PoolNotFound, now),
             Disposition::Retry("PoolNotFound")
@@ -711,7 +711,7 @@ mod tests {
             dispose(&c, &AllocError::NotReady, now),
             Disposition::Retry("PoolNotReady")
         );
-        created(&mut c, "2026-10-21T11:59:00Z");
+        created(&mut c, "2026-10-21T11:59:30Z");
         assert_eq!(
             dispose(&c, &AllocError::PoolNotFound, now),
             Disposition::Fail("PoolNotFound"),
