@@ -5,7 +5,6 @@ use std::net::SocketAddr;
 
 use futures::future::BoxFuture;
 use rustls::{CertificateError, Error};
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 
@@ -71,8 +70,9 @@ impl Refusal {
 /// Implemented by the proxy. One instance serves every connection.
 pub trait ConnectionHandler: Send + Sync + 'static {
     /// The pod, allocation and revocation checks, run synchronously inside the handshake after
-    /// checks 1–2 pass; a refusal aborts the handshake with its alert and is
-    /// counted by the listener. The default admits every verified cert.
+    /// checks 1–2 pass and before the client's signature is checked (see
+    /// [`crate::edge`]); a refusal aborts the handshake with its alert and is
+    /// counted by the verifier. The default admits every verified cert.
     fn admit(&self, id: &AllocationId) -> Result<(), Refusal> {
         let _ = id;
         Ok(())
@@ -81,16 +81,4 @@ pub trait ConnectionHandler: Send + Sync + 'static {
     /// Owns the connection until it ends. Holding the returned future keeps
     /// the connection counted against `edge.maxConnections` and the drain.
     fn handle(&self, conn: Accepted) -> BoxFuture<'static, ()>;
-}
-
-/// Placeholder until the proxy lands. It sends `close_notify` and closes.
-#[derive(Debug, Default)]
-pub struct CloseHandler;
-
-impl ConnectionHandler for CloseHandler {
-    fn handle(&self, mut conn: Accepted) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            let _ = conn.stream.shutdown().await;
-        })
-    }
 }

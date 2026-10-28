@@ -243,7 +243,7 @@ fn revocation_rules() {
 /// Registry fed from a broadcast like the runtime's root watch.
 async fn revoked_by(ev: PodEvent, store: Vec<Pod>) -> Option<Revocation> {
     let registry = Arc::new(Registry::default());
-    let (reg, rx) = registry.register(&id());
+    let (reg, rx) = registry.register(&id()).unwrap();
     let (tx, sub) = broadcast::channel(8);
     let stop = CancellationToken::new();
     let r = Arc::clone(&registry);
@@ -386,4 +386,112 @@ async fn bytes_are_counted_per_direction_and_half_close_is_kept() {
     assert!(matches!(end, End::Closed(Ok((5000, 700)))));
     assert_eq!(m.bytes(Direction::ClientToWorker).get(), 5000);
     assert_eq!(m.bytes(Direction::WorkerToClient).get(), 700);
+}
+
+#[test]
+fn each_allocation_is_capped_and_a_closed_connection_frees_its_slot() {
+    let registry = Arc::new(Registry::new(2));
+    let a = registry.register(&id()).unwrap();
+    let _b = registry.register(&id()).unwrap();
+    assert!(registry.register(&id()).is_none(), "third on one pod");
+    let other: AllocationId =
+        format!("buildkit://team-a/pool-1/1f8fad5b-d9cb-469f-a165-70867728950e/{ALLOC}")
+            .parse()
+            .unwrap();
+    assert!(
+        registry.register(&other).is_some(),
+        "another pod has its own"
+    );
+    drop(a);
+    assert!(registry.register(&id()).is_some());
+    let unlimited = Arc::new(Registry::new(0));
+    let held: Vec<_> = (0..100)
+        .map(|_| unlimited.register(&id()).unwrap())
+        .collect();
+    assert_eq!(held.len(), 100);
+}
+
+/// The proxy's back half over `pods`, with no TLS generation loaded.
+fn inner(pods: Vec<Pod>, max_per_pod: usize) -> super::Inner {
+    super::Inner {
+        view: view(pods),
+        tls: tokio::sync::watch::channel(None).1,
+        metrics: metrics(),
+        options: super::ProxyOptions {
+            upstream_connect_timeout: Duration::from_secs(1),
+            upstream_port: 1,
+        },
+        live: Arc::new(Registry::new(max_per_pod)),
+    }
+}
+
+#[tokio::test]
+async fn an_allocation_at_its_cap_is_refused_and_counted() {
+    let p = inner(vec![pod(|_| {})], 1);
+    let (_held, _rx) = p.live.register(&id()).unwrap();
+    let (client, mut c) = tokio::io::duplex(1024);
+    p.forward(client, &id(), None).await;
+    assert_eq!(p.metrics.outcome_count(Some(&id()), "allocation_limit"), 1);
+    assert_eq!(p.metrics.outcome_count(Some(&id()), "upstream_error"), 0);
+    let mut b = Vec::new();
+    c.read_to_end(&mut b).await.unwrap();
+    assert!(b.is_empty(), "closed without a byte");
+    assert_eq!(p.live.len(), 1);
+}
+
+#[tokio::test]
+async fn without_an_edge_client_cert_the_connection_is_an_upstream_error() {
+    let p = inner(vec![pod(|_| {})], 64);
+    let (client, _c) = tokio::io::duplex(1024);
+    p.forward(client, &id(), None).await;
+    assert_eq!(p.metrics.outcome_count(Some(&id()), "upstream_error"), 1);
+    assert_eq!(p.metrics.outcome_count(Some(&id()), "ok"), 0);
+    assert_eq!(p.live.len(), 0, "unregistered once closed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_revocation_sent_before_the_pump_cuts_at_once() {
+    let (mut client, _c) = tokio::io::duplex(1024);
+    let (mut up, _u) = tokio::io::duplex(1024);
+    let (tx, rx) = oneshot::channel();
+    // Fired while the upstream was being dialled.
+    tx.send(Revocation::PodGone).unwrap();
+    let m = metrics();
+    let start = tokio::time::Instant::now();
+    let end = pump(&mut client, &mut up, &m, None, rx).await;
+    assert!(matches!(end, End::Revoked(Revocation::PodGone)));
+    assert_eq!(start.elapsed(), Duration::ZERO);
+}
+
+#[tokio::test]
+async fn a_relay_dropped_mid_copy_counts_drain_and_leaves_the_gauge_at_zero() {
+    let m = metrics();
+    let (mut client, mut c) = tokio::io::duplex(1 << 16);
+    let (mut up, mut u) = tokio::io::duplex(1 << 16);
+    let (_tx, rx) = oneshot::channel();
+    let task = tokio::spawn({
+        let m = m.clone();
+        async move { super::relay(&m, &id(), &mut client, &mut up, None, rx).await }
+    });
+    c.write_all(b"ping").await.unwrap();
+    let mut b = [0u8; 4];
+    u.read_exact(&mut b).await.unwrap();
+    assert_eq!(m.active(&id()).get(), 1);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(m.revocation_count(Revocation::Drain), 1);
+    assert_eq!(m.active(&id()).get(), 0);
+}
+
+#[tokio::test]
+async fn a_revoked_relay_is_counted_once_under_its_reason() {
+    let m = metrics();
+    let (mut client, _c) = tokio::io::duplex(1024);
+    let (mut up, _u) = tokio::io::duplex(1024);
+    let (tx, rx) = oneshot::channel();
+    tx.send(Revocation::Released).unwrap();
+    super::relay(&m, &id(), &mut client, &mut up, None, rx).await;
+    assert_eq!(m.revocation_count(Revocation::Released), 1);
+    assert_eq!(m.revocation_count(Revocation::Drain), 0);
+    assert_eq!(m.active(&id()).get(), 0);
 }

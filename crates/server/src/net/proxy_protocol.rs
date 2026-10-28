@@ -16,9 +16,11 @@
 //!
 //! A `PROXY` command over TCP/IPv4 or TCP/IPv6 makes the header's source the
 //! client address. A `LOCAL` command (a gateway's own health check) is accepted
-//! and the connection keeps the gateway's address, as the spec asks. Other
-//! address families (UNIX, UDP, `AF_UNSPEC` under `PROXY`) are refused: none of
-//! them can carry a client of these TCP listeners. TLVs are skipped.
+//! and the connection keeps the gateway's address, as the spec asks. So is a
+//! `PROXY` command with the `AF_UNSPEC` family, which some load balancers send
+//! for their own probes: the spec says to ignore its address block and lets the
+//! receiver use the real endpoint addresses. Other families (UNIX, UDP) are
+//! refused: neither can carry a client of these TCP listeners. TLVs are skipped.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -45,7 +47,8 @@ pub const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 /// A parsed v2 header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Header {
-    /// `LOCAL`: the sender's own connection, e.g. a health check.
+    /// `LOCAL`, or `PROXY` with `AF_UNSPEC`: the sender's own connection, e.g. a
+    /// health check.
     Local,
     /// `PROXY` over TCP: the original client and the address it dialled.
     Proxy {
@@ -148,7 +151,8 @@ pub async fn read_header<R: AsyncRead + Unpin>(io: &mut R) -> Result<Header, Pro
     let mut block = [0u8; MAX_ADDRESS_BLOCK];
     let block = &mut block[..len];
     io.read_exact(block).await?;
-    if command == 0 {
+    // LOCAL, or PROXY with AF_UNSPEC (any transport): no address to use.
+    if command == 0 || family >> 4 == 0 {
         return Ok(Header::Local);
     }
     let short = || ProxyError::Short { family, len };

@@ -133,3 +133,70 @@ async fn step_down_releases_the_lease_after_all_leader_work_stopped() {
         "{log:?}"
     );
 }
+
+/// Records when the component holding it was dropped.
+struct Dropped(Arc<Mutex<Option<Instant>>>);
+
+impl Drop for Dropped {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = Some(Instant::now());
+    }
+}
+
+/// A component that ignores its stop and runs for an hour; `at` gets the
+/// instant it was dropped.
+fn overrun(
+    at: &Arc<Mutex<Option<Instant>>>,
+) -> impl FnOnce(CancellationToken) -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
+{
+    let guard = Dropped(Arc::clone(at));
+    move |_| {
+        Box::pin(async move {
+            let _guard = guard;
+            tokio::time::sleep(Duration::from_hours(1)).await;
+            Ok(())
+        })
+    }
+}
+
+/// An overrunning edge is aborted a scrape interval before the deadline, the
+/// later stages still stop in order, and the call returns only at the deadline,
+/// so the process is still up when Prometheus scrapes what the abort counted.
+#[tokio::test(start_paused = true)]
+async fn an_overrun_is_aborted_a_scrape_interval_early_and_held_to_the_deadline() {
+    for (budget, cut) in [
+        (
+            Duration::from_mins(10),
+            Duration::from_mins(10).saturating_sub(SCRAPE_GRACE),
+        ),
+        (Duration::from_secs(20), Duration::from_secs(10)),
+    ] {
+        let log = Log::default();
+        let dropped = Arc::default();
+        let mut s = Stages::new(&["api", "edge", "pki"]);
+        s.spawn(1, "edge", overrun(&dropped));
+        s.spawn(2, "pki", component(&log, "pki", Duration::from_secs(1)));
+        let start = Instant::now();
+        assert!(!s.stop(start + budget).await);
+        assert_eq!(start.elapsed(), budget);
+        assert_eq!(dropped.lock().unwrap().unwrap() - start, cut);
+        assert_eq!(*log.lock().unwrap(), ["pki stop", "pki done"]);
+    }
+}
+
+/// Leader work has no scrape grace: it runs until the deadline itself.
+#[tokio::test(start_paused = true)]
+async fn step_down_aborts_leader_work_at_the_deadline() {
+    let dropped = Arc::default();
+    let mut leader = Stages::new(&["leader"]);
+    leader.spawn(0, "claims", overrun(&dropped));
+    let release = CancellationToken::new();
+    let elector = tokio::spawn({
+        let release = release.clone();
+        async move { release.cancelled().await }
+    });
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(30);
+    step_down(async {}, leader, deadline, release, elector).await;
+    assert_eq!(dropped.lock().unwrap().unwrap(), deadline);
+}

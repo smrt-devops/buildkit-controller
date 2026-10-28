@@ -9,12 +9,18 @@
 //! before the Lease is released.
 
 use std::future::Future;
+use std::time::Duration;
 
 use futures::future::select_all;
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+/// How long before the drain deadline [`Stages::stop`] aborts what still runs, so
+/// a Prometheus scrape (30 s is the common interval) can read the counters the
+/// abort moved before the process exits.
+pub const SCRAPE_GRACE: Duration = Duration::from_secs(30);
 
 /// A finished component: its name and result.
 pub type Exit = (&'static str, anyhow::Result<()>);
@@ -86,44 +92,75 @@ impl Stages {
     }
 
     /// Stop the stages in order, each only after every component of the one
-    /// before has returned. At `deadline` abort whatever still runs. Returns
-    /// false when the deadline cut the drain short.
-    pub async fn stop(mut self, deadline: Instant) -> bool {
-        let ordered = async {
-            for s in &mut self.stages {
-                info!(stage = s.name, running = s.tasks.len(), "stopping stage");
-                s.stop.cancel();
-                while let Some(done) = s.tasks.join_next().await {
-                    match done {
-                        Ok((_, Ok(()))) => {}
-                        Ok((name, Err(e))) => {
-                            warn!(
-                                component = name,
-                                error = format!("{e:#}"),
-                                "component failed while stopping"
-                            );
-                        }
-                        Err(e) => warn!(error = %e, "component task panicked while stopping"),
-                    }
-                }
-            }
-        };
-        if tokio::time::timeout_at(deadline, ordered).await.is_ok() {
+    /// before has returned. What still runs [`SCRAPE_GRACE`] before `deadline`
+    /// (half the remaining time when that is shorter) is aborted then, the
+    /// later stages are stopped in order, and the call returns at `deadline`:
+    /// the process keeps serving metrics in between, so a scrape sees what the
+    /// abort counted (the edge's `drain` revocations). At `deadline` whatever
+    /// still runs is aborted. Returns false when the drain was cut short.
+    pub async fn stop(self, deadline: Instant) -> bool {
+        self.stop_with(deadline, SCRAPE_GRACE).await
+    }
+
+    async fn stop_with(mut self, deadline: Instant, grace: Duration) -> bool {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let cut = deadline - grace.min(left / 2);
+        if tokio::time::timeout_at(cut, stop_in_order(&mut self.stages))
+            .await
+            .is_ok()
+        {
             return true;
         }
-        for s in &mut self.stages {
-            if !s.tasks.is_empty() {
-                warn!(
-                    stage = s.name,
-                    running = s.tasks.len(),
-                    "drain deadline reached; aborting"
-                );
-            }
-            s.stop.cancel();
-            s.tasks.abort_all();
-            while s.tasks.join_next().await.is_some() {}
+        // The stages stopped so far that are still running overran: abort them.
+        abort_running(self.stages.iter_mut().filter(|s| s.stop.is_cancelled())).await;
+        if tokio::time::timeout_at(deadline, stop_in_order(&mut self.stages))
+            .await
+            .is_err()
+        {
+            abort_running(self.stages.iter_mut()).await;
         }
+        tokio::time::sleep_until(deadline).await;
         false
+    }
+}
+
+/// Cancels each stage in turn and waits for all its components to return.
+async fn stop_in_order(stages: &mut [Stage]) {
+    for s in stages {
+        if !s.stop.is_cancelled() {
+            info!(stage = s.name, running = s.tasks.len(), "stopping stage");
+            s.stop.cancel();
+        }
+        while let Some(done) = s.tasks.join_next().await {
+            match done {
+                Ok((_, Ok(()))) => {}
+                Ok((name, Err(e))) => {
+                    warn!(
+                        component = name,
+                        error = format!("{e:#}"),
+                        "component failed while stopping"
+                    );
+                }
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => warn!(error = %e, "component task panicked while stopping"),
+            }
+        }
+    }
+}
+
+/// Aborts every component still running in `stages` and waits until each is dropped.
+async fn abort_running<'a>(stages: impl Iterator<Item = &'a mut Stage>) {
+    for s in stages {
+        if !s.tasks.is_empty() {
+            warn!(
+                stage = s.name,
+                running = s.tasks.len(),
+                "drain budget spent; aborting"
+            );
+        }
+        s.stop.cancel();
+        s.tasks.abort_all();
+        while s.tasks.join_next().await.is_some() {}
     }
 }
 
@@ -139,7 +176,7 @@ pub async fn step_down(
     release: CancellationToken,
     elector: JoinHandle<()>,
 ) {
-    let ((), _) = tokio::join!(reconciler, leader.stop(deadline));
+    let ((), _) = tokio::join!(reconciler, leader.stop_with(deadline, Duration::ZERO));
     release.cancel();
     let _ = elector.await;
 }

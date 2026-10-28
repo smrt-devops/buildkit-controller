@@ -544,3 +544,67 @@ fn newer_valid_secret_wins_over_a_held_future_one() {
     assert!(!s.changed);
     assert!(Arc::ptr_eq(&v3, &t.loader.snapshot().serving().unwrap()));
 }
+
+/// A new resourceVersion with the same CA certificates (a label edit, a
+/// rewrite of the same data) reissues nothing and publishes nothing.
+#[test]
+fn ca_metadata_change_reissues_nothing() {
+    let mut t = t(false);
+    let b = ca();
+    t.loader.step(Some(&ca_state(&b, "1")), None, now());
+    let before = t.loader.snapshot();
+    let s = t.loader.step(Some(&ca_state(&b, "2")), None, now());
+    assert!(!s.changed);
+    let after = t.loader.snapshot();
+    assert!(Arc::ptr_eq(
+        &before.serving().unwrap(),
+        &after.serving().unwrap()
+    ));
+    assert!(std::ptr::eq(
+        before.edge_client().unwrap(),
+        after.edge_client().unwrap()
+    ));
+    assert_ne!(s.wake, Some(RETRY), "nothing pending");
+    // Unusable, then the same CA again: usable once more, still no reissue.
+    t.loader.step(Some(&absent()), None, now());
+    assert!(t.loader.snapshot().issuer().is_none());
+    let s = t.loader.step(Some(&ca_state(&b, "3")), None, now());
+    assert!(s.changed);
+    let back = t.loader.snapshot();
+    assert!(back.issuer().is_some());
+    assert!(Arc::ptr_eq(
+        &before.serving().unwrap(),
+        &back.serving().unwrap()
+    ));
+}
+
+/// A failed serving issue is retried alone; the client cert that was issued
+/// is kept.
+#[test]
+fn a_retry_reissues_only_the_cert_that_failed() {
+    let t = t(false);
+    let fails = Arc::new(AtomicUsize::new(1));
+    let calls = Arc::clone(&fails);
+    let mut loader = t.loader.with_issue_serving(Box::new(move |b, n, now| {
+        if calls
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
+            .is_ok()
+        {
+            return Err("injected".into());
+        }
+        b.issue_edge_serving(n, now).map_err(|e| e.to_string())
+    }));
+    let b = ca();
+    let s = loader.step(Some(&ca_state(&b, "1")), None, now());
+    assert_eq!(s.wake, Some(RETRY));
+    let first = loader.snapshot();
+    assert!(first.serving().is_none());
+    let s = loader.step(None, None, now());
+    let m = loader.snapshot();
+    assert!(m.serving().is_some());
+    assert!(std::ptr::eq(
+        first.edge_client().unwrap(),
+        m.edge_client().unwrap()
+    ));
+    assert_ne!(s.wake, Some(RETRY));
+}

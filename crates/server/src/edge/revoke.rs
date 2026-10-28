@@ -21,11 +21,25 @@ struct Live {
 
 type Index = HashMap<String, HashMap<u64, Live>>;
 
+/// Most proxied connections one allocation (one worker pod) may hold on a
+/// replica. buildx opens one to five edge connections over a whole allocation
+/// (two for a plain build, more for multi-platform and cache runs), so 64
+/// leaves room for many concurrent builds on one allocation while stopping a
+/// single cert from taking the replica's whole `edge.maxConnections`.
+pub const MAX_CONNECTIONS_PER_ALLOCATION: usize = 64;
+
 /// Open proxied connections, by pod uid.
-#[derive(Default)]
 pub struct Registry {
     next: AtomicU64,
     live: Mutex<Index>,
+    /// Cap per pod uid; 0 disables it.
+    max_per_pod: usize,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new(MAX_CONNECTIONS_PER_ALLOCATION)
+    }
 }
 
 /// Removes its connection from the index when dropped.
@@ -48,31 +62,48 @@ impl Drop for Registration {
 }
 
 impl Registry {
+    /// At most `max_per_pod` connections per pod uid; 0 disables the cap.
+    #[must_use]
+    pub fn new(max_per_pod: usize) -> Self {
+        Self {
+            next: AtomicU64::new(0),
+            live: Mutex::default(),
+            max_per_pod,
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Index> {
         self.live.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Indexes a connection; the receiver fires with the reason it must close.
+    /// `None` when the pod already holds `max_per_pod` connections.
     pub fn register(
         self: &Arc<Self>,
         id: &AllocationId,
-    ) -> (Registration, oneshot::Receiver<Revocation>) {
+    ) -> Option<(Registration, oneshot::Receiver<Revocation>)> {
+        let uid = id.pod_uid.as_str().to_owned();
+        let mut live = self.lock();
+        let conns = live.entry(uid.clone()).or_default();
+        if self.max_per_pod != 0 && conns.len() >= self.max_per_pod {
+            return None;
+        }
         let (tx, rx) = oneshot::channel();
         let key = self.next.fetch_add(1, Ordering::Relaxed);
-        let uid = id.pod_uid.as_str().to_owned();
-        self.lock().entry(uid.clone()).or_default().insert(
+        conns.insert(
             key,
             Live {
                 alloc: id.alloc_id.clone(),
                 tx,
             },
         );
+        drop(live);
         let reg = Registration {
             registry: Arc::clone(self),
             uid,
             key,
         };
-        (reg, rx)
+        Some((reg, rx))
     }
 
     /// Number of indexed connections (tests).
