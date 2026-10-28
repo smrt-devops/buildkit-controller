@@ -78,8 +78,11 @@ workerNetwork:
     cidrs: []
 
 shutdown:
-  delay: 5s
-  drainTimeout: 300s
+  delay: 5s          # unready to listeners closed, so Service endpoints converge first
+  # Hard cap on the drain. "" waits for every open edge connection to end on its
+  # own (release, expiry, worker gone), at most 24h5m: the 24h maxTTL cap plus the
+  # 5m allocation cert margin. The termination grace period follows this value.
+  drainTimeout: ""
 
 service:
   type: LoadBalancer  # ClusterIP | NodePort | LoadBalancer

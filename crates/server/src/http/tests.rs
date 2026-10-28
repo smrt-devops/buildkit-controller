@@ -915,6 +915,39 @@ async fn client_disconnect_mid_allocation_cancels_it() {
     stop.cancel();
 }
 
+/// After shutdown, an allocation sent on an HTTP/1 keep-alive connection that
+/// was open before gets 503 `shutting_down` with `Retry-After` and
+/// `Connection: close`, not a reset, and never reaches the allocator. New
+/// connections are refused.
+#[tokio::test]
+async fn shutdown_answers_keep_alive_allocations_with_503() {
+    let (k, c) = serving("api.test");
+    let fake = Fake::new(Next::Grant);
+    let rejected = Arc::clone(&fake.rejected);
+    let grant = Arc::clone(&fake.grant);
+    let (addr, _tx, stop) = spawn_api(fake, Some(k)).await;
+    let mut s = dial_alpn(addr, &c, &[b"http/1.1"]).await.unwrap();
+    stop.cancel();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(dial(addr, &c).await.is_err(), "new connections are refused");
+    let req = format!(
+        "POST /v1/allocations HTTP/1.1\r\nhost: api.test\r\nauthorization: Bearer {ALICE}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{OK_BODY}",
+        OK_BODY.len()
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut out = String::new();
+    tokio::time::timeout(Duration::from_secs(5), s.read_to_string(&mut out))
+        .await
+        .expect("the server closes after the response")
+        .unwrap();
+    assert!(out.starts_with("HTTP/1.1 503"), "{out}");
+    assert!(out.contains("retry-after: 1\r\n"), "{out}");
+    assert!(out.contains("connection: close\r\n"), "{out}");
+    assert!(out.contains(r#""code":"shutting_down""#), "{out}");
+    assert_eq!(*rejected.lock().unwrap(), [ErrorCode::ShuttingDown]);
+    assert_eq!(grant.load(Ordering::SeqCst), PENDING, "no grant was made");
+}
+
 #[tokio::test]
 async fn full_201_over_tls_commits() {
     let (k, c) = serving("api.test");

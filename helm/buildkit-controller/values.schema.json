@@ -112,7 +112,7 @@
       "type": "object",
       "properties": {
         "delay": {"type": "string", "minLength": 1, "pattern": "^([0-9]+h)?([0-9]+m)?([0-9]+s)?$"},
-        "drainTimeout": {"type": "string", "minLength": 1, "pattern": "^([0-9]+h)?([0-9]+m)?([0-9]+s)?$"}
+        "drainTimeout": {"type": "string", "pattern": "^([0-9]+h)?([0-9]+m)?([0-9]+s)?$"}
       }
     },
     "pools": {

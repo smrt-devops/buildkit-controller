@@ -155,7 +155,8 @@ pub enum Revocation {
     Expired,
     /// The pod was deleted or has a `deletionTimestamp`.
     PodGone,
-    /// `shutdown.drainTimeout` passed and the connection was aborted.
+    /// The drain budget (`shutdown.drainTimeout`, or the longest connection
+    /// lifetime) ran out and the connection was aborted.
     Drain,
 }
 

@@ -2,8 +2,12 @@
 //!
 //! Startup runs config (exit 2 when invalid), telemetry, kube client, shared
 //! stores, election, ops server, then the module hooks. On SIGTERM or SIGINT,
-//! `/readyz` fails, wait `shutdown.delay`, stop the components (drain, bounded
-//! by `shutdown.drainTimeout`), stop leader work, release the Lease, stop ops.
+//! `/readyz` fails, leader work stops and the Lease is released, then after
+//! `shutdown.delay` the components stop in stages: the API (queued and new
+//! allocations get 503 `shutting_down`), the edge (open connections drain until
+//! each ends on its own), the certificate loader. The drain is bounded by
+//! `shutdown.drainTimeout`, or when unset by the longest connection lifetime.
+//! The watches and the ops server stop last.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -11,7 +15,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 use kube::Client;
-use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -29,6 +33,7 @@ use buildkit_controller::runtime::hooks::{Component, Hooks, LeaderWork};
 use buildkit_controller::runtime::leader::supervise;
 use buildkit_controller::runtime::metrics::Metrics;
 use buildkit_controller::runtime::readiness::Readiness;
+use buildkit_controller::runtime::shutdown::{Stages, step_down};
 use buildkit_controller::telemetry::{logs, ops};
 
 fn main() -> ExitCode {
@@ -172,28 +177,32 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
         }
     });
 
-    let comp_stop = CancellationToken::new();
-    let mut components = JoinSet::new();
-    for c in [&hooks.pki, &hooks.alloc, &hooks.http, &hooks.edge]
-        .into_iter()
-        .chain(&hooks.extra)
-    {
-        let c: Arc<dyn Component> = Arc::clone(c);
-        let (ctx, stop) = (ctx.clone(), comp_stop.clone());
-        components.spawn(async move { (c.name(), c.run(ctx, stop).await) });
+    // Stop order after the shutdown delay: the API first (no new allocations,
+    // queued ones get 503), then the edge (open connections drain until each
+    // ends), then the certificate loader. The Pod and Secret watches stop last.
+    let mut stages = Stages::new(&["api", "edge", "pki"]);
+    for c in [&hooks.alloc, &hooks.http] {
+        spawn(&mut stages, API_STAGE, c, &ctx);
     }
+    // Leader-gated components (the claim controller) stop with the reconciler,
+    // before the Lease is released.
+    let mut leader = Stages::new(&["leader"]);
+    for c in &hooks.extra {
+        spawn(&mut leader, 0, c, &ctx);
+    }
+    spawn(&mut stages, EDGE_STAGE, &hooks.edge, &ctx);
+    spawn(&mut stages, PKI_STAGE, &hooks.pki, &ctx);
 
     let mut failed = None;
     let mut ops_done = false;
     let mut leader_done = false;
     tokio::select! {
         r = signal() => r?,
-        Some(done) = components.join_next() => {
-            let e = match done {
-                Ok((name, Ok(()))) => anyhow::anyhow!("component {name} exited early"),
-                Ok((name, Err(e))) => e.context(format!("component {name} failed")),
-                Err(e) => anyhow::anyhow!("component task panicked: {e}"),
-            };
+        e = stages.exited() => {
+            error!(error = format!("{e:#}"), "component stopped, shutting down");
+            failed = Some(e);
+        }
+        e = leader.exited() => {
             error!(error = format!("{e:#}"), "component stopped, shutting down");
             failed = Some(e);
         }
@@ -221,24 +230,23 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
     }
     info!("shutting down");
     readiness.set_shutting_down();
-    tokio::time::sleep(ctx.config().shutdown_delay()).await;
-    comp_stop.cancel();
-    let drain = ctx.config().drain_timeout();
-    if tokio::time::timeout(drain, async {
-        while components.join_next().await.is_some() {}
-    })
-    .await
-    .is_err()
-    {
-        warn!(drain_timeout_s = drain.as_secs(), "drain timed out");
-        components.abort_all();
-    }
+    // Leadership goes first, so another replica leads within seconds however
+    // long this one drains. All leader work stops before the Lease is released.
     leader_stop.cancel();
-    if !leader_done {
-        let _ = leader_task.await;
+    let reconciler = async {
+        if !leader_done {
+            let _ = leader_task.await;
+        }
+    };
+    let bound = Instant::now() + ctx.config().request_timeout();
+    step_down(reconciler, leader, bound, elect_stop, elect_task).await;
+    info!("leadership released");
+    tokio::time::sleep(ctx.config().shutdown_delay()).await;
+    let budget = ctx.config().drain_budget();
+    info!(drain_budget_s = budget.as_secs(), "draining");
+    if !stages.stop(Instant::now() + budget).await {
+        warn!(drain_budget_s = budget.as_secs(), "drain timed out");
     }
-    elect_stop.cancel();
-    let _ = elect_task.await;
     watches.cancel();
     ops_stop.cancel();
     if !ops_done {
@@ -246,4 +254,15 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
     }
     info!("exited");
     failed.map_or(Ok(()), Err)
+}
+
+const API_STAGE: usize = 0;
+const EDGE_STAGE: usize = 1;
+const PKI_STAGE: usize = 2;
+
+fn spawn(stages: &mut Stages, stage: usize, c: &Arc<dyn Component>, ctx: &AppContext) {
+    let (c, ctx) = (Arc::clone(c), ctx.clone());
+    stages.spawn(stage, c.name(), move |stop| async move {
+        c.run(ctx, stop).await
+    });
 }

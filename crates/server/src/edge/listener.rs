@@ -155,8 +155,10 @@ struct Handshaking {
 }
 
 /// Serves `listener` until `shutdown`, then stops accepting (dropping the
-/// socket) and waits for open connections; the caller bounds that wait by
-/// `shutdown.drainTimeout` and aborts the rest by dropping this future.
+/// socket) and waits for every open connection to end on its own: release,
+/// revocation, the worker pod going away, or the client cert's `notAfter`. The
+/// runtime bounds the wait by the drain budget and aborts the rest by dropping
+/// this future.
 ///
 /// An unauthenticated client can only hold handshake slots: at most
 /// `max_handshakes` in all and `max_handshakes_per_ip` per peer, each for at
@@ -215,8 +217,21 @@ pub async fn serve(listener: TcpListener, s: Serve, shutdown: CancellationToken)
     }
     drop(listener);
     info!(open = conns.len(), "edge listener closed, draining");
-    while conns.join_next().await.is_some() {}
+    let mut progress = tokio::time::interval_at(
+        tokio::time::Instant::now() + DRAIN_LOG_EVERY,
+        DRAIN_LOG_EVERY,
+    );
+    loop {
+        tokio::select! {
+            done = conns.join_next() => if done.is_none() { break },
+            _ = progress.tick() => info!(open = conns.len(), "edge draining"),
+        }
+    }
+    info!("edge drained");
 }
+
+/// How often a draining edge logs its open connection count.
+const DRAIN_LOG_EVERY: Duration = Duration::from_mins(1);
 
 /// The next connection; accept errors (e.g. `EMFILE`) are logged and retried
 /// after a short pause.

@@ -189,6 +189,7 @@ fn error_codes_match_spec_table() {
         (ErrorCode::NotReady, "not_ready", 503),
         (ErrorCode::CaUnavailable, "ca_unavailable", 503),
         (ErrorCode::UpstreamError, "upstream_error", 503),
+        (ErrorCode::ShuttingDown, "shutting_down", 503),
     ];
     assert_eq!(table.len(), ErrorCode::ALL.len());
     for (code, s, status) in table {
@@ -201,4 +202,5 @@ fn error_codes_match_spec_table() {
     assert_eq!(ErrorCode::PoolExhausted.retry_after_seconds(), Some(5));
     assert_eq!(ErrorCode::StartTimeout.retry_after_seconds(), Some(5));
     assert_eq!(ErrorCode::NotReady.retry_after_seconds(), None);
+    assert_eq!(ErrorCode::ShuttingDown.retry_after_seconds(), Some(1));
 }

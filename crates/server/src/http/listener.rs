@@ -22,8 +22,14 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use axum::http::{HeaderValue, header};
+
 use super::api::Peer;
 use crate::edge::{PerPeer, tune_socket};
+
+/// Request extension that fires when the replica starts shutting down.
+#[derive(Clone, Debug)]
+pub struct Stopping(pub CancellationToken);
 
 /// Serving cert material: `None` until the first valid cert is loaded.
 pub type ServingCerts = watch::Receiver<Option<Arc<CertifiedKey>>>;
@@ -112,8 +118,10 @@ impl Configs {
     }
 }
 
-/// Serve `app` on `listener` until `shutdown`, then let open connections
-/// finish their in-flight requests (the runtime bounds this by `drainTimeout`).
+/// Serve `app` on `listener` until `shutdown`, then stop accepting and let open
+/// connections finish. Requests carry a [`Stopping`] extension; once it fires,
+/// the API refuses new allocations with 503 `shutting_down` (see [`drive`] for
+/// how each protocol closes).
 pub async fn serve(
     listener: TcpListener,
     app: Router,
@@ -158,6 +166,8 @@ pub async fn serve(
             }
         }
     }
+    // Close the socket now, so a new connection is refused rather than left in the backlog.
+    drop(listener);
     while conns.join_next().await.is_some() {}
 }
 
@@ -186,15 +196,27 @@ async fn connection(
     };
     // The protocol comes from ALPN, so there is no sniffing phase without a deadline.
     let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
-    let inner = TowerToHyperService::new(app.layer(axum::Extension(Peer(peer))));
+    let inner = TowerToHyperService::new(
+        app.layer(axum::Extension(Peer(peer)))
+            .layer(axum::Extension(Stopping(shutdown.clone()))),
+    );
     let flight = Arc::new(InFlight::default());
     let svc = {
-        let flight = Arc::clone(&flight);
+        let (flight, stop) = (Arc::clone(&flight), shutdown.clone());
         service_fn(move |req| {
             let active = InFlight::start(&flight);
             let call = inner.call(req);
+            let stop = stop.clone();
             async move {
-                let resp = call.await;
+                let mut resp = call.await;
+                // HTTP/1 only: HTTP/2 forbids the header and closes with GOAWAY.
+                if !h2
+                    && stop.is_cancelled()
+                    && let Ok(r) = &mut resp
+                {
+                    r.headers_mut()
+                        .insert(header::CONNECTION, HeaderValue::from_static("close"));
+                }
                 drop(active);
                 resp
             }
@@ -209,14 +231,14 @@ async fn connection(
             .max_concurrent_streams(H2_MAX_STREAMS)
             .max_header_list_size(MAX_HEADER_BYTES)
             .serve_connection(io, svc);
-        drive(conn, peer, &flight, limits, shutdown).await;
+        drive(conn, peer, &flight, limits, shutdown, true).await;
     } else {
         let conn = http1::Builder::new()
             .timer(TokioTimer::new())
             .header_read_timeout(limits.header_timeout)
             .max_buf_size(MAX_HEADER_BYTES as usize)
             .serve_connection(io, svc);
-        drive(conn, peer, &flight, limits, shutdown).await;
+        drive(conn, peer, &flight, limits, shutdown, false).await;
     }
 }
 
@@ -260,12 +282,18 @@ impl Drop for Active {
 /// completes). If the connection is still idle one more `idle_timeout` later,
 /// the server drops it. This function never bounds an open request, because a
 /// POST may wait in the queue.
+///
+/// On `shutdown` an HTTP/2 connection gets GOAWAY at once. An HTTP/1 connection
+/// keeps running, its responses carry `Connection: close` from then on, and the
+/// idle bound closes it if no request comes. So a request already on the wire
+/// gets an answer (503 `shutting_down` for an allocation), not a reset.
 async fn drive<C>(
     conn: C,
     peer: SocketAddr,
     flight: &InFlight,
     limits: Limits,
     shutdown: CancellationToken,
+    h2: bool,
 ) where
     C: GracefulConnection,
     C::Error: std::fmt::Display,
@@ -274,6 +302,7 @@ async fn drive<C>(
     let deadline = tokio::time::sleep(limits.idle_timeout);
     tokio::pin!(deadline);
     let mut closing = false;
+    let mut stopped = false;
     loop {
         tokio::select! {
             // An elapsed deadline must not beat a request that just finished.
@@ -301,10 +330,13 @@ async fn drive<C>(
                 closing = true;
                 deadline.as_mut().reset(Instant::now() + limits.idle_timeout);
             }
-            () = shutdown.cancelled() => {
-                conn.as_mut().graceful_shutdown();
-                let _ = conn.await;
-                return;
+            () = shutdown.cancelled(), if !stopped => {
+                if h2 {
+                    conn.as_mut().graceful_shutdown();
+                    let _ = conn.await;
+                    return;
+                }
+                stopped = true;
             }
         }
     }
@@ -339,7 +371,14 @@ mod tests {
             });
             let conn = http1::Builder::new().serve_connection(TokioIo::new(server), svc);
             let peer: SocketAddr = ([127, 0, 0, 1], 1).into();
-            let mut drive = pin!(drive(conn, peer, &flight, limits, CancellationToken::new()));
+            let mut drive = pin!(drive(
+                conn,
+                peer,
+                &flight,
+                limits,
+                CancellationToken::new(),
+                false
+            ));
             let poll_once = async |d: &mut std::pin::Pin<&mut dyn Future<Output = ()>>| {
                 poll_fn(|cx| Poll::Ready(d.as_mut().poll(cx).is_ready())).await
             };

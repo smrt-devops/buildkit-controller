@@ -1,0 +1,32 @@
+# Values for `cargo xtask drain-verify`: two replicas, one pool with a single worker.
+# shutdown.drainTimeout stays unset, so the default unbounded drain is what runs.
+fullnameOverride: buildkit-controller
+image: {repository: buildkit-controller, tag: dev, pullPolicy: Never}
+replicaCount: 2
+logFormat: text
+service:
+  type: NodePort
+  nodePorts: {api: 30443, edge: 30444}
+# Long enough that a Lease move inside it shows the Lease went before the listeners.
+shutdown: {delay: 10s}
+edge:
+  endpoint: tcp://localhost:28444
+  serverName: bk.drain.test
+  extraNames: [localhost, 127.0.0.1]
+pools:
+  - name: drain
+    namespace: drain-ci
+    spec:
+      scaling: {min: 1, max: 1}
+      access:
+        rules:
+          - serviceAccount: {name: builder}
+      template:
+        spec:
+          containers:
+            - name: buildkitd
+              image: moby/buildkit:v0.34.0-rootless
+              imagePullPolicy: Never
+              resources:
+                requests: {cpu: 100m, memory: 256Mi, ephemeral-storage: 256Mi}
+                limits: {memory: 3Gi, ephemeral-storage: 10Gi}

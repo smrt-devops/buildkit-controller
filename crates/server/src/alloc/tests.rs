@@ -237,6 +237,7 @@ fn ready_status() -> k8s_openapi::api::core::v1::PodStatus {
 struct Env {
     metrics: AllocMetrics,
     engine: Arc<Engine>,
+    stopping: tokio_util::sync::CancellationToken,
     fake: Arc<Fake>,
     pool: BuildKitPool,
     ca: Arc<CaBundle>,
@@ -298,24 +299,29 @@ fn env_full(max: i32, cold: bool, queue_cap: usize, cache: bool) -> Env {
         Arc::clone(&ca),
         CaCertRule::ClientCa,
     ));
+    let stopping = tokio_util::sync::CancellationToken::new();
     let metrics = AllocMetrics::default();
-    let engine = Arc::new(Engine::new(
-        Arc::clone(&fake) as Arc<dyn Backend>,
-        pools.as_reader(),
-        pods,
-        Box::new(move || PodSubscription::new(tx.subscribe())),
-        Arc::new(MaterialSource::new(ca_rx)),
-        EngineConfig {
-            endpoint: "tcp://bk.example.com:8444".into(),
-            server_name: "bk.example.com".into(),
-            allocation_domain: Some("alloc.bk.example.com".into()),
-        },
-        metrics.clone(),
-        Arc::new(Queues::new(queue_cap, metrics.clone())),
-    ));
+    let engine = Arc::new(
+        Engine::new(
+            Arc::clone(&fake) as Arc<dyn Backend>,
+            pools.as_reader(),
+            pods,
+            Box::new(move || PodSubscription::new(tx.subscribe())),
+            Arc::new(MaterialSource::new(ca_rx)),
+            EngineConfig {
+                endpoint: "tcp://bk.example.com:8444".into(),
+                server_name: "bk.example.com".into(),
+                allocation_domain: Some("alloc.bk.example.com".into()),
+            },
+            metrics.clone(),
+            Arc::new(Queues::new(queue_cap, metrics.clone())),
+        )
+        .with_stopping(stopping.clone()),
+    );
     Env {
         metrics,
         engine,
+        stopping,
         fake,
         pool,
         ca,
@@ -391,6 +397,7 @@ fn every_error_maps_to_one_distinct_api_code() {
         AllocError::NotReady,
         AllocError::CaUnavailable,
         AllocError::UpstreamError,
+        AllocError::ShuttingDown,
     ];
     let codes: std::collections::BTreeSet<&str> = all.iter().map(|e| e.code().as_str()).collect();
     assert_eq!(codes.len(), all.len());
@@ -674,6 +681,58 @@ async fn queue_full_is_immediate_pool_exhausted() {
     assert_eq!(t.elapsed(), Duration::ZERO);
 }
 
+/// Shutdown wakes every queued request with `shutting_down` at once, claims
+/// nothing for it, and empties the queue.
+#[tokio::test(start_paused = true)]
+async fn shutdown_refuses_queued_requests_before_any_claim() {
+    let e = env_with(4, false, 10);
+    let _stop = e.spawn_drive();
+    let mut handles = Vec::new();
+    for i in 0..3 {
+        let engine = Arc::clone(&e.engine);
+        handles.push(tokio::spawn(async move {
+            engine
+                .allocate(&sa(&format!("w{i}")), &req(600))
+                .await
+                .err()
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let key = (NS.to_owned(), POOL.to_owned());
+    assert_eq!(e.engine.queues.lengths(), vec![(key.clone(), 3)]);
+    let t = tokio::time::Instant::now();
+    e.stopping.cancel();
+    for h in handles {
+        assert_eq!(h.await.unwrap(), Some(AllocError::ShuttingDown));
+    }
+    assert_eq!(t.elapsed(), Duration::ZERO);
+    assert_eq!(e.engine.queues.lengths(), vec![(key, 0)]);
+    assert!(
+        !e.fake.calls().iter().any(|c| c.starts_with("patch")),
+        "{:?}",
+        e.fake.calls()
+    );
+    assert_eq!(
+        AllocError::ShuttingDown.code().retry_after_seconds(),
+        Some(1)
+    );
+}
+
+/// After shutdown a new request is refused even when a warm pod is free, and
+/// that pod stays free.
+#[tokio::test(start_paused = true)]
+async fn shutdown_refuses_new_requests_and_leaves_warm_pods_free() {
+    let e = env_with(4, false, 10);
+    let name = e.warm(0);
+    e.stopping.cancel();
+    assert!(matches!(
+        e.engine.allocate(&sa("late"), &req(60)).await,
+        Err(AllocError::ShuttingDown)
+    ));
+    assert_eq!(ann(&e.fake.get(&name).unwrap(), ANN_ALLOC), Some(FREE));
+    assert!(e.fake.calls().is_empty(), "{:?}", e.fake.calls());
+}
+
 #[tokio::test(start_paused = true)]
 async fn queue_is_fifo_and_woken_by_pod_events() {
     let e = env_with(8, false, 10);
@@ -754,6 +813,25 @@ async fn waiters_status_written_on_change_heartbeat_and_zero() {
     writer.tick(&e.engine.queues, &*e.fake).await;
     writer.tick(&e.engine.queues, &*e.fake).await;
     assert_eq!(e.fake.w.lock().unwrap().waiters, vec![1, 1, 0]);
+}
+
+/// On shutdown the queued requests are refused and `drive` returns only after
+/// this replica's `status.waiters` entry is back at 0, so the leader does not
+/// count them twice while they retry elsewhere.
+#[tokio::test(start_paused = true)]
+async fn shutdown_sets_status_waiters_back_to_zero_before_drive_returns() {
+    let e = env_with(4, false, 10);
+    let stop = e.stopping.clone();
+    let engine = Arc::clone(&e.engine);
+    let drive = tokio::spawn(async move { drive(&engine, "r1".into(), stop).await });
+    let engine = Arc::clone(&e.engine);
+    let queued = tokio::spawn(async move { engine.allocate(&sa("w"), &req(600)).await.err() });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(e.fake.w.lock().unwrap().waiters, vec![1]);
+    e.stopping.cancel();
+    drive.await.unwrap();
+    assert_eq!(e.fake.w.lock().unwrap().waiters, vec![1, 0]);
+    assert_eq!(queued.await.unwrap(), Some(AllocError::ShuttingDown));
 }
 
 #[tokio::test(start_paused = true)]
