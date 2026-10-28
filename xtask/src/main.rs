@@ -265,18 +265,7 @@ fn crd_verify() -> Result<()> {
     if !applied.status.success() {
         bail!("CRD rejected: {}", String::from_utf8_lossy(&applied.stderr));
     }
-    let waited = kubectl(&[
-        "wait",
-        "--for=condition=established",
-        "--timeout=60s",
-        "crd/buildkitpools.buildkit.smrt-devops.net",
-    ])?;
-    if !waited.status.success() {
-        bail!(
-            "CRD not established: {}",
-            String::from_utf8_lossy(&waited.stderr)
-        );
-    }
+    crate::kube::wait_crd_established(&kubeconfig).context("CRD not established")?;
     let (mut passed, mut failed) = (0usize, Vec::new());
     for (dir, want_ok) in [("accept", true), ("reject", false)] {
         for file in yaml_files(&root.join(FIXTURES).join(dir))? {

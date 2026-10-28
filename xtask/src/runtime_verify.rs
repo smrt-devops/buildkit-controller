@@ -379,12 +379,7 @@ pub fn runtime_verify() -> Result<()> {
     cleanup
         .env
         .kubectl(&["apply", "--server-side", "-f", &crd.to_string_lossy()])?;
-    cleanup.env.kubectl(&[
-        "wait",
-        "--for=condition=established",
-        "--timeout=60s",
-        "crd/buildkitpools.buildkit.smrt-devops.net",
-    ])?;
+    crate::kube::wait_crd_established(&cleanup.env.kubeconfig)?;
     let t = wait_for("/readyz 200 on both", Duration::from_secs(90), || {
         replicas
             .iter()

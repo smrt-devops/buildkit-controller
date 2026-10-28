@@ -348,14 +348,13 @@ auth:
         "--timeout=300s",
     ])?;
     for p in &ready {
-        env.kubectl(&[
-            "wait",
-            "--for=condition=Ready",
+        crate::kube::wait_condition(
+            &env.kubeconfig,
             &format!("buildkitpool/{p}"),
-            "-n",
-            POOL_NS,
-            "--timeout=300s",
-        ])?;
+            Some(POOL_NS),
+            "Ready",
+            Duration::from_mins(5),
+        )?;
     }
     println!("pools Ready: {ready:?}");
 
