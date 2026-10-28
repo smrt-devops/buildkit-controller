@@ -359,7 +359,7 @@ mod waiters_tests {
         pools.apply_watcher_event(&watcher::Event::Apply(fixtures::pool("p", spec).unwrap()));
         let queues = Arc::new(Queues::new(MAX_WAITERS, AllocMetrics::default()));
         let _queued = queues
-            .enqueue(&(fixtures::POOL_NAMESPACE.into(), "p".into()))
+            .enqueue(&(fixtures::POOL_NAMESPACE.into(), "p".into()), None)
             .unwrap();
         let backend = Arc::new(SlowWaiters::default());
         let stop = CancellationToken::new();
@@ -391,7 +391,7 @@ mod waiters_tests {
         let queues = Queues::new(MAX_WAITERS, AllocMetrics::default());
         let queues = Arc::new(queues);
         let _queued = queues
-            .enqueue(&(fixtures::POOL_NAMESPACE.into(), "p".into()))
+            .enqueue(&(fixtures::POOL_NAMESPACE.into(), "p".into()), None)
             .unwrap();
         let backend = SlowWaiters::default();
         backend.1.store(true, std::sync::atomic::Ordering::SeqCst);

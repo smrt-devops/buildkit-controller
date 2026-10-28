@@ -1,5 +1,7 @@
 //! The per-replica FIFO per pool and its `status.waiters`
-//! entry.
+//! entry. With `cache.local`, each cache scope keeps its own order within
+//! the pool's queue, because a pod that one scope can use may be of no use
+//! to another.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -26,13 +28,22 @@ pub const APPLY_MIN_INTERVAL: Duration = Duration::from_secs(1);
 pub const HEARTBEAT: Duration = Duration::from_secs(30);
 
 struct PoolQueue {
-    order: VecDeque<u64>,
+    /// Ticket ids in arrival order, each with its cache scope.
+    order: VecDeque<(u64, Option<String>)>,
     next: u64,
     /// Bumped on every wake and on every head change.
     wake: watch::Sender<u64>,
 }
 
 impl PoolQueue {
+    /// The first waiter of cache `scope`.
+    fn head(&self, scope: Option<&str>) -> Option<u64> {
+        self.order
+            .iter()
+            .find(|(_, s)| s.as_deref() == scope)
+            .map(|(id, _)| *id)
+    }
+
     fn bump(&self) {
         self.wake.send_modify(|v| *v = v.wrapping_add(1));
     }
@@ -74,8 +85,8 @@ impl Queues {
         *Self::entry(&mut self.lock(), key).wake.borrow()
     }
 
-    /// Join the tail; `None` when the queue is full.
-    pub fn enqueue(self: &Arc<Self>, key: &PoolKey) -> Option<Ticket> {
+    /// Join the tail as a waiter of cache `scope`; `None` when the queue is full.
+    pub fn enqueue(self: &Arc<Self>, key: &PoolKey, scope: Option<&str>) -> Option<Ticket> {
         let mut map = self.lock();
         let q = Self::entry(&mut map, key);
         if q.order.len() >= self.cap {
@@ -83,24 +94,28 @@ impl Queues {
         }
         let id = q.next;
         q.next += 1;
-        q.order.push_back(id);
+        let scope = scope.map(str::to_owned);
+        q.order.push_back((id, scope.clone()));
         let rx = q.wake.subscribe();
         self.metrics.depth(&key.0, &key.1, q.order.len());
         Some(Ticket {
             queues: Arc::clone(self),
             key: key.clone(),
             id,
+            scope,
             rx,
         })
     }
 
-    /// Whether anyone waits in the queue of `key`.
+    /// Whether a waiter of cache `scope` is in the queue of `key`.
     #[must_use]
-    pub fn is_waiting(&self, key: &PoolKey) -> bool {
-        self.lock().get(key).is_some_and(|q| !q.order.is_empty())
+    pub fn is_waiting(&self, key: &PoolKey, scope: Option<&str>) -> bool {
+        self.lock()
+            .get(key)
+            .is_some_and(|q| q.head(scope).is_some())
     }
 
-    /// Let the head of `key` retry.
+    /// Let the heads of `key` (one per cache scope) retry.
     pub fn wake(&self, key: &PoolKey) {
         if let Some(q) = self.lock().get(key) {
             q.bump();
@@ -135,17 +150,18 @@ pub struct Ticket {
     queues: Arc<Queues>,
     key: PoolKey,
     id: u64,
+    scope: Option<String>,
     rx: watch::Receiver<u64>,
 }
 
 impl Ticket {
-    /// First in line.
+    /// First in line among the waiters of its cache scope.
     #[must_use]
     pub fn is_head(&self) -> bool {
         self.queues
             .lock()
             .get(&self.key)
-            .and_then(|q| q.order.front().copied())
+            .and_then(|q| q.head(self.scope.as_deref()))
             == Some(self.id)
     }
 
@@ -166,8 +182,8 @@ impl Drop for Ticket {
     fn drop(&mut self) {
         let mut map = self.queues.lock();
         if let Some(q) = map.get_mut(&self.key) {
-            let was_head = q.order.front() == Some(&self.id);
-            q.order.retain(|i| *i != self.id);
+            let was_head = q.head(self.scope.as_deref()) == Some(self.id);
+            q.order.retain(|(i, _)| *i != self.id);
             if was_head {
                 q.bump();
             }

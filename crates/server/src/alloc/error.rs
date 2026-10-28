@@ -1,10 +1,10 @@
-//! [`AllocError`]: one variant per the API error code the allocation service can produce.
+//! [`AllocError`]: one variant per API error code the allocation service can produce.
 
 use buildkit_controller_api::dto::ErrorCode;
 
 /// Failure of [`super::AllocService::allocate`] or [`super::AllocService::release`].
 ///
-/// Each variant maps to exactly one the API error code ([`AllocError::code`]). The
+/// Each variant maps to exactly one API error code ([`AllocError::code`]). The
 /// codes the HTTP layer produces before calling this service
 /// (`unauthenticated`, `payload_too_large`, `unsupported_media_type`, and
 /// `invalid_request` for undecodable JSON) have no variant here. Messages are
@@ -54,7 +54,7 @@ pub enum AllocError {
 }
 
 impl AllocError {
-    /// The the API error code (also the metrics `result` label, via [`ErrorCode::as_str`]).
+    /// The API error code (also the metrics `result` label, via [`ErrorCode::as_str`]).
     #[must_use]
     pub const fn code(&self) -> ErrorCode {
         match self {

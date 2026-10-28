@@ -19,7 +19,7 @@ pub enum PatchOutcome {
     Applied(Box<Pod>),
     /// 422 (a `test` failed), 409, 404.
     Lost,
-    /// Timeout or 5xx, so the outcome is unknown.
+    /// Timeout, 5xx, 408 or 429, so the outcome is unknown.
     Unknown,
     /// Any other error.
     Failed(String),
@@ -34,7 +34,7 @@ pub enum CreateOutcome {
     Exists,
     /// 403 `exceeded quota`.
     Quota,
-    /// Timeout or 5xx.
+    /// Timeout, 5xx, 408 or 429.
     Unknown,
     /// Admission, invalid, other.
     Failed(String),
@@ -91,6 +91,8 @@ pub enum PvcCreate {
     Created,
     /// 403 `exceeded quota`.
     Quota,
+    /// Timeout, 5xx, 408 or 429: the volume may or may not exist.
+    Unknown(String),
     /// Anything else.
     Failed(String),
 }
@@ -109,24 +111,34 @@ impl KubeBackend {
     }
 }
 
-enum Class {
-    Lost,
+/// What a failed call means for its caller.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Class {
+    /// 422, 404, or a 409 other than `AlreadyExists`, with the server's reason.
+    Lost(String),
     Exists,
     Quota,
     Unknown,
     Failed(String),
 }
 
-fn classify(r: Result<kube::Error, tokio::time::error::Elapsed>) -> Class {
+/// Sorts a failed call. Throttling (429) and request timeouts (408) count as
+/// unknown, like a 5xx: the client has no retry layer, so treating them as
+/// final would abandon a write that a later try would make.
+pub(super) fn classify(r: Result<kube::Error, tokio::time::error::Elapsed>) -> Class {
     match r {
         Err(_) => Class::Unknown,
-        Ok(kube::Error::Api(s)) => match s.code {
-            409 if s.reason == "AlreadyExists" => Class::Exists,
-            422 | 409 | 404 => Class::Lost,
-            403 if s.message.contains("exceeded quota") => Class::Quota,
-            c if c >= 500 => Class::Unknown,
-            c => Class::Failed(format!("http {c} {}: {}", s.reason, s.message)),
-        },
+        Ok(kube::Error::Api(s)) => {
+            let detail = || format!("http {} {}: {}", s.code, s.reason, s.message);
+            match s.code {
+                409 if s.reason == "AlreadyExists" => Class::Exists,
+                422 | 409 | 404 => Class::Lost(detail()),
+                403 if s.message.contains("exceeded quota") => Class::Quota,
+                408 | 429 => Class::Unknown,
+                c if c >= 500 => Class::Unknown,
+                _ => Class::Failed(detail()),
+            }
+        }
         // Transport failures after the request may have been sent.
         Ok(e) => Class::Unknown.or_failed(e),
     }
@@ -162,17 +174,10 @@ impl Backend for KubeBackend {
         let (api, t) = (self.pods(ns), self.timeout);
         Box::pin(async move {
             let r = tokio::time::timeout(t, api.create(&PostParams::default(), &pod)).await;
-            let class = match r {
-                Ok(Ok(pod)) => return CreateOutcome::Created(Box::new(pod)),
-                Ok(Err(e)) => classify(Ok(e)),
-                Err(e) => classify(Err(e)),
-            };
-            match class {
-                Class::Exists => CreateOutcome::Exists,
-                Class::Quota => CreateOutcome::Quota,
-                Class::Unknown => CreateOutcome::Unknown,
-                Class::Lost => CreateOutcome::Failed("conflict on create".into()),
-                Class::Failed(m) => CreateOutcome::Failed(m),
+            match r {
+                Ok(Ok(pod)) => CreateOutcome::Created(Box::new(pod)),
+                Ok(Err(e)) => created(classify(Ok(e))),
+                Err(e) => created(classify(Err(e))),
             }
         })
     }
@@ -249,13 +254,11 @@ impl Backend for KubeBackend {
             match tokio::time::timeout(t, api.create(&PostParams::default(), &pvc)).await {
                 Ok(Ok(_)) => PvcCreate::Created,
                 Ok(Err(kube::Error::Api(s))) if s.code == 409 => PvcCreate::Created,
-                Ok(Err(kube::Error::Api(s)))
-                    if s.code == 403 && s.message.contains("exceeded quota") =>
-                {
-                    PvcCreate::Quota
+                Ok(Err(e)) => {
+                    let detail = e.to_string();
+                    pvc_created(&classify(Ok(e)), detail)
                 }
-                Ok(Err(e)) => PvcCreate::Failed(e.to_string()),
-                Err(_) => PvcCreate::Failed("timeout".into()),
+                Err(e) => pvc_created(&classify(Err(e)), "timeout".into()),
             }
         })
     }
@@ -314,9 +317,29 @@ impl KubeBackend {
     }
 }
 
-fn from_class(c: Class) -> PatchOutcome {
+/// A create's outcome. A refusal keeps the server's reason, so an admission
+/// or validation error is logged as the API server gave it.
+pub(super) fn created(c: Class) -> CreateOutcome {
     match c {
-        Class::Lost | Class::Exists => PatchOutcome::Lost,
+        Class::Exists => CreateOutcome::Exists,
+        Class::Quota => CreateOutcome::Quota,
+        Class::Unknown => CreateOutcome::Unknown,
+        Class::Lost(m) | Class::Failed(m) => CreateOutcome::Failed(m),
+    }
+}
+
+/// A volume create's outcome (a 409 never gets here: it counts as created).
+pub(super) fn pvc_created(c: &Class, detail: String) -> PvcCreate {
+    match c {
+        Class::Quota => PvcCreate::Quota,
+        Class::Unknown => PvcCreate::Unknown(detail),
+        Class::Lost(_) | Class::Exists | Class::Failed(_) => PvcCreate::Failed(detail),
+    }
+}
+
+pub(super) fn from_class(c: Class) -> PatchOutcome {
+    match c {
+        Class::Lost(_) | Class::Exists => PatchOutcome::Lost,
         Class::Unknown => PatchOutcome::Unknown,
         Class::Quota => PatchOutcome::Failed("forbidden: exceeded quota".into()),
         Class::Failed(m) => PatchOutcome::Failed(m),
