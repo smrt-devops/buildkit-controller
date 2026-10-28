@@ -86,7 +86,8 @@ data:
     shutdown:
       delay: 5s
       drainTimeout: 300s
-    watchNamespace: ci
+    watchNamespaces:
+    - ci
     workerNetwork:
       clusterCIDRs: []
       deniedCIDRs:
@@ -369,7 +370,7 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: buildkit-controller-0.1.0
       annotations:
-        checksum/config: 5050c51cb1fe1f025e3627f7fcce1ef6926b3ac015d211d54b3d2a8995ee9eba
+        checksum/config: e27b4775604b73c7b8bb3b1b72c22cb4b45d7b4c82e39f72049d887011e885fd
     spec:
       serviceAccountName: buildkit-controller
       terminationGracePeriodSeconds: 315

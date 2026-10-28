@@ -354,3 +354,46 @@ fn claims_are_off_unless_enabled() {
     let e = Config::from_yaml(&format!("{MIN}claims:\n  enable: true\n")).unwrap_err();
     assert!(matches!(e, ConfigError::Parse(_)), "{e}");
 }
+
+#[test]
+fn watch_namespaces_default_to_cluster_wide() {
+    let c = Config::from_yaml(MIN).unwrap();
+    assert!(c.watched_namespaces().is_empty());
+    let c =
+        Config::from_yaml(&format!("{MIN}watchNamespace: \"\"\nwatchNamespaces: []\n")).unwrap();
+    assert!(c.watched_namespaces().is_empty());
+}
+
+#[test]
+fn watch_namespaces_list_and_deprecated_alias() {
+    let c = Config::from_yaml(&format!("{MIN}watchNamespaces: [team-a, team-b]\n")).unwrap();
+    assert_eq!(c.watched_namespaces(), ["team-a", "team-b"]);
+    let c = Config::from_yaml(&format!("{MIN}watchNamespace: ci\n")).unwrap();
+    assert_eq!(c.watched_namespaces(), ["ci"]);
+}
+
+#[test]
+fn watch_namespace_and_watch_namespaces_are_exclusive() {
+    let v = errs(&format!("{MIN}watchNamespace: ci\nwatchNamespaces: [ci]\n"));
+    assert!(v.iter().any(|m| m.contains("both set")), "{v:?}");
+}
+
+#[test]
+fn watch_namespaces_must_be_unique_namespace_names() {
+    let v = errs(&format!(
+        "{MIN}watchNamespaces: [ci, ci, \"\", Bad_Name, -x]\n"
+    ));
+    assert!(
+        v.iter().any(|m| m.contains("`ci` is listed twice")),
+        "{v:?}"
+    );
+    for bad in ["``", "`Bad_Name`", "`-x`"] {
+        assert!(
+            v.iter()
+                .any(|m| m.contains(&format!("{bad} is not a namespace name"))),
+            "{bad}: {v:?}"
+        );
+    }
+    let v = errs(&format!("{MIN}watchNamespace: Bad\n"));
+    assert!(v.iter().any(|m| m.contains("`Bad` is not")), "{v:?}");
+}

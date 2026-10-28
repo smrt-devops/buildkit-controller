@@ -36,7 +36,7 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- end -}}
 {{- $fn := include "bkc.fullname" . -}}
 {{- $cfg := dict
-  "watchNamespace" .Values.watchNamespace
+  "watchNamespace" ""
   "listen" (dict "api" "0.0.0.0:8443" "edge" "0.0.0.0:8444" "ops" (printf "0.0.0.0:%d" (int .Values.metrics.port)))
   "pki" (dict "caSecretName" (printf "%s-ca" $fn))
   "leaderElection" (dict "leaseName" (printf "%s-leader" $fn))
@@ -58,6 +58,11 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
   "workerNetwork" .Values.workerNetwork
   "shutdown" .Values.shutdown
   "claims" (dict "enabled" .Values.claims.enabled "namespaces" .Values.claims.namespaces) -}}
+{{- /* Scoped: the list. Cluster-wide: the old empty key, so existing configs (and their checksum) stay the same. */ -}}
+{{- with include "bkc.watchNamespaces" . | fromJsonArray -}}
+  {{- $_ := unset $cfg "watchNamespace" -}}
+  {{- $_ := set $cfg "watchNamespaces" . -}}
+{{- end -}}
 {{- toYaml $cfg -}}
 {{- end -}}
 
@@ -71,4 +76,16 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
   {{- else -}}{{- $t = add $t $n -}}{{- end -}}
 {{- end -}}
 {{- $t -}}
+{{- end -}}
+
+{{/* Watched namespaces as a JSON list, [] = cluster-wide. watchNamespace is the deprecated single form. */}}
+{{- define "bkc.watchNamespaces" -}}
+{{- if and .Values.watchNamespace .Values.watchNamespaces -}}
+{{- fail "set watchNamespaces or the deprecated watchNamespace, not both" -}}
+{{- end -}}
+{{- if .Values.watchNamespace -}}
+{{- list .Values.watchNamespace | toJson -}}
+{{- else -}}
+{{- default (list) .Values.watchNamespaces | toJson -}}
+{{- end -}}
 {{- end -}}

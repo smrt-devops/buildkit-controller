@@ -1,0 +1,12 @@
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+watchNamespaces: [ci-a, ci-b]
+pools:
+  - name: amd64
+    namespace: ci-a
+    spec: {}
+  - name: arm64
+    namespace: ci-b
+    spec: {}
+claims:
+  enabled: true
+  namespaces: [apps]

@@ -1,0 +1,15 @@
+# A pool outside watchNamespaces. The controller must not see it.
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: stray, namespace: bk-helm-stray}
+spec:
+  scaling: {min: 1}
+  access:
+    rules:
+      - serviceAccount: {name: builder}
+  template:
+    spec:
+      containers:
+        - name: buildkitd
+          image: moby/buildkit:v0.34.0-rootless
+          imagePullPolicy: Never

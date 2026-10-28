@@ -28,6 +28,23 @@ No OIDC issuer is configured (auth.oidc is empty), so only Kubernetes ServiceAcc
 tokens (TokenReview) can authenticate. To use GitHub Actions, add the issuer
 https://token.actions.githubusercontent.com with an audience under auth.oidc.
 {{- end }}
+{{- $watch := include "bkc.watchNamespaces" . | fromJsonArray }}
+{{- if not $watch }}
+
+WARNING: watchNamespaces is empty, so the controller serves pools in every namespace
+and its ClusterRole can create and delete pods, Secrets and ServiceAccounts in any
+namespace, kube-system included. A compromised controller can take over the cluster.
+List the pool namespaces instead:
+  helm upgrade {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} --reuse-values \
+    --set 'watchNamespaces={ci-builders}'
+{{- else }}
+
+Watching pools in: {{ join ", " $watch }}. A pool in any other namespace is ignored.
+{{- end }}
+{{- if .Values.watchNamespace }}
+
+watchNamespace is deprecated; set watchNamespaces: [{{ .Values.watchNamespace }}] instead.
+{{- end }}
 {{- if not .Values.pools }}
 
 The chart created no pools. Add them under `pools:` in values, or apply BuildKitPool objects separately.

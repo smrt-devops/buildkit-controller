@@ -1,5 +1,6 @@
 {{- $fn := include "bkc.fullname" . -}}
 {{- $ns := .Release.Namespace -}}
+{{- $watch := include "bkc.watchNamespaces" . | fromJsonArray -}}
 {{- $subjects := list (dict "kind" "ServiceAccount" "name" $fn "namespace" $ns) -}}
 {{- $workload := list
   (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitpools") "verbs" (list "get" "list" "watch"))
@@ -28,21 +29,25 @@ metadata:
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: {{ $fn }}-{{ $ns }}-tokenreview}
 subjects: {{- toYaml $subjects | nindent 2 }}
 ---
-{{- if .Values.watchNamespace }}
+{{- /* watchNamespaces set: the pool workload rights in each listed namespace, nothing cluster-wide. */}}
+{{- range $i, $wns := $watch }}
+{{- if $i }}
+---
+{{- end }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: {{ $fn }}-workload
-  namespace: {{ .Values.watchNamespace }}
-  labels: {{- include "bkc.labels" . | nindent 4 }}
+  namespace: {{ $wns }}
+  labels: {{- include "bkc.labels" $ | nindent 4 }}
 rules: {{- toYaml $workload | nindent 2 }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: {{ $fn }}-workload
-  namespace: {{ .Values.watchNamespace }}
-  labels: {{- include "bkc.labels" . | nindent 4 }}
+  namespace: {{ $wns }}
+  labels: {{- include "bkc.labels" $ | nindent 4 }}
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: {{ $fn }}-workload}
 subjects: {{- toYaml $subjects | nindent 2 }}
 {{- else }}
@@ -113,20 +118,18 @@ subjects: {{- toYaml $subjects | nindent 2 }}
 {{- if empty .Values.claims.namespaces }}
 {{- fail "claims.namespaces must list the namespaces whose claims the controller serves" }}
 {{- end }}
+{{- $claimRules := list
+  (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitclaims") "verbs" (list "get" "list" "watch"))
+  (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitclaims/status") "verbs" (list "get" "patch" "update")) }}
+{{- if not $watch }}
 ---
-{{- /* BuildKitClaim controller: claims in any namespace, Secrets only in claims.namespaces. */}}
+{{- /* BuildKitClaim controller, cluster-wide: claims in any namespace, Secrets only in claims.namespaces. */}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: {{ $fn }}-{{ $ns }}-claims
   labels: {{- include "bkc.labels" . | nindent 4 }}
-rules:
-  - apiGroups: [buildkit.smrt-devops.net]
-    resources: [buildkitclaims]
-    verbs: [get, list, watch]
-  - apiGroups: [buildkit.smrt-devops.net]
-    resources: [buildkitclaims/status]
-    verbs: [get, patch, update]
+rules: {{- toYaml $claimRules | nindent 2 }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -135,8 +138,10 @@ metadata:
   labels: {{- include "bkc.labels" . | nindent 4 }}
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: {{ $fn }}-{{ $ns }}-claims}
 subjects: {{- toYaml $subjects | nindent 2 }}
+{{- end }}
 {{- range $cns := .Values.claims.namespaces }}
 ---
+{{- /* With watchNamespaces set the claim rules are namespaced too: claims outside claims.namespaces are not read. */}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -144,6 +149,9 @@ metadata:
   namespace: {{ $cns }}
   labels: {{- include "bkc.labels" $ | nindent 4 }}
 rules:
+  {{- if $watch }}
+  {{- toYaml $claimRules | nindent 2 }}
+  {{- end }}
   - apiGroups: [""]
     resources: [secrets]
     verbs: [get, create, delete]

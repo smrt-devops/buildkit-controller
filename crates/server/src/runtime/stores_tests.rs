@@ -174,3 +174,148 @@ async fn a_watch_error_marks_the_store_stale_until_a_relist() {
     assert!(readiness.failing().is_empty());
     assert_eq!(store.state().len(), 1);
 }
+
+fn pod_in(ns: &str, name: &str) -> Pod {
+    let mut p = pod(name);
+    p.metadata.namespace = Some(ns.into());
+    p
+}
+
+fn key(p: &Pod) -> String {
+    format!(
+        "{}/{}",
+        p.metadata.namespace.as_deref().unwrap_or(""),
+        name_of(p)
+    )
+}
+
+type Tagged = (usize, watcher::Result<Event<Pod>>);
+
+/// Drive a store from the merge of namespaces `a` (0) and `b` (1). Returns the
+/// store, each event the writer applied, the readiness, and the error count.
+async fn run_merged(input: Vec<Tagged>) -> (Store<Pod>, Vec<String>, Arc<Readiness>, usize) {
+    let (store, writer) = reflector::store::<Pod>();
+    let readiness = Arc::new(Readiness::default());
+    let flag = readiness.register("pod_store");
+    let merged = merge_namespaces(
+        stream::iter(input).boxed(),
+        vec!["a".into(), "b".into()],
+        store.clone(),
+    );
+    let mut first = Some(merged.boxed());
+    let mut seen = Vec::new();
+    let errors = std::sync::atomic::AtomicUsize::new(0);
+    drive(
+        writer,
+        move || first.take().unwrap_or_else(|| stream::empty().boxed()),
+        flag,
+        |_| {
+            errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        },
+        |ev| {
+            seen.push(match ev {
+                Event::Init => "init".into(),
+                Event::InitApply(p) => format!("init-apply {}", key(p)),
+                Event::InitDone => "init-done".into(),
+                Event::Apply(p) => format!("apply {}", key(p)),
+                Event::Delete(p) => format!("delete {}", key(p)),
+            });
+        },
+    )
+    .await;
+    let errors = errors.into_inner();
+    (store, seen, readiness, errors)
+}
+
+fn keys(store: &Store<Pod>) -> Vec<String> {
+    let mut k: Vec<_> = store.state().iter().map(|p| key(p)).collect();
+    k.sort();
+    k
+}
+
+#[tokio::test]
+async fn merged_store_is_not_ready_until_every_namespace_listed() {
+    let (store, seen, readiness, _) = run_merged(vec![
+        (0, Ok(Event::Init)),
+        (0, Ok(Event::InitApply(pod_in("a", "p1")))),
+        (0, Ok(Event::InitDone)),
+        (0, Ok(Event::Apply(pod_in("a", "p2")))),
+        (1, Ok(Event::Init)),
+    ])
+    .await;
+    assert!(seen.is_empty(), "{seen:?}");
+    assert!(keys(&store).is_empty());
+    assert_eq!(readiness.failing(), ["pod_store"]);
+}
+
+#[tokio::test]
+async fn merged_initial_lists_become_one_list() {
+    let (store, seen, readiness, _) = run_merged(vec![
+        (0, Ok(Event::Init)),
+        (0, Ok(Event::InitApply(pod_in("a", "p1")))),
+        (1, Ok(Event::Init)),
+        (0, Ok(Event::InitDone)),
+        // `a` is watching while `b` still lists: these are held, not lost.
+        (0, Ok(Event::Apply(pod_in("a", "p2")))),
+        (0, Ok(Event::Delete(pod_in("a", "p1")))),
+        (1, Ok(Event::InitApply(pod_in("b", "q1")))),
+        (1, Ok(Event::InitDone)),
+        (1, Ok(Event::Apply(pod_in("b", "q2")))),
+    ])
+    .await;
+    assert_eq!(
+        seen,
+        [
+            "init",
+            "init-apply a/p2",
+            "init-apply b/q1",
+            "init-done",
+            "apply b/q2"
+        ]
+    );
+    assert_eq!(keys(&store), ["a/p2", "b/q1", "b/q2"]);
+    assert!(readiness.failing().is_empty());
+}
+
+#[tokio::test]
+async fn a_relist_of_one_namespace_replaces_only_its_objects() {
+    let (store, seen, _, _) = run_merged(vec![
+        (0, Ok(Event::Init)),
+        (0, Ok(Event::InitApply(pod_in("a", "p1")))),
+        (0, Ok(Event::InitDone)),
+        (1, Ok(Event::Init)),
+        (1, Ok(Event::InitApply(pod_in("b", "q1")))),
+        (1, Ok(Event::InitApply(pod_in("b", "q2")))),
+        (1, Ok(Event::InitDone)),
+        // `b` relists (a desync): q1 is gone, q3 is new.
+        (1, Ok(Event::Init)),
+        (1, Ok(Event::InitApply(pod_in("b", "q2")))),
+        (1, Ok(Event::InitApply(pod_in("b", "q3")))),
+        (1, Ok(Event::InitDone)),
+    ])
+    .await;
+    assert_eq!(
+        seen[5..],
+        ["apply b/q2", "apply b/q3", "delete b/q1"],
+        "{seen:?}"
+    );
+    assert_eq!(keys(&store), ["a/p1", "b/q2", "b/q3"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn merged_errors_pass_through() {
+    let (_, _, readiness, errors) = run_merged(vec![
+        (0, Ok(Event::Init)),
+        (0, Ok(Event::InitDone)),
+        (1, Ok(Event::Init)),
+        (1, Ok(Event::InitDone)),
+        (1, Err(watcher::Error::NoResourceVersion)),
+    ])
+    .await;
+    assert_eq!(errors, 1);
+    assert_eq!(
+        readiness.failing(),
+        ["pod_store"],
+        "an error marks the store stale"
+    );
+}

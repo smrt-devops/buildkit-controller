@@ -42,7 +42,8 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 | `replicaCount`, `autoscaling.*` | Deployment size; HPA on CPU (off by default) |
 | `affinity`, `topologySpreadConstraints` | when both are empty, a soft hostname anti-affinity spreads replicas |
 | `podDisruptionBudget.*` | rendered only when replicas exceed `minAvailable` |
-| `watchNamespace` | `""` = cluster-wide (ClusterRole); a name scopes the controller and its RBAC to that namespace |
+| `watchNamespaces` | namespaces whose pools the controller serves; recommended. The chart renders a Role and RoleBinding in each for pods, Secrets, ServiceAccounts, PVCs and NetworkPolicies, and only TokenReview stays cluster-wide. Pools elsewhere are ignored. `[]` (the default) = every namespace through a ClusterRole that can create pods and Secrets in any namespace, kube-system included; NOTES.txt warns about it |
+| `watchNamespace` | deprecated single-namespace form of `watchNamespaces`; setting both fails to render |
 | `edge.*` | `endpoint`, `serverName`, `allocationDomain`, `extraNames`, `tls.secretName` (user serving cert, a `kubernetes.io/tls` Secret in the release namespace), `handshakeTimeout` (10s), `maxConnections` (10000 established), `maxHandshakes` (1024), `maxHandshakesPerIp` (32; 0 = no cap) |
 | `api.*` | `maxConnections` (4096), `maxConnectionsPerIp` (128; 0 = no cap) |
 | `auth.oidc[]` | `url`, `audiences`, `jwksUrl`, and at most one of `caBundle` (inline PEM), `caBundleFile` (path), `caBundleConfigMap: {name, key}` (mounted, sets the file) |
@@ -50,7 +51,7 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 | `workerNetwork.*`, `shutdown.*` | the chart copies them into the config; the termination grace period is `shutdown.delay` + `shutdown.drainTimeout` + 10 s |
 | `service.type`, `.annotations`, `.ports`, `.nodePorts` | `ClusterIP`, `NodePort` or `LoadBalancer`; `loadBalancerClass` only for LoadBalancer, `externalTrafficPolicy` for NodePort and LoadBalancer (default `Local`, which keeps the client address the per-address caps count) |
 | `metrics.port`, `metrics.serviceMonitor.enabled` | ops port (`/healthz`, `/readyz`, `/metrics`) on its own Service; ServiceMonitor `true`, `false` or `auto` (only when the CRD exists) |
-| `pools` | list of `{name, namespace, spec}`, one BuildKitPool each; `namespace` is required unless `watchNamespace` is set, and must not be the release namespace (the chart fails to render otherwise); namespaces are not created |
+| `pools` | list of `{name, namespace, spec}`, one BuildKitPool each; `namespace` is required unless `watchNamespaces` has one entry, must be in `watchNamespaces` when that is set, and must not be the release namespace (the chart fails to render otherwise); namespaces are not created |
 
 ## Load balancer idle timeout
 

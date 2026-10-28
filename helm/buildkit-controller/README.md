@@ -13,8 +13,8 @@ helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
 ## Pools
 
 Each `pools` item is `{name, namespace, spec, cache}`. The chart copies `spec`
-into the pool unchanged. `namespace` defaults to `watchNamespace` and must not
-be the release namespace.
+into the pool unchanged. `namespace` defaults to the only entry of `watchNamespaces`, must be listed in
+`watchNamespaces` when that is set, and must not be the release namespace.
 
 ## Build cache
 
