@@ -525,7 +525,8 @@ impl<'a> Planner<'_, 'a> {
         if fp.is_some() && apply_sandbox {
             self.plan_applies();
         }
-        let counts = Some(self.plan_pods(fp.as_deref(), spec_block.is_none(), waiting));
+        let ca_lasts = self.ca_outlasts_new_workers(ca);
+        let counts = Some(self.plan_pods(fp.as_deref(), spec_block.is_none() && ca_lasts, waiting));
         if let Some(fp) = &fp {
             self.ca_replaced_check(fp);
         }
@@ -580,6 +581,25 @@ impl<'a> Planner<'_, 'a> {
             LoadOutcome::Valid(b) => Some(b),
             LoadOutcome::Missing | LoadOutcome::Invalid(_) => None,
         }
+    }
+
+    /// A worker cert ends no later than either CA. Within
+    /// `worker_cert_min_left` of the earlier CA's end every new pod would be
+    /// retired as `CertExpiring` in the pass that first sees it, and replaced
+    /// in the next, so no pod is created until the CA is replaced; the pool is
+    /// passed again just after the CA ends. `CAExpiringSoon` is True by then.
+    fn ca_outlasts_new_workers(&mut self, ca: Option<&CaBundle>) -> bool {
+        let Some(end) = ca
+            .and_then(|c| c.expiries().into_iter().map(|(_, t)| t).min())
+            .and_then(|t| Timestamp::from_second(t.unix_timestamp()).ok())
+        else {
+            return true;
+        };
+        let lasts = end >= add(self.now, self.cfg.worker_cert_min_left);
+        if !lasts {
+            self.at(add(end, SignedDuration::from_secs(1)));
+        }
+        lasts
     }
 
     /// Sandbox objects (step 4).

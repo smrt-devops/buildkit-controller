@@ -1333,3 +1333,23 @@ fn pool_in_the_controller_namespace_is_invalid_spec() {
         ("InvalidSpec", "pool is in the controller's namespace")
     );
 }
+
+/// RECON-9: in the last `worker_cert_min_left` of a CA's life every new pod
+/// would be retired as `CertExpiring` at once, so none is created; the pass
+/// comes back just after the CA ends, when it is replaced.
+#[test]
+fn no_creates_when_the_ca_ends_before_a_new_worker_could_serve() {
+    static ENDING: LazyLock<LoadOutcome> = LazyLock::new(|| {
+        let t = odt(*NOW) - time::Duration::days(7305) + time::Duration::hours(24);
+        LoadOutcome::Valid(Box::new(CaBundle::generate(t).unwrap()))
+    });
+    let mut f = fx().scale(2, 10);
+    f.ca = &ENDING;
+    f.pods.clear();
+    let p = f.plan();
+    assert!(creates(&p).is_empty());
+    assert_eq!(p.requeue_at, Some(later(24 * 3600 + 1)));
+    // With a day more the pool scales as usual.
+    f.ca = &OLD;
+    assert_eq!(creates(&f.plan()), vec![0, 1]);
+}
