@@ -67,7 +67,7 @@ roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: {{ $fn }
 subjects: {{- toYaml $subjects | nindent 2 }}
 {{- end }}
 ---
-{{- /* Controller namespace only: Lease, the CA and serving Secrets, CA Events and the CA bundle ConfigMap. */}}
+{{- /* Controller namespace only: Lease, the CA and serving Secrets, CA Events, the CA bundle ConfigMap, and the claims of CI callers (every allocation is one). */}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -105,6 +105,12 @@ rules:
     resources: [configmaps]
     resourceNames: [{{ $fn }}-ca-bundle]
     verbs: [patch]
+  - apiGroups: [buildkit.smrt-devops.net]
+    resources: [buildkitclaims]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [buildkit.smrt-devops.net]
+    resources: [buildkitclaims/status]
+    verbs: [get, patch, update]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

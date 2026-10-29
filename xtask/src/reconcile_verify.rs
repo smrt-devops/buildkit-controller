@@ -134,10 +134,7 @@ pub fn reconcile_verify() -> Result<()> {
     );
     c.create(Some(&kind_config), "180s")?;
     crate::proc::status(&mut crate::kube::kind_load(IMAGE, c.name()))?;
-    let crd = work.join("crd.yaml");
-    std::fs::write(&crd, crate::render_crd()?)?;
-    c.kubectl(&["apply", "-f", &crd.display().to_string()])?;
-    c.wait_crd_established()?;
+    c.apply_crds()?;
     let ctrl_kc = controller_kubeconfig(&c, &work)?;
 
     let [ops, api, edge] = crate::proc::free_ports()?;

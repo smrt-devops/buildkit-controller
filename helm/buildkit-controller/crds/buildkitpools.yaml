@@ -2228,9 +2228,7 @@ spec:
                 type: object
             type: object
           status:
-            description: |-
-              `BuildKitPool` status. The leader owns every field except `waiters`, which
-              each API replica owns for its own entry.
+            description: "`BuildKitPool` status, written by the leader."
             nullable: true
             properties:
               allocated:
@@ -2338,34 +2336,8 @@ spec:
                 format: int32
                 nullable: true
                 type: integer
-              waiters:
-                description: Queued allocation requests per API replica.
-                items:
-                  description: One API replica's queue length (`status.waiters`).
-                  properties:
-                    count:
-                      description: Queued POSTs on that replica.
-                      format: int32
-                      type: integer
-                    replica:
-                      description: Replica (pod) name. It is the list key.
-                      type: string
-                    updatedAt:
-                      description: When the replica last wrote the entry. Entries older than 90 s are stale.
-                      format: date-time
-                      type: string
-                  required:
-                  - count
-                  - replica
-                  - updatedAt
-                  type: object
-                maxItems: 64
-                type: array
-                x-kubernetes-list-map-keys:
-                - replica
-                x-kubernetes-list-type: map
               waiting:
-                description: Sum of the non-stale `waiters[].count` values.
+                description: Number of pending claims of this pool.
                 format: int32
                 nullable: true
                 type: integer

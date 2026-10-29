@@ -31,7 +31,7 @@ use time::OffsetDateTime;
 
 use super::edge_verify::{chart_rbac, controller_fixture, secret_from_files};
 use super::reconcile_verify::KIND_CONFIG;
-use super::{CRD_PATH, root};
+use super::root;
 use crate::image::WORKER_IMAGE;
 use crate::kube::Cluster;
 use crate::proc::{status, stdout as run_out};
@@ -398,9 +398,7 @@ fn setup(p: &Perf, work: &std::path::Path) -> Result<CaBundle> {
     for img in [WORKER_IMAGE, CURL_IMAGE] {
         status(&mut crate::kube::kind_load(img, p.env.name()))?;
     }
-    let crd = root().join(CRD_PATH).to_string_lossy().into_owned();
-    p.k(&["apply", "--server-side", "-f", &crd])?;
-    p.env.wait_crd_established()?;
+    p.env.apply_crds()?;
     p.k(&["create", "namespace", SYSTEM_NS])?;
     p.k(&[
         "label",

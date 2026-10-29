@@ -30,7 +30,7 @@ use buildkit_controller::pki::{CaBundle, EdgeNames};
 use time::OffsetDateTime;
 
 use super::edge_verify::{chart_rbac, controller_fixture};
-use super::{CRD_PATH, root};
+use super::root;
 use crate::image::WORKER_IMAGE;
 use crate::kube::Cluster;
 use crate::proc::status;
@@ -732,9 +732,7 @@ fn setup(s: &Soak, root: &std::path::Path) -> Result<CaBundle> {
         status(&mut crate::kube::kind_load(img, s.env.name()))?;
     }
 
-    let crd = root.join(CRD_PATH).to_string_lossy().into_owned();
-    s.k(&["apply", "--server-side", "-f", &crd])?;
-    s.env.wait_crd_established()?;
+    s.env.apply_crds()?;
     s.k(&["create", "namespace", SYSTEM_NS])?;
     s.k(&[
         "label",

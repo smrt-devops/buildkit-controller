@@ -3,10 +3,10 @@
 use std::sync::LazyLock;
 
 use buildkit_controller_api::v1alpha1::{
-    BuildKitPool, BuildKitPoolSpec, BuildKitPoolStatus, Day, Waiter, Window,
+    BuildKitPool, BuildKitPoolSpec, BuildKitPoolStatus, Day, Window,
 };
 use k8s_openapi::api::core::v1::Pod;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, OwnerReference, Time};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, OwnerReference};
 use k8s_openapi::jiff::tz::TimeZone;
 use k8s_openapi::jiff::{SignedDuration, Timestamp};
 
@@ -30,7 +30,7 @@ static OLD: LazyLock<LoadOutcome> = LazyLock::new(|| {
     LoadOutcome::Valid(Box::new(CaBundle::generate(t).unwrap()))
 });
 
-/// (name, min, max, pods, fresh waiters, expected creates)
+/// (name, min, max, pods, pending claims, expected creates)
 type SizingCase = (&'static str, i32, i32, Vec<WorkerPod>, i32, Vec<u32>);
 
 fn odt(t: Timestamp) -> time::OffsetDateTime {
@@ -66,7 +66,7 @@ pub(super) struct Fx {
     pub foreign: Vec<String>,
     pub slot_holds: std::collections::BTreeMap<u32, Timestamp>,
     pub became_ready: std::collections::BTreeSet<String>,
-    pub waiters_seen: std::collections::BTreeMap<(String, Timestamp), Timestamp>,
+    pub waiting: i32,
 }
 
 /// Steady state with min 0, max 10, CA valid, sandbox applied, worker Secret current
@@ -92,7 +92,7 @@ pub(super) fn fx() -> Fx {
         foreign: Vec::new(),
         slot_holds: std::collections::BTreeMap::new(),
         became_ready: std::collections::BTreeSet::new(),
-        waiters_seen: std::collections::BTreeMap::new(),
+        waiting: 0,
     }
 }
 
@@ -148,7 +148,7 @@ impl Fx {
             foreign_pods: self.foreign.clone(),
             slot_holds: self.slot_holds.clone(),
             became_ready: self.became_ready.clone(),
-            waiters_seen: self.waiters_seen.clone(),
+            waiting: self.waiting,
             down_since: self.down_since.clone(),
         }
     }
@@ -157,18 +157,6 @@ impl Fx {
         self.pool.spec.scaling.min = min;
         self.pool.spec.scaling.max = max;
         self
-    }
-
-    fn waiter(&mut self, replica: &str, count: i32, updated: Timestamp) {
-        let s = self.pool.status.get_or_insert_with(Default::default);
-        s.waiters.push(Waiter {
-            replica: replica.into(),
-            count,
-            updated_at: Time(updated),
-        });
-        // The leader saw it when it was written (clocks agree).
-        self.waiters_seen
-            .insert((replica.to_owned(), updated), updated);
     }
 }
 
@@ -218,7 +206,7 @@ fn sizing_table() {
         deletion: deleting.then(|| ago(10)),
         ..pod(s)
     };
-    // (name, min, max, pods, fresh waiters, expected creates)
+    // (name, min, max, pods, pending claims, expected creates)
     let cases: Vec<SizingCase> = vec![
         ("min warm from empty", 2, 10, vec![], 0, vec![0, 1]),
         ("min already warm", 2, 10, vec![pod(0), pod(1)], 0, vec![]),
@@ -241,7 +229,14 @@ fn sizing_table() {
             0,
             vec![],
         ),
-        ("waiters drive scale-up", 0, 10, vec![pod(0)], 3, vec![1, 2]),
+        (
+            "pending claims drive scale-up",
+            0,
+            10,
+            vec![pod(0)],
+            3,
+            vec![1, 2],
+        ),
         (
             "starting pods count as free",
             1,
@@ -259,7 +254,7 @@ fn sizing_table() {
         let mut f = fx().scale(min, max);
         f.pods = pods;
         if waiting > 0 {
-            f.waiter("r1", waiting, ago(10));
+            f.waiting = waiting;
         }
         assert_eq!(creates(&f.plan()), want, "{name}");
     }
@@ -958,30 +953,12 @@ fn schedule_windows() {
 }
 
 #[test]
-fn waiters_pruned_after_90s_and_fresh_ones_scale_up() {
+fn pending_claims_scale_up_and_show_in_status() {
     let mut f = fx();
-    f.waiter("a", 2, ago(91));
-    f.waiter("b", 3, ago(30));
-    f.waiter("c", 0, ago(10));
-    f.waiter("d", 0, ago(200));
+    f.waiting = 3;
     let p = f.plan();
-    assert_eq!(creates(&p), vec![0, 1, 2], "only fresh waiters count");
-    let prune = p
-        .actions
-        .iter()
-        .find_map(|a| match a {
-            Action::PruneWaiters { entries } => Some(entries),
-            _ => None,
-        })
-        .unwrap();
-    let got: Vec<(usize, &str)> = prune
-        .iter()
-        .map(|e| (e.index, e.replica.as_str()))
-        .collect();
-    assert_eq!(got, vec![(3, "d"), (0, "a")], "highest index first");
+    assert_eq!(creates(&p), vec![0, 1, 2]);
     assert_eq!(status(&p).waiting, Some(3));
-    // The next stale transition is b at -30 s + 90 s (+1 s past the boundary).
-    assert_eq!(p.requeue_at, Some(later(61)));
 }
 
 #[test]
@@ -1209,36 +1186,6 @@ fn held_slot_heals_after_foreign_pod_is_deleted() {
     let p = f.plan();
     assert!(p.slot_holds.is_empty());
     assert_eq!(cond(&p, "Degraded").reason, "AsExpected");
-}
-
-/// Regression (control review P3): staleness compared `updatedAt`, written by
-/// another replica's clock, with the leader's clock. A replica whose clock
-/// lagged by more than about 60 s had every entry judged stale at once, so its
-/// queued demand was ignored and pruned on every pass. Staleness now runs from
-/// when the leader first saw the `(replica, updatedAt)` pair.
-#[test]
-fn waiter_staleness_ignores_the_writers_clock() {
-    let mut f = fx().scale(0, 10);
-    f.waiter("skewed", 3, ago(300));
-    // The leader has just seen it: fresh, counted, not pruned.
-    f.waiters_seen.clear();
-    let p = f.plan();
-    assert_eq!(status(&p).waiting, Some(3));
-    assert!(
-        !p.actions
-            .iter()
-            .any(|a| matches!(a, Action::PruneWaiters { .. }))
-    );
-    assert_eq!(p.requeue_at, Some(later(91)), "stale check armed");
-    // Unchanged for 91 s on the leader's clock: stale, pruned.
-    f.waiters_seen.insert(("skewed".into(), ago(300)), ago(91));
-    let p = f.plan();
-    assert_eq!(status(&p).waiting, Some(0));
-    assert!(
-        p.actions
-            .iter()
-            .any(|a| matches!(a, Action::PruneWaiters { .. }))
-    );
 }
 
 #[test]

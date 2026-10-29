@@ -3,21 +3,20 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::rejection::PathRejection;
-use axum::extract::{MatchedPath, Path, Request, State};
+use axum::extract::{MatchedPath, Path, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use buildkit_controller_api::dto::{
-    AllocationResponse, CreateAllocationRequest, ErrorBody, ErrorCode, MAX_BODY_BYTES, PoolList,
-    PoolSummary,
+    CreateAllocationRequest, ErrorBody, ErrorCode, MAX_BODY_BYTES, PoolList, PoolSummary,
 };
-use buildkit_controller_api::v1alpha1::BuildKitPool;
+use buildkit_controller_api::v1alpha1::{self as crd, BuildKitPool};
 use futures::future::BoxFuture;
 use kube::runtime::reflector::Store;
 use serde_json::{Map, Value};
@@ -29,40 +28,27 @@ const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 pub const PUBLIC_KEY_REQUIRED: &str =
     "publicKey is required: generate an ECDSA P-256 key pair and send the PEM SPKI public key";
 
-use super::body::CommitBody;
-use super::listener::Stopping;
 use super::metrics::HttpMetrics;
-use crate::alloc::engine::access_rules;
-use crate::alloc::{AllocError, AllocService, Allocation, Engine};
+use crate::alloc::bind::access_rules;
+use crate::alloc::front::MAX_WAIT;
+use crate::alloc::{AllocError, AllocService, Outcome};
 use crate::auth::{AuthError, Authenticator, Identity, TokenReviewer, bearer_token};
-
-/// An allocation that retires its pod unless committed.
-pub trait Grant: Send + Unpin + 'static {
-    /// The 201 body.
-    fn response(&self) -> &AllocationResponse;
-    /// Disarm the orphan guard because the client has the response.
-    fn commit(self);
-}
-
-impl Grant for Allocation {
-    fn response(&self) -> &AllocationResponse {
-        Allocation::response(self)
-    }
-    fn commit(self) {
-        let _ = Allocation::commit(self);
-    }
-}
 
 /// The allocation service as the API sees it.
 pub trait Allocator: Send + Sync + 'static {
-    /// What a successful allocate returns.
-    type Grant: Grant;
     /// POST, after authentication.
     fn allocate<'a>(
         &'a self,
         who: &'a Identity,
         req: &'a CreateAllocationRequest,
-    ) -> BoxFuture<'a, Result<Self::Grant, AllocError>>;
+    ) -> BoxFuture<'a, Result<Outcome, AllocError>>;
+    /// GET, after authentication: waits up to `wait` while pending.
+    fn get<'a>(
+        &'a self,
+        who: &'a Identity,
+        id: &'a str,
+        wait: Duration,
+    ) -> BoxFuture<'a, Result<Outcome, AllocError>>;
     /// Count a POST refused before [`Allocator::allocate`] in `buildkit_allocations_total`.
     /// Labels are always empty because those refusals happen before the body parsed (or
     /// before the caller authenticated), and request strings never become labels.
@@ -76,7 +62,6 @@ pub trait Allocator: Send + Sync + 'static {
 }
 
 impl Allocator for AllocService {
-    type Grant = Allocation;
     fn rejected(&self, code: ErrorCode) {
         self.count_rejection(code);
     }
@@ -84,8 +69,16 @@ impl Allocator for AllocService {
         &'a self,
         who: &'a Identity,
         req: &'a CreateAllocationRequest,
-    ) -> BoxFuture<'a, Result<Allocation, AllocError>> {
+    ) -> BoxFuture<'a, Result<Outcome, AllocError>> {
         Box::pin(AllocService::allocate(self, who, req))
+    }
+    fn get<'a>(
+        &'a self,
+        who: &'a Identity,
+        id: &'a str,
+        wait: Duration,
+    ) -> BoxFuture<'a, Result<Outcome, AllocError>> {
+        Box::pin(AllocService::get(self, who, id, wait))
     }
     fn release<'a>(
         &'a self,
@@ -93,24 +86,6 @@ impl Allocator for AllocService {
         id: &'a str,
     ) -> BoxFuture<'a, Result<(), AllocError>> {
         Box::pin(AllocService::release(self, who, id))
-    }
-}
-
-impl Allocator for Engine {
-    type Grant = Allocation;
-    fn allocate<'a>(
-        &'a self,
-        who: &'a Identity,
-        req: &'a CreateAllocationRequest,
-    ) -> BoxFuture<'a, Result<Allocation, AllocError>> {
-        Box::pin(Engine::allocate(self, who, req))
-    }
-    fn release<'a>(
-        &'a self,
-        who: &'a Identity,
-        id: &'a str,
-    ) -> BoxFuture<'a, Result<(), AllocError>> {
-        Box::pin(Engine::release(self, who, id))
     }
 }
 
@@ -257,7 +232,7 @@ pub fn router<A: Allocator>(state: Arc<ApiState<A>>) -> Router {
         .route("/v1/allocations", post(create::<A>).fallback(not_found))
         .route(
             "/v1/allocations/{id}",
-            delete(release::<A>).fallback(not_found),
+            get(status::<A>).delete(release::<A>).fallback(not_found),
         )
         .route("/v1/pools", get(pools::<A>).fallback(not_found))
         .fallback(not_found)
@@ -296,10 +271,6 @@ async fn observe<A: Allocator>(
 
 fn peer_addr(req: &Request) -> Option<SocketAddr> {
     req.extensions().get::<Peer>().map(|p| p.0)
-}
-
-fn peer(req: &Request) -> String {
-    peer_addr(req).map_or_else(String::new, |p| p.to_string())
 }
 
 /// `oidc` when `iss` names a configured issuer or service accounts are off,
@@ -410,17 +381,7 @@ async fn read_body(headers: &HeaderMap, body: Body) -> Result<CreateAllocationRe
 }
 
 async fn create<A: Allocator>(State(s): State<Arc<ApiState<A>>>, req: Request) -> Response {
-    // A stopping replica takes no new allocation; the engine refuses queued ones.
-    if req
-        .extensions()
-        .get::<Stopping>()
-        .is_some_and(|s| s.0.is_cancelled())
-    {
-        s.alloc.rejected(ErrorCode::ShuttingDown);
-        return ApiError::from(AllocError::ShuttingDown).into_response();
-    }
     let addr = peer_addr(&req);
-    let peer = peer(&req);
     let (parts, body) = req.into_parts();
     let pre = async {
         let who = authenticate(&s, &parts.headers, addr).await?;
@@ -444,27 +405,74 @@ async fn create<A: Allocator>(State(s): State<Arc<ApiState<A>>>, req: Request) -
             return e.into_response();
         }
     };
-    let r = s.alloc.allocate(&who, &body).await.map_err(ApiError::from);
+    match s.alloc.allocate(&who, &body).await {
+        Ok(o) => answer(&o, StatusCode::CREATED),
+        Err(e) => ApiError::from(e).into_response(),
+    }
+}
+
+/// `GET /v1/allocations/{id}?wait=25s`: `200` bound, `202` pending, or the
+/// error of a failed allocation.
+async fn status<A: Allocator>(
+    State(s): State<Arc<ApiState<A>>>,
+    id: Result<Path<String>, PathRejection>,
+    RawQuery(query): RawQuery,
+    req: Request,
+) -> Response {
+    let addr = peer_addr(&req);
+    let headers = req.into_parts().0.headers;
+    let r = async {
+        let who = authenticate(&s, &headers, addr).await?;
+        let wait = wait_of(query.as_deref())?;
+        // An undecodable id (bad percent-encoding) names no allocation.
+        let Ok(Path(id)) = id else {
+            return Err(AllocError::NotFound.into());
+        };
+        s.alloc.get(&who, &id, wait).await.map_err(ApiError::from)
+    }
+    .await;
     match r {
-        Ok(grant) => match serde_json::to_vec(grant.response()) {
-            Ok(json) => {
-                let mut res = Response::new(Body::new(CommitBody::new(json.into(), grant)));
-                *res.status_mut() = StatusCode::CREATED;
-                let h = res.headers_mut();
-                h.insert(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/json"),
-                );
-                h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-                res
-            }
-            Err(e) => {
-                warn!(peer, error = %e, "serializing the allocation");
-                ApiError::new(ErrorCode::Internal, "internal error").into_response()
-            }
-        },
+        Ok(o) => answer(&o, StatusCode::OK),
         Err(e) => e.into_response(),
     }
+}
+
+/// The `wait` query parameter: a duration such as `25s` (at most 25 s), `0` when absent.
+fn wait_of(query: Option<&str>) -> Result<Duration, ApiError> {
+    let Some(v) = query
+        .into_iter()
+        .flat_map(|q| q.split('&'))
+        .find_map(|kv| kv.strip_prefix("wait="))
+    else {
+        return Ok(Duration::ZERO);
+    };
+    let secs = crd::Duration::new(v).seconds().map_err(|_| {
+        ApiError::new(
+            ErrorCode::InvalidRequest,
+            "wait must be a duration such as 25s",
+        )
+    })?;
+    Ok(Duration::from_secs(secs).min(MAX_WAIT))
+}
+
+/// The answer for an allocation: `bound` (201 on create, 200 on read) or 202 pending.
+fn answer(o: &Outcome, bound: StatusCode) -> Response {
+    let (code, json) = match o {
+        Outcome::Bound(r) => (bound, serde_json::to_vec(r)),
+        Outcome::Pending(p) => (StatusCode::ACCEPTED, serde_json::to_vec(p)),
+    };
+    let Ok(json) = json else {
+        warn!("serializing the allocation");
+        return ApiError::new(ErrorCode::Internal, "internal error").into_response();
+    };
+    let mut res = (code, json).into_response();
+    let h = res.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    res
 }
 
 async fn release<A: Allocator>(

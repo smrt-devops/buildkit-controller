@@ -46,7 +46,7 @@ async fn run_pods(
         restarting(once(events.into_iter().map(Ok).collect())),
         flag,
         |_| {},
-        move |ev| forward_pod(&tx, ev),
+        move |ev| forward(&tx, ev),
     )
     .await;
     (store, rx, readiness)

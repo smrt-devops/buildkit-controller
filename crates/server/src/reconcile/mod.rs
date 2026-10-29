@@ -25,6 +25,6 @@ mod tests_spawn;
 pub use driver::Reconciler;
 pub use plan::{
     Action, BackoffSignal, CaEvent, CreateOutcome, CreateResult, Observed, Plan, PlanConfig,
-    Requeue, RetireReason, TemplateCheck, WaiterRef, ca_warning_at, plan,
+    Requeue, RetireReason, TemplateCheck, ca_warning_at, plan,
 };
 pub use pods::{Alloc, Phase, WorkerPod, foreign_pod_name};

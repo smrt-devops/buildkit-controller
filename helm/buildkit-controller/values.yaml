@@ -211,12 +211,14 @@ affinity: {}
 topologySpreadConstraints: []
 priorityClassName: ""
 
-# BuildKitClaim support, see docs/architecture.md (BuildKitClaim). Installs the claim CRD, runs the
-# claim controller on the leader and lets it read claims in every namespace. Secret
-# get/create/delete is granted by a Role in each of `namespaces` only, and the controller
-# refuses claims from any other namespace. With watchNamespaces set, claims are read in
-# `namespaces` only and claims elsewhere are ignored. `namespaces` is required when enabled. Pools
-# still admit claims with an access rule `claims: {namespaces: [...]}`.
+# In-cluster BuildKitClaims, see docs/architecture.md (BuildKitClaim). Every allocation is a
+# claim: the claim CRD is always installed, and the API's claims live in the release namespace.
+# Enabled, the controller also serves claims that pipelines create in their own namespaces and
+# reads claims in every namespace. Secret get/create/delete is granted by a Role in each of
+# `namespaces` only, and the controller refuses claims from any other namespace. With
+# watchNamespaces set, claims are read in `namespaces` only and claims elsewhere are ignored.
+# `namespaces` is required when enabled. Pools still admit claims with an access rule
+# `claims: {namespaces: [...]}`.
 claims:
   enabled: false
   namespaces: []

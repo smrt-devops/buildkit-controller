@@ -51,7 +51,7 @@ pub enum CacheChoice {
 }
 
 /// `cache` of the `201` response.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheResponse {
     /// The effective cache key.
@@ -65,7 +65,7 @@ pub struct CacheResponse {
 }
 
 /// `cache.local` of the `201` response.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalCacheResult {
     /// `hit`, `miss`, `spill`, `cold` or `uncached`, or
@@ -141,6 +141,28 @@ pub struct AllocationResponse {
     pub cache: Option<CacheResponse>,
 }
 
+/// The `202 Accepted` body of `POST /v1/allocations` and `GET /v1/allocations/{id}`
+/// while the allocation waits in the pool's queue.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingAllocation {
+    /// Allocation id. Poll `GET /v1/allocations/{id}?wait=25s` until it is bound.
+    pub id: String,
+    /// Always `pending`.
+    pub state: AllocationState,
+    /// 1-based place in the pool's queue, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<u32>,
+}
+
+/// `state` of [`PendingAllocation`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AllocationState {
+    /// Waiting for a worker.
+    Pending,
+}
+
 /// One entry of `GET /v1/pools`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -157,7 +179,7 @@ pub struct PoolSummary {
     pub starting: i32,
     /// Number of allocated pods.
     pub allocated: i32,
-    /// Number of requests queued across replicas.
+    /// Number of allocations waiting in the pool's queue.
     pub waiting: i32,
     /// Value of `scaling.min`.
     pub min: i32,
@@ -215,20 +237,22 @@ pub enum ErrorCode {
     UnsupportedMediaType,
     /// HTTP 500 for an unexpected error.
     Internal,
-    /// HTTP 503 when the queue timeout expires, the queue timeout is `0s`, or the replica queue is full.
+    /// HTTP 503 when the allocation waited its whole queue timeout (at once with `0s`)
+    /// without a worker.
     PoolExhausted,
-    /// HTTP 503 when a cold pod is not Ready within `startTimeout`.
+    /// HTTP 503 when a worker pod is not Ready within `startTimeout`. Not sent since
+    /// allocations queue as claims; kept so older clients still parse it.
     StartTimeout,
-    /// HTTP 503 when a cold pod is deleted or changed while the request waits.
+    /// HTTP 503 when the worker pod of a bound allocation is gone.
     PodLost,
     /// HTTP 503 when pool `Ready` is not True for a reason other than the CA.
     NotReady,
     /// HTTP 503 when the CA never loaded or is invalid.
     CaUnavailable,
-    /// HTTP 503 when a Kubernetes API call times out or returns 5xx and the outcome is unknown.
+    /// HTTP 503 when a Kubernetes API call times out or returns 5xx. Retry after `Retry-After`.
     UpstreamError,
-    /// HTTP 503 when the replica is shutting down and took no pod for the request. Retry
-    /// at once: the replica has already left the Service endpoints.
+    /// HTTP 503 when the replica is shutting down. Not sent since allocations queue as
+    /// claims, which outlive a replica; kept so older clients still parse it.
     ShuttingDown,
 }
 
@@ -260,6 +284,7 @@ impl ErrorCode {
         match self {
             Self::PoolExhausted | Self::StartTimeout => Some(5),
             Self::ShuttingDown => Some(1),
+            Self::UpstreamError => Some(2),
             _ => None,
         }
     }

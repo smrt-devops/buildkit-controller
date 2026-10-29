@@ -17,7 +17,6 @@ use serde_json::json;
 
 use futures::future::BoxFuture;
 
-use super::plan::WaiterRef;
 use super::spawn::{WorkerSecrets, bounded};
 use crate::render::{ANN_ALLOC, ANN_EXPIRES_AT, CONTROLLER, LABEL_STATE};
 
@@ -129,13 +128,6 @@ pub trait KubeOps: WorkerSecrets + Send + Sync {
         pool: &str,
         status: &BuildKitPoolStatus,
     ) -> impl Future<Output = OpResult> + Send;
-    /// `[test replica, test updatedAt, remove]` on one `status.waiters` entry.
-    fn prune_waiter(
-        &self,
-        ns: &str,
-        pool: &str,
-        entry: &WaiterRef,
-    ) -> impl Future<Output = OpResult> + Send;
     /// POST a Secret (CA create, CA backup).
     fn create_secret(&self, secret: &Secret) -> impl Future<Output = OpResult> + Send;
     /// PUT a Secret; `metadata.resourceVersion` is the precondition.
@@ -203,17 +195,6 @@ pub fn retire_patch(uid: &str, expected: &str, expires_at: Option<&str>) -> serd
     serde_json::Value::Array(ops)
 }
 
-/// The waiter prune patch.
-#[must_use]
-pub fn prune_patch(entry: &WaiterRef) -> serde_json::Value {
-    let base = format!("/status/waiters/{}", entry.index);
-    json!([
-        {"op": "test", "path": format!("{base}/replica"), "value": entry.replica},
-        {"op": "test", "path": format!("{base}/updatedAt"), "value": entry.updated_at},
-        {"op": "remove", "path": base},
-    ])
-}
-
 fn json_patch(v: serde_json::Value) -> OpResult<json_patch::Patch> {
     serde_json::from_value(v).map_err(|e| OpError::Other(e.to_string()))
 }
@@ -276,11 +257,7 @@ impl KubeOps for KubeClient {
     }
 
     async fn patch_status(&self, ns: &str, pool: &str, status: &BuildKitPoolStatus) -> OpResult {
-        let mut status = serde_json::to_value(status).map_err(|e| OpError::Other(e.to_string()))?;
-        // `waiters` belongs to the API replicas; never take ownership of it.
-        if let Some(m) = status.as_object_mut() {
-            m.remove("waiters");
-        }
+        let status = serde_json::to_value(status).map_err(|e| OpError::Other(e.to_string()))?;
         let body = json!({
             "apiVersion": BuildKitPool::api_version(&()),
             "kind": BuildKitPool::kind(&()),
@@ -289,14 +266,6 @@ impl KubeOps for KubeClient {
         let pp = PatchParams::apply(FIELD_MANAGER).force();
         Api::<BuildKitPool>::namespaced(self.0.clone(), ns)
             .patch_status(pool, &pp, &Patch::Apply(body))
-            .await?;
-        Ok(())
-    }
-
-    async fn prune_waiter(&self, ns: &str, pool: &str, entry: &WaiterRef) -> OpResult {
-        let patch = json_patch(prune_patch(entry))?;
-        Api::<BuildKitPool>::namespaced(self.0.clone(), ns)
-            .patch_status(pool, &PatchParams::default(), &Patch::<()>::Json(patch))
             .await?;
         Ok(())
     }
@@ -443,11 +412,6 @@ impl<O: KubeOps> KubeOps for Timed<O> {
 
     async fn patch_status(&self, ns: &str, pool: &str, status: &BuildKitPoolStatus) -> OpResult {
         self.run("patch status", self.inner.patch_status(ns, pool, status))
-            .await
-    }
-
-    async fn prune_waiter(&self, ns: &str, pool: &str, entry: &WaiterRef) -> OpResult {
-        self.run("prune waiter", self.inner.prune_waiter(ns, pool, entry))
             .await
     }
 
