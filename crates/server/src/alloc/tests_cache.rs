@@ -10,7 +10,7 @@ use crate::alloc::cache;
 use crate::render::{ANN_SCOPE, ANN_TIER, is_scope_id, scope_id};
 
 fn oidc(event: &str) -> Identity {
-    let claims = json!({"repository_id": 42, "event_name": event});
+    let claims = json!({"repository_id": 42, "repository": "o/app", "event_name": event});
     Identity::Oidc {
         issuer: "https://token.actions.githubusercontent.com".into(),
         subject: "repo:o/app:ref:refs/heads/main".into(),
@@ -54,15 +54,45 @@ fn writers_replace_the_default() {
     p.spec.workers.cache.writers = Some(
         serde_json::from_value(json!([{"oidc": {
             "issuer": "https://token.actions.githubusercontent.com",
-            "claims": {"event_name": "pull_request"}
+            "claims": {"event_name": "workflow_dispatch"}
         }}]))
         .unwrap(),
     );
-    assert_eq!(cache::tier(&p, &oidc("pull_request")), CacheTier::Trusted);
+    assert_eq!(
+        cache::tier(&p, &oidc("workflow_dispatch")),
+        CacheTier::Trusted
+    );
     assert_eq!(cache::tier(&p, &oidc("push")), CacheTier::Untrusted);
     assert_eq!(cache::tier(&p, &sa("x")), CacheTier::Untrusted);
     p.spec.workers.cache.writers = Some(Vec::new());
     assert_eq!(cache::tier(&p, &claim_id(CI)), CacheTier::Untrusted);
+}
+
+/// Pull request builds, and the `workflow_run`, comment and review jobs that can
+/// run their code, are never trusted, whatever the writers say.
+#[test]
+fn pull_requests_never_write_whatever_the_writers_say() {
+    let mut p = pool();
+    p.spec.workers.cache.writers = Some(
+        serde_json::from_value(json!([
+            {"oidc": {"issuer": "https://token.actions.githubusercontent.com", "claims": {"event_name": "pull_request*"}}},
+            {"oidc": {"issuer": "https://token.actions.githubusercontent.com", "claims": {"repository": "o/app"}}}
+        ]))
+        .unwrap(),
+    );
+    // Jobs that run in the base repository's context but can check out fork code.
+    for e in [
+        "pull_request",
+        "pull_request_target",
+        "workflow_run",
+        "issue_comment",
+        "pull_request_review",
+        "pull_request_review_comment",
+    ] {
+        assert_eq!(cache::tier(&p, &oidc(e)), CacheTier::Untrusted, "{e}");
+    }
+    // The same caller on a push is trusted by the repository rule.
+    assert_eq!(cache::tier(&p, &oidc("push")), CacheTier::Trusted);
 }
 
 #[test]

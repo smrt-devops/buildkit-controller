@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -145,68 +146,76 @@ fn current_until(
     Some(from + (to - from) * 2 / 3)
 }
 
-/// Keep the Secret current until the term ends. `ca` returns the CA as the
+/// The Secret's reads and writes, so one [`sync`] step can be tested.
+pub trait SecretStore: Send + Sync {
+    /// GET; `Ok(None)` on 404.
+    fn get(&self, name: &str) -> BoxFuture<'_, Result<Option<Secret>, String>>;
+    /// POST when `replace` is false, else PUT at the Secret's `resourceVersion`.
+    fn put(&self, secret: Secret, replace: bool) -> BoxFuture<'_, Result<(), String>>;
+}
+
+impl SecretStore for Api<Secret> {
+    fn get(&self, name: &str) -> BoxFuture<'_, Result<Option<Secret>, String>> {
+        let name = name.to_owned();
+        Box::pin(async move { self.get_opt(&name).await.map_err(|e| e.to_string()) })
+    }
+
+    fn put(&self, secret: Secret, replace: bool) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            let pp = PostParams {
+                field_manager: Some(CONTROLLER.into()),
+                ..PostParams::default()
+            };
+            let name = secret.metadata.name.clone().unwrap_or_default();
+            let r = if replace {
+                self.replace(&name, &pp, &secret).await
+            } else {
+                self.create(&pp, &secret).await
+            };
+            r.map(drop).map_err(|e| e.to_string())
+        })
+    }
+}
+
+/// Keep the Secret current until the term ends: every [`CHECK_EVERY`] one
+/// read, and a write whenever [`decide`] asks for one, so a Secret deleted or
+/// edited by hand is restored within a check. `ca` returns the CA as the
 /// leader last loaded it.
 pub async fn keep(client: kube::Client, t: Target, ca: impl Fn() -> Option<CaBundle>) {
     let api: Api<Secret> = Api::namespaced(client, &t.namespace);
-    // Both CAs and the renewal time of the last Secret seen current.
-    let mut held: Option<(String, OffsetDateTime)> = None;
     loop {
-        let now = OffsetDateTime::now_utc();
         if let Some(bundle) = ca() {
-            let fp = format!(
-                "{}{}",
-                bundle.internal_ca().fingerprint_hex(),
-                bundle.client_ca().fingerprint_hex()
-            );
-            let due = held.as_ref().is_none_or(|(f, at)| *f != fp || *at <= now);
-            if due {
-                held = sync(&api, &t, &bundle, now).await.map(|at| (fp, at));
-            }
+            sync(&api, &t, &bundle, OffsetDateTime::now_utc()).await;
         }
         tokio::time::sleep(CHECK_EVERY).await;
     }
 }
 
-/// One read and, when needed, one write. The renewal time on success.
-async fn sync(
-    api: &Api<Secret>,
-    t: &Target,
-    ca: &CaBundle,
-    now: OffsetDateTime,
-) -> Option<OffsetDateTime> {
-    let have = match api.get_opt(&t.secret_name).await {
+/// One read and, when needed, one write. True when it wrote.
+pub async fn sync(api: &dyn SecretStore, t: &Target, ca: &CaBundle, now: OffsetDateTime) -> bool {
+    let have = match api.get(&t.secret_name).await {
         Ok(s) => s,
         Err(error) => {
             warn!(secret = %t.secret_name, %error, "reading the cache registry certificate");
-            return None;
+            return false;
         }
     };
-    let (secret, at) = match decide(have.as_ref(), ca, t, now) {
-        Ok(Decision::Keep(at)) => return Some(at),
-        Ok(Decision::Write(s, at)) => (s, at),
+    let secret = match decide(have.as_ref(), ca, t, now) {
+        Ok(Decision::Keep(_)) => return false,
+        Ok(Decision::Write(s, _)) => *s,
         Err(error) => {
             warn!(%error, "issuing the cache registry certificate");
-            return None;
+            return false;
         }
     };
-    let pp = PostParams {
-        field_manager: Some(CONTROLLER.into()),
-        ..PostParams::default()
-    };
-    let written = if have.is_some() {
-        api.replace(&t.secret_name, &pp, &secret).await
-    } else {
-        api.create(&pp, &secret).await
-    };
-    match written {
-        Ok(_) => {
+    match api.put(secret, have.is_some()).await {
+        Ok(()) => {
             info!(secret = %t.secret_name, name = %t.server_name, "issued the cache registry certificate");
-            Some(at)
+            true
         }
         Err(error) => {
             warn!(secret = %t.secret_name, %error, "writing the cache registry certificate");
-            None
+            false
         }
     }
 }
@@ -272,6 +281,57 @@ mod tests {
             ..target()
         };
         write(decide(Some(&s), &ca, &moved, now).unwrap());
+    }
+
+    /// One Secret in memory, with the writes it saw.
+    #[derive(Default)]
+    struct Fake {
+        secret: std::sync::Mutex<Option<Secret>>,
+        writes: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl SecretStore for Fake {
+        fn get(&self, _: &str) -> BoxFuture<'_, Result<Option<Secret>, String>> {
+            let s = self.secret.lock().unwrap().clone();
+            Box::pin(async move { Ok(s) })
+        }
+        fn put(&self, secret: Secret, replace: bool) -> BoxFuture<'_, Result<(), String>> {
+            self.writes.lock().unwrap().push(replace);
+            *self.secret.lock().unwrap() = Some(secret);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Every check reads the Secret: one deleted or edited by hand is written
+    /// again at the next check, a current one is left alone.
+    #[tokio::test]
+    async fn a_deleted_or_edited_secret_is_restored_at_the_next_check() {
+        let now = OffsetDateTime::now_utc();
+        let ca = CaBundle::generate(now).unwrap();
+        let (t, fake) = (target(), Fake::default());
+        assert!(sync(&fake, &t, &ca, now).await, "created");
+        assert!(!sync(&fake, &t, &ca, now).await, "current: no write");
+        // Deleted.
+        *fake.secret.lock().unwrap() = None;
+        assert!(sync(&fake, &t, &ca, now).await, "recreated");
+        // Edited: the key removed and ca.crt changed.
+        {
+            let mut s = fake.secret.lock().unwrap();
+            let s = s.as_mut().unwrap();
+            s.metadata.resource_version = Some("9".into());
+            let data = s.data.as_mut().unwrap();
+            data.remove("tls.key");
+            data.insert("ca.crt".into(), ByteString(b"x".to_vec()));
+        }
+        assert!(sync(&fake, &t, &ca, now).await, "replaced");
+        let s = fake.secret.lock().unwrap().clone().unwrap();
+        assert_eq!(s.metadata.resource_version.as_deref(), Some("9"));
+        assert!(field(&s, "tls.key").is_some());
+        assert_eq!(
+            field(&s, "ca.crt"),
+            Some(ca.client_ca().cert_pem().as_bytes())
+        );
+        assert_eq!(*fake.writes.lock().unwrap(), [false, false, true]);
     }
 
     /// The serving cert must come from the internal CA workers trust: a Secret

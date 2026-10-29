@@ -15,6 +15,17 @@ use crate::render::{self, ANN_SCOPE, ANN_TIER};
 
 /// GitHub Actions events whose builds may write the cache by default.
 pub const TRUSTED_EVENTS: [&str; 4] = ["push", "schedule", "workflow_dispatch", "merge_group"];
+/// GitHub Actions events whose builds never write the cache, whatever
+/// `cache.writers` says: they can run code from forks, and `workflow_run` and
+/// the comment and review events do so from the base repository's own ref.
+pub const READ_ONLY_EVENTS: [&str; 6] = [
+    "pull_request",
+    "pull_request_target",
+    "workflow_run",
+    "issue_comment",
+    "pull_request_review",
+    "pull_request_review_comment",
+];
 
 /// The cache of one allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,21 +143,26 @@ pub fn scope(pool: &BuildKitPool, who: &Identity) -> String {
     render::scope_id(&scope_name(pool.spec.workers.cache.scope, who))
 }
 
-/// Whether `who` may write the cache of `pool`. With `cache.writers` set, a
-/// caller one of them matches; a malformed list trusts nobody. Unset, an OIDC
-/// caller whose `event_name` is one of [`TRUSTED_EVENTS`] and every in-cluster
-/// caller.
+/// Whether `who` may write the cache of `pool`. An OIDC caller whose
+/// `event_name` is one of [`READ_ONLY_EVENTS`] never may. Otherwise, with
+/// `cache.writers` set, a caller one of them matches; a malformed list trusts
+/// nobody. Unset, an OIDC caller whose `event_name` is one of
+/// [`TRUSTED_EVENTS`] and every in-cluster caller.
 #[must_use]
 pub fn tier(pool: &BuildKitPool, who: &Identity) -> CacheTier {
-    let trusted = match &pool.spec.workers.cache.writers {
-        Some(w) => rules(w).is_some_and(|r| r.allows(who, &pool.namespace().unwrap_or_default())),
-        None => match who {
-            Identity::Oidc { claims, .. } => {
-                claim(claims, "event_name").is_some_and(|e| TRUSTED_EVENTS.contains(&e.as_str()))
+    let pull_request = matches!(who, Identity::Oidc { claims, .. }
+        if claim(claims, "event_name").is_some_and(|e| READ_ONLY_EVENTS.contains(&e.as_str())));
+    let trusted = !pull_request
+        && match &pool.spec.workers.cache.writers {
+            Some(w) => {
+                rules(w).is_some_and(|r| r.allows(who, &pool.namespace().unwrap_or_default()))
             }
-            Identity::ServiceAccount { .. } | Identity::Claim { .. } => true,
-        },
-    };
+            None => match who {
+                Identity::Oidc { claims, .. } => claim(claims, "event_name")
+                    .is_some_and(|e| TRUSTED_EVENTS.contains(&e.as_str())),
+                Identity::ServiceAccount { .. } | Identity::Claim { .. } => true,
+            },
+        };
     if trusted {
         CacheTier::Trusted
     } else {
