@@ -740,8 +740,8 @@ pub(crate) fn perf(batches: usize, idle_secs: u64) -> Result<()> {
             verdict: connect_verdict(d, e),
         });
     }
-    // 1 GiB/s is a loopback figure (`perf --loopback`); here the build path
-    // bounds both rates, so the edge is judged against direct.
+    // The build path bounds both rates, so the edge is judged against direct.
+    // `perf --loopback` reports the proxy's own GiB/s.
     let (edge, direct) = (rates[0], rates[1]);
     rows.push(Row {
         target: "edge build throughput >= 50% of direct",
