@@ -489,6 +489,15 @@ impl Backend for NoBackend {
     fn delete_claim(&self, _: &str, _: &str, _: &str) -> BoxFuture<'static, Write> {
         Box::pin(async { Write::Gone })
     }
+    fn annotate_claim(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: std::collections::BTreeMap<String, String>,
+    ) -> BoxFuture<'static, Write> {
+        Box::pin(async { Write::Gone })
+    }
     fn patch_claim_status(
         &self,
         _: &str,

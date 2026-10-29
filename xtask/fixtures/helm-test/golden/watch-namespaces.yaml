@@ -373,7 +373,8 @@ rules:
     verbs: [patch]
   - apiGroups: [buildkit.smrt-devops.net]
     resources: [buildkitclaims]
-    verbs: [get, list, watch, create, delete]
+    # patch: the API's seen-at and delivered annotations on CI claims.
+    verbs: [get, list, watch, create, delete, patch]
   - apiGroups: [buildkit.smrt-devops.net]
     resources: [buildkitclaims/status]
     verbs: [get, patch, update]

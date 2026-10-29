@@ -1234,7 +1234,8 @@ async fn reconcile_verify() {
     println!("{}", summary.last().unwrap());
 
     // 10. A client that gives up while its claim waits (a cancelled CI job)
-    // leaves no claim behind; the pod made for it retires (idle or released)
+    // leaves no claim behind once the leader finds it unasked-for for a minute;
+    // the pod made for it retires (idle or released)
     // with its worker Secret.
     let mark = h.mark();
     let inflight = allocate(&replica.api);

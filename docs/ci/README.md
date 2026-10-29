@@ -41,7 +41,7 @@ The whole allocation, the first `POST`, every poll and any new `POST`, shares on
 
 ### Retries
 
-The client makes a new key pair for each allocation, and the public key names it: the controller derives the allocation id from the key. A `POST` repeated with the same key, by the same caller, finds the allocation the first one made and answers for it as for a new one (`201` when bound, otherwise `202` after up to 20 seconds). It never makes a second allocation. So a `POST` whose answer is lost, through a reset, a timeout or a `5xx` from a gateway, is safe to send again, and the allocation keeps its place in the queue. The same key from another caller gets `403 forbidden`.
+The client makes a new key pair for each allocation, and the public key names it: the controller derives the allocation id from the key. A `POST` repeated with the same key, by the same caller, finds the allocation the first one made and answers for it as for a new one (`201` when bound, otherwise `202` after up to 20 seconds). It never makes a second allocation. So a `POST` whose answer is lost, through a reset, a timeout or a `5xx` from a gateway, is safe to send again, and the allocation keeps its place in the queue. The same key from another caller gets `403 forbidden`. Retry within a minute: the controller deletes an allocation whose caller has not asked for it (by `POST` or `GET`) for 60 seconds, unless it already answered with the bound allocation. That frees the place and the worker of a job that was cancelled before it learned its id.
 
 Which answers the client repeats, and which end the step:
 

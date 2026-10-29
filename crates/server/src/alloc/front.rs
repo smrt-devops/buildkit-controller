@@ -3,7 +3,7 @@
 //! keeps no queue; the claim is the allocation's whole state, so any replica
 //! answers for any allocation.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +14,7 @@ use buildkit_controller_api::dto::{
 use buildkit_controller_api::v1alpha1::{self as crd, BuildKitPool};
 use k8s_openapi::api::core::v1::Pod;
 use kube::runtime::reflector::{ObjectRef, Store};
+use time::OffsetDateTime;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -25,7 +26,7 @@ use super::certs::CertSource;
 use super::claims;
 use super::error::AllocError;
 use super::metrics::AllocMetrics;
-use super::pods::{ann, key_alloc_id, of_pool};
+use super::pods::{ann, fmt_ts, key_alloc_id, of_pool};
 use super::pool::{MIN_TTL, access_rules, pool_ready, seconds};
 use crate::auth::Identity;
 use crate::pki::{AllocId, ClientPublicKey, Namespace, PoolName};
@@ -147,13 +148,18 @@ impl Front {
         let mut sub = (self.subscribe)();
         let found = self.create_or_find(who, claim).await;
         let repeat = matches!(found, Ok(Some(_)));
+        if let Ok(Some(c)) = &found {
+            self.touch(c).await;
+        }
         let r = match found {
             Err(e) => Err(e),
-            Ok(Some(c)) if claims::phase(&c) != ClaimPhase::Pending => self.answer(&id, Some(c)),
+            Ok(Some(c)) if claims::phase(&c) != ClaimPhase::Pending => {
+                self.answer(&id, Some(c)).await
+            }
             Ok(c) => {
                 let at = Instant::now() + CREATE_WAIT;
                 let settled = self.settle(&id, at, &mut sub).await.or(c);
-                self.answer(&id, settled)
+                self.answer(&id, settled).await
             }
         };
         info!(namespace = %req.namespace, pool = %req.pool, alloc_id = %id, owner = %who.owner(),
@@ -197,10 +203,68 @@ impl Front {
     /// The answer to a `POST` for claim `id` as found: pending while it is not
     /// seen yet, or bound but this replica cannot name the CA yet, so the
     /// client polls for the response rather than lose the id.
-    fn answer(&self, id: &str, c: Option<Arc<BuildKitClaim>>) -> Result<Outcome, AllocError> {
-        match c.map(|c| self.outcome(&c)) {
-            None | Some(Err(AllocError::CaUnavailable)) => Ok(pending(id, None)),
-            Some(r) => r,
+    async fn answer(&self, id: &str, c: Option<Arc<BuildKitClaim>>) -> Result<Outcome, AllocError> {
+        let Some(c) = c else {
+            return Ok(pending(id, None));
+        };
+        match self.outcome(&c) {
+            Err(AllocError::CaUnavailable) => Ok(pending(id, None)),
+            r => self.deliver(&c, r).await,
+        }
+    }
+
+    /// Mark `c` delivered before its bound answer `r` goes out, so the leader
+    /// never takes it for abandoned while its client holds the certificate. A
+    /// mark that fails turns the answer into a 503 that the client retries.
+    async fn deliver(
+        &self,
+        c: &BuildKitClaim,
+        r: Result<Outcome, AllocError>,
+    ) -> Result<Outcome, AllocError> {
+        if !matches!(r, Ok(Outcome::Bound(_))) || claims::delivered(c) {
+            return r;
+        }
+        self.annotate(c, claims::ANN_DELIVERED, "true".into())
+            .await?;
+        r
+    }
+
+    /// Note that the caller of `c` asked for it, at most every
+    /// [`claims::SEEN_EVERY`]: the leader deletes an undelivered claim nobody
+    /// asks for. A failed write is retried on the next request.
+    async fn touch(&self, c: &BuildKitClaim) {
+        let now = OffsetDateTime::now_utc();
+        if !claims::seen_due(c, now) {
+            return;
+        }
+        if let Err(e) = self.annotate(c, claims::ANN_SEEN_AT, fmt_ts(now)).await {
+            warn!(claim = ?c.metadata.name, error = %e, "recording that a claim was asked for");
+        }
+    }
+
+    async fn annotate(
+        &self,
+        c: &BuildKitClaim,
+        key: &str,
+        value: String,
+    ) -> Result<(), AllocError> {
+        let (Some(name), Some(uid)) = (c.metadata.name.as_deref(), c.metadata.uid.as_deref())
+        else {
+            return Err(AllocError::Internal);
+        };
+        let set = BTreeMap::from([(key.to_owned(), value)]);
+        match self
+            .backend
+            .annotate_claim(&self.namespace, name, uid, set)
+            .await
+        {
+            Write::Done => Ok(()),
+            Write::Gone => Err(AllocError::NotFound),
+            Write::Unknown => Err(AllocError::UpstreamError),
+            w => {
+                error!(claim = name, outcome = ?w, "annotating claim");
+                Err(AllocError::Internal)
+            }
         }
     }
 
@@ -214,6 +278,7 @@ impl Front {
     ) -> Result<Outcome, AllocError> {
         let mut sub = (self.subscribe)();
         let c = self.owned(who, id).await?;
+        self.touch(&c).await;
         let c = if claims::phase(&c) == ClaimPhase::Pending && !wait.is_zero() {
             // A claim the store does not hold yet answers as last read.
             let at = Instant::now() + wait.min(MAX_WAIT);
@@ -221,7 +286,8 @@ impl Front {
         } else {
             c
         };
-        self.outcome(&c)
+        let r = self.outcome(&c);
+        self.deliver(&c, r).await
     }
 
     /// `DELETE /v1/allocations/{id}`: deletes the claim; the leader retires its pod.
@@ -468,6 +534,10 @@ impl Front {
             },
         );
         c.metadata.namespace = Some(self.namespace.clone());
+        c.metadata.annotations = Some(BTreeMap::from([(
+            claims::ANN_SEEN_AT.to_owned(),
+            fmt_ts(OffsetDateTime::now_utc()),
+        )]));
         Ok(c)
     }
 

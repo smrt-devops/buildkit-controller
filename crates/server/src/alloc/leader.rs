@@ -261,6 +261,7 @@ pub(crate) async fn tidy_with(
             continue;
         }
         let outcome = match claims::phase(c) {
+            _ if claims::abandoned(c, own, now) => abandon(binder, c).await,
             ClaimPhase::Pending if !claims::served(c, served) => refuse(binder, c).await,
             ClaimPhase::Bound if claims::expired(c, now) => {
                 end(binder, c, ClaimPhase::Expired).await
@@ -334,6 +335,23 @@ async fn end(b: &Binder, c: &BuildKitClaim, phase: ClaimPhase) -> Option<&'stati
     } else {
         "expired"
     })
+}
+
+/// Delete a CI claim whose client is gone: never answered with its bound
+/// allocation and not asked for since [`claims::ABANDON_AFTER`]. The sweep
+/// then retires its pod, if it had one.
+async fn abandon(b: &Binder, c: &BuildKitClaim) -> Option<&'static str> {
+    let (ns, name, uid) = names(c)?;
+    match b.backend().delete_claim(ns, name, uid).await {
+        Write::Done | Write::Gone => {
+            info!(namespace = ns, claim = name, phase = ?claims::phase(c), "deleted an abandoned claim");
+            Some("abandoned")
+        }
+        w => {
+            warn!(namespace = ns, claim = name, outcome = ?w, "deleting an abandoned claim");
+            None
+        }
+    }
 }
 
 /// Delete a finished claim of a CI caller.
