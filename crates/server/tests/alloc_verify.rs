@@ -56,9 +56,6 @@ const ROUNDS: usize = 20;
 const CONCURRENT: usize = 100;
 const WARM: usize = 30;
 
-static KEY: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| rcgen::KeyPair::generate().unwrap().public_key_pem());
-
 fn sa(ns: &str, name: &str) -> Identity {
     Identity::ServiceAccount {
         namespace: ns.into(),
@@ -67,9 +64,12 @@ fn sa(ns: &str, name: &str) -> Identity {
     }
 }
 
+/// A request with a fresh key: the key names the allocation, so each request
+/// that stands for a new client gets its own.
 fn req(ns: &str, ttl: u64, qt: u64) -> CreateAllocationRequest {
+    let key = rcgen::KeyPair::generate().unwrap().public_key_pem();
     serde_json::from_value(json!({"namespace": ns, "pool": POOL, "ttlSeconds": ttl,
-        "queueTimeoutSeconds": qt, "publicKey": *KEY}))
+        "queueTimeoutSeconds": qt, "publicKey": key}))
     .unwrap()
 }
 
@@ -169,6 +169,15 @@ impl H {
             })
         })
         .await;
+    }
+
+    /// The claims of CI caller `owner`, from the API server.
+    async fn claims_of(&self, owner: &str) -> Vec<BuildKitClaim> {
+        let all = self.claims.list(&ListParams::default()).await.unwrap();
+        all.items
+            .into_iter()
+            .filter(|c| c.spec.owner.as_deref() == Some(owner))
+            .collect()
     }
 
     /// Pods of the namespace that carry an allocation.
@@ -509,19 +518,92 @@ async fn alloc_verify() {
         waited.as_secs_f64()
     );
 
-    // 4. Cancelled requests leave no claim and no allocated pod behind.
+    // 4. A POST dropped while it waits keeps its claim. The client's retry with
+    // the same key finds it, ahead of a claim made in between, and it binds first.
+    let first = h.warm("d", 1).await;
+    let holder = sa(NS, "holder");
+    let held = bound(svc.allocate(&holder, &req(NS, 600, 0)).await);
+    let dropper = sa(NS, "dropper");
+    let mine = req(NS, 600, 120);
+    let cut = tokio::time::timeout(Duration::from_secs(3), svc.allocate(&dropper, &mine)).await;
+    assert!(cut.is_err(), "still waiting when the connection drops");
+    let kept = h.claims_of("sa:bk-alloc/dropper").await;
+    assert_eq!(kept.len(), 1, "the dropped POST keeps its claim");
+    let id = kept[0].name_any();
+    let later = sa(NS, "later");
+    let behind = {
+        let (svc, who) = (svc.clone(), later.clone());
+        tokio::spawn(async move {
+            let out = svc.allocate(&who, &req(NS, 600, 120)).await;
+            settle(&svc, &who, out).await
+        })
+    };
+    wait("the later claim exists", Duration::from_secs(30), || {
+        h.leader
+            .ctx
+            .claims()
+            .state()
+            .iter()
+            .any(|c| c.spec.owner.as_deref() == Some("sa:bk-alloc/later"))
+    })
+    .await;
+    let retry = {
+        let (svc, who, mine) = (svc.clone(), dropper.clone(), mine.clone());
+        tokio::spawn(async move {
+            let out = svc.allocate(&who, &mine).await;
+            settle(&svc, &who, out).await
+        })
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let place = match h.follower.svc.get(&dropper, &id, Duration::ZERO).await {
+        Ok(Outcome::Pending(p)) => p.position,
+        other => panic!("not pending: {other:?}"),
+    };
+    assert_eq!(place, Some(1), "still first in line");
+    svc.release(&holder, &held.id).await.unwrap();
+    h.gone(&first).await;
+    let next = h.warm("d2", 1).await;
+    let got = bound(
+        tokio::time::timeout(Duration::from_mins(1), retry)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(got.id, id, "the retry bound the claim of the dropped POST");
+    assert_eq!(h.claims_of("sa:bk-alloc/dropper").await.len(), 1);
+    assert!(!behind.is_finished(), "the later claim still waits");
+    println!(
+        "SCENARIO dropped-post: retry with the same key kept place 1 and bound {id} to {}",
+        next[0]
+    );
+    svc.release(&dropper, &got.id).await.unwrap();
+    h.gone(&next).await;
+    let last = h.warm("d3", 1).await;
+    let behind = bound(
+        tokio::time::timeout(Duration::from_mins(1), behind)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    svc.release(&later, &behind.id).await.unwrap();
+    h.gone(&last).await;
+
+    // 5. Cancelled requests, each retried with its key, make one claim per key.
+    // Once released they leave no claim and no allocated pod behind.
     let names = h.warm("x", 40).await;
     let canceller = sa(NS, "canceller");
     let mut finished = 0;
     for i in 0..40u64 {
-        let r = req(NS, 600, 0);
-        let fut = svc.allocate(&canceller, &r);
-        // Completed: the client has the id and releases it.
-        if let Ok(Ok(Outcome::Bound(a))) = tokio::time::timeout(Duration::from_millis(i), fut).await
+        let r = req(NS, 600, 30);
+        // Cut after i ms, as a dropped connection does.
+        if tokio::time::timeout(Duration::from_millis(i), svc.allocate(&canceller, &r))
+            .await
+            .is_ok()
         {
             finished += 1;
-            svc.release(&canceller, &a.id).await.unwrap();
         }
+        let got = bound(svc.allocate(&canceller, &r).await);
+        svc.release(&canceller, &got.id).await.unwrap();
     }
     let leftovers = || async {
         let claims = h.claims.list(&ListParams::default()).await.unwrap();
@@ -548,18 +630,24 @@ async fn alloc_verify() {
     }
     let released = metric(&h.leader.metrics, "reason=\"released\"");
     println!(
-        "SCENARIO cancelled: 40 cancelled requests ({finished} completed and released), claims left 0, allocated pods left 0, pods released {released}"
+        "SCENARIO cancelled: 40 cancelled requests ({finished} completed), each retried with its key and released, claims left 0, allocated pods left 0, pods released {released}"
     );
     for n in &names {
         let _ = h.pods.delete(n, &kube::api::DeleteParams::default()).await;
     }
     h.gone(&names).await;
 
-    // 5. Any replica answers; only the owner reads or releases; the cert.
+    // 6. Any replica answers; only the owner reads or releases; the cert.
     let names = h.warm("o", 1).await;
     let owner = sa(NS, "owner");
     let r = bound(svc.allocate(&owner, &req(NS, 900, 0)).await);
-    let read = bound(h.follower.svc.get(&owner, &r.id, Duration::ZERO).await);
+    // The follower's store may lag the bind by a moment: a waiting read returns once it sees it.
+    let read = bound(
+        h.follower
+            .svc
+            .get(&owner, &r.id, Duration::from_secs(25))
+            .await,
+    );
     assert_eq!(read, r, "the follower answers from the claim");
     let intruder = sa(NS, "intruder");
     assert_eq!(
@@ -632,7 +720,7 @@ async fn alloc_verify() {
     stop.cancel();
 }
 
-/// Scenario 6, the cold path: a pool with `min: 0` and no warm pod. The claim waits,
+/// Scenario 7, the cold path: a pool with `min: 0` and no warm pod. The claim waits,
 /// the leader's reconciler creates a pod for it (with its own serving Secret,
 /// owned by the pod), the claim binds, expires, and the pod and its Secret go.
 async fn cold(stop: &CancellationToken) {
@@ -745,7 +833,7 @@ async fn cold(stop: &CancellationToken) {
     );
 }
 
-/// Scenario 7, an upgrade: pods allocated before every allocation was a claim
+/// Scenario 8, an upgrade: pods allocated before every allocation was a claim
 /// carry no `P claim`. An API caller's is released by its owner's DELETE, and
 /// an in-cluster claim's whose claim is gone is retired by the leader's sweep.
 /// v0.1.0 upgrade shim: remove in the release after v3.

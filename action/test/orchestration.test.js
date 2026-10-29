@@ -160,6 +160,7 @@ test('pool_exhausted on a poll allocates again within the budget', { skip }, asy
   assert.ok(sent[0] >= 299 && sent[0] <= 300, `first POST queues for the input: ${sent[0]}`);
   assert.ok(sent[1] <= 300 && sent[1] > 0, `second POST queues for what is left: ${sent[1]}`);
   assert.equal(readState(f.env.GITHUB_STATE).ids, 'q2', 'the exhausted id is not kept');
+  assert.equal(new Set(f.calls.filter(isPost).map((c) => c.body.publicKey)).size, 2, 'the next allocation has a new key');
 });
 
 test('a cancel while the allocation is queued leaves its id in state, and the post step releases it', { skip }, async (t) => {
@@ -208,4 +209,18 @@ test('a release answered 503 upstream_error with Retry-After is retried', { skip
   assert.equal(p.code, 0, p.out);
   assert.equal(deletes(f.calls).length, 2);
   assert.ok(!p.out.includes('not released'), p.out);
+});
+
+test('a POST cut after it was sent is repeated with the same key, and the key matches the material', { skip }, async (t) => {
+  let posts = 0;
+  const f = await fixture(t, { override: (rec) => (isPost(rec) && ++posts === 1 ? { reset: true } : undefined) });
+  const m = await main({ ...f.env, INPUT_POOLS: 'ci/a' });
+  assert.equal(m.code, 0, m.out);
+  const keys = f.calls.filter(isPost).map((c) => c.body.publicKey);
+  assert.equal(keys.length, 2);
+  assert.equal(keys[0], keys[1]);
+  const state = readState(f.env.GITHUB_STATE);
+  const priv = fs.readFileSync(path.join(state.dirs, 'key.pem'), 'utf8');
+  const pub = require('node:crypto').createPublicKey(priv).export({ type: 'spki', format: 'pem' });
+  assert.equal(pub, keys[0]);
 });

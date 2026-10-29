@@ -137,6 +137,10 @@ spec:
           openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out /work/key.pem
           openssl pkey -in /work/key.pem -pubout -out /work/pub.pem
           sed 's/$/\\\\n/' /work/pub.pem | tr -d '\\n' > /work/pub.json
+          # The key names the allocation, so each allocation of a batch has its own.
+          for i in $(seq 0 $(({BATCH} - 1))); do
+            openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 | openssl pkey -pubout | sed 's/$/\\\\n/' | tr -d '\\n' > /work/pub.$i.json
+          done
       securityContext: &sc
         allowPrivilegeEscalation: false
         capabilities: {{drop: [ALL]}}
@@ -287,12 +291,13 @@ impl Perf {
         Ok(())
     }
 
-    fn post(ttl: u32, out: &str, fmt: &str) -> String {
+    /// `POST /v1/allocations` with the public key in JSON file `key`.
+    fn post(ttl: u32, key: &str, out: &str, fmt: &str) -> String {
         format!(
             "curl -s -o {out} -w '{fmt}' --cacert /trust/ca.crt \
              -H \"Authorization: Bearer $(cat /var/run/secrets/bk/token)\" \
              -H 'Content-Type: application/json' \
-             -d '{{\"namespace\":\"{NS}\",\"pool\":\"{POOL}\",\"ttlSeconds\":{ttl},\"publicKey\":\"'\"$(cat /work/pub.json)\"'\"}}' {API}/v1/allocations"
+             -d '{{\"namespace\":\"{NS}\",\"pool\":\"{POOL}\",\"ttlSeconds\":{ttl},\"publicKey\":\"'\"$(cat {key})\"'\"}}' {API}/v1/allocations"
         )
     }
 
@@ -311,9 +316,16 @@ impl Perf {
             let files: Vec<String> = (0..BATCH).map(|i| format!("/work/a.{i}.json")).collect();
             let script: String = files
                 .iter()
-                .map(|f| {
-                    Self::post(120, f, "%{http_code} %{time_total}")
-                        + &format!("; if grep -q clientCert {f}; then echo ' cert'; else echo ' nocert'; fi\n")
+                .enumerate()
+                .map(|(i, f)| {
+                    Self::post(
+                        120,
+                        &format!("/work/pub.{i}.json"),
+                        f,
+                        "%{http_code} %{time_total}",
+                    ) + &format!(
+                        "; if grep -q clientCert {f}; then echo ' cert'; else echo ' nocert'; fi\n"
+                    )
                 })
                 .collect();
             let out = self.sh(NS, &script)?;
@@ -561,7 +573,7 @@ pub(crate) fn perf(batches: usize, idle_secs: u64) -> Result<()> {
             "set -e\n{FIELD}{} >/dev/null\nfield clientCert /work/e.json > /work/e.crt\n\
              cp /work/key.pem /work/e.key\n{{ field caCert /work/e.json; cat /trust/ca.crt; }} > /work/e.ca\n\
              field id /work/e.json",
-            Perf::post(1800, "/work/e.json", "%{http_code}")
+            Perf::post(1800, "/work/pub.json", "/work/e.json", "%{http_code}")
         ),
     )?;
     let id = out.trim().to_owned();
@@ -757,9 +769,9 @@ mod tests {
         let pod = pool_client();
         assert!(pod.contains("openssl pkey -in /work/key.pem -pubout -out /work/pub.pem\n"));
         assert!(pod.contains("sed 's/$/\\\\n/' /work/pub.pem | tr -d '\\n' > /work/pub.json\n"));
-        let post = Perf::post(120, "/work/a.json", "%{http_code}");
+        let post = Perf::post(120, "/work/pub.0.json", "/work/a.json", "%{http_code}");
         assert!(
-            post.contains(r#""ttlSeconds":120,"publicKey":"'"$(cat /work/pub.json)"'"}'"#),
+            post.contains(r#""ttlSeconds":120,"publicKey":"'"$(cat /work/pub.0.json)"'"}'"#),
             "{post}"
         );
     }

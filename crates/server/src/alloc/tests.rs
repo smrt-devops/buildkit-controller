@@ -183,6 +183,12 @@ impl Backend for Fake {
         if let Some(out) = self.w.lock().unwrap().create_out.pop_front() {
             return ready(out);
         }
+        if self
+            .claim(c.metadata.namespace.as_deref().unwrap(), &name)
+            .is_some()
+        {
+            return ready(Write::Exists);
+        }
         let uid = {
             let mut w = self.w.lock().unwrap();
             w.uid += 1;
@@ -932,29 +938,122 @@ async fn pending_allocation_is_polled_and_released_by_its_owner() {
     );
 }
 
-/// A POST abandoned after its create (the client went away) deletes its claim.
+fn post_req(key: &str) -> CreateAllocationRequest {
+    serde_json::from_value(json!({"namespace": POOL_NS, "pool": POOL, "publicKey": key})).unwrap()
+}
+
+fn claim_names(e: &Env) -> Vec<String> {
+    e.fake
+        .w
+        .lock()
+        .unwrap()
+        .claims
+        .keys()
+        .map(|(_, n)| n.clone())
+        .collect()
+}
+
+/// The claim is named after the public key. A repeated POST from the same
+/// caller answers for the claim the first one made: pending with its place,
+/// then bound. It never creates a second claim.
 #[tokio::test(start_paused = true)]
-async fn an_abandoned_allocation_deletes_its_claim() {
-    let e = Arc::new(env());
-    let req: CreateAllocationRequest = serde_json::from_value(json!({
-        "namespace": POOL_NS, "pool": POOL, "publicKey": *KEY
-    }))
-    .unwrap();
-    let task = {
-        let e = Arc::clone(&e);
-        tokio::spawn(async move { e.front.allocate(&sa("alice"), &req).await })
+async fn a_repeated_post_follows_the_same_claim() {
+    let e = env();
+    let req = post_req(&KEY);
+    let Outcome::Pending(first) = e.front.allocate(&sa("alice"), &req).await.unwrap() else {
+        panic!("bound without a pod")
     };
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(e.fake.w.lock().unwrap().claims.len(), 1);
-    task.abort();
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    assert!(
-        e.fake.w.lock().unwrap().claims.is_empty(),
-        "{:?}",
-        e.fake.calls()
+    assert_eq!(first.position, Some(1));
+    e.ci_claim(-5, "sa:x/behind");
+    let again = e.front.allocate(&sa("alice"), &req).await.unwrap();
+    assert_eq!(again, Outcome::Pending(first.clone()));
+    e.warm(0);
+    e.binder.pass(&key()).await;
+    let Outcome::Bound(r) = e.front.allocate(&sa("alice"), &req).await.unwrap() else {
+        panic!("not bound")
+    };
+    assert_eq!(r.id, first.id);
+    let creates = e
+        .fake
+        .calls()
+        .iter()
+        .filter(|c| c.starts_with("create_claim"))
+        .count();
+    assert_eq!(
+        (creates, claim_names(&e).len()),
+        (3, 2),
+        "one claim per key"
     );
 }
 
+/// Another caller presenting the same key gets 403 and learns nothing about
+/// the claim, pending or bound, and the claim is left as it was. A key that
+/// names a claim of another pool is a 400.
+#[tokio::test(start_paused = true)]
+async fn a_key_in_use_by_another_caller_is_forbidden() {
+    let e = env();
+    let req = post_req(&KEY);
+    let Outcome::Pending(p) = e.front.allocate(&sa("alice"), &req).await.unwrap() else {
+        panic!("bound without a pod")
+    };
+    let rv = |e: &Env| e.fake.claim(OWN, &p.id).unwrap().metadata.resource_version;
+    let before = rv(&e);
+    assert_eq!(
+        e.front.allocate(&sa("mallory"), &req).await,
+        Err(AllocError::Forbidden)
+    );
+    assert_eq!(rv(&e), before, "untouched");
+    e.warm(0);
+    e.binder.pass(&key()).await;
+    assert_eq!(
+        e.front.allocate(&sa("mallory"), &req).await,
+        Err(AllocError::Forbidden)
+    );
+    assert_eq!(claim_names(&e), vec![p.id.clone()]);
+    let other = rcgen::KeyPair::generate().unwrap().public_key_pem();
+    let id = key_alloc_id(&crate::pki::ClientPublicKey::from_pem(&other).unwrap()).unwrap();
+    e.claim(
+        OWN,
+        id.as_str(),
+        0,
+        json!({"poolRef": {"namespace": POOL_NS, "name": "elsewhere"},
+            "owner": "sa:render-verify/alice", "publicKey": other}),
+    );
+    assert!(matches!(
+        e.front.allocate(&sa("alice"), &post_req(&other)).await,
+        Err(AllocError::InvalidRequest(_))
+    ));
+}
+
+/// A POST dropped while it waits (the client's connection went) leaves its
+/// claim where it was. The client's retry with the same key finds it, still
+/// ahead of a claim made in between, and it binds first.
+#[tokio::test(start_paused = true)]
+async fn a_dropped_post_keeps_its_claim_for_the_retry() {
+    let e = Arc::new(env());
+    let req = post_req(&KEY);
+    let task = {
+        let (e, req) = (Arc::clone(&e), req.clone());
+        tokio::spawn(async move { e.front.allocate(&sa("alice"), &req).await })
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let [id] = &claim_names(&e)[..] else {
+        panic!("one claim")
+    };
+    let id = id.clone();
+    task.abort();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(e.fake.claim(OWN, &id).is_some(), "{:?}", e.fake.calls());
+    let later = e.ci_claim(-5, "sa:x/later");
+    let Outcome::Pending(p) = e.front.allocate(&sa("alice"), &req).await.unwrap() else {
+        panic!("bound without a pod")
+    };
+    assert_eq!((p.id.as_str(), p.position), (id.as_str(), Some(1)));
+    e.warm(0);
+    e.binder.pass(&key()).await;
+    assert_eq!(phase(&e.fake.status(OWN, &id)), ClaimPhase::Bound);
+    assert_eq!(phase(&e.fake.status(OWN, &later)), ClaimPhase::Pending);
+}
 /// The tidy pass: refuses unserved namespaces, ends expired and lost claims,
 /// deletes finished CI claims after ten minutes, and retires pods whose claim
 /// is gone.

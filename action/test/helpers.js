@@ -20,7 +20,7 @@ function listen(srv) {
 /**
  * Controller + OIDC servers. `deny` pools answer 403, `deleteStatus` is the release answer,
  * `dockerFails` makes `docker buildx create` fail, and `override(rec)` may answer a request itself
- * with `{status, headers, body}`. `calls` records every request.
+ * with `{status, headers, body}`, or cut the connection with `{reset: true}`. `calls` records every request.
  */
 async function fixture(t, { deny = [], deleteStatus = 204, dockerFails = false, override } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bk-test-'));
@@ -44,6 +44,7 @@ async function fixture(t, { deny = [], deleteStatus = 204, dockerFails = false, 
         res.end(typeof obj === 'string' ? obj : JSON.stringify(obj));
       };
       const o = override && override(rec, calls);
+      if (o && o.reset) return req.socket.destroy();
       if (o) return reply(o.status, o.body ?? '', o.headers);
       if (req.method === 'GET' && req.url === '/v1/pools') {
         return reply(200, {

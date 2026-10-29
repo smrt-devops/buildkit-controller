@@ -16,9 +16,11 @@ async function serve({ post = [], get = [] }) {
   const steps = { POST: post, GET: get };
   const count = { POST: 0, GET: 0 };
   const srv = http.createServer((req, res) => {
-    req.resume();
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
-      seen.push({ method: req.method, url: req.url });
+      const raw = Buffer.concat(chunks).toString();
+      seen.push({ method: req.method, url: req.url, body: raw ? JSON.parse(raw) : undefined });
       const list = steps[req.method];
       const step = list[Math.min(count[req.method]++, list.length - 1)];
       if (step.reset) return req.socket.destroy();
@@ -42,7 +44,7 @@ function clock() {
 const run = (s, c, extra = {}) => {
   const ids = { got: [], gone: [] };
   const p = L.allocate(s.api, {
-    what: 'allocate ci/a', getToken: async () => 'tok', budgetMs: L.retryBudgetMs(300), attemptOpts: { method: 'POST', body: { a: 1 }, timeoutMs: 5000 },
+    what: 'allocate ci/a', getToken: async () => 'tok', budgetMs: L.retryBudgetMs(300), attemptOpts: ({ publicKey }) => ({ method: 'POST', body: { publicKey }, timeoutMs: 5000 }),
     onId: (id) => ids.got.push(id), onGone: (id) => ids.gone.push(id), log: c.log, sleep: c.sleep, now: c.now, ...extra,
   });
   return { p, ids };
@@ -163,4 +165,40 @@ test('a refused release answered 503 upstream_error with Retry-After is retried'
   srv.close();
   assert.equal(n, 2);
   assert.deepEqual(c.waits, [2000]);
+});
+
+const keysSent = (s) => s.seen.filter((r) => r.method === 'POST').map((r) => r.body.publicKey);
+
+test('a POST cut after it was sent, or answered 5xx, is repeated with the same key, then followed', async () => {
+  const s = await serve({ post: [{ reset: true }, { status: 500 }, err(503, 'upstream_error', { 'Retry-After': '2' }), pending], get: [bound] });
+  const c = clock();
+  const { p, ids } = run(s, c);
+  assert.deepEqual(await p, ALLOC);
+  s.close();
+  const keys = keysSent(s);
+  assert.equal(keys.length, 4);
+  assert.ok(keys[0] && keys.every((k) => k === keys[0]), 'one key for every try');
+  assert.deepEqual(c.waits, [1000, 2000, 2000]);
+  assert.deepEqual(ids.got, ['abc123']);
+});
+
+test('a queue timeout, on a poll or on the POST, starts the next allocation with a new key', async () => {
+  const s = await serve({
+    post: [pending, err(503, 'pool_exhausted', { 'Retry-After': '1' }), { status: 201, body: bound.body }],
+    get: [err(503, 'pool_exhausted', { 'Retry-After': '1' })],
+  });
+  const c = clock();
+  const { p } = run(s, c);
+  assert.deepEqual(await p, ALLOC);
+  s.close();
+  const keys = keysSent(s);
+  assert.equal(new Set(keys).size, 3, 'each ended allocation gets a new key');
+});
+
+test('pod_lost on the POST ends the run without another POST', async () => {
+  const s = await serve({ post: [err(503, 'pod_lost', { 'Retry-After': '1' })] });
+  const { p } = run(s, clock());
+  await assert.rejects(p, /pod_lost/);
+  s.close();
+  assert.equal(keysSent(s).length, 1);
 });

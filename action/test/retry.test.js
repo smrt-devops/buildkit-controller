@@ -5,7 +5,7 @@ const http = require('node:http');
 const net = require('node:net');
 const L = require('../dist/lib');
 
-/** What the controller sends with a 503 and Retry-After before it claims a worker. */
+/** The controller's answer when the queue timeout ran out. */
 const BUSY = JSON.stringify({ error: { code: 'pool_exhausted', message: 'no free worker' } });
 
 /** Local server that answers from `script` (one entry per request) and records the requests. */
@@ -74,13 +74,10 @@ test('Retry-After is floored at 1s and capped at 30s', () => {
 });
 
 for (const [name, step] of [
-  ['503 without Retry-After', { status: 503 }],
-  ['503 with unusable Retry-After', { status: 503, headers: { 'Retry-After': 'later' } }],
   ['400', { status: 400, headers: { 'Retry-After': '1' } }],
   ['401', { status: 401 }],
+  ['403', { status: 403 }],
   ['429 with Retry-After', { status: 429, headers: { 'Retry-After': '1' } }],
-  ['500', { status: 500 }],
-  ['504 with Retry-After', { status: 504, headers: { 'Retry-After': '1' } }],
 ]) {
   test(`no retry on ${name}`, async () => {
     const s = await serve([step, { status: 201 }]);
@@ -93,24 +90,50 @@ for (const [name, step] of [
   });
 }
 
-test('no retry on a reset after the request was sent', async () => {
+for (const [name, step, wait] of [
+  ['503 without Retry-After', { status: 503 }, 1000],
+  ['503 with unusable Retry-After', { status: 503, headers: { 'Retry-After': 'later' } }, 1000],
+  ['500', { status: 500 }, 1000],
+  ['502 with a body that is not JSON', { status: 502, body: '<html>bad gateway</html>' }, 1000],
+  ['504 with Retry-After', { status: 504, headers: { 'Retry-After': '3' } }, 3000],
+]) {
+  test(`retries ${name} with the same request`, async () => {
+    const s = await serve([step, { status: 201 }]);
+    const h = harness();
+    const res = await L.requestWithRetry(s.url, post, h.opts);
+    s.close();
+    assert.equal(res.status, 201);
+    assert.deepEqual(s.seen.map((r) => r.body), [post.body, post.body]);
+    assert.deepEqual(h.waits, [wait]);
+  });
+}
+
+test('a reset after the request was sent is retried with the same body', async () => {
   const s = await serve([{ reset: true }, { status: 201 }]);
   const h = harness();
-  await assert.rejects(L.requestWithRetry(s.url, post, h.opts), (e) => e.code === 'ECONNRESET');
+  const res = await L.requestWithRetry(s.url, post, h.opts);
   s.close();
-  assert.equal(s.seen.length, 1);
-  assert.deepEqual(h.waits, []);
+  assert.equal(res.status, 201);
+  assert.deepEqual(s.seen.map((r) => r.body), [post.body, post.body]);
+  assert.deepEqual(h.waits, [1000]);
+  assert.match(h.logs[0], /ECONNRESET/);
 });
 
-test('no retry on a timeout waiting for the response', async () => {
-  const srv = http.createServer(() => {});
+test('a timeout waiting for the response is retried', async () => {
+  let n = 0;
+  const srv = http.createServer((req, res) => {
+    req.resume();
+    if (++n > 1) { res.writeHead(201); res.end(); }
+  });
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   const h = harness();
   const url = `http://127.0.0.1:${srv.address().port}/v1/allocations`;
-  await assert.rejects(L.requestWithRetry(url, { ...post, timeoutMs: 100 }, h.opts), /timed out/);
+  const res = await L.requestWithRetry(url, { ...post, timeoutMs: 100 }, h.opts);
   srv.closeAllConnections();
   srv.close();
-  assert.deepEqual(h.waits, []);
+  assert.equal(res.status, 201);
+  assert.equal(n, 2);
+  assert.match(h.logs[0], /timed out/);
 });
 
 test('retries connection refused, then succeeds', async () => {
@@ -127,15 +150,7 @@ test('retries connection refused, then succeeds', async () => {
   srv.close();
   assert.equal(res.status, 201);
   assert.deepEqual(h.waits, [1000]);
-  assert.match(h.logs[0], /ECONNREFUSED before send/);
-});
-
-test('isPreSendError accepts connect failures only', () => {
-  assert.ok(L.isPreSendError({ code: 'ECONNREFUSED' }));
-  assert.ok(L.isPreSendError({ code: 'ENOTFOUND' }));
-  assert.ok(!L.isPreSendError({ code: 'ECONNRESET' }));
-  assert.ok(!L.isPreSendError({ code: 'ETIMEDOUT' }));
-  assert.ok(!L.isPreSendError(new Error('timed out')));
+  assert.match(h.logs[0], /ECONNREFUSED/);
 });
 
 test('total time is bounded by queue timeout + 60s', async () => {
@@ -166,7 +181,7 @@ test('the bound also stops connection-error retries', async () => {
 test('DELETE retries 503 with Retry-After the same way', async () => {
   const s = await serve([{ status: 503, headers: { 'Retry-After': '3' } }, { status: 204 }]);
   const h = harness();
-  const res = await L.requestWithRetry(s.url, { method: 'DELETE' }, { ...h.opts, idempotent: true });
+  const res = await L.requestWithRetry(s.url, { method: 'DELETE' }, h.opts);
   s.close();
   assert.equal(res.status, 204);
   assert.deepEqual(s.seen.map((r) => r.method), ['DELETE', 'DELETE']);
@@ -260,14 +275,11 @@ test('a server that reports no pool default keeps the 1 h budget', async () => {
   assert.equal(L.retryBudgetMs(L.effectiveQueueTimeout(undefined, {})), 3660000);
 });
 
-for (const [name, body] of [
-  ['an empty body', ''],
-  ['an error code that may follow a claim', JSON.stringify({ error: { code: 'ca_unavailable', message: 'x' } })],
-  ['a body that is not JSON', '<html>overloaded</html>'],
-]) {
-  test(`POST is not retried on 503 with Retry-After and ${name}`, async () => {
+for (const code of ['pool_exhausted', 'pod_lost']) {
+  test(`a 503 ${code} that \`final\` marks returns at once`, async () => {
+    const body = JSON.stringify({ error: { code, message: 'x' } });
     const s = await serve([{ status: 503, headers: { 'Retry-After': '1' }, body }, { status: 201 }]);
-    const h = harness();
+    const h = harness({ final: (r) => L.errorCode(r) === code });
     const res = await L.requestWithRetry(s.url, post, h.opts);
     s.close();
     assert.equal(res.status, 503);
@@ -275,9 +287,8 @@ for (const [name, body] of [
   });
 }
 
-// start_timeout and shutting_down: v0.1.0 only (v0.1.0 upgrade shim: remove them in the release after v3).
-for (const code of ['pool_exhausted', 'start_timeout', 'shutting_down', 'upstream_error']) {
-  test(`POST is retried on 503 with Retry-After and code ${code}`, async () => {
+for (const code of ['upstream_error', 'ca_unavailable', 'not_ready']) {
+  test(`a 503 ${code} is retried`, async () => {
     const body = JSON.stringify({ error: { code, message: 'x' } });
     const s = await serve([{ status: 503, headers: { 'Retry-After': '1' }, body }, { status: 201 }]);
     const h = harness();
@@ -287,10 +298,10 @@ for (const code of ['pool_exhausted', 'start_timeout', 'shutting_down', 'upstrea
   });
 }
 
-test('an idempotent request retries any 503 with Retry-After', async () => {
+test('a GET retries any 503 with Retry-After', async () => {
   const s = await serve([{ status: 503, headers: { 'Retry-After': '1' }, body: '' }, { status: 200, body: '{}' }]);
   const h = harness();
-  const res = await L.requestWithRetry(s.url, { method: 'GET' }, { ...h.opts, idempotent: true });
+  const res = await L.requestWithRetry(s.url, { method: 'GET' }, h.opts);
   s.close();
   assert.equal(res.status, 200);
 });

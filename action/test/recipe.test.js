@@ -61,21 +61,27 @@ test('an allocation id that is not what the controller mints is refused', { skip
   assert.deepEqual(deletes(f.calls), []);
 });
 
-test('a 503 with Retry-After is retried only for a code the controller sends before it claims', { skip }, async (t) => {
+test('a POST cut after it was sent, or answered 5xx, is repeated with the same key', { skip }, async (t) => {
   let posts = 0;
   const f = await fixture(t, {
     override: (rec) => {
       if (rec.method !== 'POST') return undefined;
       posts += 1;
-      return { status: 503, headers: { 'Retry-After': '1' }, body: '' };
+      if (posts === 1) return { reset: true };
+      if (posts === 2) return { status: 502, body: '<html>bad gateway</html>' };
+      if (posts === 3) return { status: 503, headers: { 'Retry-After': '1' }, body: JSON.stringify({ error: { code: 'upstream_error', message: 'x' } }) };
+      return undefined;
     },
   });
   const r = await sh(f, ['true']);
-  assert.equal(r.code, 1);
-  assert.equal(posts, 1, 'an intermediary 503 is not retried');
+  assert.equal(r.code, 0, r.out);
+  const keys = f.calls.filter((c) => c.method === 'POST').map((c) => c.body.publicKey);
+  assert.equal(keys.length, 4);
+  assert.ok(keys[0] && keys.every((k) => k === keys[0]), 'one key for every try');
+  assert.match(r.out, /retrying with the same key/);
 });
 
-test('a pool_exhausted 503 with Retry-After is retried', { skip }, async (t) => {
+test('a pool_exhausted 503 on the POST allocates again with a new key', { skip }, async (t) => {
   let posts = 0;
   const f = await fixture(t, {
     override: (rec) => {
@@ -85,7 +91,8 @@ test('a pool_exhausted 503 with Retry-After is retried', { skip }, async (t) => 
   });
   const r = await sh(f, ['true']);
   assert.equal(r.code, 0, r.out);
-  assert.equal(posts, 2);
+  const keys = f.calls.filter((c) => c.method === 'POST').map((c) => c.body.publicKey);
+  assert.equal(new Set(keys).size, 2);
 });
 
 test('the pool listing is retried on 503 with Retry-After', { skip }, async (t) => {
@@ -158,6 +165,7 @@ test('pool_exhausted on a poll allocates again within the budget', { skip }, asy
   assert.equal(r.code, 0, r.out);
   assert.equal(posts, 2);
   assert.deepEqual(deletes(f.calls), ['/v1/allocations/q2'], 'the exhausted id is not released');
+  assert.equal(new Set(f.calls.filter(isPost).map((c) => c.body.publicKey)).size, 2, 'the next allocation has a new key');
 });
 
 test('pod_lost on a poll fails the run without another POST', { skip }, async (t) => {

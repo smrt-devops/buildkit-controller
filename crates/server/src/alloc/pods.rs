@@ -6,7 +6,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Value, json};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
-use crate::pki::AllocId;
+use crate::pki::{AllocId, ClientPublicKey};
 use crate::render::{
     ANN_ALLOC, ANN_ALLOCATED_AT, ANN_CLAIM, ANN_EXPIRES_AT, ANN_INTERNAL_CA, ANN_OWNER,
     ANN_WORKER_CERT_NOT_AFTER, DRAINING, FREE, LABEL_POOL, LABEL_STATE, LABEL_TEMPLATE_HASH,
@@ -197,6 +197,16 @@ pub fn new_alloc_id() -> Option<AllocId> {
 #[must_use]
 pub fn derived_alloc_id(uid: &str) -> Option<AllocId> {
     let d = ring::digest::digest(&ring::digest::SHA256, uid.as_bytes());
+    alloc_id_of(d.as_ref().get(..16)?.try_into().ok()?)
+}
+
+/// The allocation id of an HTTP allocation: the first 16 bytes of SHA-256 over
+/// the client's public key point, as [`new_alloc_id`] encodes them. The same
+/// key always names the same claim, so a client that repeats its `POST` finds
+/// the allocation it already made.
+#[must_use]
+pub fn key_alloc_id(key: &ClientPublicKey) -> Option<AllocId> {
+    let d = ring::digest::digest(&ring::digest::SHA256, key.point());
     alloc_id_of(d.as_ref().get(..16)?.try_into().ok()?)
 }
 
