@@ -275,6 +275,12 @@ A watch can also hang without failing, for example when the API server freezes o
 - If the API server runs with the watch cache disabled (`--watch-cache=false`), there are no bookmarks. A watch that sees no change then fails after 90 s and starts again; for the Pool and Pod caches that means a full list, so expect one extra list of each every 90 s on each replica. The replica stays Ready through these relists, but `buildkit_watch_errors_total` counts each one.
 - The timeout covers every request on the client: the Pool, Pod, Secret, Lease and claim watches, each namespace's watch when `watchNamespaces` lists several, and every write. It counts silence, not duration, so a large list that keeps streaming is not cut. Allocation, reconcile, TokenReview and Lease calls give up after `kube.requestTimeout`. The controller refuses a `kube.requestTimeout` of 90 s or more, because the 90 s limit would end those calls first and the setting would have no effect. The default is 5 s. The chart renders no `kube` key, so the default applies to a chart install. In practice the 90 s limit ends only stalled watches and lists, and calls that have no timeout of their own.
 
+## Abandoned allocations
+
+A CI job that is cancelled before it learns its allocation id cannot release it. The API stamps each claim with a `seen-at` annotation whenever its caller asks for it (`POST` or `GET`, at most every 15 seconds), and with `delivered` once it answers with the bound allocation. The leader deletes a claim that was never delivered and has not been asked for in 3 minutes, pending or bound, and then retires its worker. The log line is `deleted an abandoned claim`, and `buildkit_claim_reconciles_total{result="abandoned"}` counts them. A delivered claim is left to its TTL or its release.
+
+`seen-at` is written with the clock of the API replica that answered and compared with the clock of the leader. Keep the nodes' clocks synchronized (NTP or your cloud's time service) to well within a minute. A leader whose clock runs ahead by more than about a minute can delete the claim of a client that is still polling, which then sees `404 not_found` and fails its step.
+
 ## Troubleshooting
 
 Start with the pool conditions.
