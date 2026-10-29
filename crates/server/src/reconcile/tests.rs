@@ -1355,7 +1355,7 @@ fn no_creates_when_the_ca_ends_before_a_new_worker_could_serve() {
 }
 
 /// RECON-7: a pass that creates pods applies the sandbox first, even when it
-/// was applied moments ago, so a NetworkPolicy deleted out of band never
+/// was applied moments ago, so a `NetworkPolicy` deleted out of band never
 /// covers a new pod. A pass with no creates applies nothing.
 #[test]
 fn creates_follow_a_fresh_sandbox_apply() {

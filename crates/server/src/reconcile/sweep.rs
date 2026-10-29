@@ -46,7 +46,7 @@ pub async fn old_cache_volumes(client: &Client, namespaces: &[String]) -> bool {
 
 /// No controller other than a `BuildKitPool` holds the PVC. v0.1.0 made each
 /// cache volume's pool its controller; a volume another controller holds
-/// (a StatefulSet, an operator) only shares the labels and is kept.
+/// (a `StatefulSet`, an operator) only shares the labels and is kept.
 fn is_old_cache_volume(pvc: &PersistentVolumeClaim) -> bool {
     pvc.owner_references()
         .iter()
