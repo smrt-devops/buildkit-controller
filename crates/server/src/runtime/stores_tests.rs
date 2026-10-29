@@ -618,3 +618,168 @@ async fn a_stalled_watch_turns_stale_within_the_read_timeout_plus_the_bound_and_
     );
     assert_eq!(names(&store), ["b"]);
 }
+
+/// The hand-fed watches of each namespace.
+type Senders = std::collections::HashMap<String, Vec<mpsc::UnboundedSender<Item>>>;
+
+/// Watch factories for [`merged_watch`] fed by hand: `n` watches per
+/// namespace (`""` = all namespaces), handed out one per (re)start, in order.
+fn fed_namespaces(
+    names: &[&str],
+    n: usize,
+) -> (
+    Senders,
+    impl Fn(Option<&str>) -> BoxStream<'static, Item> + Clone + Send + 'static,
+) {
+    let mut txs = std::collections::HashMap::new();
+    let mut rxs = std::collections::HashMap::new();
+    for name in names {
+        let (t, r): (Vec<_>, Vec<_>) = (0..n).map(|_| mpsc::unbounded()).unzip();
+        txs.insert((*name).to_owned(), t);
+        rxs.insert((*name).to_owned(), r.into_iter());
+    }
+    let rxs = Arc::new(std::sync::Mutex::new(rxs));
+    let watch = move |ns: Option<&str>| {
+        rxs.lock()
+            .unwrap()
+            .get_mut(ns.unwrap_or(""))
+            .and_then(Iterator::next)
+            .map_or_else(|| stream::pending().boxed(), StreamExt::boxed)
+    };
+    (txs, watch)
+}
+
+/// The claim watch path: after a watch error kube resumes the watch from its
+/// last resourceVersion with `Apply` events and no `InitDone`. The store's
+/// readiness must still come back, so an error is always followed by a relist.
+#[tokio::test(start_paused = true)]
+async fn a_strict_watch_relists_after_an_error_and_stays_ready() {
+    for names in [&[""][..], &["a"], &["a", "b"]] {
+        let (store, writer) = reflector::store::<Pod>();
+        let (txs, watch) = fed_namespaces(names, 3);
+        let namespaces: Vec<String> = names
+            .iter()
+            .filter(|n| !n.is_empty())
+            .map(|n| (*n).to_owned())
+            .collect();
+        let events = merged_watch(&namespaces, store.clone(), None, watch);
+        let readiness = Arc::new(Readiness::default());
+        let flag = readiness.register("claim_store");
+        tokio::spawn(drive(writer, events, flag, |_| {}, |_| {}));
+        for (name, tx) in &txs {
+            send(&tx[0], listed(&[pod_in(name, "p1")]));
+        }
+        settle().await;
+        assert!(readiness.failing().is_empty(), "{names:?}");
+
+        let t0 = tokio::time::Instant::now();
+        let first = &txs[names[0]];
+        // The error, then what a resumed kube watch sends: no InitDone.
+        send(
+            &first[0],
+            [failed(), Ok(Event::Apply(pod_in(names[0], "p2")))],
+        );
+        at(t0, 2 * SEC).await;
+        send(&first[1], listed(&[pod_in(names[0], "p3")]));
+        at(t0, STALE_AFTER * 3).await;
+        assert!(
+            readiness.failing().is_empty(),
+            "{names:?}: the relist after the error restored readiness"
+        );
+        let mut want: Vec<String> = names
+            .iter()
+            .map(|n| format!("{n}/{}", if *n == names[0] { "p3" } else { "p1" }))
+            .collect();
+        want.sort();
+        assert_eq!(keys(&store), want, "{names:?}");
+    }
+}
+
+/// With every namespace failing and recovering at different times, the strict
+/// merge becomes ready again only once the last one relisted.
+#[tokio::test(start_paused = true)]
+async fn a_strict_merge_is_ready_again_once_every_namespace_relisted() {
+    let (store, writer) = reflector::store::<Pod>();
+    let (txs, watch) = fed_namespaces(&["a", "b"], 10);
+    let events = merged_watch(&["a".into(), "b".into()], store.clone(), None, watch);
+    let readiness = Arc::new(Readiness::default());
+    let flag = readiness.register("claim_store");
+    tokio::spawn(drive(writer, events, flag, |_| {}, |_| {}));
+    send(&txs["a"][0], listed(&[pod_in("a", "p1")]));
+    send(&txs["b"][0], listed(&[pod_in("b", "q1")]));
+    settle().await;
+    let t0 = tokio::time::Instant::now();
+    send(&txs["a"][0], [failed()]);
+    fail_every(&txs["b"][..5]);
+    at(t0, 2 * SEC).await;
+    send(&txs["a"][1], listed(&[pod_in("a", "p2")]));
+    at(t0, STALE_AFTER + SEC).await;
+    assert_eq!(
+        readiness.failing(),
+        ["claim_store"],
+        "b has not relisted: no partial list counts as synced"
+    );
+    send(&txs["b"][5], listed(&[pod_in("b", "q2")]));
+    at(t0, STALE_AFTER + 40 * SEC).await;
+    assert!(readiness.failing().is_empty());
+    assert_eq!(keys(&store), ["a/p2", "b/q2"]);
+}
+
+/// A namespace given up is marked listed again only once its relist is in the
+/// store: before that the leader would see it as listed but empty, and release
+/// the workers of its claims as strays.
+#[tokio::test(start_paused = true)]
+async fn a_namespace_listed_again_is_unmarked_only_after_its_objects_are_stored() {
+    let (store, writer) = reflector::store::<Pod>();
+    let (a, wa) = fed(10);
+    let (b, wb) = fed(10);
+    let tagged = stream::select_all([
+        restarting(wa).map(|ev| (0, ev)).boxed(),
+        restarting(wb).map(|ev| (1, ev)).boxed(),
+    ]);
+    let readiness = Arc::new(Readiness::default());
+    let merged = merge_tolerant(
+        tagged.boxed(),
+        vec!["a".into(), "b".into()],
+        store.clone(),
+        NamespaceReport::full("pod", Arc::new(Metrics::new()), Arc::clone(&readiness)),
+    );
+    let flag = readiness.register("pod_store");
+    let early = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let given_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (rd, st, ea, gu) = (
+        Arc::clone(&readiness),
+        store.clone(),
+        Arc::clone(&early),
+        Arc::clone(&given_up),
+    );
+    // Checked after each event is applied: what the leader could see then.
+    let check = move || {
+        let marked = !rd.degraded().is_empty();
+        if marked {
+            gu.store(true, std::sync::atomic::Ordering::SeqCst);
+        } else if gu.load(std::sync::atomic::Ordering::SeqCst)
+            && !keys(&st).contains(&"b/q1".to_owned())
+        {
+            ea.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    };
+    let tap = check.clone();
+    tokio::spawn(drive(writer, merged, flag, |_| {}, move |_| tap()));
+    let t0 = tokio::time::Instant::now();
+    send(&a[0], listed(&[pod_in("a", "p1")]));
+    fail_every(&b[..5]);
+    at(t0, GIVE_UP_AFTER + SEC).await;
+    assert_eq!(readiness.degraded(), ["pod_store/b"]);
+    send(&b[5], listed(&[pod_in("b", "q1")]));
+    for _ in 0..50 {
+        settle().await;
+        check();
+    }
+    assert!(readiness.degraded().is_empty(), "b is listed again");
+    assert_eq!(keys(&store), ["a/p1", "b/q1"]);
+    assert!(
+        !early.load(std::sync::atomic::Ordering::SeqCst),
+        "b was unmarked before its objects were stored"
+    );
+}

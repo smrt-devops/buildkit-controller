@@ -15,7 +15,7 @@ Items to confirm before making the repository public.
 2. The README links resolve and the example hostnames use `example.com`.
 3. No credentials in history. Run a scanner such as `gitleaks detect` over the full history and review any hit.
 4. `cargo deny check` passes, so every dependency license and advisory is accepted.
-5. The checks in [GITHUB_SETUP.md](GITHUB_SETUP.md) are done, covering workflow permissions, branch protection and package visibility.
+5. The [repository settings](workflows/README.md#repository-settings) are applied, covering workflow permissions, branch protection, tag rulesets, Pages and package visibility.
 6. `cargo xtask crdgen --check` and `cargo xtask helm-test` pass, so the chart in the repository matches the code.
 7. A pre-release tag has produced a signed image, an SBOM and a chart on the GitHub release. Verify the signature with `cosign verify`.
 

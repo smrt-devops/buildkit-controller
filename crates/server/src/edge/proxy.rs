@@ -24,7 +24,7 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 use super::handler::{Accepted, ConnectionHandler, Refusal};
 use super::metrics::{Direction, EdgeMetrics, Revocation};
 use super::pods::PodView;
-use super::revoke::{MAX_CONNECTIONS_PER_ALLOCATION, Registry};
+use super::revoke::{MAX_CONNECTIONS_PER_ALLOCATION, Namespaces, Registry, namespace_cap};
 use super::tls::EdgeTls;
 use super::upstream::{dial, worker_name};
 use crate::pki::AllocationId;
@@ -56,17 +56,33 @@ struct Inner {
     metrics: EdgeMetrics,
     options: ProxyOptions,
     live: Arc<Registry>,
+    namespaces: Arc<Namespaces>,
 }
 
 impl ProxyHandler {
     /// `tls` is the generation the listener uses; its `upstream` config is
-    /// the worker-leg client config.
+    /// the worker-leg client config. Each pool namespace may hold [`namespace_cap`] of the
+    /// default `edge.maxConnections`.
     #[must_use]
     pub fn new(
         view: PodView,
         tls: watch::Receiver<Option<Arc<EdgeTls>>>,
         metrics: EdgeMetrics,
         options: ProxyOptions,
+    ) -> Self {
+        let max = usize::try_from(crate::config::EDGE_MAX_CONNECTIONS).unwrap_or(usize::MAX);
+        Self::with_namespace_cap(view, tls, metrics, options, namespace_cap(max))
+    }
+
+    /// [`Self::new`] with at most `max_per_namespace` proxied connections per
+    /// pool namespace (from the allocation certificate) on this replica; 0 disables the cap.
+    #[must_use]
+    pub fn with_namespace_cap(
+        view: PodView,
+        tls: watch::Receiver<Option<Arc<EdgeTls>>>,
+        metrics: EdgeMetrics,
+        options: ProxyOptions,
+        max_per_namespace: usize,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -75,6 +91,7 @@ impl ProxyHandler {
                 metrics,
                 options,
                 live: Arc::new(Registry::new(MAX_CONNECTIONS_PER_ALLOCATION)),
+                namespaces: Arc::new(Namespaces::new(max_per_namespace)),
             }),
         }
     }
@@ -141,6 +158,13 @@ impl Inner {
                 let _ = tokio::time::timeout(CLOSE_GRACE, client.shutdown()).await;
                 return;
             }
+        };
+        // One tenant's allocations together may not fill the replica.
+        let Some(_ns) = self.namespaces.try_take(id.namespace.as_str()) else {
+            self.metrics.outcome(Some(id), "namespace_limit");
+            warn!("edge per-namespace connection limit reached; closing");
+            let _ = tokio::time::timeout(CLOSE_GRACE, client.shutdown()).await;
+            return;
         };
         let start = Instant::now();
         let addr = SocketAddr::new(target.ip, self.options.upstream_port);

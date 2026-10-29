@@ -33,4 +33,4 @@ serde-saphyr = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 # Self dev-dependency: turns the `client` feature on for this crate's own tests.
-buildkit-controller-api = { path = ".", version = "0.1.0", features = ["client"] }
+buildkit-controller-api = { path = ".", version = "0.2.0", features = ["client"] }

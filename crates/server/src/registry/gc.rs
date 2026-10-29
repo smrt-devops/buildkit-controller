@@ -1,23 +1,24 @@
 //! Garbage collection planning.
 //!
 //! [`plan`] reads the index and returns what to remove; the store applies the
-//! plan under its index lock, so no upload or push interleaves. In order:
+//! plan under its index lock, so no upload or push interleaves. Candidates are
+//! the manifests, with every blob they reach, and the recent blob links that
+//! no manifest reaches yet (a push in flight: its blobs land before the
+//! manifest that references them). In order:
 //!
-//! 1. Per pool (repositories under `<namespace>/<pool>/`): manifests are kept
-//!    newest first (by last pull or push) while the distinct blobs they reach
-//!    fit the pool budget. The first manifest that does not fit, and every
-//!    older one, is evicted.
-//! 2. The same over every remaining manifest, against the volume budget.
+//! 1. Per pool (repositories under `<namespace>/<pool>/`): candidates are
+//!    kept newest first (a manifest by last pull or push, a link by when it
+//!    was made or last read) while the distinct blobs they hold fit the pool
+//!    budget. One that does not fit is removed and the scan goes on, so one
+//!    oversized push cannot empty the pool.
+//! 2. The same over every remaining candidate, against the volume budget.
 //! 3. Mark and sweep: a repository keeps a blob link while a remaining
 //!    manifest of it reaches the blob, or while the link is younger than the
-//!    grace period. The grace period covers a push in flight: its blobs land
-//!    before the manifest that references them, and a HEAD or GET of a blob
-//!    renews its link. A blob no repository links is deleted.
+//!    grace period and was not removed. A blob no repository links is deleted.
 //!
-//! Recent links that no manifest reaches (a push in flight) count against
-//! both budgets first, so such a push is never evicted to make room for older
-//! manifests. Blobs a manifest reaches count only with that manifest, so a
-//! busy pool keeps its newest manifests rather than losing all of them.
+//! So recent links count against the budgets like anything else: no amount
+//! of unreferenced uploads can push a pool past its budget or evict more than
+//! a newer manifest of the same size would.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -79,13 +80,13 @@ pub(super) fn pool_of(repo: &str) -> &str {
         .map_or(repo, |(i, _)| &repo[..i])
 }
 
-/// The manifest `root`, everything it references and, through manifests of
-/// the same repository, everything they reference.
-fn closure(repo: &Repo, root: &Digest) -> HashSet<Digest> {
+/// The `roots`, everything they reference and, through manifests of the same
+/// repository, everything those reference.
+fn reach<'a>(repo: &'a Repo, roots: impl IntoIterator<Item = &'a Digest>) -> HashSet<&'a Digest> {
     let mut out = HashSet::new();
-    let mut stack = vec![root];
+    let mut stack: Vec<&Digest> = roots.into_iter().collect();
     while let Some(d) = stack.pop() {
-        if out.insert(d.clone())
+        if out.insert(d)
             && let Some(m) = repo.manifests.get(d)
         {
             stack.extend(m.refs.iter());
@@ -94,106 +95,142 @@ fn closure(repo: &Repo, root: &Digest) -> HashSet<Digest> {
     out
 }
 
-type Candidate = (String, Digest, u64);
+/// A manifest, or a recent link no manifest reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Kind {
+    Manifest,
+    Link,
+}
 
-/// The candidates to evict so that `seed` plus the kept manifests fit `budget`.
-fn fit(
-    idx: &Index,
-    mut cands: Vec<Candidate>,
-    seed: HashSet<Digest>,
+/// `(repository, digest, last used, kind)`.
+type Candidate<'a> = (&'a str, &'a Digest, u64, Kind);
+
+/// Splits `cands` into those kept within `budget`, newest first, and those
+/// removed.
+fn fit<'a>(
+    idx: &'a Index,
+    mut cands: Vec<Candidate<'a>>,
     budget: u64,
-) -> Vec<(String, Digest)> {
+) -> (Vec<Candidate<'a>>, Vec<Candidate<'a>>) {
     cands.sort_by(|a, b| {
         b.2.cmp(&a.2)
-            .then_with(|| a.0.cmp(&b.0))
-            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.0.cmp(b.0))
+            .then_with(|| a.1.cmp(b.1))
+            .then_with(|| a.3.cmp(&b.3))
     });
     let size = |d: &Digest| idx.blobs.get(d).copied().unwrap_or(0);
-    let mut used: u64 = seed.iter().map(size).sum();
-    let mut blobs = seed;
-    let mut kept: HashSet<(String, Digest)> = HashSet::new();
-    let mut full = false;
-    let mut evict = Vec::new();
-    for (name, d, _) in cands {
-        let Some(repo) = idx.repos.get(&name) else {
-            continue;
-        };
-        if kept.contains(&(name.clone(), d.clone())) {
-            continue;
-        }
-        if !full {
-            let reach = closure(repo, &d);
-            let add: u64 = reach.iter().filter(|b| !blobs.contains(*b)).map(size).sum();
-            if used.saturating_add(add) <= budget {
-                used += add;
-                for b in reach {
-                    if repo.manifests.contains_key(&b) {
-                        kept.insert((name.clone(), b.clone()));
-                    }
-                    blobs.insert(b);
+    let mut used: u64 = 0;
+    let mut blobs: HashSet<&Digest> = HashSet::new();
+    let mut kept_manifests: HashSet<(&str, &Digest)> = HashSet::new();
+    let mut removed_manifests: HashSet<(&str, &Digest)> = HashSet::new();
+    let (mut kept, mut removed) = (Vec::new(), Vec::new());
+    for c in cands {
+        let (name, d, _, kind) = c;
+        let fits = match kind {
+            Kind::Link => {
+                let add = if blobs.contains(d) { 0 } else { size(d) };
+                let fits = used.saturating_add(add) <= budget;
+                if fits {
+                    used += add;
+                    blobs.insert(d);
                 }
-                continue;
+                fits
             }
-            full = true;
+            Kind::Manifest if kept_manifests.contains(&(name, d)) => true,
+            Kind::Manifest => {
+                let Some(repo) = idx.repos.get(name) else {
+                    continue;
+                };
+                let reached = reach(repo, [d]);
+                let manifests: Vec<&Digest> = reached
+                    .iter()
+                    .copied()
+                    .filter(|b| repo.manifests.contains_key(*b))
+                    .collect();
+                let add: u64 = reached
+                    .iter()
+                    .filter(|b| !blobs.contains(**b))
+                    .map(|b| size(b))
+                    .sum();
+                // A manifest whose closure lost a manifest already cannot be whole.
+                let fits = used.saturating_add(add) <= budget
+                    && !manifests
+                        .iter()
+                        .any(|b| removed_manifests.contains(&(name, *b)));
+                if fits {
+                    used += add;
+                    kept_manifests.extend(manifests.into_iter().map(|b| (name, b)));
+                    blobs.extend(reached);
+                } else {
+                    removed_manifests.insert((name, d));
+                }
+                fits
+            }
+        };
+        if fits {
+            kept.push(c);
+        } else {
+            removed.push(c);
         }
-        evict.push((name, d));
     }
-    evict
+    (kept, removed)
 }
 
 /// The collection for `idx` at `now` (unix seconds).
 pub(super) fn plan(idx: &Index, budgets: &dyn Budgets, now: u64, grace: u64) -> Plan {
     let young = |t: u64| now.saturating_sub(t) < grace;
-    let mut pools: BTreeMap<&str, (Vec<Candidate>, HashSet<Digest>)> = BTreeMap::new();
+    let mut pools: BTreeMap<&str, Vec<Candidate>> = BTreeMap::new();
     for (name, repo) in &idx.repos {
-        let (cands, seed) = pools.entry(pool_of(name)).or_default();
+        let cands = pools.entry(pool_of(name)).or_default();
+        let reached = reach(repo, repo.manifests.keys());
         cands.extend(
             repo.manifests
                 .iter()
-                .map(|(d, m)| (name.clone(), d.clone(), m.last_used)),
+                .map(|(d, m)| (name.as_str(), d, m.last_used, Kind::Manifest)),
         );
-        // Only uploads in flight: a young link a manifest reaches competes
-        // with that manifest, newest first, like any other.
-        let reached: HashSet<Digest> = repo
-            .manifests
-            .keys()
-            .flat_map(|d| closure(repo, d))
-            .collect();
-        seed.extend(
+        cands.extend(
             repo.links
                 .iter()
-                .filter(|(d, t)| young(**t) && !reached.contains(*d))
-                .map(|(d, _)| d.clone()),
+                .filter(|(d, t)| young(**t) && !reached.contains(d))
+                .map(|(d, t)| (name.as_str(), d, *t, Kind::Link)),
         );
     }
-    let mut out = Plan::default();
-    let mut gone: HashSet<(String, Digest)> = HashSet::new();
+    let mut removed: Vec<(Candidate, Reason)> = Vec::new();
     let mut all = Vec::new();
-    let mut all_seed = HashSet::new();
-    for (pool, (cands, seed)) in pools {
-        all.extend(cands.iter().cloned());
-        all_seed.extend(seed.iter().cloned());
-        for (name, d) in fit(idx, cands, seed, budgets.pool(pool)) {
-            gone.insert((name.clone(), d.clone()));
-            out.evict.push((name, d, Reason::Pool));
-        }
+    for (pool, cands) in pools {
+        let (kept, gone) = fit(idx, cands, budgets.pool(pool));
+        all.extend(kept);
+        removed.extend(gone.into_iter().map(|c| (c, Reason::Pool)));
     }
-    all.retain(|(n, d, _)| !gone.contains(&(n.clone(), d.clone())));
-    for (name, d) in fit(idx, all, all_seed, budgets.total()) {
-        gone.insert((name.clone(), d.clone()));
-        out.evict.push((name, d, Reason::Volume));
+    let (_, gone) = fit(idx, all, budgets.total());
+    removed.extend(gone.into_iter().map(|c| (c, Reason::Volume)));
+
+    let mut out = Plan::default();
+    let mut evicted: HashSet<(&str, &Digest)> = HashSet::new();
+    let mut dropped: HashSet<(&str, &Digest)> = HashSet::new();
+    for ((name, d, _, kind), reason) in removed {
+        match kind {
+            Kind::Manifest => {
+                evicted.insert((name, d));
+                out.evict.push((name.to_owned(), d.clone(), reason));
+            }
+            Kind::Link => {
+                dropped.insert((name, d));
+            }
+        }
     }
     let mut linked = HashSet::new();
     for (name, repo) in &idx.repos {
-        let mut reached = HashSet::new();
-        for d in repo.manifests.keys() {
-            if !gone.contains(&(name.clone(), d.clone())) {
-                reached.extend(closure(repo, d));
-            }
-        }
+        let reached = reach(
+            repo,
+            repo.manifests
+                .keys()
+                .filter(|d| !evicted.contains(&(name.as_str(), *d))),
+        );
         for (d, t) in &repo.links {
-            if reached.contains(d) || young(*t) {
-                linked.insert(d.clone());
+            let keep = reached.contains(d) || (young(*t) && !dropped.contains(&(name.as_str(), d)));
+            if keep {
+                linked.insert(d);
             } else {
                 out.unlink.push((name.clone(), d.clone()));
             }
@@ -202,7 +239,7 @@ pub(super) fn plan(idx: &Index, budgets: &dyn Budgets, now: u64, grace: u64) -> 
     out.delete = idx
         .blobs
         .keys()
-        .filter(|d| !linked.contains(*d))
+        .filter(|d| !linked.contains(d))
         .cloned()
         .collect();
     out.delete.sort();
@@ -376,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn young_links_are_kept_and_counted_first() {
+    fn young_links_are_kept_and_compete_by_age() {
         let mut idx = Index::default();
         put(&mut idx, "ns/p/a", 1, 10, &[], 10);
         // A push in flight: a blob uploaded at t=95, no manifest yet.
@@ -390,5 +427,84 @@ mod tests {
         assert_eq!(evicted(&p), vec![("ns/p/a".into(), 1, Reason::Pool)]);
         // The evicted manifest's own link is old; the fresh blob survives.
         assert_eq!(p.delete, vec![dg(1)]);
+    }
+
+    /// Links in `name` at times `ts`, each to a fresh 10-byte blob numbered from `first`.
+    fn junk(idx: &mut Index, name: &str, first: u8, ts: &[u64]) -> Vec<Digest> {
+        let repo = idx.repos.entry(name.to_owned()).or_default();
+        ts.iter()
+            .zip(first..)
+            .map(|(t, n)| {
+                repo.links.insert(dg(n), *t);
+                idx.blobs.insert(dg(n), 10);
+                dg(n)
+            })
+            .collect()
+    }
+
+    fn kept_bytes(idx: &Index, p: &Plan) -> u64 {
+        idx.blobs
+            .iter()
+            .filter(|(d, _)| !p.delete.contains(d))
+            .map(|(_, s)| s)
+            .sum()
+    }
+
+    /// Unreferenced uploads, kept fresh by reads, cannot hold a pool or the
+    /// volume past its budget, and lose to a newer manifest.
+    #[test]
+    fn unreferenced_links_count_by_age_and_stay_within_budget() {
+        for budgets in [
+            FixedBudgets {
+                pool: 30,
+                total: u64::MAX,
+            },
+            FixedBudgets {
+                pool: u64::MAX,
+                total: 30,
+            },
+        ] {
+            let mut idx = Index::default();
+            put(&mut idx, "ns/p/a", 1, 99, &[], 10);
+            idx.repos.get_mut("ns/p/a").unwrap().links.insert(dg(1), 99);
+            let j = junk(&mut idx, "ns/p/x", 100, &[90, 91, 92, 93, 94]);
+            let p = plan(&idx, &budgets, 100, 60);
+            assert!(p.evict.is_empty(), "{:?}", p.evict);
+            assert_eq!(kept_bytes(&idx, &p), 30);
+            // The two newest links stay, the older ones go.
+            for (d, gone) in j.iter().zip([true, true, true, false, false]) {
+                assert_eq!(p.delete.contains(d), gone, "{d}");
+                assert_eq!(p.unlink.contains(&("ns/p/x".into(), d.clone())), gone);
+            }
+        }
+    }
+
+    /// One manifest larger than the budget is evicted alone; older ones that
+    /// fit stay.
+    #[test]
+    fn an_oversized_manifest_does_not_take_the_older_ones_with_it() {
+        for budgets in [
+            FixedBudgets {
+                pool: 25,
+                total: u64::MAX,
+            },
+            FixedBudgets {
+                pool: u64::MAX,
+                total: 25,
+            },
+        ] {
+            let mut idx = Index::default();
+            put(&mut idx, "ns/p/a", 1, 99, &[11, 12], 10);
+            put(&mut idx, "ns/p/b", 2, 50, &[], 10);
+            put(&mut idx, "ns/p/a", 3, 40, &[], 10);
+            let reason = if budgets.pool == 25 {
+                Reason::Pool
+            } else {
+                Reason::Volume
+            };
+            let p = plan(&idx, &budgets, 100, 0);
+            assert_eq!(evicted(&p), vec![("ns/p/a".into(), 1, reason)]);
+            assert_eq!(kept_bytes(&idx, &p), 20);
+        }
     }
 }

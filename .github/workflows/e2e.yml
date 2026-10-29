@@ -18,6 +18,10 @@ jobs:
   # Every kind suite but soak and perf in one run (cargo xtask kind-all): the controller
   # image is built once, the suites share two kind clusters and run side by side. The
   # suites' logs are kept as an artifact.
+  # --jobs 3: three shared suites plus the solo thread is one suite per CPU on the 4-CPU
+  # runner. Measured locally, reconcile-verify (330-430 s) is the critical path and the
+  # other shared suites (about 750 s together) fit beside it on two lanes, so 3 is as fast
+  # as 4 with less contention. --jobs 2 would add about 5 minutes.
   kind-all:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
@@ -27,7 +31,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-      - run: cargo xtask kind-all --jobs 4
+      - run: cargo xtask kind-all --jobs 3
+      - name: Show the runner's disk and memory on failure
+        if: failure()
+        run: df -h / && free -m && docker system df
       - name: Keep the suite logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -131,3 +138,16 @@ jobs:
           persist-credentials: false
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
       - run: cargo xtask ${{ matrix.suite }}
+      # The perf table (target/perf/result-*.md) is a report: a MISS does not fail the job.
+      - name: Keep the results and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nightly-${{ strategy.job-index }}
+          path: |
+            target/soak/result.txt
+            target/soak/client.log
+            target/perf/result-*.md
+            target/perf/alloc-*.txt
+            target/drain-verify/*.log
+          if-no-files-found: ignore

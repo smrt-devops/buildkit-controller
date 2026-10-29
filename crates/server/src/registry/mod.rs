@@ -82,6 +82,7 @@ pub async fn run(args: RegistryArgs, shutdown: CancellationToken) -> anyhow::Res
         store,
         auth,
         metrics: RegistryMetrics::register(&metrics),
+        manifest_puts: tokio::sync::Semaphore::new(api::MANIFEST_PUTS),
     });
 
     let gc_task = tokio::spawn(collect(

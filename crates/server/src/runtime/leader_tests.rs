@@ -109,3 +109,26 @@ async fn a_panicked_or_finished_term_ends_supervision() {
         drop(tx);
     }
 }
+
+/// A leader whose stores never sync (a namespace it cannot list) must not hold
+/// the Lease with no work running: the term fails after [`SYNC_GATE`].
+#[tokio::test(start_paused = true)]
+async fn a_term_whose_stores_never_sync_ends_supervision() {
+    let started = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let (_tx, rx) = watch::channel(LeaderState::Leader { term: 3 });
+    let sup = tokio::spawn(supervise(
+        rx,
+        CancellationToken::new(),
+        || Box::pin(std::future::pending()),
+        Arc::new(Counting(Arc::clone(&started), Arc::clone(&dropped))),
+    ));
+    tokio::time::sleep(SYNC_GATE.checked_sub(Duration::from_secs(1)).unwrap()).await;
+    assert!(!sup.is_finished(), "still inside the bound");
+    let r = tokio::time::timeout(Duration::from_secs(2), sup)
+        .await
+        .expect("supervise gave up after the bound")
+        .unwrap();
+    assert!(matches!(r, Err(TermFailed::NotSynced { term: 3 })), "{r:?}");
+    assert_eq!(started.load(Ordering::SeqCst), 0);
+}

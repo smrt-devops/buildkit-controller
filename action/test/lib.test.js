@@ -128,7 +128,7 @@ test('parseCacheInputs: defaults, validation, one cache-from per line', () => {
   assert.deepEqual(L.parseCacheInputs({}), { cache: 'auto', cacheKey: undefined, mode: undefined, from: [] });
   assert.deepEqual(L.parseCacheInputs({ cache: 'none', cacheKey: 'app-main', cacheMode: 'min', cacheFrom: 'type=registry,ref=r/x:a\n\n type=gha \n' }),
     { cache: 'none', cacheKey: 'app-main', mode: 'min', from: ['type=registry,ref=r/x:a', 'type=gha'] });
-  for (const gone of ['all', 'registry', 'local']) assert.throws(() => L.parseCacheInputs({ cache: gone }), /invalid cache/);
+  assert.throws(() => L.parseCacheInputs({ cache: 'all' }), /invalid cache/);
   for (const bad of ['-a', 'a/b', 'a-', 'x'.repeat(64)]) assert.throws(() => L.parseCacheInputs({ cacheKey: bad }), /invalid cache-key/);
   assert.equal(L.parseCacheInputs({ cacheKey: 'x'.repeat(63) }).cacheKey.length, 63);
   assert.throws(() => L.parseCacheInputs({ cacheMode: 'all' }), /invalid cache-mode/);
@@ -190,4 +190,13 @@ test('cachedToken fetches every time when exp cannot be read', async () => {
   await get();
   await get();
   assert.equal(n, 2);
+});
+
+test('parseCacheInputs: the v0.1.0 layers registry and local mean auto, with a warning', () => {
+  for (const old of ['registry', 'local']) {
+    const warned = [];
+    assert.equal(L.parseCacheInputs({ cache: old }, (m) => warned.push(m)).cache, 'auto');
+    assert.equal(warned.length, 1);
+    assert.match(warned[0], new RegExp(`cache "${old}" is deprecated`));
+  }
 });

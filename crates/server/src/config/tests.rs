@@ -471,7 +471,7 @@ fn proxy_protocol_is_off_by_default() {
 #[test]
 fn proxy_protocol_parses_per_listener() {
     let c = Config::from_yaml(&format!(
-        "{MIN}  proxyProtocol: {{enabled: true, trustedCIDRs: [10.244.0.0/16, \"fd00::/8\"], headerTimeout: 2s}}\napi:\n  proxyProtocol: {{enabled: true, trustedCIDRs: [192.0.2.10/32]}}\n"
+        "{MIN}  proxyProtocol: {{enabled: true, trustedCIDRs: [10.244.0.0/16, \"fd00:10::/48\"], headerTimeout: 2s}}\napi:\n  proxyProtocol: {{enabled: true, trustedCIDRs: [192.0.2.10/32]}}\n"
     ))
     .unwrap();
     assert_eq!(c.edge.proxy_protocol.trusted_cidrs.len(), 2);
@@ -497,7 +497,7 @@ fn proxy_protocol_needs_canonical_trusted_cidrs() {
         );
     }
     assert!(
-        v.iter().any(|m| m.contains("would trust every address")),
+        v.iter().any(|m| m.contains("`0.0.0.0/0` is too broad")),
         "{v:?}"
     );
     assert!(
@@ -644,4 +644,148 @@ fn registry_is_off_without_a_host_and_checked_with_one() {
         v.iter().any(|m| m.contains("registry.tlsSecretName")),
         "{v:?}"
     );
+}
+
+#[test]
+fn dns_cidrs_must_not_open_port_53_to_a_protected_range() {
+    let v = errs(&format!(
+        "{MIN}workerNetwork:\n  dns:\n    cidrs: ['0.0.0.0/0', '169.254.0.0/16', '128.0.0.0/1']\n"
+    ));
+    for c in ["0.0.0.0/0", "169.254.0.0/16", "128.0.0.0/1"] {
+        assert!(
+            v.iter()
+                .any(|m| m.starts_with("workerNetwork.dns.cidrs") && m.contains(c)),
+            "{c}: {v:?}"
+        );
+    }
+    // NodeLocal DNSCache and the AWS resolver sit at single link-local addresses.
+    Config::from_yaml(&format!(
+        "{MIN}workerNetwork:\n  dns:\n    cidrs: ['169.254.20.10/32', '169.254.169.253/32', '10.96.0.10/32']\n"
+    ))
+    .unwrap();
+}
+
+#[test]
+fn trusted_cidrs_must_not_be_huge() {
+    let v = errs(&format!(
+        "{MIN}  proxyProtocol: {{enabled: true, trustedCIDRs: ['0.0.0.0/1', '128.0.0.0/1', '2000::/3']}}\n"
+    ));
+    for c in ["0.0.0.0/1", "128.0.0.0/1", "2000::/3"] {
+        assert!(
+            v.iter().any(|m| m.contains(&format!("`{c}` is too broad"))),
+            "{c}: {v:?}"
+        );
+    }
+    Config::from_yaml(&format!(
+        "{MIN}  proxyProtocol: {{enabled: true, trustedCIDRs: ['10.0.0.0/8', '2600:1f18::/32']}}\n"
+    ))
+    .unwrap();
+}
+
+/// Huge durations used to panic on `Duration` or `Instant` overflow, in
+/// validation, at shutdown or in the elector.
+#[test]
+fn durations_are_bounded() {
+    let v = errs(&format!(
+        "{MIN}leaderElection:\n  renewInterval: 18446744073709551615s\n  leaseDuration: 11m\nshutdown:\n  delay: 2h\n  drainTimeout: 49h\n"
+    ));
+    for f in [
+        "leaderElection.renewInterval: must be at most",
+        "leaderElection.leaseDuration: must be at most 600s",
+        "shutdown.delay: must be at most 3600s",
+        "shutdown.drainTimeout: must be at most 172800s",
+    ] {
+        assert!(v.iter().any(|m| m.starts_with(f)), "{f}: {v:?}");
+    }
+    Config::from_yaml(&format!(
+        "{MIN}leaderElection:\n  leaseDuration: 10m\nshutdown:\n  delay: 1h\n  drainTimeout: 48h\n"
+    ))
+    .unwrap();
+}
+
+#[test]
+fn the_controller_namespace_is_refused_in_the_namespace_lists() {
+    let c = Config::from_yaml(&format!(
+        "{MIN}watchNamespaces: [team-a, buildkit-system]\nclaims:\n  namespaces: [buildkit-system, team-b]\n"
+    ))
+    .unwrap();
+    let v = c.own_namespace_problems("buildkit-system");
+    assert_eq!(v.len(), 2, "{v:?}");
+    assert!(
+        v[0].starts_with("watchNamespaces must not include"),
+        "{v:?}"
+    );
+    assert!(
+        v[1].starts_with("claims.namespaces must not include"),
+        "{v:?}"
+    );
+    assert!(v[1].contains("cluster admins"), "{v:?}");
+    assert!(c.own_namespace_problems("other").is_empty());
+}
+
+#[test]
+fn settings_refuse_the_controller_namespace_in_claims_namespaces() {
+    let dir = std::env::temp_dir().join(format!("bkc-cfg-own-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("c.yaml");
+    std::fs::write(&path, format!("{MIN}claims:\n  namespaces: [bk]\n")).unwrap();
+    let cli = Cli::try_parse_from(["x", "--config", path.to_str().unwrap()]).unwrap();
+    let e = Settings::load(cli, |k| {
+        Some(if k == "POD_NAMESPACE" {
+            "bk".into()
+        } else {
+            "p".into()
+        })
+    })
+    .unwrap_err();
+    assert!(
+        e.to_string().contains("claims.namespaces must not include"),
+        "{e}"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Helm replaces a list, so overriding `deniedCIDRs` to add one range used to
+/// drop the metadata ranges from the internet rule's `except`. The binary
+/// always appends the ones the lists no longer cover.
+#[test]
+fn the_protected_ranges_are_always_denied() {
+    let c = Config::from_yaml(MIN).unwrap();
+    assert_eq!(
+        c.render_config("bk").worker_network.denied_cidrs,
+        c.worker_network.denied_cidrs,
+        "the defaults cover them all"
+    );
+    for yaml in [
+        "workerNetwork:\n  deniedCIDRs: [10.0.0.0/8, 203.0.113.0/24]\n",
+        "workerNetwork:\n  deniedCIDRs: []\n",
+    ] {
+        let c = Config::from_yaml(&format!("{MIN}{yaml}")).unwrap();
+        let d = c.render_config("bk").worker_network.denied_cidrs;
+        for r in [
+            "169.254.0.0/16",
+            "168.63.129.16/32",
+            "100.100.100.200/32",
+            "fd00:ec2::254/128",
+            "64:ff9b::/96",
+        ] {
+            assert!(d.iter().any(|x| x == r), "{r}: {d:?}");
+        }
+        assert!(
+            !d.iter().any(|x| x == "127.0.0.0/8"),
+            "loopback never leaves the pod"
+        );
+    }
+    // A range covered by any of the three lists is not added again.
+    let c = Config::from_yaml(&format!(
+        "{MIN}workerNetwork:\n  deniedCIDRs: [169.254.0.0/16]\n  extraDeniedCIDRs: [100.64.0.0/10]\n"
+    ))
+    .unwrap();
+    let d = c.render_config("bk").worker_network.denied_cidrs;
+    assert!(
+        !d.iter().any(|x| x == "169.254.0.0/16" && x != &d[0]),
+        "{d:?}"
+    );
+    assert!(!d.iter().any(|x| x == "100.100.100.200/32"), "{d:?}");
+    assert!(d.iter().any(|x| x == "168.63.129.16/32"), "{d:?}");
 }

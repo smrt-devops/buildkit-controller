@@ -16,8 +16,8 @@ anyhow = { workspace = true }
 base64 = { workspace = true }
 rcgen = { workspace = true }
 ring = { workspace = true }
-buildkit-controller-api = { path = "../crates/api", version = "0.1.0" }
-buildkit-controller = { path = "../crates/server", version = "0.1.0", features = ["fixtures"] }
+buildkit-controller-api = { path = "../crates/api", version = "0.2.0" }
+buildkit-controller = { path = "../crates/server", version = "0.2.0", features = ["fixtures"] }
 clap = { workspace = true }
 kube-core = { workspace = true }
 serde = { workspace = true }

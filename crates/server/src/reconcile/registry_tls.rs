@@ -16,6 +16,9 @@ use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, PostParams};
+use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PublicKeyData};
+use rustls_pki_types::PrivatePkcs8KeyDer;
+use rustls_pki_types::pem::PemObject;
 use time::OffsetDateTime;
 use tracing::{info, warn};
 use x509_parser::extensions::{GeneralName, ParsedExtension};
@@ -61,8 +64,12 @@ pub fn decide(
 ) -> Result<Decision, IssueError> {
     let ca_pem = ca.client_ca().cert_pem();
     if let Some(renew_at) = have
-        .filter(|s| field(s, "ca.crt") == Some(ca_pem.as_bytes()) && field(s, "tls.key").is_some())
-        .and_then(|s| current_until(field(s, "tls.crt")?, &t.server_name, ca, now))
+        .filter(|s| field(s, "ca.crt") == Some(ca_pem.as_bytes()))
+        .and_then(|s| {
+            let crt = field(s, "tls.crt")?;
+            let at = current_until(crt, &t.server_name, ca, now)?;
+            key_matches(field(s, "tls.key")?, crt).then_some(at)
+        })
         .filter(|at| *at > now)
     {
         return Ok(Decision::Keep(renew_at));
@@ -144,6 +151,25 @@ fn current_until(
     let v = cert.validity();
     let (from, to) = (v.not_before.to_datetime(), v.not_after.to_datetime());
     Some(from + (to - from) * 2 / 3)
+}
+
+/// Whether `key_pem` is the P-256 PKCS#8 private key of the certificate
+/// `crt_pem`. A key swapped or restored apart from its certificate fails
+/// every handshake, so the Secret is reissued.
+fn key_matches(key_pem: &[u8], crt_pem: &[u8]) -> bool {
+    let Ok(pkcs8) = PrivatePkcs8KeyDer::from_pem_slice(key_pem) else {
+        return false;
+    };
+    let Ok(key) = KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &PKCS_ECDSA_P256_SHA256) else {
+        return false;
+    };
+    parse_x509_pem(crt_pem)
+        .ok()
+        .and_then(|(_, pem)| {
+            let cert = pem.parse_x509().ok()?;
+            Some(cert.public_key().raw == key.subject_public_key_info().as_slice())
+        })
+        .unwrap_or(false)
 }
 
 /// The Secret's reads and writes, so one [`sync`] step can be tested.
@@ -332,6 +358,31 @@ mod tests {
             Some(ca.client_ca().cert_pem().as_bytes())
         );
         assert_eq!(*fake.writes.lock().unwrap(), [false, false, true]);
+    }
+
+    /// A `tls.key` that does not belong to `tls.crt` (a hand edit, a partial
+    /// restore) fails every worker's handshake, so the Secret is reissued.
+    #[test]
+    fn a_key_that_does_not_match_the_cert_is_reissued() {
+        let now = OffsetDateTime::now_utc();
+        let ca = CaBundle::generate(now).unwrap();
+        let (mut s, _) = write(decide(None, &ca, &target(), now).unwrap());
+        let (other, _) = write(decide(None, &ca, &target(), now).unwrap());
+        let foreign = field(&other, "tls.key").unwrap().to_vec();
+        s.data
+            .as_mut()
+            .unwrap()
+            .insert("tls.key".into(), ByteString(foreign));
+        let (fresh, _) = write(decide(Some(&s), &ca, &target(), now).unwrap());
+        assert!(key_matches(
+            field(&fresh, "tls.key").unwrap(),
+            field(&fresh, "tls.crt").unwrap()
+        ));
+        s.data
+            .as_mut()
+            .unwrap()
+            .insert("tls.key".into(), ByteString(b"not a key".to_vec()));
+        write(decide(Some(&s), &ca, &target(), now).unwrap());
     }
 
     /// The serving cert must come from the internal CA workers trust: a Secret

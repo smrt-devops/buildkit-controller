@@ -232,6 +232,19 @@ impl AppContext {
         self.inner.stores.claims.clone()
     }
 
+    /// The claim namespaces the claim watch gave up on because they cannot be
+    /// listed. Their claims in the store are as last listed, or absent, so the
+    /// leader must neither act on them nor count their workers as strays.
+    #[must_use]
+    pub fn unlisted_claim_namespaces(&self) -> std::collections::HashSet<String> {
+        self.inner
+            .readiness
+            .degraded()
+            .into_iter()
+            .filter_map(|d| d.strip_prefix("claim_store/").map(str::to_owned))
+            .collect()
+    }
+
     /// A new claim event subscription.
     #[must_use]
     pub fn claim_events(&self) -> ClaimSubscription {

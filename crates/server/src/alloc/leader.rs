@@ -28,7 +28,7 @@ use super::claims::{self, reason};
 use super::pods::{ann, is_ready};
 use super::{BindConfig, Binder, Shared};
 use crate::reconcile::driver::{Trigger, schedule};
-use crate::render::{ANN_ALLOC, FREE, LABEL_POOL};
+use crate::render::{ANN_ALLOC, ANN_CLAIM, ANN_OWNER, FREE, LABEL_POOL};
 use crate::runtime::AppContext;
 use crate::runtime::hooks::{BoxResult, Component, LeaderWork};
 use crate::runtime::leader::{BoxFut, supervise};
@@ -235,10 +235,14 @@ async fn tidy_loop(t: &Term) {
     }
 }
 
-/// One tidy pass over the claim store.
+/// One tidy pass over the claim store, leaving out the namespaces the claim
+/// watch cannot list.
 async fn tidy(t: &Term) {
-    let claims = t.ctx.claims().state();
-    let pods = t.ctx.pods().state();
+    let (claims, pods) = listed_only(
+        t.ctx.claims().state(),
+        t.ctx.pods().state(),
+        &t.ctx.unlisted_claim_namespaces(),
+    );
     let outcomes = tidy_with(&t.binder, &claims, &pods, OffsetDateTime::now_utc()).await;
     for o in outcomes {
         t.metrics.count(o);
@@ -293,6 +297,35 @@ pub(crate) async fn tidy_with(
     }
     done.extend(sweep(binder, claims, pods, served, own).await);
     done
+}
+
+/// `claims` and `pods` without the claims of `unlisted` namespaces and the
+/// workers bound to them. Those claims are as last listed or absent, so their
+/// workers would look like strays of a gone claim.
+fn listed_only(
+    mut claims: Vec<Arc<BuildKitClaim>>,
+    mut pods: Vec<Arc<Pod>>,
+    unlisted: &HashSet<String>,
+) -> (Vec<Arc<BuildKitClaim>>, Vec<Arc<Pod>>) {
+    if unlisted.is_empty() {
+        return (claims, pods);
+    }
+    let listed = |ns: Option<&str>| !ns.is_some_and(|ns| unlisted.contains(ns));
+    claims.retain(|c| listed(c.metadata.namespace.as_deref()));
+    pods.retain(|p| {
+        listed(
+            // Workers bound by an earlier version name the claim only in the owner.
+            ann(p, ANN_CLAIM)
+                .and_then(|r| r.split_once('/'))
+                .map(|(ns, _)| ns)
+                .or_else(|| {
+                    ann(p, ANN_OWNER)
+                        .and_then(claims::claim_owner)
+                        .map(|(ns, _)| ns)
+                }),
+        )
+    });
+    (claims, pods)
 }
 
 /// Fail a claim from a namespace the controller does not serve. The chart
@@ -489,5 +522,76 @@ mod tests {
             claim_trigger(&ClaimEvent::Resync),
             Some(Trigger::All)
         ));
+    }
+}
+
+#[cfg(test)]
+mod listed_tests {
+    use super::*;
+    use kube::api::ObjectMeta;
+
+    fn claim(ns: &str) -> Arc<BuildKitClaim> {
+        let mut c: BuildKitClaim = serde_json::from_value(serde_json::json!({
+            "apiVersion": "buildkit.smrt-devops.net/v1alpha1",
+            "kind": "BuildKitClaim",
+            "metadata": {"name": "c", "namespace": ns},
+            "spec": {"poolRef": {"namespace": "ci", "name": "p"}}
+        }))
+        .unwrap();
+        c.metadata.namespace = Some(ns.into());
+        Arc::new(c)
+    }
+
+    fn worker(claim_ns: Option<&str>) -> Arc<Pod> {
+        Arc::new(Pod {
+            metadata: ObjectMeta {
+                name: Some(format!("w-{}", claim_ns.unwrap_or("none"))),
+                annotations: claim_ns.map(|ns| [(ANN_CLAIM.to_owned(), format!("{ns}/c"))].into()),
+                ..ObjectMeta::default()
+            },
+            ..Pod::default()
+        })
+    }
+
+    /// A worker bound by an earlier version: the claim is named only in the owner.
+    fn owned_worker(claim_ns: &str) -> Arc<Pod> {
+        Arc::new(Pod {
+            metadata: ObjectMeta {
+                name: Some(format!("old-{claim_ns}")),
+                annotations: Some(
+                    [(ANN_OWNER.to_owned(), format!("claim:{claim_ns}/c#u1"))].into(),
+                ),
+                ..ObjectMeta::default()
+            },
+            ..Pod::default()
+        })
+    }
+
+    /// A claims namespace given up (its `RoleBinding` was deleted) must not
+    /// make its bound workers look like strays to release.
+    #[test]
+    fn an_unlisted_claim_namespace_is_left_alone() {
+        let unlisted = HashSet::from(["b".to_owned()]);
+        let (claims, pods) = listed_only(
+            vec![claim("a"), claim("b")],
+            vec![
+                worker(Some("a")),
+                worker(Some("b")),
+                worker(None),
+                owned_worker("a"),
+                owned_worker("b"),
+            ],
+            &unlisted,
+        );
+        let ns: Vec<_> = claims
+            .iter()
+            .map(|c| c.metadata.namespace.clone().unwrap())
+            .collect();
+        assert_eq!(ns, ["a"]);
+        let names: Vec<_> = pods
+            .iter()
+            .map(|p| p.metadata.name.clone().unwrap())
+            .collect();
+        assert_eq!(names, ["w-a", "w-none", "old-a"]);
     }
 }
