@@ -2,8 +2,9 @@
 // Runs docs/ci/buildkit-allocate.sh against the local fixture.
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const { fixture, run, deletes, sleep, skipNoOpenssl, have } = require('./helpers');
 
 const SCRIPT = path.join(__dirname, '..', '..', 'docs', 'ci', 'buildkit-allocate.sh');
@@ -209,4 +210,86 @@ test('a release answered 503 upstream_error with Retry-After is retried', { skip
   assert.equal(r.code, 0, r.out);
   assert.equal(deletes(f.calls).length, 2);
   assert.ok(!r.out.includes('warning: release'), r.out);
+});
+
+const poolsWith = (qt) => ({ status: 200, body: JSON.stringify({ pools: [{ namespace: 'ci', name: 'a', ready: true, ...(qt === undefined ? {} : { queueTimeoutSeconds: qt }) }] }) });
+const isPools = (rec) => rec.method === 'GET' && rec.url === '/v1/pools';
+
+test('the command does not inherit TOKEN', { skip }, async (t) => {
+  const f = await fixture(t);
+  const r = await sh(f, ['sh', '-c', 'test -z "${TOKEN+set}"']);
+  assert.equal(r.code, 0, r.out);
+});
+
+test('TOKEN_FILE is read again for every request, the release included', { skip }, async (t) => {
+  const f = await fixture(t);
+  const tf = path.join(f.dir, 'token');
+  fs.writeFileSync(tf, 'old\n');
+  const e = env(f, { TOKEN_FILE: tf });
+  delete e.TOKEN;
+  const r = await run('sh', [SCRIPT, 'sh', '-c', `printf new > '${tf}'`], e);
+  assert.equal(r.code, 0, r.out);
+  assert.equal(f.calls.find(isPost).auth, 'Bearer old');
+  assert.equal(f.calls.find((c) => c.method === 'DELETE').auth, 'Bearer new');
+});
+
+test('a 401 on a poll still releases the id', { skip }, async (t) => {
+  const f = await fixture(t, {
+    override: (rec) => {
+      if (isPost(rec)) return queued('q1');
+      if (isPoll(rec)) return errBody(401, 'unauthorized');
+      return undefined;
+    },
+  });
+  const r = await sh(f, ['true']);
+  assert.equal(r.code, 1);
+  assert.deepEqual(deletes(f.calls), ['/v1/allocations/q1']);
+});
+
+test('a 202 poll answered at once is followed by a pause of at least 1 s', { skip }, async (t) => {
+  let polls = 0;
+  const f = await fixture(t, {
+    override: (rec) => {
+      if (isPost(rec)) return queued('q1');
+      if (isPoll(rec)) return ++polls < 2 ? queued('q1') : boundBody('q1');
+      return undefined;
+    },
+  });
+  const r = await sh(f, ['true']);
+  assert.equal(r.code, 0, r.out);
+  const [a, b] = f.calls.filter(isPoll);
+  assert.ok(b.at - a.at >= 900, `gap ${b.at - a.at} ms`);
+});
+
+/** A curl on PATH that records its --max-time values, then runs the real curl. */
+function curlSpy(f) {
+  const real = spawnSync('which', ['curl'], { encoding: 'utf8' }).stdout.trim();
+  const bin = path.join(f.dir, 'spy');
+  fs.mkdirSync(bin);
+  const log = path.join(f.dir, 'curl.log');
+  fs.writeFileSync(path.join(bin, 'curl'),
+    `#!/bin/sh\nfor a in "$@"; do case $a in */v1/allocations) post=1;; esac; done\nprev=\nfor a in "$@"; do [ "$prev" != --max-time ] || [ -z "\${post:-}" ] || echo "$a" >> '${log}'; prev=$a; done\nexec '${real}' "$@"\n`, { mode: 0o755 });
+  f.env.PATH = `${bin}:${f.env.PATH}`;
+  return () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map(Number) : []);
+}
+
+test('a POST has a 40 s limit on the current server and the whole budget on v0.1.0', { skip }, async (t) => {
+  for (const [qt, want] of [[300, (m) => m <= 40], [undefined, (m) => m > 3000]]) {
+    const f = await fixture(t, { override: (rec) => (isPools(rec) ? poolsWith(qt) : undefined) });
+    const limits = curlSpy(f);
+    const r = await sh(f, ['true']);
+    assert.equal(r.code, 0, r.out);
+    const m = limits();
+    assert.equal(m.length, 1, String(m));
+    assert.ok(want(m[0]), `queueTimeoutSeconds ${qt}: --max-time ${m[0]}`);
+  }
+});
+
+test('no fresh POST is sent once the queue timeout it would carry is 0', { skip, timeout: 30000 }, async (t) => {
+  const f = await fixture(t, {
+    override: (rec) => (isPost(rec) ? errBody(503, 'pool_exhausted', { 'Retry-After': '1' }) : undefined),
+  });
+  const r = await sh(f, ['true'], { QUEUE_TIMEOUT: '2' });
+  assert.equal(r.code, 1);
+  assert.ok(f.calls.filter(isPost).length <= 3, `${f.calls.filter(isPost).length} POSTs`);
 });

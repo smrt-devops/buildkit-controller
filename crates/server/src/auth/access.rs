@@ -214,6 +214,7 @@ mod tests {
             namespace: ns.into(),
             name: name.into(),
             uid: "u".into(),
+            pod_uid: None,
         }
     }
 

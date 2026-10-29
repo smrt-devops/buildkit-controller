@@ -198,12 +198,15 @@ pub fn waits<S: std::hash::BuildHasher>(c: &BuildKitClaim, served_ns: &HashSet<S
 }
 
 /// Queue order: oldest `creationTimestamp` first (the API server's clock, so
-/// no replica can jump the queue), then name, then namespace.
+/// no replica can jump the queue), then `uid`, then name and namespace. The
+/// API server picks the uid at random; the name of an API claim derives from
+/// the client's key, so a client could grind keys to win every tie.
 #[must_use]
 pub fn queue_order(a: &BuildKitClaim, b: &BuildKitClaim) -> Ordering {
     let key = |c: &BuildKitClaim| {
         (
             c.metadata.creation_timestamp.as_ref().map(|t| t.0),
+            c.metadata.uid.clone(),
             c.metadata.name.clone(),
             c.metadata.namespace.clone(),
         )
@@ -211,14 +214,20 @@ pub fn queue_order(a: &BuildKitClaim, b: &BuildKitClaim) -> Ordering {
     key(a).cmp(&key(b))
 }
 
-/// The waiting claims of every pool, each queue in [`queue_order`].
+/// True once the leader has admitted waiting claim `c`: it writes a status
+/// only after the pool's access rules admit the claim, and tenants cannot
+/// write status. A claim naming a pool that refuses it never counts as a
+/// waiter, so it can neither grow that pool nor push its queue back.
 #[must_use]
-pub fn queues<S: std::hash::BuildHasher>(
-    claims: &[Arc<BuildKitClaim>],
-    served_ns: &HashSet<String, S>,
+pub fn admitted(c: &BuildKitClaim) -> bool {
+    c.status.is_some()
+}
+
+fn by_pool<'a>(
+    claims: impl Iterator<Item = &'a Arc<BuildKitClaim>>,
 ) -> HashMap<PoolKey, Vec<Arc<BuildKitClaim>>> {
     let mut out: HashMap<PoolKey, Vec<Arc<BuildKitClaim>>> = HashMap::new();
-    for c in claims.iter().filter(|c| waits(c, served_ns)) {
+    for c in claims {
         out.entry(pool_key(c)).or_default().push(Arc::clone(c));
     }
     for q in out.values_mut() {
@@ -227,11 +236,34 @@ pub fn queues<S: std::hash::BuildHasher>(
     out
 }
 
-/// The 1-based place of `c` among the waiting claims of its pool.
+/// Every waiting claim of every pool, admitted or not, each queue in
+/// [`queue_order`]: what the leader serves, so it can bind or refuse each.
+#[must_use]
+pub fn pending<S: std::hash::BuildHasher>(
+    claims: &[Arc<BuildKitClaim>],
+    served_ns: &HashSet<String, S>,
+) -> HashMap<PoolKey, Vec<Arc<BuildKitClaim>>> {
+    by_pool(claims.iter().filter(|c| waits(c, served_ns)))
+}
+
+/// The admitted waiting claims of every pool ([`admitted`]), each queue in
+/// [`queue_order`]: the demand a pool scales for.
+#[must_use]
+pub fn queues<S: std::hash::BuildHasher>(
+    claims: &[Arc<BuildKitClaim>],
+    served_ns: &HashSet<String, S>,
+) -> HashMap<PoolKey, Vec<Arc<BuildKitClaim>>> {
+    by_pool(claims.iter().filter(|c| waits(c, served_ns) && admitted(c)))
+}
+
+/// The 1-based place of `c` among the waiting claims of its pool. Only
+/// [`admitted`] claims, and claims of the controller's namespace `own` (the
+/// API admitted their callers), count as ahead of it.
 #[must_use]
 pub fn position<S: std::hash::BuildHasher>(
     claims: &[Arc<BuildKitClaim>],
     served_ns: &HashSet<String, S>,
+    own: &str,
     c: &BuildKitClaim,
 ) -> Option<u32> {
     if !waits(c, served_ns) {
@@ -241,9 +273,29 @@ pub fn position<S: std::hash::BuildHasher>(
     let ahead = claims
         .iter()
         .filter(|o| waits(o, served_ns) && pool_key(o) == key)
+        .filter(|o| admitted(o) || o.metadata.namespace.as_deref() == Some(own))
         .filter(|o| queue_order(o, c) == Ordering::Less)
         .count();
     u32::try_from(ahead + 1).ok()
+}
+
+/// Claims of the controller's namespace `own` that `owner` holds or waits
+/// for in pool `key`, other than the claim named `except`.
+#[must_use]
+pub fn active_of(
+    claims: &[Arc<BuildKitClaim>],
+    own: &str,
+    owner: &str,
+    key: &PoolKey,
+    except: &str,
+) -> usize {
+    claims
+        .iter()
+        .filter(|c| c.metadata.namespace.as_deref() == Some(own))
+        .filter(|c| c.metadata.deletion_timestamp.is_none() && !phase(c).is_terminal())
+        .filter(|c| c.spec.owner.as_deref() == Some(owner))
+        .filter(|c| c.metadata.name.as_deref() != Some(except) && pool_key(c) == *key)
+        .count()
 }
 
 /// When a waiting claim's queue timeout ends, given its timeout in seconds.

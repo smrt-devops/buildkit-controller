@@ -3,8 +3,9 @@
 //!
 //! Every allocation is a `BuildKitClaim`. The harness runs the allocation
 //! component on the host as the leader (front door and allocator), and a second
-//! replica as a follower that only answers reads. In namespace `bk-alloc` it
-//! stands in for the reconciler: it creates warm pause pods with the labels,
+//! replica as a follower that only answers reads, in controller namespace
+//! `<pool namespace>-system`. In pool namespace `bk-alloc` it stands in for
+//! the reconciler: it creates warm pause pods with the labels,
 //! annotations and ownerReference the reconciler would render. In namespace
 //! `bk-alloc-cold` the real reconciler runs too, for a pool with no warm pod.
 
@@ -51,6 +52,12 @@ use tokio_util::sync::CancellationToken;
 
 const NS: &str = "bk-alloc";
 const COLD_NS: &str = "bk-alloc-cold";
+
+/// The controller's namespace for pools in `ns`: the CA Secret and the API's
+/// claims live there, and the controller keeps no pool in its own namespace.
+fn system(ns: &str) -> String {
+    format!("{ns}-system")
+}
 const POOL: &str = "p";
 const ROUNDS: usize = 20;
 const CONCURRENT: usize = 100;
@@ -61,6 +68,7 @@ fn sa(ns: &str, name: &str) -> Identity {
         namespace: ns.into(),
         name: name.into(),
         uid: "u".into(),
+        pod_uid: None,
     }
 }
 
@@ -232,7 +240,7 @@ async fn ca_secret(client: &kube::Client, ns: &str, config: &Config) -> CaBundle
 
 fn config(ns: &str) -> String {
     format!(
-        "watchNamespaces: [{ns}]\nedge:\n  endpoint: tcp://bk.example.com:8444\n  serverName: bk.example.com\n  allocationDomain: alloc.bk.example.com\n"
+        "watchNamespaces: [{ns}]\nclaims:\n  namespaces: [{ns}]\nedge:\n  endpoint: tcp://bk.example.com:8444\n  serverName: bk.example.com\n  allocationDomain: alloc.bk.example.com\n"
     )
 }
 
@@ -252,7 +260,7 @@ async fn replica(
     std::fs::write(&path, &yaml).unwrap();
     let mut cli = Cli::parse_from(["buildkit-controller", "--config", path.to_str().unwrap()]);
     cli.pod_name = name.into();
-    cli.pod_namespace = ns.into();
+    cli.pod_namespace = system(ns);
     let config = Config::from_yaml(&yaml).unwrap();
     let metrics = Arc::new(Metrics::new());
     let state = if leader {
@@ -322,8 +330,9 @@ async fn setup(stop: &CancellationToken) -> H {
     let client = harness::client().await;
     let image = std::env::var("ALLOC_VERIFY_PAUSE_IMAGE").unwrap();
     namespace(&client, NS).await;
+    namespace(&client, &system(NS)).await;
     let yaml = config(NS);
-    let ca = ca_secret(&client, NS, &Config::from_yaml(&yaml).unwrap()).await;
+    let ca = ca_secret(&client, &system(NS), &Config::from_yaml(&yaml).unwrap()).await;
     let fp = ca.internal_ca().fingerprint_hex();
     let pools: Api<BuildKitPool> = Api::namespaced(client.clone(), NS);
     let pool: BuildKitPool =
@@ -354,7 +363,7 @@ async fn setup(stop: &CancellationToken) -> H {
     .await;
     H {
         pods: Api::namespaced(client.clone(), NS),
-        claims: Api::namespaced(client, NS),
+        claims: Api::namespaced(client, &system(NS)),
         pool,
         fp,
         image,
@@ -652,11 +661,11 @@ async fn alloc_verify() {
     let intruder = sa(NS, "intruder");
     assert_eq!(
         h.follower.svc.get(&intruder, &r.id, Duration::ZERO).await,
-        Err(AllocError::Forbidden)
+        Err(AllocError::NotFound)
     );
     assert_eq!(
         svc.release(&intruder, &r.id).await,
-        Err(AllocError::Forbidden)
+        Err(AllocError::NotFound)
     );
     let claim = h.claims.get(&r.id).await.unwrap();
     let pod_name = claim.status.as_ref().unwrap().pod.clone().unwrap();
@@ -667,7 +676,7 @@ async fn alloc_verify() {
         "non-owner release must not touch the pod"
     );
     println!(
-        "SCENARIO owner-only: follower answered, forbidden for others, pod {pod_name} still allocated"
+        "SCENARIO owner-only: follower answered, not found for others, pod {pod_name} still allocated"
     );
     let pod_uid = pod.metadata.uid.clone().unwrap();
     let der = pem::parse(&r.client_cert).unwrap();
@@ -727,9 +736,10 @@ async fn cold(stop: &CancellationToken) {
     let client = harness::client().await;
     let image = std::env::var("ALLOC_VERIFY_WORKER_IMAGE").unwrap();
     namespace(&client, COLD_NS).await;
+    namespace(&client, &system(COLD_NS)).await;
     ca_secret(
         &client,
-        COLD_NS,
+        &system(COLD_NS),
         &Config::from_yaml(&config(COLD_NS)).unwrap(),
     )
     .await;
@@ -738,7 +748,7 @@ async fn cold(stop: &CancellationToken) {
     pools.create(&PostParams::default(), &pool).await.unwrap();
     let r = replica(&client, COLD_NS, "c1", true, true, stop).await;
     let pods: Api<Pod> = Api::namespaced(client.clone(), COLD_NS);
-    let claims: Api<BuildKitClaim> = Api::namespaced(client.clone(), COLD_NS);
+    let claims: Api<BuildKitClaim> = Api::namespaced(client.clone(), &system(COLD_NS));
     let store = r.ctx.pools();
     wait("cold pool Ready", Duration::from_mins(1), || {
         store.state().iter().any(|p| {
@@ -769,9 +779,9 @@ async fn cold(stop: &CancellationToken) {
     let claim_store = r.ctx.claims();
     wait("claim pending", Duration::from_secs(20), || {
         claim_store.state().iter().any(|c| {
-            c.status.as_ref().is_some_and(|s| {
-                s.phase == Some(ClaimPhase::Pending) && s.queue_position == Some(1)
-            })
+            c.status
+                .as_ref()
+                .is_some_and(|s| s.phase == Some(ClaimPhase::Pending))
         })
     })
     .await;
@@ -863,7 +873,7 @@ async fn upgrade(h: &H) {
     let svc = &h.leader.svc;
     assert_eq!(
         svc.release(&sa(NS, "intruder"), &api_id).await,
-        Err(AllocError::Forbidden)
+        Err(AllocError::NotFound)
     );
     // The store may lag the patch by a moment.
     let end = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -878,6 +888,6 @@ async fn upgrade(h: &H) {
     }
     h.gone(&names).await;
     println!(
-        "SCENARIO upgrade: a pre-claim allocation released by its owner's DELETE (others 403); a pre-claim pod of a deleted in-cluster claim retired by the sweep"
+        "SCENARIO upgrade: a pre-claim allocation released by its owner's DELETE (others 404); a pre-claim pod of a deleted in-cluster claim retired by the sweep"
     );
 }

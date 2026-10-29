@@ -59,6 +59,9 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 const NS: &str = "bk-api";
+/// The controller's namespace (the CA Secret, the API's claims); the controller
+/// keeps no pool in its own namespace.
+const SYS: &str = "bk-api-system";
 const POOL: &str = "p";
 const HIDDEN: &str = "hidden";
 const SERVER_NAME: &str = "bk.example.com";
@@ -256,13 +259,15 @@ async fn setup(issuer: &Issuer, stop: &CancellationToken) -> (H, SocketAddr, Arc
     let client = harness::client().await;
     let image = std::env::var("API_VERIFY_PAUSE_IMAGE").unwrap();
     let work = std::path::PathBuf::from(std::env::var("API_VERIFY_WORK").unwrap());
-    Api::<Namespace>::all(client.clone())
-        .create(
-            &PostParams::default(),
-            &serde_json::from_value(json!({"metadata": {"name": NS}})).unwrap(),
-        )
-        .await
-        .unwrap();
+    for ns in [NS, SYS] {
+        Api::<Namespace>::all(client.clone())
+            .create(
+                &PostParams::default(),
+                &serde_json::from_value(json!({"metadata": {"name": ns}})).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
 
     let api = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -279,7 +284,7 @@ async fn setup(issuer: &Issuer, stop: &CancellationToken) -> (H, SocketAddr, Arc
     std::fs::write(&path, &yaml).unwrap();
     let mut cli = Cli::parse_from(["buildkit-controller", "--config", path.to_str().unwrap()]);
     cli.pod_name = "r1".into();
-    cli.pod_namespace = NS.into();
+    cli.pod_namespace = SYS.into();
     let config = Config::from_yaml(&yaml).unwrap();
 
     let ca = CaBundle::generate(OffsetDateTime::now_utc()).unwrap();
@@ -292,7 +297,7 @@ async fn setup(issuer: &Issuer, stop: &CancellationToken) -> (H, SocketAddr, Arc
             .map(|(k, v)| (k, ByteString(v)))
             .collect(),
     );
-    Api::<Secret>::namespaced(client.clone(), NS)
+    Api::<Secret>::namespaced(client.clone(), SYS)
         .create(&PostParams::default(), &secret)
         .await
         .unwrap();
@@ -535,10 +540,10 @@ async fn api_verify() {
                 .status()
         }
     };
-    assert_eq!(del(sa.clone(), a_id.clone()).await, StatusCode::FORBIDDEN);
+    assert_eq!(del(sa.clone(), a_id.clone()).await, StatusCode::NOT_FOUND);
     assert_eq!(
         del(issuer.token(AUD, "other"), a_id.clone()).await,
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND
     );
     assert_eq!(h.claimed(&a_id), std::slice::from_ref(&pa), "still claimed");
     assert_eq!(
@@ -546,7 +551,7 @@ async fn api_verify() {
         StatusCode::NO_CONTENT
     );
     h.gone(&pa).await;
-    println!("d. DELETE non-owner 403, owner 204, pod drained: PASS");
+    println!("d. DELETE non-owner 404, owner 204, pod drained: PASS");
 
     // f. With no worker for 20 s the POST answers 202 with the id and the
     // place; the reconciler's replacement arrives; a long poll follows the
@@ -578,7 +583,7 @@ async fn api_verify() {
     let (st, v) = get(sa.clone(), "").await;
     assert_eq!(
         (st, v["error"]["code"].as_str()),
-        (StatusCode::FORBIDDEN, Some("forbidden")),
+        (StatusCode::NOT_FOUND, Some("not_found")),
         "{v}"
     );
     let (st, v) = get(alice.clone(), "").await;
@@ -594,7 +599,7 @@ async fn api_verify() {
     assert_eq!(f["id"], f_id.as_str());
     assert_eq!(h.wait_claimed(&f_id).await, w3);
     println!(
-        "f. POST 202 pending at place 1, GET 403 for others, long poll 200 once a worker is free: PASS"
+        "f. POST 202 pending at place 1, GET 404 for others, long poll 200 once a worker is free: PASS"
     );
     assert_eq!(
         del(alice.clone(), a_id.clone()).await,

@@ -83,8 +83,6 @@ auth:
     audiences: [buildkit-controller]   # never the API server audience (https://kubernetes.default.svc...)
     maxConcurrentReviews: 32           # TokenReview calls in flight per replica; more callers get 503
     maxReviewsPerIp: 4                 # TokenReview calls in flight per client address; 0 = no cap
-    reservedReviews: 8                 # of maxConcurrentReviews, held for service accounts that passed a review recently
-    recentSubjectTtl: 10m              # how long a service account that passed a review counts as recently seen
 
 workerNetwork:
   # Ranges the internet rule of every pool leaves out. Helm replaces a list it is given,

@@ -37,7 +37,7 @@ async function fixture(t, { deny = [], deleteStatus = 204, dockerFails = false, 
     req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
       const body = Buffer.concat(chunks).toString();
-      const rec = { method: req.method, url: req.url, body: body ? JSON.parse(body) : undefined, at: Date.now() };
+      const rec = { method: req.method, url: req.url, body: body ? JSON.parse(body) : undefined, at: Date.now(), auth: req.headers.authorization };
       calls.push(rec);
       const reply = (status, obj, headers = {}) => {
         res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
