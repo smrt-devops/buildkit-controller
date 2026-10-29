@@ -52,8 +52,8 @@ impl Issuer {
         })
     }
 
-    /// A fresh ten-minute token for `aud` carrying `team`, from a push: the
-    /// cache treats it as trusted.
+    /// A fresh ten-minute token for `aud` carrying `team`, from a push to a
+    /// protected ref: the cache treats it as trusted.
     pub(crate) fn token(&self, aud: &str, team: &str) -> Result<String> {
         self.token_for_event(aud, team, "push")
     }
@@ -63,7 +63,7 @@ impl Issuer {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let header = json!({"alg": "ES256", "typ": "JWT", "kid": "k1"});
         let claims = json!({"iss": self.url, "sub": format!("user-{team}"), "aud": aud,
-            "iat": now, "nbf": now - 5, "exp": now + 600, "team": team, "event_name": event});
+            "iat": now, "nbf": now - 5, "exp": now + 600, "team": team, "event_name": event, "ref_protected": "true"});
         let msg = format!(
             "{}.{}",
             B64.encode(header.to_string()),
