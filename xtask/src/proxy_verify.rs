@@ -32,21 +32,18 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 
-use crate::helm_verify::{Env, until};
+use buildkit_controller::net::ProxyError;
+
+use crate::gateway::SOCAT;
 use crate::image::WORKER_IMAGE;
+use crate::kube::Cluster;
+use crate::proc::{Spawned, host_platform, output, until, write};
 use crate::root;
 
-static CLUSTER: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| super::kind_cluster("bk-proxy-verify"));
 const NS: &str = "bk-system";
 const POOL_NS: &str = "ci";
 const CLIENT_NS: &str = "bk-clients";
 const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
-/// socat 1.8.1.3 for the client pods, pulled by index digest and tagged.
-const SOCAT: (&str, &str) = (
-    "docker.io/alpine/socat:1.8.1.3",
-    "sha256:603174b77eebaba25ba8f8ebb15e1234d6600409554e95d6fb203fd106150287",
-);
 const SOCAT_IMAGE: &str = SOCAT.0;
 const SERVER_NAME: &str = "bk.proxy.test";
 /// SNI of the extra passthrough `TLSRoute` to the API (scenario e).
@@ -55,26 +52,16 @@ const AUD: &str = "buildkit-controller";
 const FORGED: [u8; 4] = [203, 0, 113, 9];
 const CONTROLLER: &str = "buildkit-controller.bk-system.svc";
 
-struct Cleanup(Env);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        if std::env::var_os("PROXY_VERIFY_KEEP").is_some() {
-            return;
-        }
-        let _ = self
-            .0
-            .tool("kind", &["delete", "cluster", "--name", CLUSTER.as_str()]);
-    }
-}
-
 pub(crate) fn proxy_verify() -> Result<()> {
     let work = root().join("target/proxy-verify");
     std::fs::create_dir_all(&work)?;
-    let cleanup = Cleanup(Env {
-        kubeconfig: work.join("kubeconfig"),
-    });
-    let env = &cleanup.0;
+    let env = &Cluster::new(
+        &super::kind_cluster("bk-proxy-verify"),
+        work.join("kubeconfig"),
+    );
+    if std::env::var_os("PROXY_VERIFY_KEEP").is_some() {
+        env.keep();
+    }
     let result = run(env, &work);
     if result.is_err() {
         for args in [
@@ -88,32 +75,6 @@ pub(crate) fn proxy_verify() -> Result<()> {
         crate::gateway::dump(env);
     }
     result
-}
-
-/// Stdout and stderr of `c`; fails with both when it exits non-zero.
-fn output(c: &mut Command) -> Result<String> {
-    let o = c.output().with_context(|| format!("{c:?}"))?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&o.stdout),
-        String::from_utf8_lossy(&o.stderr)
-    );
-    ensure!(o.status.success(), "{c:?} failed:\n{text}");
-    Ok(text)
-}
-
-fn write(path: &Path, text: &str) -> Result<String> {
-    std::fs::write(path, text).with_context(|| path.display().to_string())?;
-    Ok(path.to_string_lossy().into_owned())
-}
-
-/// The pool platform of this host.
-fn host_platform() -> Result<&'static str> {
-    match std::env::consts::ARCH {
-        "aarch64" => Ok("arm64"),
-        "x86_64" => Ok("amd64"),
-        a => anyhow::bail!("unsupported host architecture {a}"),
-    }
 }
 
 /// `bytes` as a `printf` format of octal escapes, which busybox `printf` accepts.
@@ -257,7 +218,7 @@ impl std::fmt::Display for Event {
 }
 
 struct Rig<'a> {
-    env: &'a Env,
+    env: &'a Cluster,
     /// In-cluster name of the Envoy Service.
     envoy: String,
 }
@@ -265,11 +226,12 @@ struct Rig<'a> {
 impl Rig<'_> {
     /// `sh -c script` in client pod `pod`; `(exit ok, output)`.
     fn sh(&self, pod: &str, script: &str) -> Result<(bool, String)> {
-        let o = crate::kube::kubectl(&self.env.kubeconfig)
-            .arg("--kubeconfig")
-            .arg(&self.env.kubeconfig)
-            .args(["exec", "-n", CLIENT_NS, pod, "--", "sh", "-c", script])
-            .output()
+        let o = self
+            .env
+            .kubectl_raw(
+                &["exec", "-n", CLIENT_NS, pod, "--", "sh", "-c", script],
+                None,
+            )
             .context("kubectl exec")?;
         Ok((
             o.status.success(),
@@ -323,7 +285,9 @@ impl Rig<'_> {
         )
     }
 
-    fn metric(&self, name: &str, result: &str) -> Result<f64> {
+    /// `name{result="<result>"}`, or `None` when the controller has not created
+    /// that series. Fails when the metric family itself is missing.
+    fn metric(&self, name: &str, result: &str) -> Result<Option<f64>> {
         let (ok, out) = self.sh(
             "p1",
             &format!(
@@ -331,36 +295,30 @@ impl Rig<'_> {
             ),
         )?;
         ensure!(ok, "metrics: {out}");
+        let family = name.strip_suffix("_total").unwrap_or(name);
+        ensure!(
+            out.lines()
+                .any(|l| l.starts_with(&format!("# TYPE {family} "))),
+            "no {family} family in /metrics:\n{out}"
+        );
         let want = format!("{name}{{result=\"{result}\"}} ");
         Ok(out
             .lines()
             .find_map(|l| l.strip_prefix(&want))
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0.0))
+            .and_then(|v| v.trim().parse().ok()))
     }
 }
 
 #[allow(clippy::too_many_lines, reason = "one linear scenario script")]
-fn run(env: &Env, work: &Path) -> Result<()> {
-    let _ = env.tool("kind", &["delete", "cluster", "--name", CLUSTER.as_str()]);
-    env.tool(
-        "kind",
-        &[
-            "create",
-            "cluster",
-            "--name",
-            CLUSTER.as_str(),
-            "--wait",
-            "120s",
-        ],
-    )?;
-    crate::image::image(CONTROLLER_IMAGE, Some(CLUSTER.as_str()))?;
+fn run(env: &Cluster, work: &Path) -> Result<()> {
+    env.create(None, "120s")?;
+    crate::image::image(CONTROLLER_IMAGE, Some(env.name()))?;
     crate::image::ensure_worker()?;
     crate::gateway::ensure_image(SOCAT.0, SOCAT.1)?;
     for image in [WORKER_IMAGE, SOCAT_IMAGE] {
-        output(&mut crate::kube::kind_load(image, CLUSTER.as_str()))?;
+        output(&mut crate::kube::kind_load(image, env.name()))?;
     }
-    let gateway_ca = crate::gateway::install(env, CLUSTER.as_str(), work)?;
+    let gateway_ca = crate::gateway::install(env, work)?;
     let envoy_ips = crate::gateway::envoy_pod_ips(env)?;
     println!("Envoy pod addresses (trusted): {envoy_ips:?}");
     let rig = Rig {
@@ -387,19 +345,16 @@ fn run(env: &Env, work: &Path) -> Result<()> {
     )?;
     let chart = root().join("helm/buildkit-controller");
     let chart = chart.to_string_lossy();
-    env.tool(
-        "helm",
-        &[
-            "upgrade",
-            "--install",
-            "bk",
-            &chart,
-            "-n",
-            NS,
-            "-f",
-            &values_file,
-        ],
-    )?;
+    env.helm(&[
+        "upgrade",
+        "--install",
+        "bk",
+        &chart,
+        "-n",
+        NS,
+        "-f",
+        &values_file,
+    ])?;
     env.kubectl(&[
         "rollout",
         "status",
@@ -408,8 +363,7 @@ fn run(env: &Env, work: &Path) -> Result<()> {
         NS,
         "--timeout=300s",
     ])?;
-    crate::kube::wait_condition(
-        &env.kubeconfig,
+    env.wait_condition(
         "buildkitpool/proxy",
         Some(POOL_NS),
         "Ready",
@@ -603,8 +557,12 @@ fn run(env: &Env, work: &Path) -> Result<()> {
     );
 
     // d. Header counters: proxied connections on both listeners, no refusals.
-    let api_proxied = rig.metric("buildkit_api_proxy_protocol_headers_total", "proxied")?;
-    let edge_proxied = rig.metric("buildkit_edge_proxy_protocol_headers_total", "proxied")?;
+    let proxied = |family: &str| -> Result<f64> {
+        rig.metric(family, "proxied")?
+            .with_context(|| format!("no {family}{{result=\"proxied\"}} sample"))
+    };
+    let api_proxied = proxied("buildkit_api_proxy_protocol_headers_total")?;
+    let edge_proxied = proxied("buildkit_edge_proxy_protocol_headers_total")?;
     ensure!(
         api_proxied >= 1.0 && edge_proxied >= 1.0,
         "proxied: api {api_proxied}, edge {edge_proxied}"
@@ -613,8 +571,15 @@ fn run(env: &Env, work: &Path) -> Result<()> {
         "buildkit_api_proxy_protocol_headers_total",
         "buildkit_edge_proxy_protocol_headers_total",
     ] {
-        for result in ["bad_signature", "timeout", "truncated"] {
-            let n = rig.metric(family, result)?;
+        // The labels come from the controller, so a rename cannot leave this
+        // reading series that no longer exist.
+        for err in [
+            ProxyError::Signature,
+            ProxyError::Timeout(Duration::ZERO),
+            ProxyError::Truncated,
+        ] {
+            let result = err.label();
+            let n = rig.metric(family, result)?.unwrap_or(0.0);
             ensure!(n == 0.0, "{family}{{result={result}}} = {n}");
         }
     }
@@ -623,20 +588,17 @@ fn run(env: &Env, work: &Path) -> Result<()> {
     );
 
     // e. The per-address cap counts clients behind Envoy.
-    env.tool(
-        "helm",
-        &[
-            "upgrade",
-            "bk",
-            &chart,
-            "-n",
-            NS,
-            "-f",
-            &values_file,
-            "--set",
-            "api.maxConnectionsPerIp=1",
-        ],
-    )?;
+    env.helm(&[
+        "upgrade",
+        "bk",
+        &chart,
+        "-n",
+        NS,
+        "-f",
+        &values_file,
+        "--set",
+        "api.maxConnectionsPerIp=1",
+    ])?;
     env.kubectl(&[
         "rollout",
         "status",
@@ -653,16 +615,28 @@ fn run(env: &Env, work: &Path) -> Result<()> {
     // p2's probe connection ends when socat closes; let it go.
     std::thread::sleep(Duration::from_secs(3));
     // p1 holds one connection; the controller closes it after 10 s idle.
-    let mut held = crate::kube::kubectl(&env.kubeconfig)
-        .arg("--kubeconfig")
-        .arg(&env.kubeconfig)
-        .args(["exec", "-n", CLIENT_NS, "p1", "--", "sh", "-c"])
-        .arg(rig.passthrough("sleep 7"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("holding p1's connection")?;
-    std::thread::sleep(Duration::from_secs(3));
+    let accepted_from_p1 = || -> Result<usize> {
+        Ok(rig
+            .events()?
+            .iter()
+            .filter(|e| e.is("API PROXY header accepted") && e.ip("peer") == p1)
+            .count())
+    };
+    let before = accepted_from_p1()?;
+    let mut held = Spawned::spawn(
+        env.kubectl_cmd()
+            .args(["exec", "-n", CLIENT_NS, "p1", "--", "sh", "-c"])
+            .arg(rig.passthrough("sleep 7"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .context("holding p1's connection")?;
+    crate::proc::poll(
+        "the controller to accept p1's held connection",
+        Duration::from_secs(5),
+        Duration::from_millis(200),
+        || Ok((accepted_from_p1()? > before).then_some(())),
+    )?;
     let (p1_second, p1_out) = rig.sh("p1", &rig.passthrough("true"))?;
     let (p2_first, p2_out) = rig.sh("p2", &rig.passthrough("true"))?;
     let _ = held.wait();

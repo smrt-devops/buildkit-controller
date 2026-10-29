@@ -20,6 +20,7 @@ mod helm_verify;
 mod image;
 mod kube;
 mod perf;
+mod proc;
 mod proxy_verify;
 mod reconcile_verify;
 mod render_verify;
@@ -137,6 +138,61 @@ pub(crate) fn root() -> PathBuf {
         .map_or_else(PathBuf::new, Path::to_path_buf)
 }
 
+/// Placeholders every fixture under `xtask/fixtures` may use, so an image bump
+/// in code reaches the manifests too.
+fn image_placeholders() -> [(&'static str, &'static str); 2] {
+    [
+        ("WORKER_IMAGE", image::WORKER_IMAGE),
+        ("SOCAT_IMAGE", gateway::SOCAT.0),
+    ]
+}
+
+/// Reads `xtask/fixtures/<rel>`, fills in the image placeholders and `subs`,
+/// and writes the result under `work`. Returns the written path.
+pub(crate) fn fixture(rel: &str, work: &Path, subs: &[(&str, String)]) -> Result<PathBuf> {
+    let src = root().join("xtask/fixtures").join(rel);
+    let mut text =
+        std::fs::read_to_string(&src).with_context(|| format!("reading {}", src.display()))?;
+    for (from, to) in image_placeholders() {
+        text = text.replace(from, to);
+    }
+    for (from, to) in subs {
+        text = text.replace(from, to);
+    }
+    let name = Path::new(rel).file_name().context("fixture file name")?;
+    let path = work.join(name);
+    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+/// Builds the controller binary for the host and returns its path, wherever
+/// `CARGO_TARGET_DIR` or `build.target-dir` puts it.
+pub(crate) fn build_controller() -> Result<PathBuf> {
+    let out = Command::new("cargo")
+        .current_dir(root())
+        .args(["build", "--locked", "-p", "buildkit-controller"])
+        .args(["--bin", "buildkit-controller"])
+        .arg("--message-format=json-render-diagnostics")
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .context("running cargo build")?;
+    if !out.status.success() {
+        bail!("cargo build failed");
+    }
+    executable(&String::from_utf8_lossy(&out.stdout), "buildkit-controller")
+}
+
+/// The `executable` of the `compiler-artifact` message for binary `name` in
+/// `cargo build --message-format=json` output.
+fn executable(messages: &str, name: &str) -> Result<PathBuf> {
+    messages
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == name)
+        .find_map(|m| m["executable"].as_str().map(PathBuf::from))
+        .with_context(|| format!("cargo build reported no executable for {name}"))
+}
+
 /// Render the CRD exactly as it is committed.
 fn render_crd() -> Result<String> {
     let yaml = serde_saphyr::to_string(&buildkit_controller_api::v1alpha1::crd())
@@ -181,30 +237,8 @@ fn write_or_check(rel: &str, want: &str, check: bool) -> Result<()> {
     std::fs::write(&path, want).with_context(|| format!("writing {}", path.display()))
 }
 
-/// Name of the throwaway kind cluster used by `crd-verify`.
-fn verify_cluster() -> String {
-    kind_cluster("bk-crd-verify")
-}
 /// Repository-relative directory of the `crd-verify` fixtures.
 const FIXTURES: &str = "crates/api/tests/fixtures";
-
-/// Deletes the verification cluster when dropped, including on failure.
-struct ClusterGuard(PathBuf);
-
-impl Drop for ClusterGuard {
-    fn drop(&mut self) {
-        let _ = crate::kube::kind(&self.0)
-            .args(["delete", "cluster", "--name", verify_cluster().as_str()])
-            .arg("--kubeconfig")
-            .arg(&self.0)
-            .status();
-    }
-}
-
-fn run(cmd: &mut Command) -> Result<std::process::Output> {
-    cmd.output()
-        .with_context(|| format!("running {}", cmd.get_program().display()))
-}
 
 pub(crate) fn yaml_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -222,38 +256,12 @@ fn crd_verify() -> Result<()> {
     let root = root();
     let work = root.join("target/crd-verify");
     std::fs::create_dir_all(&work)?;
-    let kubeconfig = work.join("kubeconfig");
-    // Delete any leftover cluster first. The guard removes this run's cluster afterwards.
-    let _ = crate::kube::kind(&kubeconfig)
-        .args(["delete", "cluster", "--name", verify_cluster().as_str()])
-        .arg("--kubeconfig")
-        .arg(&kubeconfig)
-        .status();
-    let _guard = ClusterGuard(kubeconfig.clone());
-    let created = run(crate::kube::kind(&kubeconfig)
-        .args([
-            "create",
-            "cluster",
-            "--name",
-            verify_cluster().as_str(),
-            "--wait",
-            "120s",
-        ])
-        .arg("--kubeconfig")
-        .arg(&kubeconfig))?;
-    if !created.status.success() {
-        bail!(
-            "kind create failed: {}",
-            String::from_utf8_lossy(&created.stderr)
-        );
-    }
-    let kubectl = |args: &[&str]| -> Result<std::process::Output> {
-        run(crate::kube::kubectl(&kubeconfig).args(args))
-    };
-    let version = kubectl(&["version", "-o", "json"])?;
+    let cluster = kube::Cluster::new(&kind_cluster("bk-crd-verify"), work.join("kubeconfig"));
+    cluster.create(None, "120s")?;
+    let version = cluster.kubectl(&["version", "-o", "json"])?;
     println!(
         "{}",
-        String::from_utf8_lossy(&version.stdout)
+        version
             .lines()
             .filter(|l| l.contains("gitVersion"))
             .collect::<Vec<_>>()
@@ -261,16 +269,20 @@ fn crd_verify() -> Result<()> {
     );
     let crd_file = root.join(CRD_PATH);
     let crd_arg = crd_file.to_string_lossy().into_owned();
-    let applied = kubectl(&["apply", "--server-side", "-f", &crd_arg])?;
-    if !applied.status.success() {
-        bail!("CRD rejected: {}", String::from_utf8_lossy(&applied.stderr));
-    }
-    crate::kube::wait_crd_established(&kubeconfig).context("CRD not established")?;
+    cluster
+        .kubectl(&["apply", "--server-side", "-f", &crd_arg])
+        .context("CRD rejected")?;
+    cluster
+        .wait_crd_established()
+        .context("CRD not established")?;
     let (mut passed, mut failed) = (0usize, Vec::new());
     for (dir, want_ok) in [("accept", true), ("reject", false)] {
         for file in yaml_files(&root.join(FIXTURES).join(dir))? {
             let arg = file.to_string_lossy().into_owned();
-            let out = kubectl(&["apply", "--dry-run=server", "--validate=strict", "-f", &arg])?;
+            let out = cluster.kubectl_raw(
+                &["apply", "--dry-run=server", "--validate=strict", "-f", &arg],
+                None,
+            )?;
             let ok = out.status.success();
             let verdict = if ok == want_ok { "PASS" } else { "FAIL" };
             let name = file
@@ -349,6 +361,65 @@ fn kind_cluster(base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Image references live in code; fixtures name them by placeholder, so a
+    /// bump cannot leave a fixture on the old tag (pods then sit in
+    /// `ErrImageNeverPull` until the suite times out).
+    #[test]
+    fn fixtures_name_images_by_placeholder() {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&root().join("xtask/fixtures"), &mut files);
+        for p in files {
+            // helm-test fixtures are rendered, never installed.
+            if p.components().any(|c| c.as_os_str() == "helm-test") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&p).unwrap_or_default();
+            for (_, image) in image_placeholders() {
+                assert!(!text.contains(image), "{} names {image}", p.display());
+            }
+        }
+    }
+
+    #[test]
+    fn fixture_fills_placeholders() {
+        let work = std::env::temp_dir().join(format!("xtask-fixture-{}", std::process::id()));
+        std::fs::create_dir_all(&work).unwrap();
+        let p = fixture(
+            "drain-verify/values.yaml",
+            &work,
+            &[("EDGE_PORT", "20001".into())],
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(p).unwrap();
+        assert!(text.contains(image::WORKER_IMAGE), "{text}");
+        assert!(text.contains("tcp://localhost:20001"), "{text}");
+        assert!(!text.contains("WORKER_IMAGE") && !text.contains("EDGE_PORT"));
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn executable_comes_from_the_build_messages() {
+        let msgs = r#"{"reason":"compiler-artifact","target":{"name":"buildkit_controller"},"executable":null}
+not json
+{"reason":"compiler-artifact","target":{"name":"buildkit-controller"},"executable":"/shared/target/debug/buildkit-controller"}
+{"reason":"build-finished","success":true}"#;
+        assert_eq!(
+            executable(msgs, "buildkit-controller").unwrap(),
+            Path::new("/shared/target/debug/buildkit-controller")
+        );
+        assert!(executable(r#"{"reason":"build-finished"}"#, "buildkit-controller").is_err());
+    }
 
     #[test]
     fn parses_tasks() {

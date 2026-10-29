@@ -30,11 +30,12 @@ The edge needs no input: each allocation response carries the CA for the edge, a
 
 ### Retries
 
-The controller answers `503` with a `Retry-After` header when it holds no claim for the request: the pool
-is exhausted or its queue is full (`pool_exhausted`), a worker did not start in time (`start_timeout`),
-token review is unavailable, or a replica is shutting down (`shutting_down`). Other 503 answers, such as
-an unavailable CA, carry no `Retry-After` and are not retried. The Action retries `POST /v1/allocations` on
-exactly that, and on connection errors raised before the request was sent (connection refused, DNS
+The controller answers `503` with a `Retry-After` header when it holds no claim for the request. The body's `error.code` says why: the pool is exhausted or its queue is full (`pool_exhausted`), a worker did not
+start in time (`start_timeout`), a replica is shutting down (`shutting_down`), or token review or the
+issuer's keys are unavailable (`upstream_error`). Other 503 answers, such as an unavailable CA, carry no
+`Retry-After` and are not retried. The Action retries `POST /v1/allocations` only on a 503 with `Retry-After`
+and one of those four codes, because an intermediary that adds its own `Retry-After` to a 503 may have
+forwarded the request. It also retries connection errors raised before the request was sent (connection refused, DNS
 failure). It waits the `Retry-After` seconds (at least 1, at most 30), logs each retry, and fetches a
 fresh OIDC token for every attempt. Retries stop after the queue timeout plus 60 seconds and the step then fails with the last error. The
 queue timeout is `queue-timeout`, or, when that is unset, the pool's default `queueTimeoutSeconds` from
@@ -46,8 +47,8 @@ Action, and the bound is then 1 hour (the largest queue timeout a pool allows) p
 Nothing else is retried: other statuses, a 503 without `Retry-After`, a connection reset after the request
 was sent and a timeout waiting for the response all fail the step, because the controller may have
 claimed a worker whose id the client never saw. With several pools, each pool retries on its own; if one
-pool still fails, the allocations that succeeded are released. Releases (`DELETE`) retry a 503 with
-`Retry-After` under the same limits, since a repeated release is safe.
+pool still fails, the allocations that succeeded are released. Releases (`DELETE`) and the pool listing (`GET /v1/pools`) retry any 503 with
+`Retry-After`, since repeating them is safe. They have their own budget of 60 seconds, not the queue timeout plus 60 seconds, because neither queues.
 
 ### Build cache
 
@@ -111,8 +112,8 @@ sh docs/ci/buildkit-allocate.sh sh -c 'docker buildx build --builder "$BUILDER" 
 
 Optional variables are `TTL` and `QUEUE_TIMEOUT` (seconds), `API_CA` (PEM file for the API listener, needed under the same conditions as the Action's `ca-cert`),
 `CACHE_KEY` and `CACHE` (the Action's `cache-key` and `cache` inputs). The script retries the allocation
-under the same rules and limits as the Action (see Retries above): a 503 with `Retry-After`, or a curl
-failure to resolve or connect, for at most the queue timeout plus 60 seconds, shrinking the queue timeout it sends on each retry.
+under the same rules as the Action (see Retries above): a 503 with `Retry-After` and one of the four codes, or a curl
+failure to resolve or connect, for at most the queue timeout plus 60 seconds, shrinking the queue timeout it sends on each retry. Its release and pool listing retry any 503 with `Retry-After` for 60 seconds.
 Without `QUEUE_TIMEOUT` it reads the pool default from `GET /v1/pools` first, as the Action does. It reuses `TOKEN` for every
 attempt, so give it a token that outlives that window. The script prints the registry cache
 flags to stderr and exports them to the command as `$CACHE_ARGS`:

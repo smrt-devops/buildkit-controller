@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: volumes-17, namespace: default}
+spec:
+  template: {spec: {volumes: [{name: v1, emptyDir: {}}, {name: v2, emptyDir: {}}, {name: v3, emptyDir: {}}, {name: v4, emptyDir: {}}, {name: v5, emptyDir: {}}, {name: v6, emptyDir: {}}, {name: v7, emptyDir: {}}, {name: v8, emptyDir: {}}, {name: v9, emptyDir: {}}, {name: v10, emptyDir: {}}, {name: v11, emptyDir: {}}, {name: v12, emptyDir: {}}, {name: v13, emptyDir: {}}, {name: v14, emptyDir: {}}, {name: v15, emptyDir: {}}, {name: v16, emptyDir: {}}, {name: v17, emptyDir: {}}]}}

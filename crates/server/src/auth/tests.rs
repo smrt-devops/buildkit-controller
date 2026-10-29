@@ -24,13 +24,13 @@ enum TestKey {
     Rsa(sig::RsaKeyPair, &'static str),
 }
 
-struct Signer {
+pub(crate) struct Signer {
     kid: String,
     key: TestKey,
 }
 
 impl Signer {
-    fn es256(kid: &str) -> Self {
+    pub(crate) fn es256(kid: &str) -> Self {
         let rng = SystemRandom::new();
         let alg = &sig::ECDSA_P256_SHA256_FIXED_SIGNING;
         let der = EcdsaKeyPair::generate_pkcs8(alg, &rng).unwrap();
@@ -53,7 +53,7 @@ impl Signer {
     /// RSA signer over a committed throwaway 2048-bit test key (ring cannot
     /// generate RSA keys). Its JWK declares no `alg`, so a padding mismatch is
     /// caught by the signature check, not by `check_jwk`.
-    fn rsa(kid: &str, alg: &'static str) -> Self {
+    pub(crate) fn rsa(kid: &str, alg: &'static str) -> Self {
         let pkcs8 = include_bytes!("testdata/rsa2048-test-only.pk8");
         Self {
             kid: kid.into(),
@@ -92,14 +92,14 @@ impl Signer {
         }
     }
 
-    fn token(&self, claims: &Value) -> String {
+    pub(crate) fn token(&self, claims: &Value) -> String {
         self.token_with_header(
             &json!({"alg": self.alg(), "kid": self.kid, "typ": "JWT"}),
             claims,
         )
     }
 
-    fn token_with_header(&self, header: &Value, claims: &Value) -> String {
+    pub(crate) fn token_with_header(&self, header: &Value, claims: &Value) -> String {
         let msg = format!(
             "{}.{}",
             B64.encode(header.to_string()),
@@ -131,7 +131,7 @@ fn now() -> i64 {
     i64::try_from(jsonwebtoken::get_current_timestamp()).unwrap()
 }
 
-fn claims(iss: &str) -> Value {
+pub(crate) fn claims(iss: &str) -> Value {
     json!({"iss": iss, "aud": AUD, "sub": "repo:smrt-devops/app:ref:refs/heads/main",
            "exp": now() + 300, "iat": now(), "repository_owner": "smrt-devops"})
 }
@@ -149,15 +149,15 @@ struct IssuerState {
     slow: bool,
 }
 
-struct TestIssuer {
-    url: String,
+pub(crate) struct TestIssuer {
+    pub(crate) url: String,
     cert: rustls::pki_types::CertificateDer<'static>,
-    roots: rustls::RootCertStore,
+    pub(crate) roots: rustls::RootCertStore,
     state: Arc<Mutex<IssuerState>>,
 }
 
 impl TestIssuer {
-    async fn start(keys: &[&Signer]) -> Self {
+    pub(crate) async fn start(keys: &[&Signer]) -> Self {
         let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
         let cert_der = cert.cert.der().clone();
         let leaf = cert_der.clone();
@@ -856,7 +856,7 @@ fn error_mapping() {
             "unauthenticated",
             "unknown_issuer",
         ),
-        (AuthError::KeysUnavailable, 401, "unauthenticated", "error"),
+        (AuthError::KeysUnavailable, 503, "upstream_error", "error"),
         (
             AuthError::Upstream("x".into()),
             503,
@@ -870,6 +870,26 @@ fn error_mapping() {
             (e.status(), e.code(), e.metric_result()),
             (status, code, metric)
         );
+    }
+    assert_eq!(
+        AuthError::Invalid("audience mismatch").detail(),
+        "audience mismatch"
+    );
+    assert_eq!(AuthError::UnknownIssuer.detail(), "unknown_issuer");
+    assert_eq!(
+        AuthError::KeysUnavailable.retry_after(),
+        Some(REFETCH_INTERVAL.as_secs())
+    );
+    assert_eq!(
+        AuthError::Upstream("x".into()).retry_after(),
+        Some(REVIEW_RETRY_AFTER_SECS)
+    );
+    for e in [
+        AuthError::Invalid("x"),
+        AuthError::UnknownIssuer,
+        AuthError::Internal("x".into()),
+    ] {
+        assert_eq!(e.retry_after(), None, "{e:?}");
     }
 }
 
@@ -1583,4 +1603,27 @@ async fn verified_token_owner_carries_run_claims() {
             iss.url
         )
     );
+}
+
+/// The issuer is escaped like `sub`, so an issuer containing `#` cannot
+/// collide with another issuer's owner.
+#[test]
+fn issuer_hash_cannot_forge_another_issuers_owner() {
+    let owner = |iss: &str, sub: &str, claims: Value| {
+        let Value::Object(claims) = claims else {
+            panic!("object")
+        };
+        Identity::Oidc {
+            issuer: iss.into(),
+            subject: sub.into(),
+            claims,
+        }
+        .owner()
+    };
+    // Unescaped, both were `oidc:https://a#x#run_id=1`.
+    let forged = owner("https://a#x", "run_id=1", json!({}));
+    let real = owner("https://a", "x", json!({"run_id": "1"}));
+    assert_eq!(real, "oidc:https://a#x#run_id=1");
+    assert_eq!(forged, "oidc:https://a%23x#run_id=1");
+    assert_eq!(owner(GH, "s", json!({})), format!("oidc:{GH}#s"));
 }

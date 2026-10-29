@@ -6,7 +6,15 @@
 //! [`AllocationId`](crate::pki::AllocationId) and maps a [`Refusal`] to the
 //! spec's alert and `result` label; `handle` receives each [`Accepted`]
 //! connection (TLS stream, identity, peer) and owns it until it ends.
-//! [`ProxyHandler`] is the production handler; [`CloseHandler`] a stub for tests.
+//! [`ProxyHandler`] is the handler.
+//!
+//! rustls verifies the client certificate before the client's `CertificateVerify`
+//! signature, so `admit` runs before the peer has proved it holds the key. A peer
+//! with a copy of an allocation certificate but not its key learns from the
+//! alert whether that allocation is still live, and its attempts are counted
+//! under the allocation's labels. It gains no access: the handshake then fails
+//! on the signature. This is the price of refusing inside the handshake with
+//! the spec's alerts.
 
 mod handler;
 mod listener;
@@ -21,12 +29,13 @@ mod upstream;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::TcpListener;
+use anyhow::Context;
+
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-pub use handler::{Accepted, CloseHandler, ConnectionHandler, Refusal};
+pub use handler::{Accepted, ConnectionHandler, Refusal};
 pub use listener::{
     ListenerOptions, PeerKey, PeerSlot, PerPeer, Serve, serve, serve_with_proxy, tune_socket,
 };
@@ -41,35 +50,26 @@ use crate::net::ProxyProtocol;
 use crate::render::BUILDKIT_PORT;
 use crate::runtime::AppContext;
 use crate::runtime::hooks::{BoxResult, Component};
+use buildkit_controller_api::v1alpha1::Duration as CrdDuration;
 
 /// The runtime's `edge` component.
 pub struct EdgeComponent {
     material: watch::Receiver<CertMaterial>,
-    /// `None`: the [`ProxyHandler`] over the runtime's stores.
-    handler: Option<Arc<dyn ConnectionHandler>>,
 }
 
 impl EdgeComponent {
     /// The production edge: proxies to workers.
     #[must_use]
     pub fn proxy(material: watch::Receiver<CertMaterial>) -> Self {
-        Self {
-            material,
-            handler: None,
-        }
+        Self { material }
     }
+}
 
-    /// An edge with a fixed handler (tests).
-    #[must_use]
-    pub fn new(
-        handler: Arc<dyn ConnectionHandler>,
-        material: watch::Receiver<CertMaterial>,
-    ) -> Self {
-        Self {
-            material,
-            handler: Some(handler),
-        }
-    }
+/// `key` from the config. Validation has already rejected a value that does not
+/// parse, so the error is unreachable short of a validation bug.
+fn secs(d: &CrdDuration, key: &str) -> anyhow::Result<Duration> {
+    let s = d.seconds().with_context(|| key.to_owned())?;
+    Ok(Duration::from_secs(s))
 }
 
 impl Component for EdgeComponent {
@@ -78,16 +78,13 @@ impl Component for EdgeComponent {
     }
 
     fn run(&self, ctx: AppContext, shutdown: CancellationToken) -> BoxResult {
-        let fixed = self.handler.clone();
         let certs = self.material.clone();
         Box::pin(async move {
             let ready = ctx.readiness().register("edge_listener");
             let metrics = EdgeMetrics::register(ctx.metrics());
             let edge = &ctx.config().edge;
             let options = ListenerOptions {
-                handshake_timeout: Duration::from_secs(
-                    edge.handshake_timeout.seconds().unwrap_or(10),
-                ),
+                handshake_timeout: secs(&edge.handshake_timeout, "edge.handshakeTimeout")?,
                 max_connections: usize::try_from(edge.max_connections).unwrap_or(usize::MAX),
                 max_handshakes: usize::try_from(edge.max_handshakes).unwrap_or(usize::MAX),
                 max_handshakes_per_ip: usize::try_from(edge.max_handshakes_per_ip)
@@ -99,32 +96,30 @@ impl Component for EdgeComponent {
                 info!(trusted = ?proxy_protocol.trusted(), "edge reads PROXY protocol v2 from trusted sources");
             }
             let addr = ctx.config().listen.edge;
-            let listener = TcpListener::bind(addr).await?;
+            let listener = crate::runtime::listen::bind(addr)?;
             let (tx, rx) = watch::channel(None);
+            let proxy = ProxyHandler::new(
+                PodView {
+                    pods: ctx.pods(),
+                    pools: ctx.pools(),
+                    fresh: ctx.store_freshness(),
+                },
+                rx.clone(),
+                metrics.clone(),
+                ProxyOptions {
+                    upstream_connect_timeout: secs(
+                        &edge.upstream_connect_timeout,
+                        "edge.upstreamConnectTimeout",
+                    )?,
+                    upstream_port: u16::try_from(BUILDKIT_PORT)?,
+                },
+            );
             let revoke_stop = CancellationToken::new();
-            let mut revoker = None;
-            let handler: Arc<dyn ConnectionHandler> = if let Some(h) = fixed {
-                h
-            } else {
-                let proxy = ProxyHandler::new(
-                    PodView {
-                        pods: ctx.pods(),
-                        pools: ctx.pools(),
-                        fresh: ctx.store_freshness(),
-                    },
-                    rx.clone(),
-                    metrics.clone(),
-                    ProxyOptions {
-                        upstream_connect_timeout: Duration::from_secs(
-                            edge.upstream_connect_timeout.seconds().unwrap_or(5),
-                        ),
-                        upstream_port: u16::try_from(BUILDKIT_PORT).unwrap_or(1234),
-                    },
-                );
+            let revoker = tokio::spawn({
                 let (p, sub, stop) = (proxy.clone(), ctx.pod_events(), revoke_stop.clone());
-                revoker = Some(tokio::spawn(async move { p.revoke_on(sub, stop).await }));
-                Arc::new(proxy)
-            };
+                async move { p.revoke_on(sub, stop).await }
+            });
+            let handler: Arc<dyn ConnectionHandler> = Arc::new(proxy);
             let builder = TlsBuilder::new(Arc::clone(&handler), metrics.clone());
             let material_stop = CancellationToken::new();
             let material =
@@ -140,9 +135,7 @@ impl Component for EdgeComponent {
             material_stop.cancel();
             let _ = material.await;
             revoke_stop.cancel();
-            if let Some(r) = revoker {
-                let _ = r.await;
-            }
+            let _ = revoker.await;
             Ok(())
         })
     }

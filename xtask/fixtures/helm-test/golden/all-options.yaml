@@ -109,7 +109,10 @@ data:
     watchNamespaces:
     - ci
     workerNetwork:
-      clusterCIDRs: []
+      clusterCIDRs:
+      - 10.244.0.0/16
+      - 10.96.0.0/12
+      - fd00::/48
       deniedCIDRs:
       - 10.0.0.0/8
       - 172.16.0.0/12
@@ -173,7 +176,7 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: bkc-workload
+  name: bkc-buildkit-system-workload
   namespace: ci
   labels:
     app.kubernetes.io/name: buildkit-controller
@@ -213,8 +216,6 @@ rules:
     - secrets
     verbs:
     - create
-    - patch
-    - delete
   - apiGroups:
     - ""
     resources:
@@ -288,7 +289,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: bkc-workload
+  name: bkc-buildkit-system-workload
   namespace: ci
   labels:
     app.kubernetes.io/name: buildkit-controller
@@ -296,7 +297,7 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: buildkit-controller-0.1.0
-roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: bkc-workload}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: bkc-buildkit-system-workload}
 subjects:
   - kind: ServiceAccount
     name: bkc
@@ -403,7 +404,7 @@ spec:
         helm.sh/chart: buildkit-controller-0.1.0
         team: ci
       annotations:
-        checksum/config: 146f641520918cf70dc2f4b3dcd24b288db17ebafa4821efc56e5935bd8bb4d6
+        checksum/config: 1f3765e302a340117d7a5a5303ceb831d7b75a81569cd30a99e29f45395cd8ba
         example.com/x: "1"
     spec:
       serviceAccountName: bkc

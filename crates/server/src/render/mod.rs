@@ -145,7 +145,7 @@ pub struct WorkerNetwork {
     pub denied_cidrs: Vec<String>,
     /// Extra denied ranges (the API server's public address, other clouds).
     pub extra_denied_cidrs: Vec<String>,
-    /// The cluster.s own pod, service and node ranges (both families), denied like
+    /// The cluster's own pod, service and node ranges (both families), denied like
     /// `denied_cidrs`. The IPv6 internet rule is rendered only when this holds an IPv6
     /// range: without one the controller cannot tell cluster addresses (often global
     /// unicast on IPv6 clusters) from the internet, so IPv6 egress stays closed.

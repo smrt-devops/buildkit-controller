@@ -81,9 +81,19 @@ impl Fake {
         }
     }
 
+    /// Delete the Lease (`kubectl delete lease`) and notify watchers.
+    fn delete(&self) {
+        let mut c = self.cluster.lock().unwrap();
+        c.lease = None;
+        c.watchers.retain(|w| w.send(None).is_ok());
+    }
+
     fn write(&self, expect: Option<&str>, spec: LeaseSpec) -> Result<LeaseSnapshot, ApiError> {
         let mut c = self.cluster.lock().unwrap();
         let cur = c.lease.as_ref().map(|l| l.resource_version.as_str());
+        if expect.is_some() && cur.is_none() {
+            return Err(ApiError::NotFound);
+        }
         if cur != expect {
             return Err(ApiError::Conflict);
         }
@@ -373,4 +383,55 @@ async fn expiry_honours_a_longer_holder_lease_duration() {
     assert!(!leads(&a), "holder promised 30 s");
     secs(11).await;
     assert!(leads(&a));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lease_deleted_while_leading_is_created_again() {
+    let f = Fake::default();
+    let a = start("a", &f);
+    secs(1).await;
+    assert_eq!(*a.rx.borrow(), LeaderState::Leader { term: 1 });
+    // The leader ignores watch events, so only its next renew can notice.
+    f.delete();
+    secs(3).await;
+    assert_eq!(
+        *a.rx.borrow(),
+        LeaderState::Leader { term: 2 },
+        "the deleted Lease was created again by the only replica"
+    );
+    assert_eq!(f.holder().as_deref(), Some("a"));
+    secs(20).await;
+    assert!(leads(&a), "and it keeps renewing the new Lease");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_follower_that_last_held_a_deleted_lease_creates_it() {
+    let f = Fake::default();
+    let a = start("a", &f);
+    secs(1).await;
+    assert!(leads(&a));
+    // Renews stop landing until the leader fences; the Lease is deleted
+    // meanwhile, and the watch event is dropped because a still leads.
+    f.block.store(true, Ordering::SeqCst);
+    f.delete();
+    secs(12).await;
+    assert!(!leads(&a), "fenced");
+    f.block.store(false, Ordering::SeqCst);
+    secs(10).await;
+    assert!(leads(&a), "the follower re-read the Lease and created it");
+    assert_eq!(f.holder().as_deref(), Some("a"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn release_after_a_lost_renew_response_still_clears_the_holder() {
+    let f = Fake::default();
+    let a = start("a", &f);
+    secs(1).await;
+    assert!(leads(&a));
+    // A renew committed but its response was lost: the version moved, holder still a.
+    let snap = f.cluster.lock().unwrap().lease.clone().unwrap();
+    f.force("5000", snap.spec);
+    a.stop.cancel();
+    a.task.await.unwrap();
+    assert_eq!(f.holder(), None, "released after re-reading the Lease");
 }

@@ -45,6 +45,7 @@ fn snap(l: Lease) -> LeaseSnapshot {
 fn map_err(e: &Error) -> ApiError {
     match e {
         Error::Api(s) if s.code == 409 => ApiError::Conflict,
+        Error::Api(s) if s.code == 404 => ApiError::NotFound,
         other => ApiError::Other(other.to_string()),
     }
 }
@@ -96,23 +97,96 @@ impl LeaseApi for KubeLeaseApi {
     fn watch(&self) -> BoxStream<'static, Option<LeaseSnapshot>> {
         let cfg = watcher::Config::default().fields(&format!("metadata.name={}", self.name));
         let on_err = Arc::clone(&self.on_watch_error);
-        watcher(self.api.clone(), cfg)
+        let events = watcher(self.api.clone(), cfg)
             .default_backoff()
             .filter_map(move |ev| {
-                let out = match ev {
-                    Ok(watcher::Event::Apply(l) | watcher::Event::InitApply(l)) => {
-                        Some(Some(snap(l)))
-                    }
-                    Ok(watcher::Event::Delete(_)) => Some(None),
-                    Ok(_) => None,
+                let ev = match ev {
+                    Ok(ev) => Some(ev),
                     Err(e) => {
                         warn!(error = %e, kind = "lease", "watch error");
                         on_err();
                         None
                     }
                 };
-                std::future::ready(out)
-            })
-            .boxed()
+                std::future::ready(ev)
+            });
+        lease_changes(events).boxed()
+    }
+}
+
+/// The Lease as each watcher event leaves it, `None` when absent. A list that
+/// finds no Lease reports `None` at its `InitDone`, so a deletion missed while
+/// the watch was down (or ignored while leading) is still learned on the relist.
+fn lease_changes(
+    events: impl futures::Stream<Item = watcher::Event<Lease>> + Send + 'static,
+) -> impl futures::Stream<Item = Option<LeaseSnapshot>> + Send + 'static {
+    let mut listed = false;
+    events.filter_map(move |ev| {
+        let out = match ev {
+            watcher::Event::Init => {
+                listed = false;
+                None
+            }
+            watcher::Event::Apply(l) | watcher::Event::InitApply(l) => {
+                listed = true;
+                Some(Some(snap(l)))
+            }
+            watcher::Event::Delete(_) => Some(None),
+            watcher::Event::InitDone => (!listed).then_some(None),
+        };
+        std::future::ready(out)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::StreamExt;
+    use futures::stream;
+    use k8s_openapi::api::coordination::v1::Lease;
+    use kube::runtime::watcher::Event;
+
+    use super::lease_changes;
+
+    fn lease(rv: &str) -> Lease {
+        let mut l = Lease::default();
+        l.metadata.resource_version = Some(rv.into());
+        l
+    }
+
+    fn versions(events: Vec<Event<Lease>>) -> Vec<Option<String>> {
+        futures::executor::block_on(
+            lease_changes(stream::iter(events))
+                .map(|s| s.map(|s| s.resource_version))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_relist_without_the_lease_reports_it_gone() {
+        assert_eq!(
+            versions(vec![
+                Event::Init,
+                Event::InitApply(lease("1")),
+                Event::InitDone,
+                Event::Apply(lease("2")),
+                // The watch fails and relists; the Lease was deleted meanwhile.
+                Event::Init,
+                Event::InitDone,
+            ]),
+            [Some("1".into()), Some("2".into()), None]
+        );
+    }
+
+    #[test]
+    fn a_relist_with_the_lease_reports_only_the_lease() {
+        assert_eq!(
+            versions(vec![
+                Event::Init,
+                Event::InitApply(lease("1")),
+                Event::InitDone,
+                Event::Delete(lease("1")),
+            ]),
+            [Some("1".into()), None]
+        );
     }
 }

@@ -14,7 +14,7 @@ use tracing::{error, warn};
 use super::backend::{Backend, PvcCreate};
 use super::error::AllocError;
 use super::metrics::AllocMetrics;
-use super::pods::{FREE, ann, shuffle, slot_of};
+use super::pods::{FREE, ann, ptr, shuffle, slot_of};
 use crate::auth::Identity;
 use crate::render::{
     self, ANN_ALLOC, Binding, KEY_CACHE_KEYS, KEY_CACHE_SCOPE, LABEL_VOLUME_HASH, keys_contain,
@@ -189,9 +189,11 @@ pub(super) async fn ensure_volume(
         }
     };
     let (ns, name) = (want.namespace().unwrap_or_default(), want.name_any());
+    // The read changed nothing, so its failure is the API server's (logged in
+    // full, since a missing permission also lands here).
     let have = backend.get_pvc(&ns, &name).await.map_err(|error| {
         error!(namespace = %ns, volume = %name, error, "get cache volume");
-        AllocError::Internal
+        AllocError::UpstreamError
     })?;
     let label = |p: &PersistentVolumeClaim| p.labels().get(LABEL_VOLUME_HASH).cloned();
     let Some(have) = have else {
@@ -203,6 +205,11 @@ pub(super) async fn ensure_volume(
             PvcCreate::Quota => {
                 metrics.volume_op("create", "error");
                 Ok(Volume::Quota)
+            }
+            PvcCreate::Unknown(error) => {
+                metrics.volume_op("create", "error");
+                warn!(namespace = %ns, volume = %name, error, "create cache volume");
+                Err(AllocError::UpstreamError)
             }
             PvcCreate::Failed(error) => {
                 metrics.volume_op("create", "error");
@@ -466,12 +473,11 @@ pub(super) fn claim_ops(
     if !cached(pool, pod) {
         return;
     }
-    let at = |k: &str| format!("/metadata/annotations/{}", k.replace('/', "~1"));
     if let Some((k, cap)) = affinity {
         let keys = render::push_key(before, k, *cap);
-        ops.push(json!({"op": "add", "path": at(KEY_CACHE_KEYS), "value": keys}));
+        ops.push(json!({"op": "add", "path": ptr("annotations", KEY_CACHE_KEYS), "value": keys}));
     }
     if let Some(s) = scope {
-        ops.push(json!({"op": "add", "path": at(KEY_CACHE_SCOPE), "value": s}));
+        ops.push(json!({"op": "add", "path": ptr("annotations", KEY_CACHE_SCOPE), "value": s}));
     }
 }

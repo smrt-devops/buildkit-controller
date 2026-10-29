@@ -1,0 +1,6 @@
+---
+source: crates/server/src/render/tests.rs
+assertion_line: 284
+expression: err.to_string()
+---
+template conflict: spec.template.spec.containers[0].volumeMounts[0].subPath (must not contain control characters)

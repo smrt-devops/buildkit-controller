@@ -1,0 +1,6 @@
+---
+source: crates/server/src/render/tests.rs
+assertion_line: 284
+expression: err.to_string()
+---
+template conflict: spec.template.spec.volumes[0].projected.sources[0] (must set exactly one of configMap, secret or downwardAPI)

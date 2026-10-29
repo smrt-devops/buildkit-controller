@@ -5,6 +5,9 @@ const http = require('node:http');
 const net = require('node:net');
 const L = require('../dist/lib');
 
+/** What the controller sends with a 503 and Retry-After before it claims a worker. */
+const BUSY = JSON.stringify({ error: { code: 'pool_exhausted', message: 'no free worker' } });
+
 /** Local server that answers from `script` (one entry per request) and records the requests. */
 async function serve(script) {
   const seen = [];
@@ -18,7 +21,7 @@ async function serve(script) {
       if (step.onRequest) step.onRequest();
       if (step.reset) return req.socket.destroy();
       res.writeHead(step.status, step.headers || {});
-      res.end(step.body || '');
+      res.end(step.body ?? (step.status === 503 && step.headers ? BUSY : ''));
     });
   });
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
@@ -163,7 +166,7 @@ test('the bound also stops connection-error retries', async () => {
 test('DELETE retries 503 with Retry-After the same way', async () => {
   const s = await serve([{ status: 503, headers: { 'Retry-After': '3' } }, { status: 204 }]);
   const h = harness();
-  const res = await L.requestWithRetry(s.url, { method: 'DELETE' }, h.opts);
+  const res = await L.requestWithRetry(s.url, { method: 'DELETE' }, { ...h.opts, idempotent: true });
   s.close();
   assert.equal(res.status, 204);
   assert.deepEqual(s.seen.map((r) => r.method), ['DELETE', 'DELETE']);
@@ -255,4 +258,72 @@ test('a server that reports no pool default keeps the 1 h budget', async () => {
   const { sent } = await busyPool(undefined, {}, 120);
   assert.ok(sent.every((q) => q === undefined), 'the server default is not overridden');
   assert.equal(L.retryBudgetMs(L.effectiveQueueTimeout(undefined, {})), 3660000);
+});
+
+for (const [name, body] of [
+  ['an empty body', ''],
+  ['an error code that may follow a claim', JSON.stringify({ error: { code: 'ca_unavailable', message: 'x' } })],
+  ['a body that is not JSON', '<html>overloaded</html>'],
+]) {
+  test(`POST is not retried on 503 with Retry-After and ${name}`, async () => {
+    const s = await serve([{ status: 503, headers: { 'Retry-After': '1' }, body }, { status: 201 }]);
+    const h = harness();
+    const res = await L.requestWithRetry(s.url, post, h.opts);
+    s.close();
+    assert.equal(res.status, 503);
+    assert.equal(s.seen.length, 1);
+  });
+}
+
+for (const code of ['pool_exhausted', 'start_timeout', 'shutting_down', 'upstream_error']) {
+  test(`POST is retried on 503 with Retry-After and code ${code}`, async () => {
+    const body = JSON.stringify({ error: { code, message: 'x' } });
+    const s = await serve([{ status: 503, headers: { 'Retry-After': '1' }, body }, { status: 201 }]);
+    const h = harness();
+    const res = await L.requestWithRetry(s.url, post, h.opts);
+    s.close();
+    assert.equal(res.status, 201);
+  });
+}
+
+test('an idempotent request retries any 503 with Retry-After', async () => {
+  const s = await serve([{ status: 503, headers: { 'Retry-After': '1' }, body: '' }, { status: 200, body: '{}' }]);
+  const h = harness();
+  const res = await L.requestWithRetry(s.url, { method: 'GET' }, { ...h.opts, idempotent: true });
+  s.close();
+  assert.equal(res.status, 200);
+});
+
+test('a release gives up after 60 s, whatever the queue timeout', async () => {
+  const s = await serve([{ status: 503, headers: { 'Retry-After': '30' }, body: '' }]);
+  let t = 0;
+  const waits = [];
+  const api = s.url.replace('/v1/allocations', '');
+  await assert.rejects(
+    L.releaseAllocation({ api, id: 'abc', getToken: async () => 't', log: () => {}, now: () => t, sleep: async (ms) => { waits.push(ms); t += ms; } }),
+    /release abc failed: HTTP 503/,
+  );
+  s.close();
+  assert.equal(L.SHORT_BUDGET_MS, 60000);
+  assert.deepEqual(waits, [30000, 30000]);
+});
+
+test('a release stops retrying an unreachable API after 60 s', async () => {
+  const probe = net.createServer();
+  await new Promise((r) => probe.listen(0, '127.0.0.1', r));
+  const port = probe.address().port;
+  await new Promise((r) => probe.close(r));
+  let t = 0;
+  const waits = [];
+  await assert.rejects(
+    L.releaseAllocation({ api: `http://127.0.0.1:${port}`, id: 'abc', getToken: async () => 't', now: () => t, sleep: async (ms) => { waits.push(ms); t += ms; } }),
+    (e) => e.code === 'ECONNREFUSED',
+  );
+  assert.ok(t <= 60000, `waited ${t} ms`);
+});
+
+test('a release counts 404 as released', async () => {
+  const s = await serve([{ status: 404, body: '{}' }]);
+  await L.releaseAllocation({ api: s.url.replace('/v1/allocations', ''), id: 'abc', getToken: async () => 't' });
+  s.close();
 });

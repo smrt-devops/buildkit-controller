@@ -3,7 +3,6 @@ What the chart renders for Gateway API exposure, as JSON:
   apiRefs, edgeRefs   parentRefs per route; [] = that route is not rendered
   apiHostnames        HTTPRoute or TLSRoute hostnames of the API
   edgeHostnames       TLSRoute hostnames (SNI) of the edge
-  missing             kinds the routes need that the cluster does not serve
   envoyMissing        gateway.envoy.enabled but no BackendTrafficPolicy CRD
   apiUnpinned         an HTTPRoute parentRef names no sectionName or port
 Fails when a route has no parentRefs and service.type is not LoadBalancer, and in
@@ -11,7 +10,7 @@ passthrough mode when both TLSRoutes could match one SNI on one listener.
 */}}
 {{- define "bkc.gateway" -}}
 {{- $gw := .Values.gateway -}}
-{{- $out := dict "apiRefs" (list) "edgeRefs" (list) "apiHostnames" (list) "edgeHostnames" (list) "missing" (list) "envoyMissing" false -}}
+{{- $out := dict "apiRefs" (list) "edgeRefs" (list) "apiHostnames" (list) "edgeHostnames" (list) "envoyMissing" false -}}
 {{- if $gw.enabled -}}
   {{- $apiRefs := default $gw.parentRefs $gw.api.parentRefs -}}
   {{- $edgeRefs := default $gw.parentRefs $gw.edge.parentRefs -}}
@@ -59,29 +58,11 @@ passthrough mode when both TLSRoutes could match one SNI on one listener.
     {{- end -}}
   {{- end -}}
   {{- $_ := set $out "apiUnpinned" $unpinned -}}
-  {{- $caps := .Capabilities.APIVersions -}}
-  {{- $missing := list -}}
-  {{- $apiKinds := ternary (list "HTTPRoute" "BackendTLSPolicy") (list "TLSRoute") (eq $gw.api.mode "terminate") -}}
-  {{- $apiOk := true -}}
-  {{- if $apiRefs -}}
-    {{- range $apiKinds -}}
-      {{- if not ($caps.Has (printf "gateway.networking.k8s.io/v1/%s" .)) -}}
-        {{- $apiOk = false -}}
-        {{- if not (has . $missing) }}{{ $missing = append $missing . }}{{ end -}}
-      {{- end -}}
-    {{- end -}}
-  {{- end -}}
-  {{- $edgeOk := true -}}
-  {{- if and $edgeRefs (not ($caps.Has "gateway.networking.k8s.io/v1/TLSRoute")) -}}
-    {{- $edgeOk = false -}}
-    {{- if not (has "TLSRoute" $missing) }}{{ $missing = append $missing "TLSRoute" }}{{ end -}}
-  {{- end -}}
-  {{- $_ := set $out "apiRefs" (ternary $apiRefs (list) $apiOk) -}}
-  {{- $_ := set $out "edgeRefs" (ternary $edgeRefs (list) $edgeOk) -}}
+  {{- $_ := set $out "apiRefs" $apiRefs -}}
+  {{- $_ := set $out "edgeRefs" $edgeRefs -}}
   {{- $_ := set $out "apiHostnames" $apiHosts -}}
   {{- $_ := set $out "edgeHostnames" $edgeHosts -}}
-  {{- $_ := set $out "missing" $missing -}}
-  {{- $_ := set $out "envoyMissing" (and $gw.envoy.enabled (not ($caps.Has "gateway.envoyproxy.io/v1alpha1/BackendTrafficPolicy"))) -}}
+  {{- $_ := set $out "envoyMissing" (and $gw.envoy.enabled (not (.Capabilities.APIVersions.Has "gateway.envoyproxy.io/v1alpha1/BackendTrafficPolicy"))) -}}
 {{- end -}}
 {{- toJson $out -}}
 {{- end -}}

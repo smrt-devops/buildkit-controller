@@ -1,4 +1,3 @@
-//! `cargo xtask edge-verify`: the mTLS edge proven in a throwaway kind
 //! `cargo xtask edge-verify` tests the mTLS edge in a throwaway kind cluster.
 //! The controller runs in-cluster as a Deployment, the task allocates a
 //! hand-rendered worker pod to a test identity, and a `buildctl` client pod
@@ -14,12 +13,14 @@
 //! e. A 512 MiB COPY through the edge, compared with one direct to buildkitd,
 //!    in MB/s.
 //!
-//! Every kind and kubectl call gets the private kubeconfig under
-//! `target/edge-verify`. The task never reads or writes `~/.kube/config`, and
-//! it deletes the cluster on every exit path.
+//! The controller's RBAC is the chart's (`templates/rbac.yaml`, rendered with
+//! `helm template`), so the "no 403s" check covers the RBAC that ships. Every
+//! kind and kubectl call gets the private kubeconfig under `target/edge-verify`.
+//! The task never reads or writes `~/.kube/config`, and it deletes the cluster
+//! on every exit path.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::path::Path;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -33,9 +34,8 @@ use time::format_description::well_known::Rfc3339;
 
 use super::{CRD_PATH, root};
 use crate::image::WORKER_IMAGE;
-
-static CLUSTER: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| super::kind_cluster("bk-edge-verify"));
+use crate::kube::Cluster;
+use crate::proc::{Spawned, status};
 const SYSTEM_NS: &str = "buildkit-system";
 const NS: &str = "bk-edge";
 const POOL: &str = "edge";
@@ -106,92 +106,68 @@ for d in big-edge big-direct; do
 done
 "#;
 
-pub(crate) struct Env {
-    pub(crate) kubeconfig: PathBuf,
+/// The controller's `ServiceAccount` and RBAC, rendered from the chart for the
+/// release `bk` in [`SYSTEM_NS`]. `tls_secret` is the chart's
+/// `edge.tls.secretName`, which the RBAC lets the controller read.
+pub(crate) fn chart_rbac(tls_secret: &str) -> Result<String> {
+    let chart = root().join("helm/buildkit-controller");
+    let rbac = crate::proc::stdout(
+        crate::kube::helm(&crate::kube::sandbox())
+            .args(["template", "bk"])
+            .arg(&chart)
+            .args(["-n", SYSTEM_NS])
+            .args(["--show-only", "templates/serviceaccount.yaml"])
+            .args(["--show-only", "templates/rbac.yaml"])
+            .args(["--set", "fullnameOverride=buildkit-controller"])
+            .args(["--set", "gateway.enabled=false"])
+            .args(["--set", "edge.endpoint=tcp://bk.example.com:8444"])
+            .args(["--set", "edge.serverName=bk.example.com"])
+            .args(["--set-string", &format!("edge.tls.secretName={tls_secret}")]),
+    )
+    .context("rendering the chart's RBAC")?;
+    Ok(rbac + "\n---\n")
 }
 
-impl Env {
-    pub(crate) fn kind(&self, args: &[&str]) -> Result<Output> {
-        crate::kube::kind(&self.kubeconfig)
-            .args(args)
-            .arg("--kubeconfig")
-            .arg(&self.kubeconfig)
-            .output()
-            .context("running kind")
-    }
-
-    pub(crate) fn kubectl_cmd(&self) -> Command {
-        let mut c = crate::kube::kubectl(&self.kubeconfig);
-        c.arg("--kubeconfig").arg(&self.kubeconfig);
-        c
-    }
-
-    pub(crate) fn kubectl_raw(&self, args: &[&str], stdin: Option<&str>) -> Result<Output> {
-        use std::io::Write;
-        let mut cmd = self.kubectl_cmd();
-        cmd.args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd.spawn().context("spawning kubectl")?;
-        let mut pipe = child.stdin.take().context("kubectl stdin")?;
-        pipe.write_all(stdin.unwrap_or_default().as_bytes())?;
-        drop(pipe);
-        child.wait_with_output().context("waiting for kubectl")
-    }
-
-    pub(crate) fn kubectl(&self, args: &[&str]) -> Result<String> {
-        self.kubectl_in(args, None)
-    }
-
-    pub(crate) fn kubectl_in(&self, args: &[&str], stdin: Option<&str>) -> Result<String> {
-        let out = self.kubectl_raw(args, stdin)?;
-        ensure!(
-            out.status.success(),
-            "kubectl {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    }
-
-    pub(crate) fn apply(&self, yaml: &str) -> Result<()> {
-        self.kubectl_in(&["apply", "-f", "-"], Some(yaml)).map(drop)
-    }
-
-    /// Runs `script` in the client pod and returns (success, stdout+stderr).
-    fn client(&self, script: &str) -> Result<(bool, String)> {
-        self.client_in(NS, script)
-    }
-
-    /// Runs `script` in the client pod of namespace `ns`.
-    fn client_in(&self, ns: &str, script: &str) -> Result<(bool, String)> {
-        let out = self.kubectl_raw(
-            &["-n", ns, "exec", "client", "--", "sh", "-c", script],
-            None,
-        )?;
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        Ok((out.status.success(), text))
-    }
-
-    /// Sum of `name` samples whose labels contain `label`.
-    fn metric(&self, name: &str, label: &str) -> Result<f64> {
-        let (ok, text) = self.client(&format!("wget -qO- {METRICS}"))?;
-        ensure!(ok, "metrics fetch failed: {text}");
-        Ok(text
-            .lines()
-            .filter(|l| l.starts_with(&format!("{name}{{")) && l.contains(label))
-            .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
-            .fold(0.0, |a, b| a + b))
-    }
+/// The in-cluster controller of `xtask/fixtures/edge-verify`, without its
+/// `ServiceAccount` and RBAC; apply [`chart_rbac`] with it.
+pub(crate) fn controller_fixture() -> Result<String> {
+    std::fs::read_to_string(root().join("xtask/fixtures/edge-verify/controller.yaml"))
+        .context("reading the controller fixture")
 }
 
-/// Deletes the cluster when dropped. Unless the run succeeded, it first dumps
-/// controller state.
-struct Cleanup(Env, std::cell::Cell<bool>);
+/// Runs `script` in the client pod and returns (success, stdout+stderr).
+fn client(env: &Cluster, script: &str) -> Result<(bool, String)> {
+    client_in(env, NS, script)
+}
+
+/// Runs `script` in the client pod of namespace `ns`.
+fn client_in(env: &Cluster, ns: &str, script: &str) -> Result<(bool, String)> {
+    let out = env.kubectl_raw(
+        &["-n", ns, "exec", "client", "--", "sh", "-c", script],
+        None,
+    )?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok((out.status.success(), text))
+}
+
+/// Sum of `name` samples whose labels contain `label`.
+fn metric(env: &Cluster, name: &str, label: &str) -> Result<f64> {
+    let (ok, text) = client(env, &format!("wget -qO- {METRICS}"))?;
+    ensure!(ok, "metrics fetch failed: {text}");
+    Ok(text
+        .lines()
+        .filter(|l| l.starts_with(&format!("{name}{{")) && l.contains(label))
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+        .fold(0.0, |a, b| a + b))
+}
+
+/// Dumps controller state when dropped unless the run succeeded. The cluster
+/// it holds is deleted after that.
+struct Cleanup(Cluster, std::cell::Cell<bool>);
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
@@ -216,23 +192,7 @@ impl Drop for Cleanup {
                 }
             }
         }
-        let _ = self
-            .0
-            .kind(&["delete", "cluster", "--name", CLUSTER.as_str()]);
     }
-}
-
-pub(crate) fn run_ok(cmd: &mut Command) -> Result<()> {
-    let out = cmd
-        .output()
-        .with_context(|| format!("running {}", cmd.get_program().display()))?;
-    ensure!(
-        out.status.success(),
-        "{} failed: {}",
-        cmd.get_program().display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Ok(())
 }
 
 fn rfc3339(t: OffsetDateTime) -> Result<String> {
@@ -290,33 +250,23 @@ pub(crate) fn edge_verify() -> Result<()> {
     let root = root();
     let work = root.join("target/edge-verify");
     std::fs::create_dir_all(&work)?;
-    let env = Env {
-        kubeconfig: work.join("kubeconfig"),
-    };
-    let _ = env.kind(&["delete", "cluster", "--name", CLUSTER.as_str()]);
-    let cleanup = Cleanup(env, std::cell::Cell::new(false));
-    let env = &cleanup.0;
-    let created = env.kind(&[
-        "create",
-        "cluster",
-        "--name",
-        CLUSTER.as_str(),
-        "--wait",
-        "120s",
-    ])?;
-    ensure!(
-        created.status.success(),
-        "kind create failed: {}",
-        String::from_utf8_lossy(&created.stderr)
+    let cleanup = Cleanup(
+        Cluster::new(
+            &super::kind_cluster("bk-edge-verify"),
+            work.join("kubeconfig"),
+        ),
+        std::cell::Cell::new(false),
     );
+    let env = &cleanup.0;
+    env.create(None, "120s")?;
 
-    super::image::image(CONTROLLER_IMAGE, Some(CLUSTER.as_str()))?;
+    super::image::image(CONTROLLER_IMAGE, Some(env.name()))?;
     crate::image::ensure_worker()?;
-    run_ok(&mut crate::kube::kind_load(WORKER_IMAGE, CLUSTER.as_str()))?;
+    status(&mut crate::kube::kind_load(WORKER_IMAGE, env.name()))?;
 
     let crd = root.join(CRD_PATH).to_string_lossy().into_owned();
     env.kubectl(&["apply", "--server-side", "-f", &crd])?;
-    crate::kube::wait_crd_established(&env.kubeconfig)?;
+    env.wait_crd_established()?;
     env.kubectl(&["create", "namespace", SYSTEM_NS])?;
     // The controller pod must pass PodSecurity "restricted".
     env.kubectl(&[
@@ -336,8 +286,7 @@ pub(crate) fn edge_verify() -> Result<()> {
         &work.join("ca"),
         ca.to_secret_data(),
     )?;
-    let manifest = root.join("xtask/fixtures/edge-verify/controller.yaml");
-    env.kubectl(&["apply", "-f", &manifest.to_string_lossy()])?;
+    env.apply(&(chart_rbac("")? + &controller_fixture()?))?;
 
     let pod_ip = deploy(env, &work, &ca, now)?;
 
@@ -374,7 +323,7 @@ pub(crate) fn edge_verify() -> Result<()> {
 
 /// Creates the pool, the allocated worker pod, the client certs and the
 /// client pod. Returns the worker pod IP.
-fn deploy(env: &Env, work: &Path, ca: &CaBundle, now: OffsetDateTime) -> Result<String> {
+fn deploy(env: &Cluster, work: &Path, ca: &CaBundle, now: OffsetDateTime) -> Result<String> {
     // The pool must exist because the edge checks the pod's ownerReference uid.
     env.apply(&format!(
         "apiVersion: buildkit.smrt-devops.net/v1alpha1\nkind: BuildKitPool\n\
@@ -462,7 +411,7 @@ fn deploy(env: &Env, work: &Path, ca: &CaBundle, now: OffsetDateTime) -> Result<
             "pod/client",
             "--timeout=120s",
         ])?;
-        let (ok, out) = env.client_in(ns, PREPARE)?;
+        let (ok, out) = client_in(env, ns, PREPARE)?;
         ensure!(ok, "preparing build contexts in {ns}: {out}");
     }
     Ok(pod_ip)
@@ -473,35 +422,53 @@ fn edge_flags(cert: &str) -> String {
 }
 
 /// Runs scenarios a, b, c and e. Returns the edge and direct throughput in MB/s.
-fn scenarios(env: &Env, pod_ip: &str, r: &mut Report) -> Result<Vec<f64>> {
+fn scenarios(env: &Cluster, pod_ip: &str, r: &mut Report) -> Result<Vec<f64>> {
     let edge = edge_flags;
     let direct_addr = format!("tcp://{pod_ip}:{BUILDKIT_PORT}");
     let worker_name = worker_identity()?.dns_name();
     let direct = |cert: &str| flags(&direct_addr, &worker_name, "internal-ca.crt", cert);
 
     // a.
-    let (ok, out) = env.client(&format!("{} debug workers", edge("alloc")))?;
+    let (ok, out) = client(env, &format!("{} debug workers", edge("alloc")))?;
     r.check("a/debug-workers via edge", ok, last_line(&out));
-    let (ok, out) = env.client(&build(&edge("alloc"), "small"))?;
+    let (ok, out) = client(env, &build(&edge("alloc"), "small"))?;
     let ran = out.contains("built-through-edge");
     r.check("a/build with RUN via edge", ok && ran, last_line(&out));
 
     // b.
-    let (ok, out) = env.client_in(
+    let (ok, out) = client_in(
+        env,
         SYSTEM_NS,
-        &format!("timeout 30 {} debug workers", direct("alloc")),
+        &format!(
+            "timeout 30 {} debug workers; rc=$?; echo rc=$rc; exit $rc",
+            direct("alloc")
+        ),
     )?;
+    println!("{out}");
+    // buildkitd refuses the handshake at once: buildctl exits 1, not 124 from
+    // `timeout`, and the TCP connect itself succeeded.
     r.check(
         "b/alloc cert direct to worker refused",
-        !ok,
+        !ok && out.contains("rc=1") && !out.contains("connection refused"),
         last_line(&out),
     );
 
     // c.
-    let tls_before = env.metric("buildkit_edge_connections_total", "result=\"tls_error\"")?;
-    let (ok, out) = env.client(&format!("timeout 30 {} debug workers", edge("expired")))?;
+    let tls_before = metric(
+        env,
+        "buildkit_edge_connections_total",
+        "result=\"tls_error\"",
+    )?;
+    let (ok, out) = client(
+        env,
+        &format!("timeout 30 {} debug workers", edge("expired")),
+    )?;
     println!("{out}");
-    let tls_after = env.metric("buildkit_edge_connections_total", "result=\"tls_error\"")?;
+    let tls_after = metric(
+        env,
+        "buildkit_edge_connections_total",
+        "result=\"tls_error\"",
+    )?;
     r.check(
         "c/expired cert refused at edge",
         !ok && tls_after > tls_before,
@@ -511,13 +478,15 @@ fn scenarios(env: &Env, pod_ip: &str, r: &mut Report) -> Result<Vec<f64>> {
             last_line(&out)
         ),
     );
-    let mm_before = env.metric(
+    let mm_before = metric(
+        env,
         "buildkit_edge_connections_total",
         "result=\"alloc_mismatch\"",
     )?;
-    let (ok, out) = env.client(&format!("timeout 30 {} debug workers", edge("other")))?;
+    let (ok, out) = client(env, &format!("timeout 30 {} debug workers", edge("other")))?;
     println!("{out}");
-    let mismatch = env.metric(
+    let mismatch = metric(
+        env,
         "buildkit_edge_connections_total",
         "result=\"alloc_mismatch\"",
     )?;
@@ -538,11 +507,11 @@ fn scenarios(env: &Env, pod_ip: &str, r: &mut Report) -> Result<Vec<f64>> {
         ("direct", SYSTEM_NS, direct("direct"), "big-direct"),
     ] {
         let bytes = "direction=\"client_to_worker\"";
-        let before = env.metric("buildkit_edge_bytes_total", bytes)?;
+        let before = metric(env, "buildkit_edge_bytes_total", bytes)?;
         let start = Instant::now();
-        let (ok, out) = env.client_in(ns, &build(&fl, dir))?;
+        let (ok, out) = client_in(env, ns, &build(&fl, dir))?;
         let secs = start.elapsed().as_secs_f64();
-        let proxied = env.metric("buildkit_edge_bytes_total", bytes)? - before;
+        let proxied = metric(env, "buildkit_edge_bytes_total", bytes)? - before;
         // The edge run must carry the whole file; the direct one none of it.
         #[allow(clippy::cast_precision_loss)]
         let carried = if name == "edge" {
@@ -568,26 +537,37 @@ fn scenarios(env: &Env, pod_ip: &str, r: &mut Report) -> Result<Vec<f64>> {
 
 /// Scenario d. Deletes the worker under a live build through the edge and
 /// measures how long the client session survives.
-fn revocation(env: &Env, r: &mut Report) -> Result<()> {
+fn revocation(env: &Cluster, r: &mut Report) -> Result<()> {
     let worker = format!("{POOL}-0");
     let edge = edge_flags;
-    let mut long = env.kubectl_cmd();
-    long.args([
-        "-n",
-        NS,
-        "exec",
-        "client",
-        "--",
-        "sh",
-        "-c",
-        &build(&edge("alloc"), "long"),
-    ])
-    .stdout(Stdio::null())
-    .stderr(Stdio::null());
-    let mut child = long.spawn().context("starting the long build")?;
-    std::thread::sleep(Duration::from_secs(8));
-    let active = env.metric("buildkit_edge_active_connections", "pool=\"edge\"")?;
-    let gone_before = env.metric("buildkit_edge_revocations_total", "pod_gone")?;
+    let mut child = Spawned::spawn(
+        env.kubectl_cmd()
+            .args([
+                "-n",
+                NS,
+                "exec",
+                "client",
+                "--",
+                "sh",
+                "-c",
+                &build(&edge("alloc"), "long"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .context("starting the long build")?;
+    // The session is live once the edge counts its connection.
+    let active = crate::proc::poll(
+        "the long build's edge connection",
+        Duration::from_mins(1),
+        Duration::from_millis(500),
+        || {
+            ensure!(child.try_wait()?.is_none(), "the long build exited early");
+            let n = metric(env, "buildkit_edge_active_connections", "pool=\"edge\"")?;
+            Ok((n >= 1.0).then_some(n))
+        },
+    )?;
+    let gone_before = metric(env, "buildkit_edge_revocations_total", "pod_gone")?;
     let live = child.try_wait()?.is_none();
     let start = Instant::now();
     env.kubectl(&["-n", NS, "delete", "pod", &worker, "--wait=false"])?;
@@ -599,11 +579,8 @@ fn revocation(env: &Env, r: &mut Report) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    if cut.is_none() {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
-    let gone_after = env.metric("buildkit_edge_revocations_total", "pod_gone")?;
+    child.kill();
+    let gone_after = metric(env, "buildkit_edge_revocations_total", "pod_gone")?;
     r.check(
         "d/pod delete cuts the live session",
         live && active >= 1.0 && cut.is_some_and(|d| d <= REVOKE_BOUND) && gone_after > gone_before,
@@ -625,7 +602,7 @@ fn serving_not_after(now: OffsetDateTime) -> OffsetDateTime {
 
 /// Writes `data` to `dir` and creates a generic Secret from those files.
 pub(crate) fn secret_from_files(
-    env: &Env,
+    env: &Cluster,
     ns: &str,
     name: &str,
     dir: &Path,
@@ -652,7 +629,7 @@ pub(crate) fn secret_from_files(
 /// Client certs for the allocation, an expired one, another allocation's, and
 /// the internal-CA edge client cert for the direct baseline.
 fn client_certs(
-    env: &Env,
+    env: &Cluster,
     work: &Path,
     ca: &CaBundle,
     now: OffsetDateTime,
@@ -704,18 +681,10 @@ fn client_certs(
 }
 
 /// The controller ran the whole time without restarts and its log has no
-/// RBAC refusals. Any 403 means the fixture RBAC lacks a grant.
-fn controller_health(env: &Env, r: &mut Report) -> Result<()> {
+/// RBAC refusals. Any denial means the chart's RBAC lacks a grant.
+fn controller_health(env: &Cluster, r: &mut Report) -> Result<()> {
     let log = env.kubectl(&["-n", SYSTEM_NS, "logs", "deploy/buildkit-controller"])?;
-    let forbidden: Vec<&str> = log
-        .lines()
-        // Match 403 as a whole token: a timestamp such as `34.704031Z` holds the digits too.
-        .filter(|l| {
-            l.split(|c: char| !c.is_ascii_alphanumeric())
-                .any(|t| t == "403")
-                || l.to_ascii_lowercase().contains("forbidden")
-        })
-        .collect();
+    let forbidden: Vec<&str> = crate::kube::rbac_denials(&log).collect();
     let restarts = env.kubectl(&[
         "-n",
         SYSTEM_NS,
@@ -750,4 +719,29 @@ fn worker_identity() -> Result<WorkerIdentity> {
         pod: format!("{POOL}-0"),
         nonce: NONCE.into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The controller's RBAC comes from the chart only; a hand-written copy
+    /// here would be what edge-verify, soak and perf test instead.
+    #[test]
+    fn controller_fixture_has_no_rbac_of_its_own() {
+        let fixture = controller_fixture().unwrap();
+        for kind in [
+            "ServiceAccount",
+            "ClusterRole",
+            "ClusterRoleBinding",
+            "Role",
+            "RoleBinding",
+        ] {
+            assert!(
+                !fixture.lines().any(|l| l.trim() == format!("kind: {kind}")),
+                "controller fixture defines a {kind}"
+            );
+        }
+        assert!(fixture.contains("serviceAccountName: buildkit-controller"));
+    }
 }

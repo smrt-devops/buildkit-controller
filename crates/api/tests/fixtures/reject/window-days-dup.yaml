@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: window-days-dup, namespace: default}
+spec:
+  scaling: {schedule: [{days: [Mon, Mon], start: "01:00", end: "02:00", min: 0}]}

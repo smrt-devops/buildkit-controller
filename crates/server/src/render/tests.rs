@@ -211,6 +211,52 @@ fn conflict_cases() -> Vec<(&'static str, Value, &'static str)> {
             json!({"platforms": ["linux/amd64"], "template": {"spec": {"nodeSelector": {"kubernetes.io/arch": "arm64"}}}}),
             "spec.template.spec.nodeSelector[kubernetes.io/arch]",
         ),
+        (
+            "priority-system",
+            c(json!({"priorityClassName": "system-node-critical"})),
+            "spec.template.spec.priorityClassName",
+        ),
+        (
+            "mount-bidirectional",
+            ctr(
+                json!({"volumeMounts": [{"name": "v", "mountPath": "/data", "mountPropagation": "Bidirectional"}]}),
+            ),
+            "spec.template.spec.containers[0].volumeMounts[0].mountPropagation",
+        ),
+        (
+            "mount-path-control",
+            ctr(json!({"volumeMounts": [{"name": "v", "mountPath": "/data\u{7f}"}]})),
+            "spec.template.spec.containers[0].volumeMounts[0].mountPath",
+        ),
+        (
+            "mount-subpath-control",
+            ctr(json!({"volumeMounts": [{"name": "v", "mountPath": "/data", "subPath": "a\nb"}]})),
+            "spec.template.spec.containers[0].volumeMounts[0].subPath",
+        ),
+        (
+            "projected-two-sources",
+            c(
+                json!({"volumes": [{"name": "t", "projected": {"sources": [{"secret": {"name": "s"}, "configMap": {"name": "c"}}]}}]}),
+            ),
+            "spec.template.spec.volumes[0].projected.sources[0]",
+        ),
+        (
+            "env-valuefrom-two",
+            ctr(
+                json!({"env": [{"name": "A", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}, "secretKeyRef": {"name": "s", "key": "k"}}}]}),
+            ),
+            "spec.template.spec.containers[0].env[0].valueFrom",
+        ),
+        (
+            "config-not-toml",
+            json!({"workers": {"buildkitdConfig": "[worker.oci\n", "cache": {"local": {}}}}),
+            "spec.workers.buildkitdConfig",
+        ),
+        (
+            "config-worker-not-table",
+            json!({"workers": {"buildkitdConfig": "worker = 1\n", "cache": {"local": {}}}}),
+            "spec.workers.buildkitdConfig",
+        ),
     ]
 }
 
@@ -649,7 +695,7 @@ fn local_cache_bounds_buildkitd_gc() {
     // 80% of the 20Gi default size.
     assert_eq!(
         buildkitd_config(&p),
-        "[worker.oci]\n  maxUsedSpace = \"17179869184\"\n  gc = true\n[history]\n  maxEntries = 0\n"
+        "[worker.oci]\nmaxUsedSpace = \"17179869184\"\ngc = true\n\n[history]\nmaxEntries = 0\n"
     );
     // A `gc = false` in the section is replaced; `gc` elsewhere and `gckeepstorage` stay.
     p.spec.workers.buildkitd_config =
@@ -660,30 +706,93 @@ fn local_cache_bounds_buildkitd_gc() {
     );
     assert_eq!(
         buildkitd_config(&p),
-        "debug = true\n[worker.oci]\n  maxUsedSpace = \"1073741824\"\n  gc = true\n  gckeepstorage = 1\n[worker.containerd]\n  gc = false\n[history]\n  maxEntries = 0\n"
+        "debug = true\n[worker.oci]\n  gc = true\n  gckeepstorage = 1\nmaxUsedSpace = \"1073741824\"\n[worker.containerd]\n  gc = false\n\n[history]\nmaxEntries = 0\n"
     );
-    p.spec.workers.buildkitd_config = "debug = true".into();
+    // A pool that sets maxUsedSpace keeps it and its own gc; history is turned off all the same.
+    p.spec.workers.buildkitd_config = "[worker.oci]\nmaxUsedSpace = \"5GB\"\ngc = false".into();
     assert_eq!(
         buildkitd_config(&p),
-        "debug = true\n[worker.oci]\n  maxUsedSpace = \"1073741824\"\n  gc = true\n[history]\n  maxEntries = 0\n"
+        "[worker.oci]\nmaxUsedSpace = \"5GB\"\ngc = false\n\n[history]\nmaxEntries = 0\n"
     );
-    // A pool that sets maxUsedSpace keeps it; history is turned off all the same.
-    p.spec.workers.buildkitd_config = "[worker.oci]\nmaxUsedSpace = \"5GB\"".into();
-    assert_eq!(
-        buildkitd_config(&p),
-        "[worker.oci]\nmaxUsedSpace = \"5GB\"\n[history]\n  maxEntries = 0\n"
-    );
-    // A [history] of the pool's own loses its maxEntries and keeps the rest.
+    // A [history] of the pool's own gets maxEntries = 0 and keeps the rest.
     p.spec.workers.buildkitd_config =
         "[history]\n  maxAge = 3600\n  maxEntries = 50\n[worker.oci]\nmaxUsedSpace = \"5GB\"\n"
             .into();
     assert_eq!(
         buildkitd_config(&p),
-        "[history]\n  maxEntries = 0\n  maxAge = 3600\n[worker.oci]\nmaxUsedSpace = \"5GB\"\n"
+        "[history]\n  maxAge = 3600\n  maxEntries = 0\n[worker.oci]\nmaxUsedSpace = \"5GB\"\n"
     );
     p.spec.workers.buildkitd_config = "debug = true".into();
     p.spec.workers.cache.local = None;
     assert_eq!(buildkitd_config(&p), "debug = true");
+}
+
+/// The parsed `buildkitd.toml` of a cached pool whose own config is `cfg`.
+fn cached_config(cfg: &str) -> toml_edit::DocumentMut {
+    let mut p = cached_pool(2, 5);
+    p.spec.workers.buildkitd_config = cfg.into();
+    assert!(validate_template(&p.spec).is_empty(), "{cfg}");
+    let out = buildkitd_config(&p);
+    out.parse()
+        .unwrap_or_else(|e| panic!("{cfg:?} rendered invalid TOML {out:?}: {e}"))
+}
+
+#[test]
+fn buildkitd_config_edits_any_valid_toml_form() {
+    let bound = |d: &toml_edit::DocumentMut| {
+        (
+            d["worker"]["oci"]["maxUsedSpace"]
+                .as_str()
+                .map(str::to_owned),
+            d["worker"]["oci"]["gc"].as_bool(),
+            d["history"]["maxEntries"].as_integer(),
+        )
+    };
+    let ours = (Some("17179869184".to_owned()), Some(true), Some(0));
+    for cfg in [
+        // A header with a trailing comment.
+        "[worker.oci] # tuned\nmax-parallelism = 4\n",
+        "[history] # kept short\nmaxAge = 60\n",
+        // Tables defined through dotted keys.
+        "[worker]\noci.gc = false\n",
+        "worker.oci.max-parallelism = 4\nhistory.maxEntries = 9\n",
+        // Inline tables.
+        "history = { maxAge = 3600 }\n",
+        "worker = { oci = { gc = false } }\n",
+        // Comments and gcpolicy entries that mention maxUsedSpace set no worker bound.
+        "# maxUsedSpace = \"1GB\"\n[worker.oci]\n",
+        "[[worker.oci.gcpolicy]]\nmaxUsedSpace = \"1GB\"\nall = true\n",
+    ] {
+        let d = cached_config(cfg);
+        assert_eq!(bound(&d), ours, "{cfg}");
+    }
+    // The pool's own worker bound stays, with its own gc setting.
+    let d = cached_config("worker.oci = { maxUsedSpace = \"5GB\", gc = false }\n");
+    assert_eq!(bound(&d), (Some("5GB".to_owned()), Some(false), Some(0)));
+}
+
+#[test]
+fn buildkitd_config_that_cannot_take_the_cache_settings_is_refused() {
+    for cfg in [
+        "[worker.oci\n",
+        "worker = 1\n",
+        "worker.oci = \"x\"\n",
+        "[[worker.oci]]\n",
+        "history = []\n",
+        "[history]\n[history]\n",
+    ] {
+        let mut p = cached_pool(2, 5);
+        p.spec.workers.buildkitd_config = cfg.into();
+        let c = validate_template(&p.spec);
+        assert!(
+            c.iter().any(|c| c.field == "spec.workers.buildkitdConfig"),
+            "{cfg:?}: {c:?}"
+        );
+    }
+    // Without cache.local the config is passed through unread.
+    let p = pool("p", json!({"workers": {"buildkitdConfig": "worker = 1\n"}}));
+    assert!(validate_template(&p.spec).is_empty());
+    assert_eq!(buildkitd_config(&p), "worker = 1\n");
 }
 
 fn pod_ann<'a>(p: &'a k8s_openapi::api::core::v1::Pod, k: &str) -> Option<&'a str> {
@@ -888,7 +997,7 @@ fn allow_cidr_overlapping_a_protected_range_is_refused() {
         ("10.0.0.0/8", "10.244.0.0/16"),
         ("10.244.3.0/24", "10.244.0.0/16"),
         ("10.100.0.10/32", "10.96.0.0/12"),
-        ("fd00::/8", "fd00:10:244::/56"),
+        ("fd00:10::/32", "fd00:10:244::/56"),
         ("fd00:10:244:7::/64", "fd00:10:244::/56"),
         // IPv4-mapped IPv6 names the IPv4 hosts.
         ("::ffff:169.254.169.254/128", "169.254.0.0/16"),
@@ -1044,4 +1153,124 @@ fn allow_cidr_overlapping_extra_denied_cidrs_is_refused() {
     net.permitted_cidrs = vec!["203.0.113.7/32".into()];
     assert_eq!(refused_allow_cidr("203.0.113.7/32", &net), None);
     assert!(refused_allow_cidr("203.0.113.8/32", &net).is_some());
+}
+
+#[test]
+fn cloud_metadata_endpoints_are_protected() {
+    let net = WorkerNetwork::default();
+    for (entry, hit) in [
+        // AWS IMDS over IPv6, GCE metadata over IPv6, Akamai metadata over IPv6.
+        ("fd00:ec2::254/128", "fd00:ec2::254/128"),
+        ("fd00:ec2::/32", "fd00:ec2::254/128"),
+        ("fd20:ce::254/128", "fd20:ce::254/128"),
+        ("fd00:a9fe:a9fe::1/128", "fd00:a9fe:a9fe::1/128"),
+        // Oracle Cloud and Scaleway metadata over IPv6.
+        ("fd00:c1::a9fe:a9fe/128", "fd00:c1::a9fe:a9fe/128"),
+        ("fd00:42::42/128", "fd00:42::42/128"),
+        // Alibaba Cloud.
+        ("100.100.100.200/32", "100.100.100.200/32"),
+        ("100.64.0.0/10", "100.100.100.200/32"),
+    ] {
+        let why = refused_allow_cidr(entry, &net).unwrap_or_else(|| panic!("{entry} allowed"));
+        assert!(why.contains(&format!(" {hit};")), "{entry}: {why}");
+    }
+    let mut net = net;
+    net.permitted_cidrs = vec!["fd00:ec2::254/128".into()];
+    assert_eq!(refused_allow_cidr("fd00:ec2::254/128", &net), None);
+}
+
+#[test]
+fn nat64_entries_are_checked_as_the_ipv4_they_reach() {
+    let net = cluster_net();
+    for (entry, hit) in [
+        // 64:ff9b::/96 (RFC 6052) embeds the IPv4 address in its last 32 bits.
+        ("64:ff9b::a9fe:a9fe/128", "169.254.0.0/16"),
+        ("64:ff9b::7f00:1/128", "127.0.0.0/8"),
+        ("64:ff9b::af4:0/120", "10.244.0.0/16"),
+        ("64:ff9b::a00:0/104", "10.244.0.0/16"),
+        // A range holding the whole NAT64 block reaches every IPv4 address.
+        ("64:ff9b::/64", "169.254.0.0/16"),
+        // The local-use prefix (RFC 8215) places the IPv4 address where the
+        // operator chose, so any entry inside it is refused.
+        ("64:ff9b:1::/48", "64:ff9b:1::/48"),
+        ("64:ff9b:1:ab::/64", "64:ff9b:1::/48"),
+        ("64:ff9b:1::808:808/128", "64:ff9b:1::/48"),
+    ] {
+        let why = refused_allow_cidr(entry, &net).unwrap_or_else(|| panic!("{entry} allowed"));
+        assert!(why.contains(&format!(" {hit};")), "{entry}: {why}");
+    }
+    assert_eq!(
+        refused_allow_cidr("64:ff9b::/96", &net).as_deref(),
+        Some("opens a whole address family")
+    );
+    // A public IPv4 destination through NAT64 is allowed, as it is directly.
+    assert_eq!(refused_allow_cidr("64:ff9b::808:808/128", &net), None);
+    assert_eq!(refused_allow_cidr("64:ff9b::c000:200/120", &net), None);
+    // An operator permit in IPv4 form covers the NAT64 form of the same hosts.
+    let mut net = net;
+    net.permitted_cidrs = vec!["10.244.1.0/24".into()];
+    assert_eq!(refused_allow_cidr("64:ff9b::af4:100/120", &net), None);
+}
+
+#[test]
+fn cache_settings_the_pod_never_reads_leave_the_hash_alone() {
+    let base = cached_pool(2, 5);
+    let hash = |p: &BuildKitPool| template_hash(p).unwrap();
+    let mut other = base.clone();
+    let lc = other.spec.workers.cache.local.as_mut().unwrap();
+    lc.keys_per_volume = 16;
+    lc.affinity = buildkit_controller_api::v1alpha1::CacheAffinity::Off;
+    assert_eq!(hash(&base), hash(&other));
+    for edit in [
+        |lc: &mut buildkit_controller_api::v1alpha1::LocalCache| {
+            lc.size = k8s_openapi::apimachinery::pkg::api::resource::Quantity("30Gi".into());
+        },
+        |lc: &mut buildkit_controller_api::v1alpha1::LocalCache| {
+            lc.storage_class = Some("fast".into());
+        },
+        |lc: &mut buildkit_controller_api::v1alpha1::LocalCache| lc.max_volumes = 3,
+        |lc: &mut buildkit_controller_api::v1alpha1::LocalCache| {
+            lc.scope = buildkit_controller_api::v1alpha1::CacheScope::Pool;
+        },
+    ] {
+        let mut p = base.clone();
+        edit(p.spec.workers.cache.local.as_mut().unwrap());
+        assert_ne!(hash(&base), hash(&p));
+    }
+}
+
+#[test]
+fn startup_is_probed_fast_and_readiness_slowly() {
+    let spec = pod_spec(&pool("p", json!({}))).unwrap();
+    let c = &spec.containers[0];
+    let startup = c.startup_probe.as_ref().unwrap();
+    let ready = c.readiness_probe.as_ref().unwrap();
+    assert_eq!(startup.exec, ready.exec);
+    assert_eq!(startup.period_seconds, Some(1));
+    // Never shorter than the longest startTimeout (30m): the reconciler retires a slow pod first.
+    let budget = startup.period_seconds.unwrap() * startup.failure_threshold.unwrap();
+    assert!(budget > 30 * 60, "{budget}");
+    assert_eq!(ready.period_seconds, Some(10));
+    assert_eq!(c.image_pull_policy.as_deref(), Some("IfNotPresent"));
+}
+
+#[test]
+fn history_is_off_even_when_the_gc_bound_cannot_be_read() {
+    let mut p = cached_pool(2, 5);
+    p.spec.workers.cache.local.as_mut().unwrap().size =
+        k8s_openapi::apimachinery::pkg::api::resource::Quantity("25e9".into());
+    p.spec.workers.buildkitd_config = "debug = true\n".into();
+    let d: toml_edit::DocumentMut = buildkitd_config(&p).parse().unwrap();
+    assert_eq!(d["history"]["maxEntries"].as_integer(), Some(0));
+    assert!(
+        d.get("worker")
+            .is_none_or(|w| w.get("oci").is_none_or(|o| o.get("maxUsedSpace").is_none()))
+    );
+    // The config check runs all the same.
+    p.spec.workers.buildkitd_config = "worker = 1\n".into();
+    assert!(
+        validate_template(&p.spec)
+            .iter()
+            .any(|c| c.field == "spec.workers.buildkitdConfig")
+    );
 }

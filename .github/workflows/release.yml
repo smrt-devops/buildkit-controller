@@ -33,10 +33,16 @@ jobs:
             echo "::error::$SHA is not reachable from main; refusing to release"
             exit 1
           fi
-          # rust.yml covers fmt, clippy, test, deny and the image build. Require its push run on this exact commit.
+          # rust.yml covers fmt, clippy, test, deny, the chart checks and the image build. Require its push run, and action.yml's, on this exact commit.
           n="$(gh api "repos/$REPO/actions/workflows/rust.yml/runs?head_sha=$SHA&event=push&status=success" --jq .total_count)"
           if [ "$n" -lt 1 ]; then
             echo "::error::no successful push run of rust.yml on $SHA"
+            exit 1
+          fi
+          # The Action tests, shellcheck and the recipe are what the vN tag ships to every user.
+          n="$(gh api "repos/$REPO/actions/workflows/action.yml/runs?head_sha=$SHA&event=push&status=success" --jq .total_count)"
+          if [ "$n" -lt 1 ]; then
+            echo "::error::no successful push run of action.yml on $SHA"
             exit 1
           fi
 

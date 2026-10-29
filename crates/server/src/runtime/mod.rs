@@ -1,9 +1,10 @@
-//! The server runtime. Every phase-2 module plugs into it.
+//! The server runtime: the kube client, the shared stores, readiness, metrics,
+//! leadership and the ordered shutdown that `main` runs the components on.
 //!
-//! # Plugging in
+//! # The context
 //!
-//! Each of reconcile, alloc, http and edge receives an [`AppContext`] and
-//! nothing else global. Its stable surface:
+//! Each of reconcile, alloc, http, edge, the certificate loader and the claim
+//! controller receives an [`AppContext`] and nothing else global. Its surface:
 //!
 //! | Accessor | Gives |
 //! |---|---|
@@ -18,18 +19,22 @@
 //! | [`AppContext::readiness`] | register `/readyz` checks: `ca_loaded`, `serving_cert`, `api_listener`, `edge_listener` |
 //! | [`AppContext::wait_synced`] | resolves once Pool and Pod stores and the CA Secret watch saw `InitDone` |
 //!
-//! Long-running modules implement [`hooks::Component`] (alloc, http and edge; they run on
-//! every replica until the shutdown token fires) or [`hooks::LeaderWork`]
-//! (reconcile; it starts per leadership term, after `wait_synced`, dropped when
-//! leadership ends). Replace the stubs in [`hooks::Hooks`].
+//! Long-running modules implement [`hooks::Component`] (alloc, http, edge and
+//! the certificate loader run on every replica until their stage's shutdown
+//! token fires; the claim controller acts only while leading) or
+//! [`hooks::LeaderWork`] (reconcile; it starts per leadership term, after
+//! `wait_synced`, and is dropped when leadership ends). `main` fills
+//! [`hooks::Hooks`] with them.
 
 mod idle;
 
 pub mod hooks;
 pub mod leader;
+pub mod listen;
 pub mod metrics;
 pub mod readiness;
 pub mod shutdown;
+pub mod stop;
 pub mod stores;
 
 use std::sync::Arc;
@@ -146,8 +151,7 @@ impl AppContext {
                 ca_secret_name: &settings.config.pki.ca_secret_name,
                 serving_secret_name: &settings.config.edge.tls.secret_name,
                 metrics: Arc::clone(&metrics),
-                pools_ready: readiness.register("pool_store"),
-                pods_ready: readiness.register("pod_store"),
+                readiness: Arc::clone(&readiness),
             },
             shutdown,
         );

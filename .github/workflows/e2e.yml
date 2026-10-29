@@ -28,6 +28,52 @@ jobs:
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
       - run: cargo xtask e2e
 
+  # The cheap kind suites, on every pull request: the CRD against its fixtures, the rendered
+  # objects server-side, and the chart installed on a cluster. Each leg has its own runner,
+  # so none needs a BK_KIND_SUFFIX.
+  kind:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [crd-verify, render-verify, helm-verify]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - run: cargo xtask ${{ matrix.suite }}
+
+  # examples/*.yaml against the CRDs in a real API server, so a field rename that breaks the files
+  # the README tells users to apply fails here.
+  examples:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Dry-run every example on a throwaway cluster
+        run: |
+          set -euo pipefail
+          kind create cluster --name bk-examples --wait 120s
+          trap 'kind delete cluster --name bk-examples' EXIT
+          kubectl apply --server-side -f helm/buildkit-controller/crds/buildkitpools.yaml
+          helm template bk helm/buildkit-controller --show-only templates/crd-buildkitclaims.yaml \
+            --set claims.enabled=true --set 'claims.namespaces={apps}' --set gateway.enabled=false \
+            --set edge.endpoint=tcp://bk.example.com:8444 --set edge.serverName=bk.example.com |
+            kubectl apply --server-side -f -
+          kubectl wait --for condition=established --timeout=60s crd --all
+          kubectl create namespace ci
+          kubectl create namespace apps
+          for f in examples/pool-*.yaml examples/claim-pod.yaml; do
+            echo "== $f"
+            kubectl apply --dry-run=server --validate=strict -f "$f"
+          done
+
   # The real GitHub Action with this job's OIDC token, against a kind install
   # that trusts GitHub's issuer for this repository only. The install sits behind
   # Envoy Gateway; target/e2e/api-ca.pem is the Gateway's self-signed certificate.
@@ -81,6 +127,23 @@ jobs:
           kubectl --kubeconfig target/e2e/kubeconfig -n bk-system logs deploy/buildkit-controller --tail=100
           kubectl --kubeconfig target/e2e/kubeconfig get gateway,httproute,tlsroute,backendtlspolicy -A -o yaml
           kubectl --kubeconfig target/e2e/kubeconfig -n envoy-gateway-system logs deploy/envoy-gateway --tail=100
+
+  # The remaining kind suites, nightly and on demand only. Each leg has its own runner, so none
+  # needs a BK_KIND_SUFFIX.
+  nightly:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [alloc-verify, api-verify, runtime-verify, reconcile-verify, edge-verify, claim-verify, proxy-verify]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - run: cargo xtask ${{ matrix.suite }}
 
   # Cert-lifecycle soak (cargo xtask soak). Long: nightly and on demand only.
   soak:

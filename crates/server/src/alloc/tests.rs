@@ -61,6 +61,10 @@ struct World {
     lost_creates: Option<bool>,
     /// Every worker Secret create fails with this.
     secret_err: Option<String>,
+    /// Every `get_pvc` fails with this.
+    pvc_get_err: Option<String>,
+    /// Answer every claim patch `Unknown` after this long, unapplied (sustained throttling).
+    unknown_claims: Option<Duration>,
 }
 
 struct Fake {
@@ -112,6 +116,20 @@ impl Backend for Fake {
             if let (true, Some(out)) = (commit, w.extend.clone()) {
                 return Box::pin(async move { out });
             }
+        }
+        let (throttle, sent) = {
+            let w = self.w.lock().unwrap();
+            (w.unknown_claims, w.patches.len())
+        };
+        if let (false, Some(d)) = (first_replace == DRAINING, throttle) {
+            // A retry storm ends the request instead of running forever.
+            if sent > 400 {
+                return Box::pin(async { PatchOutcome::Failed("retry storm".into()) });
+            }
+            return Box::pin(async move {
+                tokio::time::sleep(d).await;
+                PatchOutcome::Unknown
+            });
         }
         if first_replace == DRAINING {
             let mut w = self.w.lock().unwrap();
@@ -218,7 +236,10 @@ impl Backend for Fake {
     ) -> BoxFuture<'static, Result<Option<PersistentVolumeClaim>, String>> {
         let mut w = self.w.lock().unwrap();
         w.calls.push(format!("get_pvc {name}"));
-        let out = Ok(w.pvcs.get(name).cloned());
+        let out = match w.pvc_get_err.clone() {
+            Some(e) => Err(e),
+            None => Ok(w.pvcs.get(name).cloned()),
+        };
         Box::pin(async move { out })
     }
 
@@ -331,6 +352,8 @@ fn env_full(max: i32, cold: bool, queue_cap: usize, cache: bool) -> Env {
             create_delay: Duration::ZERO,
             lost_creates: None,
             secret_err: None,
+            pvc_get_err: None,
+            unknown_claims: None,
         }),
         tx: tx.clone(),
     });
@@ -942,7 +965,7 @@ async fn waiters_status_written_on_change_heartbeat_and_zero() {
     let e = env_with(4, false, 10);
     let mut writer = WaitersWriter::new("r1".into(), e.engine.pools.clone());
     let key = (NS.to_owned(), POOL.to_owned());
-    let ticket = e.engine.queues.enqueue(&key).unwrap();
+    let ticket = e.engine.queues.enqueue(&key, None).unwrap();
     writer.tick(&e.engine.queues, &*e.fake).await;
     tokio::time::sleep(Duration::from_secs(10)).await;
     writer.tick(&e.engine.queues, &*e.fake).await;
@@ -1197,7 +1220,7 @@ async fn waiters_of_a_deleted_pool_are_not_written_again() {
     let mut e = env_with(4, false, 10);
     let mut writer = WaitersWriter::new("r1".into(), e.engine.pools.clone());
     let key = (NS.to_owned(), POOL.to_owned());
-    let ticket = e.engine.queues.enqueue(&key).unwrap();
+    let ticket = e.engine.queues.enqueue(&key, None).unwrap();
     writer.tick(&e.engine.queues, &*e.fake).await;
     drop(ticket);
     e.pools
@@ -1797,17 +1820,29 @@ async fn a_lost_create_answer_is_read_back_before_any_secret() {
     for landed in [true, false] {
         let e = env_with(1, true, 10);
         e.fake.w.lock().unwrap().lost_creates = Some(landed);
-        let got = e.engine.allocate(&sa("b"), &req(0)).await.err();
-        assert_eq!(got, Some(AllocError::UpstreamError), "landed {landed}");
-        tokio::time::sleep(Duration::from_secs(15)).await;
-        settle().await;
+        let engine = Arc::clone(&e.engine);
+        let h = tokio::spawn(async move { engine.allocate(&sa("b"), &req(0)).await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
         let calls = e.fake.calls();
         assert_eq!(calls[..2], ["create p-0", "get p-0"], "{calls:?}");
         let secret = calls.iter().any(|c| c.starts_with("secret create"));
-        // A pod that landed gets its Secret (owned by it) and is retired;
-        // a pod that did not land gets no Secret at all.
+        // A pod that landed gets its Secret (owned by it); a pod that did not
+        // land gets no Secret at all.
         assert_eq!(secret, landed, "{calls:?}");
-        assert!(e.fake.get("p-0").is_none(), "{calls:?}");
+        if landed {
+            // The read-back found the pod, so the request goes on with it.
+            e.fake.set_ready("p-0");
+            let a = h.await.unwrap().unwrap();
+            assert_eq!(a.pod().0, "p-0");
+            let _ = a.commit();
+            settle().await;
+            assert!(e.fake.get("p-0").is_some(), "{:?}", e.fake.calls());
+        } else {
+            assert_eq!(h.await.unwrap().err(), Some(AllocError::UpstreamError));
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            settle().await;
+            assert!(e.fake.get("p-0").is_none(), "{calls:?}");
+        }
     }
 }
 
@@ -2140,4 +2175,317 @@ async fn warm_pods_of_another_scope_are_recycled_when_nothing_else_is_left() {
     // `a` is never recycled for: it still has its own pod.
     let r = e.engine.allocate(&sa("a"), &req(0)).await.unwrap();
     assert_eq!(r.pod().0, format!("{POOL}-{}", 1 - slot));
+}
+
+// Review fixes: transient API errors, lost claims, replicas, queue and cold-path order.
+
+fn api_error(code: u16, reason: &str, message: &str) -> kube::Error {
+    let s = json!({"code": code, "reason": reason, "message": message});
+    kube::Error::Api(Box::new(serde_json::from_value(s).unwrap()))
+}
+
+#[test]
+fn throttling_is_transient_and_a_refused_create_keeps_its_reason() {
+    use super::backend::{Class, classify, created, from_class, pvc_created};
+    for code in [408, 429, 500, 503] {
+        let c = classify(Ok(api_error(code, "TooManyRequests", "slow down")));
+        assert_eq!(c, Class::Unknown, "{code}");
+    }
+    // A throttled claim or retire is retried, not given up.
+    let c = classify(Ok(api_error(429, "TooManyRequests", "")));
+    assert!(matches!(from_class(c), PatchOutcome::Unknown));
+    let c = classify(Ok(api_error(429, "TooManyRequests", "")));
+    assert!(matches!(
+        pvc_created(&c, "throttled".into()),
+        PvcCreate::Unknown(_)
+    ));
+    // A create refused by admission or validation names the server's reason.
+    let c = classify(Ok(api_error(422, "Invalid", "denied by policy-x")));
+    match created(c) {
+        CreateOutcome::Failed(m) => assert_eq!(m, "http 422 Invalid: denied by policy-x"),
+        other => panic!("{other:?}"),
+    }
+    let c = classify(Ok(api_error(409, "AlreadyExists", "")));
+    assert!(matches!(created(c), CreateOutcome::Exists));
+    let c = classify(Ok(api_error(403, "Forbidden", "exceeded quota: q")));
+    assert!(matches!(created(c), CreateOutcome::Quota));
+    let c = classify(Ok(api_error(403, "Forbidden", "no rbac")));
+    assert!(matches!(created(c), CreateOutcome::Failed(_)));
+    let c = classify(Ok(api_error(422, "Invalid", "test failed")));
+    assert!(matches!(from_class(c), PatchOutcome::Lost));
+}
+
+impl Fake {
+    /// Change the pod on the "API server" only, as another replica would,
+    /// leaving this replica's store behind.
+    fn set_remote(&self, pod: Pod) {
+        let name = pod.metadata.name.clone().unwrap();
+        self.w.lock().unwrap().pods.insert(name, pod);
+    }
+}
+
+fn metrics_text(m: &AllocMetrics) -> String {
+    let mut reg = prometheus_client::registry::Registry::default();
+    m.register(&mut reg);
+    let mut s = String::new();
+    prometheus_client::encoding::text::encode(&mut s, &reg).unwrap();
+    s
+}
+
+fn taken(p: &Pod) -> Pod {
+    let mut p = p.clone();
+    p.metadata
+        .annotations
+        .get_or_insert_default()
+        .insert(ANN_ALLOC.into(), "another-replica".into());
+    p
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lost_claim_moves_to_the_next_pod() {
+    let e = env_with(2, false, 10);
+    let (p0, p1) = (e.warm(0), e.warm(1));
+    e.fake.set_remote(taken(&e.fake.get(&p0).unwrap()));
+    let a = e.engine.allocate(&sa("b"), &req(0)).await.unwrap();
+    assert_eq!(a.pod().0, p1);
+    let _ = a.commit();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_head_whose_claims_lost_tries_again_without_a_pod_event() {
+    // No drive task: no pod event wakes the queue.
+    let e = env_with(1, false, 10);
+    let p0 = e.warm(0);
+    let free = e.fake.get(&p0).unwrap();
+    e.fake.set_remote(taken(&free));
+    let engine = Arc::clone(&e.engine);
+    let h = tokio::spawn(async move { engine.allocate(&sa("b"), &req(60)).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(metrics_text(&e.metrics).contains("claim_conflicts_total{"));
+    assert!(!h.is_finished());
+    // The other replica's allocation ends; this replica's store never showed it.
+    e.fake.set_remote(free);
+    let a = tokio::time::timeout(Duration::from_secs(5), h)
+        .await
+        .expect("the head retried after the conflict")
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.pod().0, p0);
+    let _ = a.commit();
+}
+
+impl Env {
+    /// Another replica over the same API server, with its own metrics and queues.
+    fn replica(&self, pods: kube::runtime::reflector::Store<Pod>) -> (Arc<Engine>, AllocMetrics) {
+        let tx = self.fake.tx.clone();
+        let metrics = AllocMetrics::default();
+        let engine = Engine::new(
+            Arc::clone(&self.fake) as Arc<dyn Backend>,
+            self.pools.as_reader(),
+            pods,
+            Box::new(move || PodSubscription::new(tx.subscribe())),
+            Arc::new(MaterialSource::new(self.ca_tx.subscribe())),
+            EngineConfig {
+                endpoint: "tcp://bk.example.com:8444".into(),
+                server_name: "bk.example.com".into(),
+                allocation_domain: None,
+            },
+            metrics.clone(),
+            Arc::new(Queues::new(10, metrics.clone())),
+        );
+        (Arc::new(engine), metrics)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_replicas_never_claim_the_same_pod() {
+    let e = env_with(1, false, 10);
+    let p0 = e.warm(0);
+    // Replica B's store still shows the pod free after A claimed it.
+    let mut stale = Writer::<Pod>::default();
+    stale.apply_watcher_event(&watcher::Event::Apply(e.fake.get(&p0).unwrap()));
+    let (b, b_metrics) = e.replica(stale.as_reader());
+    let a = e.engine.allocate(&sa("a"), &req(0)).await.unwrap();
+    let got = b.allocate(&sa("b"), &req(0)).await.err();
+    assert!(matches!(got, Some(AllocError::PoolExhausted(_))), "{got:?}");
+    assert!(metrics_text(&b_metrics).contains("claim_conflicts_total{"));
+    let pod = e.fake.get(&p0).unwrap();
+    assert_eq!(ann(&pod, ANN_ALLOC), Some(a.response().id.as_str()));
+    let _ = a.commit();
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_replicas_creating_in_one_slot_leave_one_pod_and_one_loser() {
+    // One slot, and both replicas see it free: the second create gets
+    // AlreadyExists, finds no other slot, and claims nothing.
+    let e = env_with(1, true, 10);
+    let pods = e.fake.w.lock().unwrap().writer.as_reader();
+    let (b, _) = e.replica(pods);
+    let ea = Arc::clone(&e.engine);
+    let ha = tokio::spawn(async move { ea.allocate(&sa("a"), &req(0)).await });
+    let hb = tokio::spawn(async move { b.allocate(&sa("b"), &req(0)).await });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let creates: Vec<String> = (e.fake.calls().into_iter())
+        .filter(|c| c.starts_with("create "))
+        .collect();
+    assert_eq!(creates, ["create p-0", "create p-0"]);
+    e.fake.set_ready("p-0");
+    let (a, b) = (ha.await.unwrap(), hb.await.unwrap());
+    let (won, lost) = if a.is_ok() { (a, b) } else { (b, a) };
+    assert!(
+        matches!(lost, Err(AllocError::PoolExhausted(_))),
+        "{:?}",
+        lost.err()
+    );
+    let won = won.unwrap();
+    assert_eq!(won.pod().0, "p-0");
+    let pod = e.fake.get("p-0").unwrap();
+    assert_eq!(ann(&pod, ANN_ALLOC), Some(won.response().id.as_str()));
+    let _ = won.commit();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_queued_request_whose_attempt_fails_is_counted_as_an_error() {
+    let mut e = env_with(4, false, 10);
+    let _stop = e.spawn_drive();
+    let engine = Arc::clone(&e.engine);
+    let h = tokio::spawn(async move { engine.allocate(&sa("b"), &req(60)).await.map(|_| ()) });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut next = e.pool.clone();
+    next.metadata.uid = Some("9f6c1f4e-3b0a-4c43-9a55-5d4f0c7b1a99".into());
+    e.pools
+        .apply_watcher_event(&watcher::Event::Apply(next.clone()));
+    e.warm_for(&next, &e.ca, 0);
+    assert_eq!(h.await.unwrap(), Err(AllocError::PoolNotFound));
+    let m = metrics_text(&e.metrics);
+    let wait = m
+        .lines()
+        .find(|l| l.starts_with("queue_wait_seconds_count{"));
+    assert!(wait.unwrap().contains("result=\"error\""), "{m}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_waiter_of_another_scope_does_not_block_a_request_its_pods_can_serve() {
+    // max 2, both slots cached; creates hit quota.
+    let e = env_full(2, false, 10, true);
+    let b = e.scope(&sa("b"));
+    let p0 = e.warm(0);
+    e.bind(&p0, &b, "g0");
+    // Slot 1 holds a pod that is still starting, so nothing is recycled for `a`.
+    let p1 = e.warm(1);
+    let mut starting = e.fake.get(&p1).unwrap();
+    starting.status = None;
+    e.fake.put(starting);
+    let _stop = e.spawn_drive();
+    let engine = Arc::clone(&e.engine);
+    let ha = tokio::spawn(async move { engine.allocate(&sa("a"), &req(60)).await.map(|_| ()) });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!ha.is_finished());
+    let r = tokio::time::timeout(
+        Duration::from_secs(1),
+        e.engine.allocate(&sa("b"), &req(60)),
+    )
+    .await
+    .expect("`b` is not queued behind `a`")
+    .unwrap();
+    assert_eq!(r.pod().0, p0);
+    let _ = r.commit();
+    ha.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cold_pod_that_never_starts_leaves_the_volume_binding_alone() {
+    let e = env_full(1, true, 10, true);
+    let a = e.scope(&sa("a"));
+    e.seed_volume(0, &format!("{a}@g0"), "k");
+    let got = e.engine.allocate(&sa("b"), &keyed_req("k")).await.err();
+    assert_eq!(got, Some(AllocError::StartTimeout));
+    settle().await;
+    // `a` keeps its cache: `b`'s pod never ran its init step.
+    assert_eq!(e.volume_binding(0), Some(format!("{a}@g0")));
+    let calls = e.fake.calls();
+    assert!(
+        !calls.iter().any(|c| c.starts_with("annotate_pvc")),
+        "{calls:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cold_start_never_outlasts_the_claim() {
+    // TTL 60 s with the default 2 m startTimeout: the claim ends at 59 s.
+    let e = env_with(1, true, 10);
+    let mut r = req(0);
+    r.ttl_seconds = Some(60);
+    let t0 = tokio::time::Instant::now();
+    let got = e.engine.allocate(&sa("b"), &r).await.err();
+    assert_eq!(got, Some(AllocError::StartTimeout));
+    let waited = t0.elapsed();
+    assert!(
+        waited > Duration::from_secs(50) && waited < Duration::from_secs(59),
+        "{waited:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn volume_read_and_create_failures_of_the_api_server_are_upstream_errors() {
+    let e = env_full(1, true, 10, true);
+    e.fake.w.lock().unwrap().pvc_get_err = Some("timeout".into());
+    let got = e.engine.allocate(&sa("b"), &req(0)).await.err();
+    assert_eq!(got, Some(AllocError::UpstreamError));
+    {
+        let mut w = e.fake.w.lock().unwrap();
+        w.pvc_get_err = None;
+        w.pvc_create = PvcCreate::Unknown("timeout".into());
+    }
+    let got = e.engine.allocate(&sa("b"), &req(0)).await.err();
+    assert_eq!(got, Some(AllocError::UpstreamError));
+    e.fake.w.lock().unwrap().pvc_create = PvcCreate::Failed("bad".into());
+    let got = e.engine.allocate(&sa("b"), &req(0)).await.err();
+    assert_eq!(got, Some(AllocError::Internal));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_internal_ca_ending_before_the_allocation_is_ca_unavailable() {
+    let e = env_with(1, true, 10);
+    let born = OffsetDateTime::now_utc() - crate::pki::CA_VALIDITY + time::Duration::minutes(5);
+    let short = Arc::new(CaBundle::generate(born).unwrap());
+    e.ca_tx
+        .send(CertMaterial::from_bundle(short, CaCertRule::ClientCa))
+        .unwrap();
+    let got = e.engine.allocate(&sa("b"), &req(0)).await.err();
+    assert_eq!(got, Some(AllocError::CaUnavailable));
+    assert!(!e.fake.calls().iter().any(|c| c.starts_with("create ")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn throttled_claims_of_several_scope_heads_retry_once_a_second_each() {
+    // Two cached slots with warm pods any scope may take; every claim is throttled.
+    let e = env_full(2, false, 10, true);
+    e.warm(0);
+    e.warm(1);
+    e.fake.w.lock().unwrap().unknown_claims = Some(Duration::from_millis(300));
+    // `b` arrives 300 ms after `a`, so their retries do not line up.
+    let heads: Vec<_> = [("a", 0), ("b", 300)]
+        .into_iter()
+        .map(|(who, after)| {
+            let engine = Arc::clone(&e.engine);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(after)).await;
+                engine.allocate(&sa(who), &req(10)).await.map(|_| ())
+            })
+        })
+        .collect();
+    for h in heads {
+        assert!(matches!(
+            h.await.unwrap(),
+            Err(AllocError::PoolExhausted(_))
+        ));
+    }
+    let claims = (e.fake.calls().iter())
+        .filter(|c| c.starts_with("patch ") && !c.ends_with(" draining"))
+        .count();
+    // Each head tries both pods (0.6 s), then waits 1 s: about 7 attempts in
+    // 10 s, 2 heads x 2 pods x 7. With a shared wake per contended attempt each
+    // head re-attempts back to back instead (about 17 attempts each).
+    assert!((8..=40).contains(&claims), "{claims} claim patches");
 }

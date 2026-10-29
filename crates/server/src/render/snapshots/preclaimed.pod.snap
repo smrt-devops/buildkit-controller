@@ -1,5 +1,6 @@
 ---
 source: crates/server/src/render/tests.rs
+assertion_line: 29
 expression: y
 ---
 apiVersion: v1
@@ -19,7 +20,7 @@ metadata:
     app.kubernetes.io/name: buildkitd
     buildkit.smrt-devops.net/pool: preclaimed
     buildkit.smrt-devops.net/state: allocated
-    buildkit.smrt-devops.net/template-hash: 278c356824
+    buildkit.smrt-devops.net/template-hash: 01d83d4bae
   name: preclaimed-3
   namespace: render-verify
   ownerReferences:
@@ -55,7 +56,7 @@ spec:
         - debug
         - workers
       failureThreshold: 3
-      periodSeconds: 1
+      periodSeconds: 10
       timeoutSeconds: 5
     resources:
       limits:
@@ -67,6 +68,17 @@ spec:
         memory: 1Gi
     securityContext:
       privileged: false
+    startupProbe:
+      exec:
+        command:
+        - buildctl
+        - --addr
+        - unix:///run/user/1000/buildkit/buildkitd.sock
+        - debug
+        - workers
+      failureThreshold: 1860
+      periodSeconds: 1
+      timeoutSeconds: 5
     volumeMounts:
     - mountPath: /certs
       name: certs

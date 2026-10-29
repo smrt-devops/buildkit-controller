@@ -108,11 +108,16 @@ pub struct WorkerPod {
 }
 
 impl WorkerPod {
-    /// Parses a store pod. `None` unless its controller ownerReference uid is
-    /// `pool_uid` and it has a uid.
+    /// Parses a store pod. `None` unless it is in the pool's namespace
+    /// `pool_ns`, its controller ownerReference uid is `pool_uid`, and it has a
+    /// uid. The store spans every watched namespace, and an ownerReference
+    /// can be forged in any of them.
     #[must_use]
-    pub fn from_pod(pod: &Pod, pool: &str, pool_uid: &str) -> Option<Self> {
+    pub fn from_pod(pod: &Pod, pool_ns: &str, pool: &str, pool_uid: &str) -> Option<Self> {
         let m = &pod.metadata;
+        if m.namespace.as_deref() != Some(pool_ns) {
+            return None;
+        }
         let owned = m
             .owner_references
             .iter()
@@ -180,6 +185,16 @@ impl WorkerPod {
     #[must_use]
     pub fn terminating(&self) -> bool {
         self.deletion.is_some()
+    }
+
+    /// Serving: Ready when free, Running with an IP when allocated (a claim
+    /// needs Ready, so an allocated pod is judged by what its build needs).
+    #[must_use]
+    pub fn up(&self) -> bool {
+        match self.alloc {
+            Alloc::Allocated(_) => self.phase == Phase::Running && self.has_ip,
+            Alloc::Free | Alloc::Draining | Alloc::Unknown => self.ready,
+        }
     }
 }
 

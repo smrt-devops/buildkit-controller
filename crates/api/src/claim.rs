@@ -60,7 +60,7 @@ pub struct BuildKitClaimSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(
         length(min = 1, max = 63),
-        regex(pattern = r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+        regex(pattern = r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$")
     )]
     pub cache_key: Option<String>,
     /// Which cache layers to use, as `cache` of `POST /v1/allocations`. Unset means `auto`.

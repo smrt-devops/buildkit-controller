@@ -329,7 +329,7 @@ pub struct Edge {
     pub handshake_timeout: CrdDuration,
     /// Upstream connect timeout.
     pub upstream_connect_timeout: CrdDuration,
-    /// Established connection cap.
+    /// Established connection cap ([`EDGE_MAX_CONNECTIONS`] by default).
     pub max_connections: u32,
     /// In-handshake connection cap.
     pub max_handshakes: u32,
@@ -350,13 +350,19 @@ impl Default for Edge {
             tls: EdgeTls::default(),
             handshake_timeout: CrdDuration::new("10s"),
             upstream_connect_timeout: CrdDuration::new("5s"),
-            max_connections: 10_000,
+            max_connections: EDGE_MAX_CONNECTIONS,
             max_handshakes: 1024,
             max_handshakes_per_ip: 32,
             proxy_protocol: ProxyProtocol::default(),
         }
     }
 }
+
+/// Default `edge.maxConnections`, the same as the chart. Sized to the chart's
+/// 512Mi memory limit: an established edge connection holds about 200 KiB and
+/// an idle replica about 14 MiB, so 2000 connections stay near 400 MiB.
+/// Raise it together with the memory limit.
+pub const EDGE_MAX_CONNECTIONS: u32 = 2000;
 
 /// `edge.tls`.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -611,6 +617,23 @@ fn is_namespace_name(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// A lowercase DNS-1123 subdomain, the form of most object names.
+fn is_object_name(s: &str) -> bool {
+    s.len() <= 253 && s.split('.').all(is_namespace_name)
+}
+
+/// Each entry of `list` is a namespace name, listed once.
+fn namespace_list(field: &str, list: &[String], p: &mut Vec<String>) {
+    let mut seen = std::collections::BTreeSet::new();
+    for ns in list {
+        if !is_namespace_name(ns) {
+            p.push(format!("{field}: `{ns}` is not a namespace name"));
+        } else if !seen.insert(ns.as_str()) {
+            p.push(format!("{field}: `{ns}` is listed twice"));
+        }
+    }
+}
+
 fn is_dns_name(s: &str) -> bool {
     let s = s.strip_suffix('.').unwrap_or(s);
     !s.is_empty()
@@ -697,16 +720,19 @@ impl Config {
             "leaderElection.fenceMargin",
             &mut p,
         );
+        // A zero timeout fails every edge handshake or upstream dial at once.
         for (d, f) in [
             (&self.edge.handshake_timeout, "edge.handshakeTimeout"),
             (
                 &self.edge.upstream_connect_timeout,
                 "edge.upstreamConnectTimeout",
             ),
-            (&self.shutdown.delay, "shutdown.delay"),
         ] {
-            secs(d, f, &mut p);
+            if secs(d, f, &mut p).is_zero() {
+                p.push(format!("{f} must be positive"));
+            }
         }
+        secs(&self.shutdown.delay, "shutdown.delay", &mut p);
         if let Some(d) = &self.shutdown.drain_timeout {
             secs(d, "shutdown.drainTimeout", &mut p);
         }
@@ -722,8 +748,11 @@ impl Config {
         if ri.is_zero() {
             p.push("leaderElection.renewInterval must be positive".into());
         }
-        if self.leader_election.lease_name.is_empty() {
-            p.push("leaderElection.leaseName must not be empty".into());
+        if !is_object_name(&self.leader_election.lease_name) {
+            p.push(format!(
+                "leaderElection.leaseName must be a lowercase DNS-1123 subdomain (got `{}`)",
+                self.leader_election.lease_name
+            ));
         }
         if fm < rt {
             p.push(format!(
@@ -770,14 +799,8 @@ impl Config {
                     .into(),
             );
         }
-        let mut seen = std::collections::BTreeSet::new();
-        for ns in self.watched_namespaces() {
-            if !is_namespace_name(ns) {
-                p.push(format!("watchNamespaces: `{ns}` is not a namespace name"));
-            } else if !seen.insert(ns.as_str()) {
-                p.push(format!("watchNamespaces: `{ns}` is listed twice"));
-            }
-        }
+        namespace_list("watchNamespaces", self.watched_namespaces(), p);
+        namespace_list("claims.namespaces", &self.claims.namespaces, p);
     }
 
     fn validate_edge(&self, p: &mut Vec<String>) {
@@ -822,6 +845,13 @@ impl Config {
             if !o.url.starts_with("https://") {
                 p.push(format!(
                     "auth.oidc[{i}].url must be https (got `{}`)",
+                    o.url
+                ));
+            }
+            // `iss` is compared as an exact string and discovery appends a path to it.
+            if o.url.contains(['?', '#']) {
+                p.push(format!(
+                    "auth.oidc[{i}].url must not contain a query or fragment (got `{}`)",
                     o.url
                 ));
             }
@@ -936,6 +966,19 @@ impl Config {
             worker_min_left = lt.worker_min_left.as_str(),
             edge_validity = lt.edge_validity.as_str(),
             "pki.testLeafLifetimes is set: TEST ONLY short leaf lifetimes, never for production"
+        );
+        true
+    }
+
+    /// Logs a startup warning when `workerNetwork.clusterCIDRs` is empty, so a
+    /// pool's `allowCIDRs` cannot be checked against the cluster's ranges;
+    /// returns whether it did.
+    pub fn warn_unchecked_cluster_ranges(&self) -> bool {
+        if !self.worker_network.cluster_cidrs.is_empty() {
+            return false;
+        }
+        tracing::warn!(
+            "workerNetwork.clusterCIDRs is empty: allowCIDRs entries cannot be checked against the cluster's pod, service and node ranges, so a pool can open worker egress into the cluster; set clusterCIDRs"
         );
         true
     }

@@ -7,6 +7,7 @@ use kube::runtime::watcher::Event;
 use tokio::sync::broadcast;
 
 use super::*;
+use crate::runtime::metrics::Metrics;
 use crate::runtime::readiness::Readiness;
 
 fn pod(name: &str) -> Pod {
@@ -42,7 +43,7 @@ async fn run_pods(
     let flag = readiness.register("pod_store");
     drive(
         writer,
-        once(events.into_iter().map(Ok).collect()),
+        restarting(once(events.into_iter().map(Ok).collect())),
         flag,
         |_| {},
         move |ev| forward_pod(&tx, ev),
@@ -153,12 +154,11 @@ async fn run_merged(input: Vec<Tagged>) -> (Store<Pod>, Vec<String>, Arc<Readine
         vec!["a".into(), "b".into()],
         store.clone(),
     );
-    let mut first = Some(merged.boxed());
     let mut seen = Vec::new();
     let errors = std::sync::atomic::AtomicUsize::new(0);
     drive(
         writer,
-        move || first.take().unwrap_or_else(|| stream::empty().boxed()),
+        merged,
         flag,
         |_| {
             errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -315,7 +315,7 @@ where
 {
     let readiness = Arc::new(Readiness::default());
     let flag = readiness.register("pod_store");
-    tokio::spawn(drive(writer, watch, flag, |_| {}, |_| {}));
+    tokio::spawn(drive(writer, restarting(watch), flag, |_| {}, |_| {}));
     readiness
 }
 
@@ -420,40 +420,157 @@ async fn a_long_outage_marks_the_store_stale_after_the_bound_until_a_relist() {
     assert_eq!(readiness.failing(), ["pod_store"]);
 }
 
-#[tokio::test(start_paused = true)]
-async fn one_namespace_failing_keeps_the_merged_store_ready_until_the_bound() {
+/// A tolerant merge of namespaces `a` and `b`, each fed by hand with `n`
+/// watches (one per restart), driving a `pod_store` in the background.
+struct Tolerant {
+    store: Store<Pod>,
+    a: Vec<mpsc::UnboundedSender<Item>>,
+    b: Vec<mpsc::UnboundedSender<Item>>,
+    readiness: Arc<Readiness>,
+    metrics: Arc<Metrics>,
+}
+
+fn tolerant(n: usize) -> Tolerant {
     let (store, writer) = reflector::store::<Pod>();
-    let (txs, rxs): (Vec<_>, Vec<_>) = (0..3).map(|_| mpsc::unbounded::<Tagged>()).unzip();
-    let mut rxs = rxs.into_iter();
-    let s = store.clone();
-    let watch = move || match rxs.next() {
-        Some(rx) => merge_namespaces(rx.boxed(), vec!["a".into(), "b".into()], s.clone()).boxed(),
-        None => stream::pending().boxed(),
-    };
-    let readiness = spawn_pods(writer, watch);
-    let list = |i: usize, pods: Vec<Pod>| listed(&pods).into_iter().map(move |e| (i, e));
-    send(&txs[0], list(0, vec![pod_in("a", "p1")]));
-    send(&txs[0], list(1, vec![pod_in("b", "q1")]));
-    settle().await;
-    assert!(readiness.failing().is_empty());
+    let (a, wa) = fed(n);
+    let (b, wb) = fed(n);
+    let tagged = stream::select_all([
+        restarting(wa).map(|ev| (0, ev)).boxed(),
+        restarting(wb).map(|ev| (1, ev)).boxed(),
+    ]);
+    let readiness = Arc::new(Readiness::default());
+    let metrics = Arc::new(Metrics::new());
+    let merged = merge_tolerant(
+        tagged.boxed(),
+        vec!["a".into(), "b".into()],
+        store.clone(),
+        NamespaceReport::full("pod", Arc::clone(&metrics), Arc::clone(&readiness)),
+    );
+    let flag = readiness.register("pod_store");
+    tokio::spawn(drive(writer, merged, flag, |_| {}, |_| {}));
+    Tolerant {
+        store,
+        a,
+        b,
+        readiness,
+        metrics,
+    }
+}
 
+/// Every restart of `txs` fails at once.
+fn fail_every(txs: &[mpsc::UnboundedSender<Item>]) {
+    for tx in txs {
+        send(tx, [failed()]);
+    }
+}
+
+fn unlisted_gauge(m: &Metrics, ns: &str) -> bool {
+    m.render().contains(&format!(
+        "buildkit_watch_namespace_unlisted{{kind=\"pod\",namespace=\"{ns}\"}} 1"
+    ))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_namespace_that_never_lists_is_given_up_and_the_others_are_served() {
+    let t = tolerant(10);
     let t0 = tokio::time::Instant::now();
-    send(&txs[0], [(1, failed())]);
-    // Both namespaces relist; `a` is done, `b` is not, and then fails again.
-    at(t0, 2 * SEC).await;
-    send(&txs[1], list(0, vec![pod_in("a", "p1")]));
-    send(&txs[1], [(1, Ok(Event::Init)), (1, failed())]);
-    at(t0, STALE_AFTER.checked_sub(SEC).unwrap()).await;
-    assert!(readiness.failing().is_empty(), "inside the bound");
-    assert_eq!(keys(&store), ["a/p1", "b/q1"], "last good state kept");
-    at(t0, STALE_AFTER + SEC).await;
-    assert_eq!(readiness.failing(), ["pod_store"]);
+    send(&t.a[0], listed(&[pod_in("a", "p1")]));
+    fail_every(&t.b);
+    at(t0, GIVE_UP_AFTER.checked_sub(SEC).unwrap()).await;
+    assert_eq!(t.readiness.failing(), ["pod_store"], "b still has time");
+    assert!(keys(&t.store).is_empty());
 
-    send(&txs[2], list(0, vec![pod_in("a", "p1")]));
-    send(&txs[2], list(1, vec![pod_in("b", "q2")]));
+    at(t0, GIVE_UP_AFTER + SEC).await;
+    assert!(t.readiness.failing().is_empty(), "served without b");
+    assert_eq!(keys(&t.store), ["a/p1"]);
+    assert_eq!(t.readiness.degraded(), ["pod_store/b"]);
+    assert!(unlisted_gauge(&t.metrics, "b"));
+    // The errors of b no longer count against readiness.
+    at(t0, GIVE_UP_AFTER + STALE_AFTER * 3).await;
+    assert!(t.readiness.failing().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_namespace_given_up_is_merged_back_when_it_lists() {
+    let t = tolerant(10);
+    let t0 = tokio::time::Instant::now();
+    send(&t.a[0], listed(&[pod_in("a", "p1")]));
+    // b fails its first five watches, then lists.
+    fail_every(&t.b[..5]);
+    at(t0, GIVE_UP_AFTER + SEC).await;
+    assert_eq!(t.readiness.degraded(), ["pod_store/b"]);
+    send(&t.b[5], listed(&[pod_in("b", "q1")]));
+    at(t0, GIVE_UP_AFTER + 40 * SEC).await;
+    assert_eq!(keys(&t.store), ["a/p1", "b/q1"]);
+    assert!(t.readiness.degraded().is_empty());
+    assert!(!unlisted_gauge(&t.metrics, "b"));
+    assert!(t.readiness.failing().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_namespace_failing_after_sync_keeps_the_store_ready_and_its_objects() {
+    let t = tolerant(10);
+    send(&t.a[0], listed(&[pod_in("a", "p1")]));
+    send(&t.b[0], listed(&[pod_in("b", "q1")]));
     settle().await;
-    assert!(readiness.failing().is_empty(), "every namespace relisted");
-    assert_eq!(keys(&store), ["a/p1", "b/q2"]);
+    assert!(t.readiness.failing().is_empty());
+    let t0 = tokio::time::Instant::now();
+    fail_every(&t.b);
+    at(t0, STALE_AFTER * 3).await;
+    assert!(
+        t.readiness.failing().is_empty(),
+        "one broken namespace does not take the store down"
+    );
+    assert_eq!(t.readiness.degraded(), ["pod_store/b"]);
+    assert_eq!(keys(&t.store), ["a/p1", "b/q1"], "b's last list is kept");
+    // a still flows.
+    send(&t.a[0], [Ok(Event::Apply(pod_in("a", "p2")))]);
+    settle().await;
+    assert_eq!(keys(&t.store), ["a/p1", "a/p2", "b/q1"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_relist_of_one_namespace_restarts_only_that_namespace() {
+    let t = tolerant(3);
+    send(&t.a[0], listed(&[pod_in("a", "p1")]));
+    send(&t.b[0], listed(&[pod_in("b", "q1")]));
+    settle().await;
+    let t0 = tokio::time::Instant::now();
+    send(&t.b[0], [failed()]);
+    at(t0, 2 * SEC).await;
+    send(&t.b[1], listed(&[pod_in("b", "q2")]));
+    settle().await;
+    // a's first watch is still the one in use: an event on it lands.
+    send(&t.a[0], [Ok(Event::Apply(pod_in("a", "p2")))]);
+    settle().await;
+    assert_eq!(keys(&t.store), ["a/p1", "a/p2", "b/q2"]);
+    at(t0, STALE_AFTER * 2).await;
+    assert!(t.readiness.failing().is_empty(), "the relist made it whole");
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_namespace_failing_still_goes_stale() {
+    let t = tolerant(10);
+    send(&t.a[0], listed(&[pod_in("a", "p1")]));
+    send(&t.b[0], listed(&[pod_in("b", "q1")]));
+    settle().await;
+    let t0 = tokio::time::Instant::now();
+    fail_every(&t.a);
+    fail_every(&t.b);
+    at(t0, STALE_AFTER.checked_sub(SEC).unwrap()).await;
+    assert!(t.readiness.failing().is_empty(), "inside the bound");
+    at(t0, STALE_AFTER + SEC).await;
+    assert_eq!(t.readiness.failing(), ["pod_store"]);
+    assert_eq!(t.readiness.degraded(), ["pod_store/a", "pod_store/b"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_namespace_failing_from_the_start_never_becomes_ready() {
+    let t = tolerant(10);
+    fail_every(&t.a);
+    fail_every(&t.b);
+    tokio::time::sleep(STALE_AFTER * 3).await;
+    assert_eq!(t.readiness.failing(), ["pod_store"]);
 }
 
 /// What the client's read timeout does to a watch: when `events` yields

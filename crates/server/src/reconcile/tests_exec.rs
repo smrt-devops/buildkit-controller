@@ -36,6 +36,8 @@ struct Fake {
     statuses: Mutex<Vec<BuildKitPoolStatus>>,
     deletes: Mutex<Vec<Delete>>,
     pvcs: Mutex<std::collections::BTreeMap<String, PersistentVolumeClaim>>,
+    /// When set, every apply waits for a permit first.
+    gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Fake {
@@ -79,6 +81,9 @@ impl Fake {
 
 impl KubeOps for Fake {
     async fn apply<K: Applied>(&self, _obj: &K) -> OpResult {
+        if let Some(g) = &self.gate {
+            g.notified().await;
+        }
         self.call(format!("apply:{}", K::kind(&())))
     }
     async fn create_pod(&self, _ns: &str, pod: &Pod) -> OpResult<Pod> {
@@ -196,7 +201,6 @@ fn env<'a>(
         render: RENDER.get_or_init(fixtures::default_config),
         worker_cert_validity: crate::pki::LeafValidity::default().worker_serving,
         replica: "r0",
-        config_hash: "cfg",
         now: now(),
     }
 }
@@ -592,18 +596,30 @@ fn requeue_after_create_outcomes() {
         Some(Duration::ZERO)
     );
     // For any other failure the error backoff starts at 1 s, doubles, caps at 60 s and resets on success.
+    // Regression (RECON-8): it never delays the plan deadline (30 s here),
+    // so an expiry or start timeout runs on time while some call keeps failing.
     let failed = outcome(CreateResult::Failed {
         message: "quota".into(),
     });
     let seq: Vec<_> = (0..8)
         .map(|_| rq(&mut mem, &failed).unwrap().as_secs())
         .collect();
-    assert_eq!(seq, [1, 2, 4, 8, 16, 32, 60, 60]);
+    assert_eq!(seq, [1, 2, 4, 8, 16, 30, 30, 30]);
     assert_eq!(
         rq(&mut mem, &outcome(CreateResult::Created)),
         Some(Duration::from_secs(30))
     );
     assert_eq!(rq(&mut mem, &failed), Some(Duration::from_secs(1)));
+    // Without a plan deadline the backoff alone counts, up to its 60 s cap.
+    pl.requeue_at = None;
+    let seq: Vec<_> = (0..8)
+        .map(|_| {
+            remember(&mut mem, &p, &pl, &failed, BTreeSet::new(), now())
+                .unwrap()
+                .as_secs()
+        })
+        .collect();
+    assert_eq!(seq, [2, 4, 8, 16, 32, 60, 60, 60]);
 }
 
 fn key(n: &str) -> PoolKey {
@@ -1026,7 +1042,7 @@ async fn a_slow_ca_write_does_not_stall_pool_passes() {
     let fake = Fake::default();
     let pool_pass = async {
         // What a pool pass reads before it plans.
-        let _ = guard.bundle_current(1);
+        let _ = guard.bundle_current(1, now());
         // A second pass of the same epoch skips the claimed create.
         let r = execute(
             &fake,
@@ -1415,4 +1431,223 @@ async fn volumes_above_the_limit_are_reaped_unless_a_pod_holds_the_slot() {
     off.spec.workers.cache.local = None;
     assert!(super::cache::reap_above_limit(&fake, &off, &BTreeSet::new(), &mut r).await);
     assert!(fake.pvcs.lock().unwrap().is_empty());
+}
+
+/// Regression (RECON-2): `SandboxPending` was written only inside a planned
+/// `PatchStatus`, and the planner plans one only when the status changed. A
+/// failed apply under an unchanged status (a new term's first pass, say)
+/// left `Ready=True`. The executor now patches the status itself, once.
+#[tokio::test]
+async fn failed_apply_downgrades_ready_without_a_planned_status_patch() {
+    let (mut p, ca) = (pool(), valid_ca());
+    p.status = Some(*ready_status());
+    let actions = vec![Action::ApplySa, Action::ApplyNetworkPolicy, create(0)];
+    let fake = Fake::failing(&[("apply:NetworkPolicy", OpError::Other("denied".into()))]);
+    let r = execute(
+        &fake,
+        &CaGuard::default(),
+        &env(&p, &ca, None, 0),
+        &plan(actions.clone()),
+    )
+    .await;
+    assert_eq!(
+        fake.calls(),
+        ["apply:ServiceAccount", "apply:NetworkPolicy", "status"]
+    );
+    let sent = r.status_sent.clone().unwrap();
+    let ready = sent
+        .conditions
+        .iter()
+        .find(|c| c.type_ == condition::READY)
+        .unwrap();
+    assert_eq!(
+        (ready.status.as_str(), ready.reason.as_str()),
+        ("False", reason::SANDBOX_PENDING)
+    );
+    // With that status cached, the same failure sends nothing more.
+    p.status = Some(sent);
+    let fake = Fake::failing(&[("apply:NetworkPolicy", OpError::Other("denied".into()))]);
+    let r = execute(
+        &fake,
+        &CaGuard::default(),
+        &env(&p, &ca, None, 0),
+        &plan(actions),
+    )
+    .await;
+    assert_eq!(
+        fake.calls(),
+        ["apply:ServiceAccount", "apply:NetworkPolicy"]
+    );
+    assert!(r.status_sent.is_none());
+}
+
+/// Regression (RECON-7): a pass that read an older CA epoch could apply its
+/// bundle after a newer epoch's, leaving the `ConfigMap` on a replaced CA
+/// while the guard recorded it current. An older epoch never starts after a
+/// newer one, and one that lands late makes the newest apply again.
+#[tokio::test]
+async fn an_older_ca_bundle_never_wins() {
+    let guard = CaGuard::default();
+    let (p, old, new) = (pool(), valid_ca(), valid_ca());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let slow = Fake {
+        gate: Some(gate.clone()),
+        ..Fake::default()
+    };
+    let bundle = || plan(vec![Action::ApplyCaBundle]);
+    let (old_env, new_env) = (env(&p, &old, None, 1), env(&p, &new, None, 3));
+    let slow_plan = bundle();
+    let slow_pass = execute(&slow, &guard, &old_env, &slow_plan);
+    tokio::pin!(slow_pass);
+    assert!(futures::poll!(&mut slow_pass).is_pending());
+    // Epoch 3 applies while epoch 1 is in flight.
+    let fast = Fake::default();
+    let r = execute(&fast, &guard, &new_env, &bundle()).await;
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert!(guard.bundle_current(3, now()));
+    // A pass that read epoch 1 only now applies nothing.
+    let late = Fake::default();
+    execute(&late, &guard, &old_env, &bundle()).await;
+    assert!(late.calls().is_empty(), "{:?}", late.calls());
+    // The in-flight epoch 1 apply lands last: epoch 3 is due again and the
+    // pass fails, so it requeues.
+    gate.notify_one();
+    let r = slow_pass.await;
+    assert!(!r.errors.is_empty());
+    assert!(!guard.bundle_current(3, now()));
+    let again = Fake::default();
+    execute(&again, &guard, &new_env, &bundle()).await;
+    assert_eq!(again.calls(), ["apply:ConfigMap"]);
+    assert!(guard.bundle_current(3, now()));
+}
+
+/// RECON-4: the CA bundle `ConfigMap` counts as current for `REAPPLY_AFTER`,
+/// then the CA pass applies it again, so a deleted one comes back without a
+/// pool or a CA change.
+#[tokio::test]
+async fn ca_bundle_is_applied_again_after_the_reapply_period() {
+    use super::pass::ca_pass;
+    use super::plan::REAPPLY_AFTER;
+    let (s, guard) = (ca_settings(), CaGuard::default());
+    let data = CaBundle::generate(super::exec::odt(now()))
+        .unwrap()
+        .to_secret_data();
+    let view = ca_view(1, Some(data));
+    let fake = Fake::default();
+    ca_pass(&fake, &guard, &s, &view, now()).await;
+    ca_pass(
+        &fake,
+        &guard,
+        &s,
+        &view,
+        now() + REAPPLY_AFTER - k8s_openapi::jiff::SignedDuration::from_secs(1),
+    )
+    .await;
+    assert_eq!(fake.calls(), ["apply:ConfigMap"]);
+    ca_pass(&fake, &guard, &s, &view, now() + REAPPLY_AFTER).await;
+    assert_eq!(fake.calls(), ["apply:ConfigMap", "apply:ConfigMap"]);
+}
+
+/// RECON-11: the driver over a pool watch of two namespaces. After the first
+/// lists, a relist of one namespace that lacks a pool becomes a `Delete`, so
+/// the pass for that pool runs, finds it gone and forgets it, and the other
+/// namespace is untouched.
+#[tokio::test]
+async fn relist_of_one_namespace_triggers_its_deleted_pools() {
+    use futures::StreamExt;
+    use kube::runtime::reflector;
+    use kube::runtime::watcher::Event;
+
+    use super::driver::pool_trigger;
+    use crate::runtime::stores::merge_namespaces;
+    let in_ns = |ns: &str, name: &str| {
+        let mut p = fixtures::pool(name, json!({})).unwrap();
+        p.metadata.namespace = Some(ns.into());
+        p
+    };
+    let (a1, bx, by) = (in_ns("a", "p1"), in_ns("b", "x"), in_ns("b", "y"));
+    let input: Vec<(usize, kube::runtime::watcher::Result<Event<BuildKitPool>>)> = vec![
+        (0, Ok(Event::Init)),
+        (0, Ok(Event::InitApply(a1.clone()))),
+        (0, Ok(Event::InitDone)),
+        (1, Ok(Event::Init)),
+        (1, Ok(Event::InitApply(bx.clone()))),
+        (1, Ok(Event::InitApply(by.clone()))),
+        (1, Ok(Event::InitDone)),
+        // `x` is deleted while `b` relists.
+        (1, Ok(Event::Init)),
+        (1, Ok(Event::InitApply(by))),
+        (1, Ok(Event::InitDone)),
+    ];
+    let (store, writer) = reflector::store::<BuildKitPool>();
+    let merged = merge_namespaces(
+        futures::stream::iter(input).boxed(),
+        vec!["a".into(), "b".into()],
+        store.clone(),
+    );
+    let triggers: Vec<Trigger> = reflector::reflector(writer, merged)
+        .filter_map(|ev| std::future::ready(ev.ok().as_ref().and_then(pool_trigger)))
+        .collect()
+        .await;
+    assert_eq!(
+        triggers,
+        [
+            Trigger::All,
+            Trigger::Pool(("b".into(), "y".into())),
+            Trigger::Pool(("b".into(), "x".into())),
+        ]
+    );
+    let mut left: Vec<String> = store
+        .state()
+        .iter()
+        .map(|p| {
+            format!(
+                "{}/{}",
+                p.metadata.namespace.as_deref().unwrap_or(""),
+                p.metadata.name.as_deref().unwrap_or("")
+            )
+        })
+        .collect();
+    left.sort();
+    assert_eq!(left, ["a/p1", "b/y"]);
+}
+
+/// The leader's Pool watch is tolerant: with namespace `b` failing every list,
+/// the pools of `a` still get an `All` trigger once `b` is given up.
+#[tokio::test(start_paused = true)]
+async fn an_unlistable_namespace_does_not_hold_the_other_pools() {
+    use futures::StreamExt;
+    use kube::runtime::reflector;
+    use kube::runtime::watcher::{Error, Event};
+
+    use super::driver::pool_trigger;
+    use crate::runtime::stores::{GIVE_UP_AFTER, NamespaceReport, merge_tolerant};
+    let mut a1 = fixtures::pool("p1", json!({})).unwrap();
+    a1.metadata.namespace = Some("a".into());
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    for item in [
+        (0, Ok(Event::Init)),
+        (0, Ok(Event::InitApply(a1))),
+        (0, Ok(Event::InitDone)),
+        (1, Err(Error::NoResourceVersion)),
+    ] {
+        tx.unbounded_send(item).unwrap();
+    }
+    let (store, writer) = reflector::store::<BuildKitPool>();
+    let merged = merge_tolerant(
+        rx.boxed(),
+        vec!["a".into(), "b".into()],
+        store.clone(),
+        NamespaceReport::log("controller"),
+    );
+    let mut triggers = Box::pin(
+        reflector::reflector(writer, merged)
+            .filter_map(|ev| std::future::ready(ev.ok().as_ref().and_then(pool_trigger))),
+    );
+    let first = tokio::time::timeout(GIVE_UP_AFTER * 2, triggers.next())
+        .await
+        .expect("a trigger once b is given up");
+    assert_eq!(first, Some(Trigger::All));
+    assert_eq!(store.state().len(), 1);
+    drop(tx);
 }

@@ -298,6 +298,22 @@ async fn closed_within_a_second(s: &mut tokio_rustls::client::TlsStream<TcpStrea
     );
 }
 
+/// Polls `get` until it returns `want`, failing with the last value after 10 s.
+async fn until<T: PartialEq + std::fmt::Debug>(what: &str, want: T, get: impl Fn() -> T) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = get();
+        if got == want {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what}: last saw {got:?}, want {want:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn live(rig: &mut Rig) -> tokio_rustls::client::TlsStream<TcpStream> {
     let ca = rig.bundle.client_ca().cert_der().clone();
     let s = connect(rig.edge, client(rig, &id(), &ca), HOST)
@@ -323,9 +339,11 @@ async fn proxies_and_pod_delete_cuts_the_session() {
         .send(PodEvent::Delete(Arc::new(pod(ALLOC))))
         .unwrap();
     closed_within_a_second(&mut s).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(rig.metrics.revocation_count(Revocation::PodGone), 1);
-    assert_eq!(rig.proxy.live_connections(), 0);
+    until("pod_gone revocations", 1, || {
+        rig.metrics.revocation_count(Revocation::PodGone)
+    })
+    .await;
+    until("live connections", 0, || rig.proxy.live_connections()).await;
 }
 
 #[tokio::test]
@@ -340,8 +358,7 @@ async fn alloc_change_and_draining_cut_the_session() {
             .send(PodEvent::Apply(Arc::new(pod(alloc))))
             .unwrap();
         closed_within_a_second(&mut s).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(rig.metrics.revocation_count(reason), 1, "{alloc}");
+        until(alloc, 1, || rig.metrics.revocation_count(reason)).await;
     }
 }
 
@@ -404,13 +421,14 @@ async fn bytes_are_counted() {
     s.shutdown().await.unwrap();
     let mut rest = Vec::new();
     let _ = s.read_to_end(&mut rest).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
     // The bytes are the TLS records' plaintext, a ping and data each way.
-    let (up, down) = (
-        rig.metrics.bytes(Direction::ClientToWorker).get(),
-        rig.metrics.bytes(Direction::WorkerToClient).get(),
-    );
-    assert_eq!((up, down), (300_004, 300_004));
+    until("bytes (up, down)", (300_004, 300_004), || {
+        (
+            rig.metrics.bytes(Direction::ClientToWorker).get(),
+            rig.metrics.bytes(Direction::WorkerToClient).get(),
+        )
+    })
+    .await;
 }
 
 /// Connects through the edge to a worker whose cert names another pod
@@ -423,8 +441,10 @@ async fn refused_upstream(store_pod: Pod) {
             .await
             .is_err()
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(rig.metrics.outcome_count(Some(&id()), "upstream_error"), 1);
+    until("upstream_error outcomes", 1, || {
+        rig.metrics.outcome_count(Some(&id()), "upstream_error")
+    })
+    .await;
     assert_eq!(rig.metrics.outcome_count(Some(&id()), "ok"), 0);
 }
 

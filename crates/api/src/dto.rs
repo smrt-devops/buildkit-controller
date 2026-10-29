@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 
 /// Largest accepted request body, in bytes.
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
-/// Smallest `ttlSeconds` a request may ask for.
-pub const MIN_TTL_SECONDS: u64 = 60;
 
 /// `POST /v1/allocations` request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

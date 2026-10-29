@@ -17,7 +17,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Context;
-use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -117,8 +116,7 @@ impl Component for HttpComponent {
             let follower = CancellationToken::new();
             let certs = serving_of(material, follower.clone());
             let addr = c.listen.api;
-            let listener = TcpListener::bind(addr)
-                .await
+            let listener = crate::runtime::listen::bind(addr)
                 .with_context(|| format!("binding listen.api {addr}"))?;
             ready.set();
             info!(component = "http", addr = %addr, "API listening");

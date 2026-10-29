@@ -24,6 +24,7 @@ pub struct Metrics {
     leader: Gauge,
     leader_transitions: Counter,
     watch_errors: Family<KindLabel, Counter>,
+    namespace_unlisted: Family<PoolLabels, Gauge>,
     ca_valid: Gauge,
     cert_load_errors: Family<KindLabel, Counter>,
     cert_not_after: Family<KindLabel, Gauge>,
@@ -46,6 +47,7 @@ impl Metrics {
             leader: Gauge::default(),
             leader_transitions: Counter::default(),
             watch_errors: Family::default(),
+            namespace_unlisted: Family::default(),
             ca_valid: Gauge::default(),
             cert_load_errors: Family::default(),
             cert_not_after: Family::default(),
@@ -61,6 +63,11 @@ impl Metrics {
             "watch_errors",
             "Watcher error items",
             m.watch_errors.clone(),
+        );
+        registry.register(
+            "watch_namespace_unlisted",
+            "1 while a watch carries on without a namespace it cannot list",
+            m.namespace_unlisted.clone(),
         );
         registry.register(
             "ca_valid",
@@ -100,6 +107,16 @@ impl Metrics {
     /// Count a watcher `Err` item; `kind` is `pool`, `pod`, `ca_secret`, `serving_secret`, `lease` or `controller`.
     pub fn watch_error(&self, kind: &'static str) {
         self.watch_errors.get_or_create(&vec![("kind", kind)]).inc();
+    }
+
+    /// Set `buildkit_watch_namespace_unlisted{kind,namespace}`; `kind` is `pool` or `pod`.
+    pub fn set_namespace_unlisted(&self, kind: &'static str, namespace: &str, unlisted: bool) {
+        self.namespace_unlisted
+            .get_or_create(&vec![
+                ("kind", kind.to_owned()),
+                ("namespace", namespace.to_owned()),
+            ])
+            .set(i64::from(unlisted));
     }
 
     /// Count a certificate load failure; `cert` is `ca` or `edge_serving`.

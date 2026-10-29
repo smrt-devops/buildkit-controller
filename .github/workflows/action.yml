@@ -18,6 +18,8 @@ jobs:
         with:
           node-version: 24
       - run: node --test action/test/*.test.js
+      - name: action.yml is valid YAML
+        run: yq . action/action.yml > /dev/null
   shellcheck:
     runs-on: ubuntu-latest
     steps:

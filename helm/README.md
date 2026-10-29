@@ -18,7 +18,7 @@ helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
 
 `edge.endpoint` and `edge.serverName` are required, and so is `gateway.parentRefs`
 unless `service.type` is `LoadBalancer` or `gateway.enabled` is `false`. The chart ships no OIDC issuer, so without `auth.oidc` only ServiceAccount tokens
-authenticate. `values.schema.json` validates values.
+authenticate. `values.schema.json` validates values and rejects keys it does not know, so a misspelled key fails `helm install` instead of being ignored.
 
 ## Exposure
 
@@ -38,10 +38,9 @@ It renders upstream `gateway.networking.k8s.io/v1` kinds only:
 | Edge | `TLSRoute` | `TLS`, `tls.mode: Passthrough` | v1.5.0 |
 
 So the default needs the Gateway API v1.5.0 or later standard-channel CRDs and an
-implementation that supports both kinds. The chart checks `.Capabilities.APIVersions`
-and skips a route whose kinds the cluster does not serve; NOTES.txt then names the
-missing kinds. With `helm template`, pass them, for example
-`--api-versions gateway.networking.k8s.io/v1/TLSRoute`.
+implementation that supports both kinds. The chart renders the routes without checking which Gateway API kinds the cluster serves,
+so `helm template` needs no extra flags. `helm install` fails at apply time when a CRD is
+missing. Install the Gateway API CRDs first.
 
 The edge is always TLS passthrough. The controller authenticates each build by its
 client certificate, which a gateway that terminates TLS would never forward, so the
@@ -198,7 +197,7 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
   range, workers get no IPv6 egress, so on an IPv6-only cluster image pulls fail. Listing
   every pod, service and node range there also stops a pool's `allowCIDRs` from opening
   them; `workerNetwork.permittedCIDRs` lists the exceptions (see docs/operations.md, Worker
-  egress).
+  egress). With the list empty, `helm install` prints a warning and the controller logs one at startup.
 
 ## Values
 
@@ -206,11 +205,12 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 |---|---|
 | `image.repository`, `image.tag` | `ghcr.io/smrt-devops/buildkit-controller`, tag defaults to the chart appVersion |
 | `replicaCount`, `autoscaling.*` | Deployment size; HPA on CPU (off by default) |
+| `resources` | 100m CPU and 128Mi memory requested, 512Mi memory limit. An established edge connection holds about 200 KiB and an idle replica about 14 MiB, so 512Mi holds about 2300 connections. Raise `resources.limits.memory` and `edge.maxConnections` together |
 | `affinity`, `topologySpreadConstraints` | when both are empty, a soft hostname anti-affinity spreads replicas |
 | `podDisruptionBudget.*` | rendered only when replicas exceed `minAvailable` |
-| `watchNamespaces` | namespaces whose pools the controller serves; recommended. The chart renders a Role and RoleBinding in each for pods, Secrets, ServiceAccounts, PVCs and NetworkPolicies, and only TokenReview stays cluster-wide. Pools elsewhere are ignored. `[]` (the default) = every namespace through a ClusterRole that can create pods and Secrets in any namespace, kube-system included; NOTES.txt warns about it |
+| `watchNamespaces` | namespaces whose pools the controller serves; recommended. The chart renders a Role and RoleBinding in each for pods, Secrets, ServiceAccounts, PVCs and NetworkPolicies, and only TokenReview stays cluster-wide. The list may not include the release namespace (the chart fails to render). The Role in each namespace is named `<fullname>-<release namespace>-workload` and grants `create` on Secrets only; Kubernetes garbage collection deletes a worker Secret with its pod. Pools elsewhere are ignored. `[]` (the default) = every namespace through a ClusterRole that can create pods and Secrets in any namespace, kube-system included; NOTES.txt warns about it |
 | `watchNamespace` | deprecated single-namespace form of `watchNamespaces`; setting both fails to render |
-| `edge.*` | `endpoint`, `serverName`, `allocationDomain`, `extraNames`, `tls.secretName` (user serving cert, a `kubernetes.io/tls` Secret in the release namespace), `handshakeTimeout` (10s), `maxConnections` (10000 established), `maxHandshakes` (1024), `maxHandshakesPerIp` (32; 0 = no cap), `proxyProtocol.enabled` (false), `.trustedCIDRs` (required when enabled), `.headerTimeout` (5s) |
+| `edge.*` | `endpoint`, `serverName`, `allocationDomain`, `extraNames`, `tls.secretName` (user serving cert, a `kubernetes.io/tls` Secret in the release namespace), `handshakeTimeout` (10s), `maxConnections` (2000 established, sized to the 512Mi memory limit), `maxHandshakes` (1024), `maxHandshakesPerIp` (32; 0 = no cap), `proxyProtocol.enabled` (false), `.trustedCIDRs` (required when enabled), `.headerTimeout` (5s) |
 | `api.*` | `maxConnections` (4096), `maxConnectionsPerIp` (128; 0 = no cap), `proxyProtocol` (as `edge.proxyProtocol`) |
 | `auth.oidc[]` | `url`, `audiences`, `jwksUrl`, and at most one of `caBundle` (inline PEM), `caBundleFile` (path), `caBundleConfigMap: {name, key}` (mounted, sets the file) |
 | `auth.serviceAccount` | `enabled`, `audiences` (never the API server audience), `maxConcurrentReviews` (32), `maxReviewsPerIp` (4; 0 = no cap), `reservedReviews` (8; slots held for recently seen service accounts), `recentSubjectTtl` (10m) |

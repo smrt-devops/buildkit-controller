@@ -11,9 +11,6 @@ pub mod client;
 /// Errors raised while validating API types.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ApiError {
-    /// A field failed validation.
-    #[error("invalid field `{0}`")]
-    InvalidField(&'static str),
     /// A field failed validation, with the reason.
     #[error("invalid field `{field}`: {reason}")]
     Invalid {

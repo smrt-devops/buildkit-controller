@@ -59,8 +59,8 @@ pub(super) struct Fx {
     pub tz: Option<TimeZone>,
     pub template: TemplateCheck,
     pub network: crate::render::WorkerNetwork,
-    pub sandbox_gen: Option<i64>,
-    pub prev_fail: bool,
+    pub sandbox: Option<(i64, Timestamp)>,
+    pub down_since: std::collections::BTreeMap<String, Timestamp>,
     pub creates: Vec<CreateOutcome>,
     pub backoff: Option<Timestamp>,
     pub foreign: Vec<String>,
@@ -84,8 +84,9 @@ pub(super) fn fx() -> Fx {
         tz: Some(TimeZone::UTC),
         template: TemplateCheck::Current { hash: "h".into() },
         network: crate::render::WorkerNetwork::default(),
-        sandbox_gen: Some(1),
-        prev_fail: false,
+        // Applied, and not due again within any test's horizon.
+        sandbox: Some((1, later(100 * 365 * 86_400))),
+        down_since: std::collections::BTreeMap::new(),
         creates: Vec::new(),
         backoff: None,
         foreign: Vec::new(),
@@ -136,13 +137,11 @@ impl Fx {
             time_zone: self.tz.clone(),
             template: self.template.clone(),
             network: &self.network,
-            config_hash: "cfg".into(),
             platforms: Vec::new(),
             ca: self.ca,
             ca_bundle_current: true,
             pods: self.pods.clone(),
-            sandbox_applied_generation: self.sandbox_gen,
-            previous_pod_failure: self.prev_fail,
+            sandbox_applied: self.sandbox,
             recent_creates: self.creates.clone(),
             create_backoff_until: self.backoff,
             unknown_issuer: None,
@@ -150,6 +149,7 @@ impl Fx {
             slot_holds: self.slot_holds.clone(),
             became_ready: self.became_ready.clone(),
             waiters_seen: self.waiters_seen.clone(),
+            down_since: self.down_since.clone(),
         }
     }
 
@@ -786,7 +786,7 @@ fn template_conflict_and_invalid_spec_stop_creates_but_retire() {
                 message: "sets metadata.name".into(),
             };
         }
-        f.sandbox_gen = None;
+        f.sandbox = None;
         f.pods = vec![
             WorkerPod {
                 expires_at: Some(ago(1)),
@@ -825,7 +825,7 @@ fn template_conflict_and_invalid_spec_stop_creates_but_retire() {
 #[test]
 fn refused_allow_cidr_narrows_the_policy_under_any_block() {
     let mut f = fx().scale(2, 10);
-    f.sandbox_gen = None;
+    f.sandbox = None;
     f.pods = vec![pod(0), allocated(1)];
     f.network.extra_denied_cidrs = vec!["203.0.113.0/24".into()];
     f.pool.spec.network.egress.allow_cidrs = vec!["203.0.113.7/32".into()];
@@ -865,7 +865,7 @@ fn refused_allow_cidr_narrows_the_policy_under_any_block() {
 #[test]
 fn refused_allow_cidr_is_invalid_spec() {
     let mut f = fx().scale(2, 10);
-    f.sandbox_gen = None;
+    f.sandbox = None;
     f.pool.spec.network.egress.allow_cidrs =
         vec!["192.0.2.0/24".into(), "169.254.169.254/32".into()];
     let p = f.plan();
@@ -1053,7 +1053,7 @@ fn requeue_earliest_deadline_and_no_polling() {
 #[test]
 fn sandbox_due() {
     let mut f = fx().scale(1, 10);
-    f.sandbox_gen = Some(0);
+    f.sandbox = Some((0, *NOW));
     let p = f.plan();
     let kinds: Vec<&Action> = p
         .actions
@@ -1077,6 +1077,7 @@ fn sandbox_due() {
 fn from_pod_checks_owner_and_slot() {
     let mut pod = Pod::default();
     pod.metadata.name = Some("p-3".into());
+    pod.metadata.namespace = Some("ns".into());
     pod.metadata.uid = Some("u".into());
     pod.metadata.owner_references = Some(vec![OwnerReference {
         uid: "pool-uid".into(),
@@ -1085,7 +1086,7 @@ fn from_pod_checks_owner_and_slot() {
     }]);
     pod.metadata.annotations =
         Some([(crate::render::ANN_ALLOC.to_owned(), ALLOC_ID.to_owned())].into());
-    let w = WorkerPod::from_pod(&pod, "p", "pool-uid").unwrap();
+    let w = WorkerPod::from_pod(&pod, "ns", "p", "pool-uid").unwrap();
     assert_eq!(
         (w.slot, w.alloc, w.grace_seconds),
         (Some(3), Alloc::Allocated(ALLOC_ID.into()), 5)
@@ -1096,9 +1097,12 @@ fn from_pod_checks_owner_and_slot() {
         reason: Some("Evicted".into()),
         ..Default::default()
     });
-    let w = WorkerPod::from_pod(&pod, "p", "pool-uid").unwrap();
+    let w = WorkerPod::from_pod(&pod, "ns", "p", "pool-uid").unwrap();
     assert!(w.evicted && w.phase == Phase::Failed);
-    assert!(WorkerPod::from_pod(&pod, "p", "other").is_none());
+    assert!(WorkerPod::from_pod(&pod, "ns", "p", "other").is_none());
+    // RECON-5: a pod in another watched namespace with a forged
+    // ownerReference to the pool uid is not the pool's.
+    assert!(WorkerPod::from_pod(&pod, "tenant", "p", "pool-uid").is_none());
     assert_eq!(parse_slot("p-03", "p"), None);
     assert_eq!(parse_slot("p-0", "p"), Some(0));
     assert_eq!(parse_slot("pp-1", "p"), None);
@@ -1264,4 +1268,114 @@ fn volumes_in_use_counts_pods_below_the_cache_limit() {
     pool.spec.scaling.max = 3;
     pool.spec.workers.cache.local = Some(LocalCache::default());
     assert_eq!(PodCounts::of(&pool, &workers).volumes_in_use, Some(3));
+}
+
+/// Regression (RECON-1): a warm pod that was Ready and failed its readiness
+/// probe after `startTimeout` was retired as `StartTimeout`, which set
+/// `Degraded=PodStartTimeout`, bumped the create backoff and, in a cached
+/// slot, deleted the cache volume. A pod seen up earlier in the term gets
+/// `startTimeout` from when it went down, then retires as `Unready` with no
+/// `Degraded` and no backoff.
+#[test]
+fn a_pod_that_was_ready_is_not_a_start_timeout() {
+    let blip = |down: i64| {
+        let mut f = fx().scale(1, 10);
+        f.pods = vec![WorkerPod {
+            ready: false,
+            ..pod(0)
+        }];
+        f.down_since.insert("uid-0".into(), ago(down));
+        f
+    };
+    // Down for 30 s of the 120 s grace: left alone, rechecked when it ends.
+    let p = blip(30).plan();
+    assert!(retires(&p).is_empty());
+    assert_eq!(p.requeue_at, Some(later(90)));
+    assert_eq!(cond(&p, "Degraded").reason, "AsExpected");
+    assert_eq!(p.backoff, BackoffSignal::Keep);
+    // Down for longer than the grace: retired, but not as a start failure.
+    let p = blip(121).plan();
+    assert_eq!(retires(&p), [("p-0".to_owned(), RetireReason::Unready)]);
+    assert_eq!(cond(&p, "Degraded").reason, "AsExpected");
+    assert_eq!(p.backoff, BackoffSignal::Keep);
+    // The same pod never seen up is a start timeout, as before.
+    let mut f = blip(121);
+    f.down_since.clear();
+    let p = f.plan();
+    assert_eq!(
+        retires(&p),
+        [("p-0".to_owned(), RetireReason::StartTimeout)]
+    );
+    assert_eq!(cond(&p, "Degraded").reason, "PodStartTimeout");
+    assert_eq!(p.backoff, BackoffSignal::Bump);
+
+    // An allocated pod that was up and lost its node is left to its expiry.
+    let mut f = fx().scale(1, 10);
+    f.pods = vec![WorkerPod {
+        phase: Phase::Unknown,
+        has_ip: false,
+        ..allocated(0)
+    }];
+    f.down_since.insert("uid-0".into(), ago(3000));
+    let p = f.plan();
+    assert!(retires(&p).is_empty());
+    assert_eq!(p.requeue_at, Some(later(3600)));
+    assert_eq!(cond(&p, "Degraded").reason, "AsExpected");
+}
+
+/// Regression (RECON-3): only `draining` pods were force-deleted, so an
+/// evicted or hand-deleted pod on a lost node held its slot for as long as
+/// the kubelet never confirmed. Every owned terminating pod is forced now,
+/// except one with an unknown `P alloc`, which is never touched.
+#[test]
+fn every_stuck_terminating_pod_is_forced() {
+    let t = |p: WorkerPod, del| WorkerPod {
+        deletion: Some(del),
+        ..p
+    };
+    let unknown = WorkerPod {
+        alloc: Alloc::Unknown,
+        ..pod(2)
+    };
+    let mut f = fx().scale(0, 4);
+    f.pods = vec![
+        t(pod(0), ago(125)),
+        t(allocated(1), ago(125)),
+        t(unknown, ago(125)),
+        t(pod(3), ago(60)),
+    ];
+    let p = f.plan();
+    let forced: Vec<&str> = p
+        .actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::ForceDelete { pod, .. } => Some(pod.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(forced, ["p-0", "p-1"]);
+    assert!(retires(&p).is_empty());
+    // p-3 is forced at -60 s + 5 s grace + 2 min.
+    assert_eq!(p.requeue_at, Some(later(65)));
+}
+
+/// Regression (RECON-4): the SA and `NetworkPolicy` were applied once per
+/// generation and term, so a deleted `NetworkPolicy` left the workers with open
+/// egress until the spec or the leader changed. They are applied again
+/// `REAPPLY_AFTER` after the last apply, and the pass requeues for it.
+#[test]
+fn sandbox_is_applied_again_after_the_reapply_period() {
+    let applies = |p: &Plan| {
+        p.actions
+            .iter()
+            .filter(|a| matches!(a, Action::ApplySa | Action::ApplyNetworkPolicy))
+            .count()
+    };
+    let mut f = fx();
+    f.sandbox = Some((1, ago(60)));
+    let p = f.plan();
+    assert_eq!(applies(&p), 0);
+    assert_eq!(p.requeue_at, Some(ago(60) + REAPPLY_AFTER));
+    f.sandbox = Some((1, *NOW - REAPPLY_AFTER));
+    assert_eq!(applies(&f.plan()), 2);
 }

@@ -6,7 +6,8 @@
 //! - actions run in order; Kubernetes calls are not retried inside a pass;
 //! - `Event` runs only if the CA action just before it succeeded;
 //! - a failed `ApplySa`/`ApplyNetworkPolicy` skips every later `CreatePod` and
-//!   downgrades `Ready` in the `PatchStatus`;
+//!   downgrades `Ready` in the `PatchStatus`, or in a status patch of its own
+//!   when the plan has none (the planned status equals the cached one);
 //! - `CreatePod` issues the pod's own serving cert and Secret first;
 //! - `Retire*` is the test-and-replace patch on `uid` and the expected `P alloc`
 //!   value, followed by the uid-preconditioned delete; a 422 means skip;
@@ -47,6 +48,11 @@ use crate::render::{WorkerNetwork, refused_allow_cidrs};
 /// Max length of a condition message.
 const MESSAGE_MAX: usize = 1024;
 
+/// How long an applied `ServiceAccount`, `NetworkPolicy` or CA bundle
+/// `ConfigMap` counts as current. Nothing watches them, so the leader applies
+/// them again this often; an out-of-band delete or edit lasts at most this long.
+pub const REAPPLY_AFTER: SignedDuration = SignedDuration::from_mins(5);
+
 /// `Degraded=True` reasons by precedence.
 const DEGRADED_ORDER: [&str; 6] = [
     "PodCreateFailed",
@@ -68,8 +74,8 @@ pub struct PlanConfig {
     /// usual race with an API replica's cold create, whose pod reaches the
     /// store a moment later, does not flap `Degraded`.
     pub slot_taken_grace: SignedDuration,
-    /// A terminating `draining` pod is force-deleted this long after
-    /// `deletionTimestamp + grace` (2 min).
+    /// A terminating pod (free, allocated or draining) is force-deleted this
+    /// long after `deletionTimestamp + grace` (2 min).
     pub force_delete_after: SignedDuration,
     /// A free pod is retired when its worker cert has less left (25 h).
     pub worker_cert_min_left: SignedDuration,
@@ -145,8 +151,6 @@ pub struct Observed<'a> {
     /// `workerNetwork`: the planner refuses (`InvalidSpec`) a pool whose
     /// `allowCIDRs` would reopen a range it keeps closed.
     pub network: &'a WorkerNetwork,
-    /// Hash of `spec.workers.buildkitdConfig` (render `config_hash`).
-    pub config_hash: String,
     /// Derived `status.platforms`.
     pub platforms: Vec<String>,
     /// Result of loading the CA Secret.
@@ -155,10 +159,11 @@ pub struct Observed<'a> {
     pub ca_bundle_current: bool,
     /// The pool's pods (owner-uid checked).
     pub pods: Vec<WorkerPod>,
-    /// `metadata.generation` of the last successful sandbox apply in this term.
-    pub sandbox_applied_generation: Option<i64>,
-    /// The previous pass saw `PodStartTimeout` or `PodFailed`.
-    pub previous_pod_failure: bool,
+    /// `metadata.generation` and time of the last successful sandbox apply in
+    /// this term. The sandbox is applied again on a new generation and
+    /// [`REAPPLY_AFTER`] after the last apply, which repairs a deleted or edited
+    /// `ServiceAccount` or `NetworkPolicy`.
+    pub sandbox_applied: Option<(i64, Timestamp)>,
     /// The leader's create outcomes since the previous pass.
     pub recent_creates: Vec<CreateOutcome>,
     /// End of the in-memory create backoff.
@@ -174,6 +179,10 @@ pub struct Observed<'a> {
     pub slot_holds: BTreeMap<u32, Timestamp>,
     /// Uids of pods that turned Ready since the previous pass (resets the backoff).
     pub became_ready: BTreeSet<String>,
+    /// Pods seen up earlier in this term (free: Ready; allocated: Running with
+    /// an IP) that are not up now, with when the leader first saw them down.
+    /// `startTimeout` judges only pods never seen up; see [`RetireReason::Unready`].
+    pub down_since: BTreeMap<String, Timestamp>,
     /// When the leader first saw each `status.waiters` entry, keyed by
     /// `(replica, updatedAt)`, on its own clock. Staleness is judged from this,
     /// never from `updatedAt`, which another replica's clock wrote. An entry
@@ -191,8 +200,13 @@ pub enum RetireReason {
     /// Free, phase `Failed`, not evicted: buildkitd exited non-zero before any
     /// build ran, so the state it loaded is suspect.
     DaemonCrashed,
-    /// Not Ready (free) or not Running with an IP (allocated) after `startTimeout`.
+    /// Never up within `startTimeout`: not Ready (free) or not Running with an
+    /// IP (allocated), and not seen up earlier in this term.
     StartTimeout,
+    /// Free, seen Ready earlier in this term, and not Ready again within
+    /// `startTimeout` of the leader first seeing it unready. Not a start
+    /// failure: no `Degraded`, no create backoff, and the slot keeps its cache volume.
+    Unready,
     /// `P internal-ca` differs from the loaded internal CA.
     CaRotated,
     /// Free with a stale `P template-hash`.
@@ -222,6 +236,7 @@ impl RetireReason {
             Self::Expired => "expired",
             Self::PodFinished | Self::DaemonCrashed => "failed",
             Self::StartTimeout => "start_timeout",
+            Self::Unready => "unready",
             Self::CaRotated => "ca_rotated",
             Self::StaleTemplate => "stale_template",
             Self::CertExpiring => "cert_expiring",
@@ -280,7 +295,7 @@ pub enum Action {
         /// Precondition.
         uid: String,
     },
-    /// Delete a stuck terminating `draining` pod with grace 0.
+    /// Delete a stuck terminating pod with grace 0.
     ForceDelete {
         /// Pod name.
         pod: String,
@@ -609,9 +624,15 @@ impl<'a> Planner<'_, 'a> {
     /// Sandbox objects (step 4).
     fn plan_applies(&mut self) {
         let o = self.o;
-        if o.sandbox_applied_generation != o.pool.metadata.generation {
-            self.actions.push(Action::ApplySa);
-            self.actions.push(Action::ApplyNetworkPolicy);
+        let generation = o.pool.metadata.generation.unwrap_or_default();
+        match o.sandbox_applied {
+            Some((g, at)) if g == generation && add(at, REAPPLY_AFTER) > self.now => {
+                self.at(add(at, REAPPLY_AFTER));
+            }
+            _ => {
+                self.actions.push(Action::ApplySa);
+                self.actions.push(Action::ApplyNetworkPolicy);
+            }
         }
     }
 
@@ -635,14 +656,19 @@ impl<'a> Planner<'_, 'a> {
     }
 
     /// Step 5 deletes draining pods and force-deletes stuck terminating ones.
+    /// Any owned terminating pod is forced, not only a draining one: an
+    /// evicted pod on a lost node, or one deleted by hand, otherwise holds its
+    /// slot for as long as the kubelet never confirms. A pod with an unknown
+    /// `P alloc` is never touched.
     fn plan_draining(&mut self) {
         let (o, now) = (self.o, self.now);
-        for p in o.pods.iter().filter(|p| p.alloc == Alloc::Draining) {
+        for p in o.pods.iter().filter(|p| p.alloc != Alloc::Unknown) {
             match p.deletion {
-                None => self.actions.push(Action::DeleteDraining {
+                None if p.alloc == Alloc::Draining => self.actions.push(Action::DeleteDraining {
                     pod: p.name.clone(),
                     uid: p.uid.clone(),
                 }),
+                None => {}
                 Some(d) => {
                     let force_at = add(
                         add(d, SignedDuration::from_secs(p.grace_seconds.max(0))),
@@ -671,11 +697,18 @@ impl<'a> Planner<'_, 'a> {
     ) {
         let (o, now) = (self.o, self.now);
         for p in o.pods.iter().filter(|p| !p.terminating()) {
-            let started_by = p.created.map(|c| add(c, start_timeout));
+            let down_since = o.down_since.get(&p.uid).copied();
+            // A pod seen up in this term started; startTimeout no longer applies.
+            let started_by = p
+                .created
+                .filter(|_| down_since.is_none())
+                .map(|c| add(c, start_timeout));
             let ca_stale = fp16.is_some_and(|f| p.internal_ca.as_deref().is_some_and(|c| c != f));
             match &p.alloc {
                 Alloc::Allocated(id) => {
-                    let not_up = p.phase != Phase::Running || !p.has_ip;
+                    // One seen up and down since is left to its expiry: a
+                    // node problem, not a start failure, and its build may resume.
+                    let not_up = !p.up();
                     let reason = if p.expires_at.is_some_and(|e| e <= now) {
                         Some(RetireReason::Expired)
                     } else if p.phase.is_finished() {
@@ -700,12 +733,17 @@ impl<'a> Planner<'_, 'a> {
                 }
                 Alloc::Free => {
                     let cert_min = add(now, self.cfg.worker_cert_min_left);
+                    let unready_by = down_since.map(|d| add(d, start_timeout)).or(started_by);
                     let reason = if p.phase == Phase::Failed && !p.evicted {
                         Some(RetireReason::DaemonCrashed)
                     } else if p.phase.is_finished() {
                         Some(RetireReason::PodFinished)
-                    } else if !p.ready && started_by.is_some_and(|t| t <= now) {
-                        Some(RetireReason::StartTimeout)
+                    } else if !p.ready && unready_by.is_some_and(|t| t <= now) {
+                        Some(if down_since.is_some() {
+                            RetireReason::Unready
+                        } else {
+                            RetireReason::StartTimeout
+                        })
                     } else if ca_stale {
                         Some(RetireReason::CaRotated)
                     } else if current_hash.is_some_and(|h| p.template_hash.as_deref() != Some(h)) {
@@ -720,7 +758,7 @@ impl<'a> Planner<'_, 'a> {
                     if let Some(reason) = reason {
                         self.retire_free(p, reason);
                     } else {
-                        if let (false, Some(t)) = (p.ready, started_by) {
+                        if let (false, Some(t)) = (p.ready, unready_by) {
                             self.at(t);
                         }
                         if let Some(t) = p.worker_cert_not_after {

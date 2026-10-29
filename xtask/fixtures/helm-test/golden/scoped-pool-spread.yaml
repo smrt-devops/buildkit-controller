@@ -68,7 +68,7 @@ data:
       endpoint: tcp://bk.example.com:8444
       extraNames: []
       handshakeTimeout: 10s
-      maxConnections: 10000
+      maxConnections: 2000
       maxHandshakes: 1024
       maxHandshakesPerIp: 32
       serverName: bk.example.com
@@ -149,7 +149,7 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: buildkit-controller-workload
+  name: buildkit-controller-buildkit-system-workload
   namespace: ci
   labels:
     app.kubernetes.io/name: buildkit-controller
@@ -189,8 +189,6 @@ rules:
     - secrets
     verbs:
     - create
-    - patch
-    - delete
   - apiGroups:
     - ""
     resources:
@@ -260,7 +258,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: buildkit-controller-workload
+  name: buildkit-controller-buildkit-system-workload
   namespace: ci
   labels:
     app.kubernetes.io/name: buildkit-controller
@@ -268,7 +266,7 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: buildkit-controller-0.1.0
-roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: buildkit-controller-workload}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: buildkit-controller-buildkit-system-workload}
 subjects:
   - kind: ServiceAccount
     name: buildkit-controller
@@ -369,7 +367,7 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: buildkit-controller-0.1.0
       annotations:
-        checksum/config: bc9419ccaa82fc6ec9ef6feb9a188d7b7fb0cc8d975f496a958519d71dbc7f49
+        checksum/config: a8e80cb248b1f59549d133ae6edf23fd8520ae04f8afc5ae4745d3be3a85a018
     spec:
       serviceAccountName: buildkit-controller
       terminationGracePeriodSeconds: 86715

@@ -13,7 +13,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use futures::{Stream, stream};
 use k8s_openapi::jiff::{SignedDuration, Timestamp};
 use kube::runtime::reflector::{self, Store};
-use kube::runtime::{WatchStreamExt, watcher};
+use kube::runtime::watcher;
 use kube::{Client, ResourceExt};
 use tokio::time::Instant;
 use tracing::{Instrument, debug, info, info_span, warn};
@@ -22,14 +22,14 @@ use super::exec::CaGuard;
 use super::metrics::{PodCounts, ReconcileMetrics, TermGauges};
 use super::ops::{KubeClient, Timed};
 use super::pass::{self, CaView, PoolMemory, Settings};
-use super::plan::PlanConfig;
+use super::plan::{PlanConfig, REAPPLY_AFTER};
 use super::pods::WorkerPod;
 use crate::config::ElectionTiming;
 use crate::render::LABEL_POOL;
 use crate::runtime::AppContext;
 use crate::runtime::hooks::LeaderWork;
 use crate::runtime::leader::BoxFut;
-use crate::runtime::stores::{PodEvent, scoped_watch};
+use crate::runtime::stores::{NamespaceReport, PodEvent, tolerant_watch};
 
 /// `(namespace, name)` of a pool.
 pub type PoolKey = (String, String);
@@ -169,19 +169,21 @@ async fn run_term(ctx: AppContext, metrics: ReconcileMetrics) {
     info!("reconciler started");
     let _gauges = TermGauges(metrics.clone());
     let client: Client = ctx.client();
-    // The leader's own Pool watch. A pass reads the pool from it.
+    // The leader's own Pool watch. A pass reads the pool from it. A namespace
+    // that cannot be listed is left out after a while rather than holding
+    // every pool: a pool missing from the store is only forgotten, never acted on.
     let (pools, writer) = reflector::store();
     let pool_triggers = {
         let ctx = ctx.clone();
         reflector::reflector(
             writer,
-            scoped_watch(
+            tolerant_watch(
                 client.clone(),
                 ctx.config().watched_namespaces(),
                 &watcher::Config::default(),
                 pools.clone(),
-            )
-            .default_backoff(),
+                NamespaceReport::log("controller"),
+            ),
         )
         .filter_map(move |ev| {
             let t = match ev {
@@ -294,7 +296,7 @@ async fn pass_once(term: &Term, key: &PoolKey) -> Option<Duration> {
         lock(&term.memory).insert(key.clone(), mem);
         let workers: Vec<WorkerPod> = pods
             .iter()
-            .filter_map(|p| WorkerPod::from_pod(p, &key.1, &pool.uid().unwrap_or_default()))
+            .filter_map(|p| WorkerPod::from_pod(p, &key.0, &key.1, &pool.uid().unwrap_or_default()))
             .collect();
         let counts = PodCounts::of(&pool, &workers);
         let elapsed = started.elapsed();
@@ -326,7 +328,9 @@ pub(super) fn ca_key() -> PoolKey {
     (String::new(), String::new())
 }
 
-/// [`pass::ca_pass`]; retried every 10 s while its writes fail.
+/// [`pass::ca_pass`]; retried every 10 s while its writes fail, and run again
+/// every [`REAPPLY_AFTER`] so a deleted or edited CA bundle `ConfigMap` is
+/// restored without a pool or a CA change.
 async fn ca_pass_once(term: &Term) -> Option<Duration> {
     let ca = lock(&term.ca).clone();
     let report = pass::ca_pass(
@@ -343,7 +347,7 @@ async fn ca_pass_once(term: &Term) -> Option<Duration> {
         if !report.trace.is_empty() {
             info!(actions = ?report.trace, "CA pass");
         }
-        None
+        REAPPLY_AFTER.try_into().ok()
     } else {
         warn!(errors = ?report.errors, actions = ?report.trace, "CA pass failed");
         Some(Duration::from_secs(10))

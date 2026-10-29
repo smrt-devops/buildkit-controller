@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: claims-rule, namespace: default}
+spec:
+  access: {rules: [{claims: {namespaces: [ci, release]}}]}

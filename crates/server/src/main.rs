@@ -5,15 +5,19 @@
 //! `/readyz` fails, leader work stops and the Lease is released, then after
 //! `shutdown.delay` the components stop in stages: the API (queued and new
 //! allocations get 503 `shutting_down`), the edge (open connections drain until
-//! each ends on its own), the certificate loader. The drain is bounded by
+//! each ends on its own), the certificate loader. The delay and the drain
+//! budget count from the signal. The drain is bounded by
 //! `shutdown.drainTimeout`, or when unset by the longest connection lifetime.
-//! The watches and the ops server stop last.
+//! The watches and the ops server stop last. A second SIGTERM or SIGINT during
+//! shutdown exits at once.
 
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
+use futures::FutureExt;
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -32,7 +36,8 @@ use buildkit_controller::runtime::hooks::{Component, Hooks, LeaderWork};
 use buildkit_controller::runtime::leader::supervise;
 use buildkit_controller::runtime::metrics::Metrics;
 use buildkit_controller::runtime::readiness::Readiness;
-use buildkit_controller::runtime::shutdown::{Stages, step_down};
+use buildkit_controller::runtime::shutdown::Stages;
+use buildkit_controller::runtime::stop::Shutdown;
 use buildkit_controller::telemetry::{logs, ops};
 
 fn main() -> ExitCode {
@@ -93,12 +98,40 @@ fn main() -> ExitCode {
     }
 }
 
-async fn signal() -> anyhow::Result<()> {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut term = signal(SignalKind::terminate())?;
-    let mut int = signal(SignalKind::interrupt())?;
-    tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
-    Ok(())
+/// SIGTERM and SIGINT.
+struct Signals {
+    term: Signal,
+    int: Signal,
+}
+
+impl Signals {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    /// The next signal, as the exit code a process killed by it reports.
+    async fn recv(&mut self) -> i32 {
+        tokio::select! {
+            _ = self.term.recv() => 128 + 15,
+            _ = self.int.recv() => 128 + 2,
+        }
+    }
+
+    /// Exit the process at once on the `n`th signal from now, so an operator
+    /// can cut a long drain short.
+    fn exit_after(mut self, n: usize) {
+        tokio::spawn(async move {
+            let mut code = 1;
+            for _ in 0..n {
+                code = self.recv().await;
+            }
+            warn!("signal during shutdown, exiting now");
+            std::process::exit(code);
+        });
+    }
 }
 
 #[allow(clippy::too_many_lines, reason = "linear startup and ordered shutdown")]
@@ -107,7 +140,9 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         "buildkit-controller starting"
     );
+    let mut signals = Signals::new().context("installing signal handlers")?;
     settings.config.warn_test_knobs();
+    settings.config.warn_unchecked_cluster_ranges();
     let timing = settings.config.election_timing();
     let metrics = Arc::new(Metrics::new());
     let readiness = Arc::new(Readiness::with_spec_checks());
@@ -138,7 +173,7 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
     );
 
     let ops_stop = CancellationToken::new();
-    let ops_listener = ops::bind(ctx.config().listen.ops).await?;
+    let ops_listener = ops::bind(ctx.config().listen.ops)?;
     let mut ops_task = tokio::spawn(ops::serve(
         ops_listener,
         ops::OpsState {
@@ -195,8 +230,14 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
     let mut failed = None;
     let mut ops_done = false;
     let mut leader_done = false;
+    // Signals left before the process exits at once: the first starts the
+    // drain, the next one ends it.
+    let mut signals_left = 2;
     tokio::select! {
-        r = signal() => r?,
+        code = signals.recv() => {
+            info!(signal_exit_code = code, "signal received");
+            signals_left = 1;
+        }
         e = stages.exited() => {
             error!(error = format!("{e:#}"), "component stopped, shutting down");
             failed = Some(e);
@@ -227,31 +268,37 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
             failed = Some(e);
         }
     }
-    info!("shutting down");
-    readiness.set_shutting_down();
-    // Leadership goes first, so another replica leads within seconds however
-    // long this one drains. All leader work stops before the Lease is released.
-    leader_stop.cancel();
-    let reconciler = async {
-        if !leader_done {
-            let _ = leader_task.await;
+    let started = Instant::now();
+    signals.exit_after(signals_left);
+    let config = ctx.config();
+    Shutdown {
+        started,
+        readiness,
+        leader_stop,
+        reconciler: async move {
+            if !leader_done {
+                let _ = leader_task.await;
+            }
         }
-    };
-    let bound = Instant::now() + ctx.config().request_timeout();
-    step_down(reconciler, leader, bound, elect_stop, elect_task).await;
-    info!("leadership released");
-    tokio::time::sleep(ctx.config().shutdown_delay()).await;
-    let budget = ctx.config().drain_budget();
-    info!(drain_budget_s = budget.as_secs(), "draining");
-    if !stages.stop(Instant::now() + budget).await {
-        warn!(drain_budget_s = budget.as_secs(), "drain timed out");
+        .boxed(),
+        leader,
+        request_timeout: config.request_timeout(),
+        elect_stop,
+        elector: elect_task,
+        delay: config.shutdown_delay(),
+        drain_budget: config.drain_budget(),
+        stages,
+        watches,
+        ops_stop,
+        ops: (!ops_done).then(|| {
+            async move {
+                let _ = ops_task.await;
+            }
+            .boxed()
+        }),
     }
-    watches.cancel();
-    ops_stop.cancel();
-    if !ops_done {
-        let _ = ops_task.await;
-    }
-    info!("exited");
+    .run()
+    .await;
     failed.map_or(Ok(()), Err)
 }
 

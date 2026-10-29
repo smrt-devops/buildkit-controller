@@ -29,13 +29,13 @@ use buildkit_controller::render::BUILDKIT_PORT;
 use serde_json::Value;
 use time::OffsetDateTime;
 
-use super::edge_verify::{Env, run_ok, secret_from_files};
+use super::edge_verify::{chart_rbac, controller_fixture, secret_from_files};
 use super::reconcile_verify::KIND_CONFIG;
 use super::{CRD_PATH, root};
 use crate::image::WORKER_IMAGE;
+use crate::kube::Cluster;
+use crate::proc::{status, stdout as run_out};
 
-static CLUSTER: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| super::kind_cluster("bk-perf"));
 const SYSTEM_NS: &str = "buildkit-system";
 const NS: &str = "bk-perf";
 const POOL: &str = "perf";
@@ -68,8 +68,7 @@ const FIELD: &str = r#"field() { v=$(tr -d '\n' < "$2" | sed -n "s/.*\"$1\": *\"
 "#;
 
 fn controller_manifest() -> Result<String> {
-    let mut m = std::fs::read_to_string(root().join("xtask/fixtures/edge-verify/controller.yaml"))
-        .context("reading the controller fixture")?;
+    let mut m = controller_fixture()?;
     for (from, to) in [
         (
             "    edge:\n      endpoint: tcp://bk.example.com:8444\n      serverName: bk.example.com\n",
@@ -241,7 +240,7 @@ fn polling(reqs: &BTreeMap<String, u64>) -> u64 {
 }
 
 struct Perf {
-    env: Env,
+    env: Cluster,
     node: String,
 }
 
@@ -391,39 +390,17 @@ impl Perf {
     }
 }
 
-fn run_out(cmd: &mut Command) -> Result<String> {
-    let out = cmd.output().context("running a command")?;
-    ensure!(
-        out.status.success(),
-        "{} failed: {}",
-        cmd.get_program().display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-struct Cleanup(Perf);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = self
-            .0
-            .env
-            .kind(&["delete", "cluster", "--name", CLUSTER.as_str()]);
-    }
-}
-
 #[allow(clippy::too_many_lines, reason = "one linear setup script")]
 fn setup(p: &Perf, work: &std::path::Path) -> Result<CaBundle> {
-    super::image::image(CONTROLLER_IMAGE, Some(CLUSTER.as_str()))?;
+    super::image::image(CONTROLLER_IMAGE, Some(p.env.name()))?;
     crate::image::ensure_worker()?;
     crate::image::ensure(CURL_IMAGE)?;
     for img in [WORKER_IMAGE, CURL_IMAGE] {
-        run_ok(&mut crate::kube::kind_load(img, CLUSTER.as_str()))?;
+        status(&mut crate::kube::kind_load(img, p.env.name()))?;
     }
     let crd = root().join(CRD_PATH).to_string_lossy().into_owned();
     p.k(&["apply", "--server-side", "-f", &crd])?;
-    crate::kube::wait_crd_established(&p.env.kubeconfig)?;
+    p.env.wait_crd_established()?;
     p.k(&["create", "namespace", SYSTEM_NS])?;
     p.k(&[
         "label",
@@ -468,7 +445,7 @@ fn setup(p: &Perf, work: &std::path::Path) -> Result<CaBundle> {
         files,
     )?;
 
-    p.env.apply(&controller_manifest()?)?;
+    p.env.apply(&(chart_rbac("")? + &controller_manifest()?))?;
     p.k(&[
         "-n",
         SYSTEM_NS,
@@ -565,33 +542,12 @@ pub(crate) fn perf(batches: usize, idle_secs: u64) -> Result<()> {
         &kind_config,
         KIND_CONFIG.replace("POLICY_DIR", &policies.display().to_string()),
     )?;
-    let p = Perf {
-        env: Env {
-            kubeconfig: work.join("kubeconfig"),
-        },
-        node: format!("{}-control-plane", CLUSTER.as_str()),
+    let name = super::kind_cluster("bk-perf");
+    let p = &Perf {
+        env: Cluster::new(&name, work.join("kubeconfig")),
+        node: format!("{name}-control-plane"),
     };
-    let _ = p
-        .env
-        .kind(&["delete", "cluster", "--name", CLUSTER.as_str()]);
-    let cleanup = Cleanup(p);
-    let p = &cleanup.0;
-    let kc = kind_config.display().to_string();
-    let created = p.env.kind(&[
-        "create",
-        "cluster",
-        "--name",
-        CLUSTER.as_str(),
-        "--config",
-        &kc,
-        "--wait",
-        "180s",
-    ])?;
-    ensure!(
-        created.status.success(),
-        "kind create failed: {}",
-        String::from_utf8_lossy(&created.stderr)
-    );
+    p.env.create(Some(&kind_config), "180s")?;
     setup(p, &work)?;
     println!("perf: cluster ready");
 

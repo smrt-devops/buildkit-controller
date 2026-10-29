@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: oidc-claims-17, namespace: default}
+spec:
+  access: {rules: [{oidc: {issuer: https://a, claims: {c1: v, c2: v, c3: v, c4: v, c5: v, c6: v, c7: v, c8: v, c9: v, c10: v, c11: v, c12: v, c13: v, c14: v, c15: v, c16: v, c17: v}}}]}
