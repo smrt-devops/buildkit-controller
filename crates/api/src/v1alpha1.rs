@@ -487,7 +487,10 @@ pub struct Cache {
     /// rest only read it. Unset trusts OIDC tokens whose `event_name` claim is `push`,
     /// `schedule`, `workflow_dispatch` or `merge_group`, and every `ServiceAccount` and
     /// `BuildKitClaim` caller. `[]` trusts nobody. A token whose `event_name` is
-    /// `pull_request` or `pull_request_target` only reads, whatever these rules say.
+    /// `pull_request`, `pull_request_target`, `workflow_run`, `issue_comment`,
+    /// `pull_request_review` or `pull_request_review_comment` only reads, whatever these
+    /// rules say, since those jobs can run fork code. Pin `event_name` in OIDC rules here
+    /// (for example `push`) rather than matching on the repository alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64))]
     pub writers: Option<Vec<AccessRule>>,
