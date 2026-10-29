@@ -14,7 +14,7 @@ workspace = true
 [features]
 default = []
 # Typed async HTTP client; the server does not enable this.
-client = ["dep:reqwest"]
+client = ["dep:reqwest", "dep:tokio"]
 
 [dependencies]
 thiserror = { workspace = true }
@@ -25,6 +25,7 @@ k8s-openapi = { workspace = true }
 kube-core = { workspace = true }
 kube-derive = { workspace = true }
 reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["time"] }
 
 [dev-dependencies]
 axum = { workspace = true }
