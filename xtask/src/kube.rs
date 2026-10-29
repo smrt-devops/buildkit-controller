@@ -7,10 +7,10 @@
 //! context, so a missing file is an error rather than a fallback to
 //! `~/.kube/config`, in-cluster credentials or `HELM_KUBEAPISERVER`.
 
-use std::cell::Cell;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::proc::Spawned;
 use std::sync::Mutex;
@@ -158,12 +158,19 @@ fn delete_cluster(name: &str, kubeconfig: &Path) {
     let _ = c.status();
 }
 
-/// A throwaway kind cluster with a private kubeconfig. Dropping it deletes the
-/// cluster, and so does SIGINT or SIGTERM (see [`crate::proc::on_signal`]).
+/// The variable that names an existing kind cluster for a suite to run on
+/// instead of creating its own (see [`Cluster::for_suite`]).
+pub(crate) const CLUSTER_VAR: &str = "BK_KIND_CLUSTER";
+
+/// A kind cluster with a private kubeconfig. A throwaway cluster is deleted
+/// when its handle is dropped, and on SIGINT or SIGTERM (see
+/// [`crate::proc::on_signal`]). An attached cluster ([`Cluster::attach`])
+/// belongs to someone else: this handle never creates or deletes it.
 pub(crate) struct Cluster {
     name: String,
     kubeconfig: PathBuf,
-    keep: Cell<bool>,
+    keep: AtomicBool,
+    attached: bool,
 }
 
 impl Cluster {
@@ -177,8 +184,86 @@ impl Cluster {
         Self {
             name: name.to_owned(),
             kubeconfig,
-            keep: Cell::new(false),
+            keep: AtomicBool::new(false),
+            attached: false,
         }
+    }
+
+    /// The cluster a suite runs on: the kind cluster named by [`CLUSTER_VAR`]
+    /// when that is set, else a new throwaway cluster `base` (plus
+    /// `-$BK_KIND_SUFFIX`). The kubeconfig is `work/kubeconfig` either way.
+    pub(crate) fn for_suite(base: &str, work: &Path) -> Result<Self> {
+        let kubeconfig = work.join("kubeconfig");
+        match std::env::var(CLUSTER_VAR) {
+            Ok(name) if !name.is_empty() => Self::attach(&name, kubeconfig),
+            _ => Ok(Self::new(&crate::kind_cluster(base), kubeconfig)),
+        }
+    }
+
+    /// A handle on the running kind cluster `name`. kind writes its
+    /// credentials to `kubeconfig`, so only a kind cluster can be attached.
+    /// The handle never creates or deletes the cluster.
+    pub(crate) fn attach(name: &str, kubeconfig: PathBuf) -> Result<Self> {
+        crate::proc::on_signal();
+        if let Some(dir) = kubeconfig.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut c = tool("kind", &kubeconfig);
+        c.args(["export", "kubeconfig", "--name", name, "--kubeconfig"])
+            .arg(&kubeconfig);
+        let out = crate::proc::run(&mut c).context("running kind export kubeconfig")?;
+        ensure!(
+            out.status.success(),
+            "no kind cluster {name} to attach to: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(Self {
+            name: name.to_owned(),
+            kubeconfig,
+            keep: AtomicBool::new(true),
+            attached: true,
+        })
+    }
+
+    /// The node containers of this cluster.
+    pub(crate) fn nodes(&self) -> Result<Vec<String>> {
+        let mut c = tool("kind", &self.kubeconfig);
+        c.args(["get", "nodes", "--name", &self.name]);
+        let out = crate::proc::run(&mut c).context("running kind get nodes")?;
+        let nodes = checked("kind", &["get", "nodes"], &out)?;
+        Ok(nodes.lines().map(str::to_owned).collect())
+    }
+
+    /// Tags the loaded image `from` as `to` on every node, as `kind load` of
+    /// `to` would, without loading it again.
+    pub(crate) fn tag_image(&self, from: &str, to: &str) -> Result<()> {
+        let full = |r: &str| {
+            if r.contains('/') {
+                r.to_owned()
+            } else {
+                format!("docker.io/library/{r}")
+            }
+        };
+        for node in self.nodes()? {
+            crate::proc::output(Command::new("docker").args([
+                "exec",
+                &node,
+                "ctr",
+                "-n",
+                "k8s.io",
+                "images",
+                "tag",
+                "--force",
+                &full(from),
+                &full(to),
+            ]))?;
+        }
+        Ok(())
+    }
+
+    /// Whether this handle is on a cluster it did not create.
+    pub(crate) fn attached(&self) -> bool {
+        self.attached
     }
 
     pub(crate) fn name(&self) -> &str {
@@ -194,14 +279,21 @@ impl Cluster {
         format!("kind-{}", self.name)
     }
 
-    /// Deletes the cluster if it exists.
+    /// Deletes the cluster if it exists, unless it is attached.
     pub(crate) fn delete(&self) {
+        if self.attached {
+            return;
+        }
         delete_cluster(&self.name, &self.kubeconfig);
     }
 
     /// Deletes any leftover cluster of this name, then creates it, with the
     /// kind config file `config` if given, waiting up to `wait` for the node.
+    /// An attached cluster exists already, so this does nothing there.
     pub(crate) fn create(&self, config: Option<&Path>, wait: &str) -> Result<()> {
+        if self.attached {
+            return Ok(());
+        }
         self.delete();
         let mut c = tool("kind", &self.kubeconfig);
         c.args(["create", "cluster", "--name", &self.name, "--wait", wait]);
@@ -222,7 +314,7 @@ impl Cluster {
 
     /// Leave the cluster running when this handle is dropped.
     pub(crate) fn keep(&self) {
-        self.keep.set(true);
+        self.keep.store(true, Ordering::Relaxed);
         self.forget();
     }
 
@@ -272,14 +364,29 @@ impl Cluster {
         checked("kubectl", args, &self.kubectl_raw(args, stdin)?)
     }
 
+    /// Creates namespace `ns` unless it exists. Two suites on a shared cluster
+    /// may both need it.
+    pub(crate) fn namespace(&self, ns: &str) -> Result<()> {
+        self.apply(&format!(
+            "apiVersion: v1\nkind: Namespace\nmetadata: {{name: {ns}}}\n"
+        ))
+    }
+
     /// `kubectl apply -f -` of `yaml`.
     pub(crate) fn apply(&self, yaml: &str) -> Result<()> {
         self.kubectl_in(&["apply", "-f", "-"], Some(yaml)).map(drop)
     }
 
-    /// helm's stdout; fails with its output when it exits non-zero.
+    /// helm's stdout; fails with its output when it exits non-zero. On an
+    /// attached cluster, which other releases share, an install or upgrade
+    /// takes over the cluster-scoped objects every release ships (the claim CRD).
     pub(crate) fn helm(&self, args: &[&str]) -> Result<String> {
-        let out = crate::proc::run(self.helm_cmd().args(args)).context("running helm")?;
+        let mut c = self.helm_cmd();
+        c.args(args);
+        if self.attached && args.iter().any(|a| *a == "install" || *a == "upgrade") {
+            c.arg("--take-ownership");
+        }
+        let out = crate::proc::run(&mut c).context("running helm")?;
         checked("helm", args, &out)
     }
 
@@ -371,7 +478,7 @@ impl Cluster {
 
 impl Drop for Cluster {
     fn drop(&mut self) {
-        if self.keep.get() {
+        if self.keep.load(Ordering::Relaxed) {
             return;
         }
         delete_cluster(&self.name, &self.kubeconfig);
@@ -506,7 +613,8 @@ mod tests {
         let cluster = Cluster {
             name: "bk-x".into(),
             kubeconfig: kc.to_path_buf(),
-            keep: Cell::new(true),
+            keep: AtomicBool::new(true),
+            attached: false,
         };
         for (name, c, context_flag) in [
             ("kubectl", cluster.kubectl_cmd(), "--context"),

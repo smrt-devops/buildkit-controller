@@ -21,10 +21,7 @@ pub fn alloc_verify() -> Result<()> {
     std::fs::create_dir_all(&work)?;
     crate::image::ensure(PAUSE)?;
     crate::image::ensure_worker()?;
-    let cluster = Cluster::new(
-        &super::kind_cluster("bk-alloc-verify"),
-        work.join("kubeconfig"),
-    );
+    let cluster = Cluster::for_suite("bk-alloc-verify", &work)?;
     cluster.create(None, "120s")?;
     status(&mut crate::kube::kind_load(PAUSE, cluster.name()))?;
     status(&mut crate::kube::kind_load(

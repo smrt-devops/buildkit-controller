@@ -32,16 +32,12 @@ const STRAY_NS: &str = "bk-helm-stray";
 /// The namespace in `claims.namespaces`.
 const APPS_NS: &str = "bk-helm-apps";
 const CONTROLLER_SA: &str = "system:serviceaccount:bk-helm:buildkit-controller";
-const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const LEASE: &str = "buildkit-controller-leader";
 
 pub(crate) fn helm_verify() -> Result<()> {
     let work = root().join("target/helm-verify");
     std::fs::create_dir_all(&work)?;
-    let env = &Cluster::new(
-        &super::kind_cluster("bk-helm-verify"),
-        work.join("kubeconfig"),
-    );
+    let env = &Cluster::for_suite("bk-helm-verify", &work)?;
     let result = verify(env);
     if result.is_err() {
         for args in [
@@ -71,7 +67,7 @@ pub(crate) fn helm_verify() -> Result<()> {
 fn verify(env: &Cluster) -> Result<()> {
     let root = root();
     env.create(None, "120s")?;
-    crate::image::image(CONTROLLER_IMAGE, Some(env.name()))?;
+    crate::image::load_controller(env)?;
     crate::image::ensure_worker()?;
     crate::proc::status(&mut crate::kube::kind_load(WORKER_IMAGE, env.name()))?;
 

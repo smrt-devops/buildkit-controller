@@ -54,9 +54,7 @@ fn prepare(cluster: &Cluster) -> Result<()> {
     }
     cluster.apply_crds().context("CRD apply")?;
     for ns in [POOL_NAMESPACE, CONTROLLER_NAMESPACE] {
-        cluster
-            .kubectl(&["create", "namespace", ns])
-            .context("create namespace")?;
+        cluster.namespace(ns).context("create namespace")?;
     }
     cluster.apply(PREREQS).context("prereqs")
 }
@@ -90,10 +88,7 @@ pub fn render_verify() -> Result<()> {
 
     let work = root.join("target/render-verify");
     std::fs::create_dir_all(&work)?;
-    let cluster = Cluster::new(
-        &super::kind_cluster("bk-render-verify"),
-        work.join("kubeconfig"),
-    );
+    let cluster = Cluster::for_suite("bk-render-verify", &work)?;
     cluster.create(None, "120s")?;
     prepare(&cluster)?;
 

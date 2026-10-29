@@ -37,7 +37,6 @@ use crate::proc::status;
 const SYSTEM_NS: &str = "buildkit-system";
 const NS: &str = "bk-soak";
 const CURL_IMAGE: &str = "curlimages/curl:8.11.1";
-const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const CA_SECRET: &str = "buildkit-controller-ca";
 const USER_TLS: &str = "soak-user-tls";
 const SERVER_NAME: &str = "bk.example.com";
@@ -375,7 +374,7 @@ pub(crate) fn soak() -> Result<()> {
     let root = root();
     let work = root.join("target/soak");
     std::fs::create_dir_all(&work)?;
-    let env = Cluster::new(&super::kind_cluster("bk-soak"), work.join("kubeconfig"));
+    let env = Cluster::for_suite("bk-soak", &work)?;
     let cleanup = Cleanup(Soak { env }, std::cell::Cell::new(false));
     let s = &cleanup.0;
     s.env.create(None, "120s")?;
@@ -725,7 +724,7 @@ fn verdict(windows: &[Window], builds: &[Build]) -> (String, bool) {
 /// Installs images, CRD, namespaces, the controller and the client pod. Returns
 /// the user serving CA (scenario b), which the client trusts from the start.
 fn setup(s: &Soak, root: &std::path::Path) -> Result<CaBundle> {
-    super::image::image(CONTROLLER_IMAGE, Some(s.env.name()))?;
+    crate::image::load_controller(&s.env)?;
     crate::image::ensure_worker()?;
     crate::image::ensure(CURL_IMAGE)?;
     for img in [WORKER_IMAGE, CURL_IMAGE] {
@@ -745,7 +744,7 @@ fn setup(s: &Soak, root: &std::path::Path) -> Result<CaBundle> {
     // The controller bootstraps its own CA. The RBAC already names the user
     // serving Secret that scenario b switches to.
     s.env
-        .apply(&(chart_rbac(USER_TLS)? + &controller_manifest("")?))?;
+        .apply(&(chart_rbac(USER_TLS, &[])? + &controller_manifest("")?))?;
     s.rollout()?;
     let user_ca = CaBundle::generate(OffsetDateTime::now_utc().replace_nanosecond(0)?)?;
     s.k(&[

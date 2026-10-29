@@ -1,10 +1,12 @@
-# The Gateway the e2e install attaches to. Envoy's Service is a NodePort on
-# 30443 (API) and 30444 (edge), which xtask/fixtures/e2e/kind.yaml publishes on
-# 127.0.0.1:18443 and :18444.
+# A Gateway a suite's routes attach to: GW_NAME in namespace GW_NS, of the
+# GatewayClass GW_CLASS (filled in by xtask/src/gateway.rs). Each suite on a
+# shared cluster has its own, so their routes never meet. e2e's Envoy Service is
+# a NodePort on the ports the kind config publishes on loopback; proxy-verify's
+# is a ClusterIP Service that the host reaches through kubectl port-forward.
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: EnvoyProxy
 metadata:
-  name: kind-nodeport
+  name: GW_CLASS
   namespace: envoy-gateway-system
 spec:
   provider:
@@ -16,34 +18,27 @@ spec:
         # v1.9.3 used its built-in image reference here and pulled it in the cluster.
         container: {image: docker.io/envoyproxy/envoy:distroless-v1.39.5}
       envoyService:
-        type: NodePort
-        patch:
-          type: StrategicMerge
-          value:
-            spec:
-              ports:
-                - {port: 8443, nodePort: 30443}
-                - {port: 8444, nodePort: 30444}
+ENVOY_SERVICE
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata:
-  name: bk-e2e
+  name: GW_CLASS
 spec:
   controllerName: gateway.envoyproxy.io/gatewayclass-controller
   parametersRef:
     group: gateway.envoyproxy.io
     kind: EnvoyProxy
-    name: kind-nodeport
+    name: GW_CLASS
     namespace: envoy-gateway-system
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
-  name: bk
-  namespace: bk-gateway
+  name: GW_NAME
+  namespace: GW_NS
 spec:
-  gatewayClassName: bk-e2e
+  gatewayClassName: GW_CLASS
   listeners:
     # The API: TLS ends here with the bk-gateway-api certificate, and the
     # HTTPRoute's BackendTLSPolicy re-encrypts to the controller.

@@ -96,13 +96,13 @@ pub(crate) fn poll<T>(
     }
 }
 
-/// [`poll`] every 3 s, for cluster state.
+/// [`poll`] every second, for cluster state.
 pub(crate) fn until<T>(
     what: &str,
     timeout: Duration,
     f: impl FnMut() -> Result<Option<T>>,
 ) -> Result<T> {
-    poll(what, timeout, Duration::from_secs(3), f)
+    poll(what, timeout, Duration::from_secs(1), f)
 }
 
 /// Process groups whose leader is a [`Spawned`] child that has not been reaped.

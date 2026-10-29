@@ -40,7 +40,6 @@ const SYSTEM_NS: &str = "buildkit-system";
 const NS: &str = "bk-perf";
 const POOL: &str = "perf";
 const CURL_IMAGE: &str = "curlimages/curl:8.11.1";
-const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const SERVER_NAME: &str = "bk.example.com";
 const API: &str = "https://buildkit-controller.buildkit-system.svc:8443";
 /// Warm pods the pool keeps (`scaling.min`).
@@ -392,7 +391,7 @@ impl Perf {
 
 #[allow(clippy::too_many_lines, reason = "one linear setup script")]
 fn setup(p: &Perf, work: &std::path::Path) -> Result<CaBundle> {
-    super::image::image(CONTROLLER_IMAGE, Some(p.env.name()))?;
+    crate::image::load_controller(&p.env)?;
     crate::image::ensure_worker()?;
     crate::image::ensure(CURL_IMAGE)?;
     for img in [WORKER_IMAGE, CURL_IMAGE] {
@@ -443,7 +442,8 @@ fn setup(p: &Perf, work: &std::path::Path) -> Result<CaBundle> {
         files,
     )?;
 
-    p.env.apply(&(chart_rbac("")? + &controller_manifest()?))?;
+    p.env
+        .apply(&(chart_rbac("", &[])? + &controller_manifest()?))?;
     p.k(&[
         "-n",
         SYSTEM_NS,

@@ -218,11 +218,118 @@ fn compile(root: &Path, work: &Path, image: &str, out: &Path) -> Result<()> {
         .args([image, "sh", "-c", &script]))
 }
 
+/// The tag every suite's manifests and chart values name the controller by.
+pub(crate) const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
+/// Repository of the content-tagged controller images.
+const REPOSITORY: &str = "buildkit-controller";
+/// Image label holding the SHA-256 of the inputs the image was built from.
+const INPUTS_LABEL: &str = "buildkit-controller.inputs";
+
+/// Repository-relative files and directories the controller image is built
+/// from. Every workspace manifest counts, because cargo reads them all.
+const INPUTS: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "xtask/Cargo.toml",
+    "docker",
+    "crates",
+];
+
+/// Every file under `path`, or `path` itself when it is a file.
+fn files_under(path: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
+    if path.is_file() {
+        out.push(path.to_path_buf());
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
+        files_under(&entry?.path(), out)?;
+    }
+    Ok(())
+}
+
+/// SHA-256 over the paths and contents of the image's inputs. Test
+/// directories are left out: they never reach the binary.
+pub(crate) fn inputs_hash(root: &Path) -> Result<String> {
+    let mut files = Vec::new();
+    for rel in INPUTS {
+        files_under(&root.join(rel), &mut files)?;
+    }
+    let mut rels: Vec<(String, std::path::PathBuf)> = files
+        .into_iter()
+        .filter_map(|p| {
+            let rel = p.strip_prefix(root).ok()?.to_string_lossy().into_owned();
+            let in_tests = rel.split('/').any(|c| c == "tests" || c == "target");
+            (!in_tests).then_some((rel, p))
+        })
+        .collect();
+    rels.sort();
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    for (rel, path) in rels {
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        ctx.update(rel.as_bytes());
+        ctx.update(&[0]);
+        ctx.update(&(bytes.len() as u64).to_le_bytes());
+        ctx.update(&bytes);
+    }
+    Ok(crate::gateway::hex(ctx.finish().as_ref()))
+}
+
+/// The inputs label of the local image `tag`, empty when it has none.
+fn inputs_label(tag: &str) -> String {
+    Command::new("docker")
+        .args(["image", "inspect", "--format"])
+        .arg(format!("{{{{index .Config.Labels \"{INPUTS_LABEL}\"}}}}"))
+        .arg(tag)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// The controller image of this checkout, tagged by a prefix of its inputs
+/// hash. It is built only when Docker has no image with that hash, so a run
+/// whose sources have not changed skips the build. Returns the tag.
+///
+/// The tag is per content, not `:dev`, so a build from another checkout cannot
+/// replace the image between this build and the `kind load` that follows.
+pub(crate) fn controller() -> Result<String> {
+    let _lock = host_lock()?;
+    let root = root();
+    let hash = inputs_hash(&root)?;
+    let tag = format!("{REPOSITORY}:{}", &hash[..16]);
+    if inputs_label(&tag) == hash {
+        println!("image {tag} is up to date");
+        return Ok(tag);
+    }
+    build(&root, &tag, &hash)?;
+    Ok(tag)
+}
+
+/// Loads the controller image into `env`, building it first if its inputs
+/// changed, and tags it there as [`CONTROLLER_IMAGE`], the name every suite uses.
+pub(crate) fn load_controller(env: &crate::kube::Cluster) -> Result<()> {
+    let tag = controller()?;
+    crate::proc::status(&mut crate::kube::kind_load(&tag, env.name()))?;
+    env.tag_image(&tag, CONTROLLER_IMAGE)
+}
+
 /// Build the image, tag it, and optionally load it into a kind cluster.
 pub(crate) fn image(tag: &str, load_kind: Option<&str>) -> Result<()> {
-    let _lock = host_lock()?;
+    let built = controller()?;
+    run(Command::new("docker").args(["tag", &built, tag]))?;
+    if let Some(cluster) = load_kind {
+        run(&mut crate::kube::kind_load(tag, cluster))?;
+    }
+    println!("tagged {built} as {tag}");
+    Ok(())
+}
+
+/// Compile the controller and build the image `tag`, labelled with `hash`.
+fn build(root: &Path, tag: &str, hash: &str) -> Result<()> {
     let _t = crate::proc::Timed::named("image build");
-    let root = root();
+    let root = root.to_path_buf();
     let work = root.join("target/image");
     let ctx = work.join("ctx");
     std::fs::create_dir_all(&ctx)?;
@@ -239,10 +346,10 @@ pub(crate) fn image(tag: &str, load_kind: Option<&str>) -> Result<()> {
     )?;
     std::fs::copy(root.join("docker/Dockerfile"), ctx.join("Dockerfile"))
         .context("copying Dockerfile")?;
-    run(Command::new("docker").args(["build", "-t", tag]).arg(&ctx))?;
-    if let Some(cluster) = load_kind {
-        run(&mut crate::kube::kind_load(tag, cluster))?;
-    }
+    run(Command::new("docker")
+        .args(["build", "-t", tag, "--label"])
+        .arg(format!("{INPUTS_LABEL}={hash}"))
+        .arg(&ctx))?;
     println!("built {tag}");
     Ok(())
 }
@@ -329,6 +436,39 @@ pub(crate) fn copy_busybox(dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The image is rebuilt exactly when a file it is built from changes.
+    #[test]
+    fn inputs_hash_follows_sources_and_ignores_tests() {
+        let root = std::env::temp_dir().join(format!("xtask-inputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        for f in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            "xtask/Cargo.toml",
+        ] {
+            write(f, "x");
+        }
+        write("docker/Dockerfile", "FROM scratch");
+        write("crates/server/src/main.rs", "fn main() {}");
+        write("crates/server/tests/kind.rs", "a");
+        let base = inputs_hash(&root).unwrap();
+        assert_eq!(base, inputs_hash(&root).unwrap(), "stable");
+        write("crates/server/tests/kind.rs", "b");
+        assert_eq!(base, inputs_hash(&root).unwrap(), "tests are not inputs");
+        write("crates/server/src/main.rs", "fn main() { }");
+        let changed = inputs_hash(&root).unwrap();
+        assert_ne!(base, changed, "a source edit rebuilds");
+        write("crates/server/src/new.rs", "");
+        assert_ne!(changed, inputs_hash(&root).unwrap(), "a new file rebuilds");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// Regression (soak): one shared volume let another worktree's newer
     /// build make this checkout's edits look up to date.

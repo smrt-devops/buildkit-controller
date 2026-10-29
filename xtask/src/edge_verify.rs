@@ -41,7 +41,6 @@ const NS: &str = "bk-edge";
 const POOL: &str = "edge";
 /// The worker pod's nonce; the edge dials `<NONCE>.<pod>.<pool>.<ns>`.
 const NONCE: &str = "0123456789abcdef";
-const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const ALLOC: &str = "mfrggzdfmztwq2lknnwg23tpoa";
 const OTHER_ALLOC: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbb";
 /// 512 MiB.
@@ -108,8 +107,9 @@ done
 
 /// The controller's `ServiceAccount` and RBAC, rendered from the chart for the
 /// release `bk` in [`SYSTEM_NS`]. `tls_secret` is the chart's
-/// `edge.tls.secretName`, which the RBAC lets the controller read.
-pub(crate) fn chart_rbac(tls_secret: &str) -> Result<String> {
+/// `edge.tls.secretName`, which the RBAC lets the controller read. `watch` is
+/// `watchNamespaces`; empty means cluster-wide.
+pub(crate) fn chart_rbac(tls_secret: &str, watch: &[&str]) -> Result<String> {
     let chart = root().join("helm/buildkit-controller");
     let rbac = crate::proc::stdout(
         crate::kube::helm(&crate::kube::sandbox())
@@ -122,7 +122,8 @@ pub(crate) fn chart_rbac(tls_secret: &str) -> Result<String> {
             .args(["--set", "gateway.enabled=false"])
             .args(["--set", "edge.endpoint=tcp://bk.example.com:8444"])
             .args(["--set", "edge.serverName=bk.example.com"])
-            .args(["--set-string", &format!("edge.tls.secretName={tls_secret}")]),
+            .args(["--set-string", &format!("edge.tls.secretName={tls_secret}")])
+            .args(["--set", &format!("watchNamespaces={{{}}}", watch.join(","))]),
     )
     .context("rendering the chart's RBAC")?;
     Ok(rbac + "\n---\n")
@@ -251,21 +252,18 @@ pub(crate) fn edge_verify() -> Result<()> {
     let work = root.join("target/edge-verify");
     std::fs::create_dir_all(&work)?;
     let cleanup = Cleanup(
-        Cluster::new(
-            &super::kind_cluster("bk-edge-verify"),
-            work.join("kubeconfig"),
-        ),
+        Cluster::for_suite("bk-edge-verify", &work)?,
         std::cell::Cell::new(false),
     );
     let env = &cleanup.0;
     env.create(None, "120s")?;
 
-    super::image::image(CONTROLLER_IMAGE, Some(env.name()))?;
+    crate::image::load_controller(env)?;
     crate::image::ensure_worker()?;
     status(&mut crate::kube::kind_load(WORKER_IMAGE, env.name()))?;
 
     env.apply_crds()?;
-    env.kubectl(&["create", "namespace", SYSTEM_NS])?;
+    env.namespace(SYSTEM_NS)?;
     // The controller pod must pass PodSecurity "restricted".
     env.kubectl(&[
         "label",
@@ -284,7 +282,17 @@ pub(crate) fn edge_verify() -> Result<()> {
         &work.join("ca"),
         ca.to_secret_data(),
     )?;
-    env.apply(&(chart_rbac("")? + &controller_fixture()?))?;
+    // Scoped to the pool namespace, so it leaves other suites on a shared cluster alone.
+    let controller = controller_fixture()?.replacen(
+        "\n    edge:\n",
+        &format!("\n    watchNamespaces: [{NS}]\n    edge:\n"),
+        1,
+    );
+    ensure!(
+        controller.contains("watchNamespaces"),
+        "no edge: key in the controller fixture config"
+    );
+    env.apply(&(chart_rbac("", &[NS])? + &controller))?;
 
     let pod_ip = deploy(env, &work, &ca, now)?;
 
