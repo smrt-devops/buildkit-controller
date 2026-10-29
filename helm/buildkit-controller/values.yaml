@@ -86,6 +86,9 @@ auth:
     recentSubjectTtl: 10m              # how long a service account that passed a review counts as recently seen
 
 workerNetwork:
+  # Ranges the internet rule of every pool leaves out. Helm replaces a list it is given,
+  # so add ranges in extraDeniedCIDRs. The link-local, cloud metadata and NAT64 ranges
+  # are always left out, whatever this list says.
   deniedCIDRs: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, 127.0.0.0/8, 168.63.129.16/32, "fc00::/7", "fe80::/10", "64:ff9b::/96", "64:ff9b:1::/48"]
   extraDeniedCIDRs: []
   # Pod, service and node ranges of this cluster, both families. IPv6 egress stays
@@ -214,6 +217,8 @@ priorityClassName: ""
 # reads claims in every namespace (with watchNamespaces set, in these only), gets a Role for
 # Secret get/create/delete in each of them, and refuses claims from any other namespace. Pools
 # still admit claims with an access rule `claims: {namespaces: [...]}`. [] = API claims only.
+# Never the release namespace: the API's claims live there, the leader trusts their owner and
+# cache fields, and only cluster admins may create claims there.
 claims:
   namespaces: []
 
