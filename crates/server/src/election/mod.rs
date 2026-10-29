@@ -142,6 +142,9 @@ pub struct Elector<A, C> {
     leading: bool,
     term: u64,
     last_renew_sent: Option<Instant>,
+    /// The Lease was deleted while another replica held it: that holder may
+    /// still lead until this instant, so creating it waits until then.
+    vacated_until: Option<Instant>,
 }
 
 impl<A: LeaseApi, C: Clock> Elector<A, C> {
@@ -164,16 +167,18 @@ impl<A: LeaseApi, C: Clock> Elector<A, C> {
             leading: false,
             term: 0,
             last_renew_sent: None,
+            vacated_until: None,
         };
         (me, rx)
     }
 
-    /// The larger of our `leaseDuration` and the one the holder wrote.
+    /// The larger of our `leaseDuration` and the one the holder wrote, which
+    /// counts up to twice ours: a Lease written with a huge duration must not
+    /// keep every replica waiting.
     fn expiry(&self, o: &Observed) -> std::time::Duration {
         let theirs = u64::try_from(o.snap.spec.lease_duration_seconds.unwrap_or(0)).unwrap_or(0);
-        self.t
-            .lease_duration
-            .max(std::time::Duration::from_secs(theirs))
+        let ours = self.t.lease_duration;
+        ours.max(std::time::Duration::from_secs(theirs).min(ours.saturating_mul(2)))
     }
 
     fn secs(&self) -> i32 {
@@ -183,6 +188,13 @@ impl<A: LeaseApi, C: Clock> Elector<A, C> {
     fn observe(&mut self, snap: Option<LeaseSnapshot>) {
         self.known = true;
         let now = self.clock.now();
+        if snap.is_some() {
+            self.vacated_until = None;
+        } else if let Some(o) = &self.observed
+            && o.snap.holder().is_some_and(|h| h != self.identity)
+        {
+            self.vacated_until = Some(o.at + self.expiry(o));
+        }
         self.observed = snap.map(|snap| {
             let at = match &self.observed {
                 Some(o)
@@ -301,7 +313,7 @@ impl<A: LeaseApi, C: Clock> Elector<A, C> {
             return;
         }
         let acquire_now = match &self.observed {
-            None => true,
+            None => self.vacated_until.is_none_or(|t| self.clock.now() >= t),
             Some(o) => {
                 o.snap.holder().is_none()
                     || self.holder_is_me()
@@ -310,11 +322,11 @@ impl<A: LeaseApi, C: Clock> Elector<A, C> {
         };
         if !acquire_now {
             let now = self.clock.now();
-            let (at, expiry) = self
-                .observed
-                .as_ref()
-                .map_or((now, self.t.lease_duration), |o| (o.at, self.expiry(o)));
-            self.wait(at + expiry, events, shutdown).await;
+            let until = match &self.observed {
+                Some(o) => o.at + self.expiry(o),
+                None => self.vacated_until.unwrap_or(now),
+            };
+            self.wait(until, events, shutdown).await;
             return;
         }
         let start = self.clock.now();

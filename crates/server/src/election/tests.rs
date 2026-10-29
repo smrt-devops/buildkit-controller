@@ -435,3 +435,42 @@ async fn release_after_a_lost_renew_response_still_clears_the_holder() {
     a.task.await.unwrap();
     assert_eq!(f.holder(), None, "released after re-reading the Lease");
 }
+
+/// A follower that sees the Lease deleted while another replica held it waits
+/// out that holder's lease before it creates a new one, so the two never lead
+/// at once.
+#[tokio::test(start_paused = true)]
+async fn a_lease_deleted_under_a_live_holder_is_not_taken_at_once() {
+    let fa = Fake::default();
+    let fb = fa.peer();
+    let a = start("a", &fa);
+    secs(1).await;
+    assert!(leads(&a));
+    let b = start("b", &fb);
+    secs(1).await;
+    assert!(!leads(&b));
+    // a stops renewing (it still believes it leads until it fences), and the
+    // Lease is deleted.
+    fa.block.store(true, Ordering::SeqCst);
+    fa.delete();
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!(leads(&a) && leads(&b)), "two leaders");
+    }
+    secs(10).await;
+    assert!(leads(&b), "b took over once a's lease ran out");
+}
+
+/// A holder-written `leaseDurationSeconds` counts for at most twice ours.
+#[tokio::test(start_paused = true)]
+async fn a_huge_holder_lease_duration_is_capped() {
+    let f = Fake::default();
+    let mut s = spec(Some("other"), true);
+    s.lease_duration_seconds = Some(i32::MAX);
+    f.seed(s);
+    let a = start("a", &f);
+    secs(29).await;
+    assert!(!leads(&a), "twice our 15 s");
+    secs(2).await;
+    assert!(leads(&a));
+}
