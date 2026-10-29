@@ -69,7 +69,6 @@ test('a 202 is polled with wait=25s until the allocation is bound', async () => 
   assert.deepEqual(s.seen.map((r) => `${r.method} ${r.url}`),
     ['POST /v1/allocations', ...Array(3).fill('GET /v1/allocations/abc123?wait=25s')]);
   assert.deepEqual(ids.got, ['abc123']);
-  assert.deepEqual(c.waits, [], 'a 202 poll answer polls again at once');
 });
 
 test('a transient poll failure (503 upstream_error, 500, reset) polls the same id again, never POSTs again', async () => {
@@ -83,7 +82,8 @@ test('a transient poll failure (503 upstream_error, 500, reset) polls the same i
   s.close();
   assert.equal(s.seen.filter((r) => r.method === 'POST').length, 1);
   assert.equal(s.seen.filter((r) => r.method === 'GET').length, 5);
-  assert.deepEqual(c.waits, [2000, 2000, 2000]);
+  assert.deepEqual(c.waits.slice(0, 3), [2000, 2000, 2000]);
+  assert.equal(c.waits.length, 4, 'and a pause after the instant 202');
 });
 
 test('pool_exhausted on a poll starts a fresh POST while the budget allows', async () => {
@@ -201,4 +201,36 @@ test('pod_lost on the POST ends the run without another POST', async () => {
   await assert.rejects(p, /pod_lost/);
   s.close();
   assert.equal(keysSent(s).length, 1);
+});
+
+test('a 202 poll answered at once is followed by a 1-2 s pause', async () => {
+  const s = await serve({ post: [pending], get: [pending, pending, bound] });
+  const c = clock();
+  const { p } = run(s, c);
+  await p;
+  s.close();
+  assert.equal(c.waits.length, 2);
+  for (const w of c.waits) assert.ok(w >= 1000 && w < 2000, `pause ${w}`);
+});
+
+test('no fresh POST is sent once the queue timeout it would carry is 0', async () => {
+  const s = await serve({ post: [err(503, 'pool_exhausted', { 'Retry-After': '30' })] });
+  const c = clock();
+  const { p } = run(s, c, {
+    budgetMs: L.retryBudgetMs(100), queueSeconds: 100,
+    attemptOpts: ({ remainingMs, publicKey }) => ({ method: 'POST', body: { publicKey, queueTimeoutSeconds: L.queueTimeoutFor(100, remainingMs) }, timeoutMs: 5000 }),
+  });
+  await assert.rejects(p, /pool_exhausted/);
+  s.close();
+  const posts = s.seen.filter((r) => r.method === 'POST').map((r) => r.body.queueTimeoutSeconds);
+  assert.deepEqual(posts, [100, 70, 40, 10]);
+});
+
+test('a 401 on a poll keeps the id for the release', async () => {
+  const s = await serve({ post: [pending], get: [err(401, 'unauthorized')] });
+  const c = clock();
+  const { p, ids } = run(s, c);
+  await assert.rejects(p, /401/);
+  s.close();
+  assert.deepEqual(ids.gone, []);
 });

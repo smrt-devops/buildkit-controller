@@ -22,7 +22,7 @@ async function run() {
     cacheMode: gha.getInput('cache-mode'), cacheFrom: gha.getInput('cache-from'),
   });
   const aud = gha.getInput('audience') || 'buildkit-controller';
-  const getToken = () => L.fetchOidcToken(aud, gha.setSecret);
+  const getToken = L.cachedToken(() => L.fetchOidcToken(aud, gha.setSecret));
 
   const lr = await L.requestWithRetry(`${api}/v1/pools`, { ca, timeoutMs: 30000 },
     { what: 'list pools', getToken, budgetMs: L.SHORT_BUDGET_MS, log: gha.info });
@@ -59,12 +59,12 @@ async function run() {
     const attemptOpts = ({ remainingMs, publicKey }) => {
       const q = L.queueTimeoutFor(pqt, remainingMs);
       return {
-        method: 'POST', ca, timeoutMs: L.postTimeoutMs(remainingMs), headers: { 'Content-Type': 'application/json' },
+        method: 'POST', ca, timeoutMs: L.postTimeoutMs(remainingMs, L.isCurrentServer(found[i])), headers: { 'Content-Type': 'application/json' },
         body: L.allocationBody(p, publicKey, ttl, q, cache),
       };
     };
     const a = await L.allocate(api, {
-      what: `allocate ${p.namespace}/${p.pool}`, ca, getToken, attemptOpts, newKey, budgetMs: L.retryBudgetMs(pqt), log: gha.info,
+      what: `allocate ${p.namespace}/${p.pool}`, ca, getToken, attemptOpts, newKey, budgetMs: L.retryBudgetMs(pqt), queueSeconds: pqt, log: gha.info,
       onId: (id) => { live.add(id); saveIds(); },
       onGone: (id) => { live.delete(id); saveIds(); },
     });

@@ -158,3 +158,36 @@ test('cacheFlags: registry flags from responses, mode override, extra refs, dedu
   assert.deepEqual(L.cacheFlags([{}], {}), { to: [], from: [], args: [] });
   assert.deepEqual(L.cacheFlags([{}], { from: ['type=gha'] }).args, ['--cache-from=type=gha']);
 });
+
+test('the current server gets a 40 s POST timeout, v0.1.0 keeps the whole budget', () => {
+  const budget = L.retryBudgetMs(300);
+  assert.equal(L.isCurrentServer({ queueTimeoutSeconds: 300 }), true);
+  assert.equal(L.isCurrentServer({ queueTimeoutSeconds: 0 }), true);
+  assert.equal(L.isCurrentServer({}), false);
+  assert.equal(L.postTimeoutMs(budget, true), 40000);
+  assert.equal(L.postTimeoutMs(5000, true), 5000);
+  assert.equal(L.postTimeoutMs(budget, false), 360000);
+});
+
+const jwt = (exp) => `h.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.s`;
+
+test('cachedToken reuses a token until 60 s before its exp', async () => {
+  let t = 1000000;
+  let n = 0;
+  const get = L.cachedToken(async () => { n += 1; return jwt(Math.floor(t / 1000) + 300); }, { now: () => t });
+  await get();
+  t += 239000;
+  await get();
+  assert.equal(n, 1, 'reused');
+  t += 2000;
+  await get();
+  assert.equal(n, 2, 'refetched inside the last 60 s');
+});
+
+test('cachedToken fetches every time when exp cannot be read', async () => {
+  let n = 0;
+  const get = L.cachedToken(async () => { n += 1; return 'opaque'; });
+  await get();
+  await get();
+  assert.equal(n, 2);
+});
