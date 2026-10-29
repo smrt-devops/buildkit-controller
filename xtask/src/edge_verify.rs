@@ -115,9 +115,11 @@ done
 /// `watchNamespaces`; empty means cluster-wide.
 pub(crate) fn chart_rbac(tls_secret: &str, watch: &[&str]) -> Result<String> {
     let chart = root().join("helm/buildkit-controller");
+    let mut helm = crate::kube::helm(&crate::kube::sandbox());
+    // `{}` would be one empty name, so cluster-wide sets nothing.
+    let watch_set = (!watch.is_empty()).then(|| format!("watchNamespaces={{{}}}", watch.join(",")));
     let rbac = crate::proc::stdout(
-        crate::kube::helm(&crate::kube::sandbox())
-            .args(["template", "bk"])
+        helm.args(["template", "bk"])
             .arg(&chart)
             .args(["-n", SYSTEM_NS])
             .args(["--show-only", "templates/serviceaccount.yaml"])
@@ -127,7 +129,7 @@ pub(crate) fn chart_rbac(tls_secret: &str, watch: &[&str]) -> Result<String> {
             .args(["--set", "edge.endpoint=tcp://bk.example.com:8444"])
             .args(["--set", "edge.serverName=bk.example.com"])
             .args(["--set-string", &format!("edge.tls.secretName={tls_secret}")])
-            .args(["--set", &format!("watchNamespaces={{{}}}", watch.join(","))]),
+            .args(watch_set.iter().flat_map(|s| ["--set", s.as_str()])),
     )
     .context("rendering the chart's RBAC")?;
     Ok(rbac + "\n---\n")
@@ -810,6 +812,16 @@ fn other_worker() -> Result<WorkerIdentity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (soak, perf): cluster-wide RBAC once rendered with
+    /// `watchNamespaces={}`, which the chart schema rejects as one empty name.
+    #[test]
+    fn chart_rbac_renders_cluster_wide_and_scoped() {
+        let wide = chart_rbac("", &[]).unwrap();
+        assert!(wide.contains("kind: ClusterRole"), "{wide}");
+        let scoped = chart_rbac("", &[NS]).unwrap();
+        assert!(scoped.contains(&format!("namespace: {NS}")), "{scoped}");
+    }
 
     /// The controller's RBAC comes from the chart only; a hand-written copy
     /// here would be what edge-verify, soak and perf test instead.
