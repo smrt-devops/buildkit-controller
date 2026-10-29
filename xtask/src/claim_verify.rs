@@ -227,8 +227,10 @@ spec:
       # runtime-verify does before this suite in kind-all). Until then a
       # connect is refused, so wait for the edge to answer first.
       i=0
-      until bk debug workers >/dev/null 2>&1; do
-        i=$((i + 1)); [ "$i" -lt 120 ] || exit 1; sleep 1
+      until err=$(bk debug workers 2>&1 >/dev/null); do
+        i=$((i + 1))
+        [ "$i" -lt 120 ] || {{ echo "edge not ready after 120s: $err" >&2; exit 1; }}
+        sleep 1
       done
       bk build --frontend dockerfile.v0 --local context=. --local dockerfile=. \
         --output type=local,dest=/tmp/out

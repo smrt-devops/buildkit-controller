@@ -89,6 +89,15 @@ pub async fn serve(
     state: OpsState,
     stop: CancellationToken,
 ) -> anyhow::Result<()> {
+    serve_with(listener, state, stop, HEADER_TIMEOUT).await
+}
+
+async fn serve_with(
+    listener: TcpListener,
+    state: OpsState,
+    stop: CancellationToken,
+    header_timeout: Duration,
+) -> anyhow::Result<()> {
     tracing::info!(addr = ?listener.local_addr().ok(), "ops server listening");
     let app = router(state);
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -115,7 +124,7 @@ pub async fn serve(
                 conns.spawn(async move {
                     let conn = http1::Builder::new()
                         .timer(TokioTimer::new())
-                        .header_read_timeout(HEADER_TIMEOUT)
+                        .header_read_timeout(header_timeout)
                         .serve_connection(TokioIo::new(tcp), svc);
                     tokio::pin!(conn);
                     tokio::select! {
@@ -245,13 +254,18 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_request_head_that_never_ends_is_cut() {
         use tokio::io::AsyncWriteExt;
-        let (addr, _stop, _task) = start();
+        // A short real-time bound: a paused clock jumps ahead while the server
+        // is still accepting, so the test deadline would beat the server timer.
+        let short = Duration::from_millis(500);
+        let l = bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = l.local_addr().unwrap();
+        let _task = tokio::spawn(serve_with(l, state(), CancellationToken::new(), short));
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
         s.write_all(b"GET /metrics HTTP/1.1\r\n").await.unwrap();
-        tokio::time::timeout(HEADER_TIMEOUT * 2, closed(&mut s))
+        tokio::time::timeout(short * 10, closed(&mut s))
             .await
             .expect("closed by the header read timeout");
     }

@@ -192,7 +192,7 @@ fn compile(root: &Path, work: &Path, image: &str, out: &Path) -> Result<()> {
     // version when the image ships a different one, which needs the network.
     // Local-only fallback for an offline Docker: set BK_IMAGE_PREINSTALLED=1 to
     // build with the toolchain the image ships instead (CI never sets it).
-    let pick = if std::env::var_os("BK_IMAGE_PREINSTALLED").is_some() {
+    let pick = if preinstalled() {
         "export RUSTUP_TOOLCHAIN=\"$(rustup toolchain list | head -n1 | cut -d' ' -f1)\"; "
     } else {
         ""
@@ -232,6 +232,8 @@ const INPUTS: &[&str] = &[
     "Cargo.lock",
     "rust-toolchain.toml",
     "xtask/Cargo.toml",
+    // The compile flags live here.
+    "xtask/src/image.rs",
     "docker",
     "crates",
 ];
@@ -248,9 +250,10 @@ fn files_under(path: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// SHA-256 over the paths and contents of the image's inputs. Test
+/// SHA-256 over the paths and contents of the image's inputs and the
+/// `BK_IMAGE_PREINSTALLED` setting, which changes the toolchain. Test
 /// directories are left out: they never reach the binary.
-pub(crate) fn inputs_hash(root: &Path) -> Result<String> {
+pub(crate) fn inputs_hash(root: &Path, preinstalled: bool) -> Result<String> {
     let mut files = Vec::new();
     for rel in INPUTS {
         files_under(&root.join(rel), &mut files)?;
@@ -265,6 +268,7 @@ pub(crate) fn inputs_hash(root: &Path) -> Result<String> {
         .collect();
     rels.sort();
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    ctx.update(&[u8::from(preinstalled)]);
     for (rel, path) in rels {
         let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         ctx.update(rel.as_bytes());
@@ -273,6 +277,11 @@ pub(crate) fn inputs_hash(root: &Path) -> Result<String> {
         ctx.update(&bytes);
     }
     Ok(crate::gateway::hex(ctx.finish().as_ref()))
+}
+
+/// Whether `BK_IMAGE_PREINSTALLED` selects the toolchain the build image ships.
+fn preinstalled() -> bool {
+    std::env::var_os("BK_IMAGE_PREINSTALLED").is_some()
 }
 
 /// The inputs label of the local image `tag`, empty when it has none.
@@ -297,7 +306,7 @@ fn inputs_label(tag: &str) -> String {
 pub(crate) fn controller() -> Result<String> {
     let _lock = host_lock()?;
     let root = root();
-    let hash = inputs_hash(&root)?;
+    let hash = inputs_hash(&root, preinstalled())?;
     let tag = format!("{REPOSITORY}:{}", &hash[..16]);
     if inputs_label(&tag) == hash {
         println!("image {tag} is up to date");
@@ -452,21 +461,42 @@ mod tests {
             "Cargo.lock",
             "rust-toolchain.toml",
             "xtask/Cargo.toml",
+            "xtask/src/image.rs",
         ] {
             write(f, "x");
         }
         write("docker/Dockerfile", "FROM scratch");
         write("crates/server/src/main.rs", "fn main() {}");
         write("crates/server/tests/kind.rs", "a");
-        let base = inputs_hash(&root).unwrap();
-        assert_eq!(base, inputs_hash(&root).unwrap(), "stable");
+        let base = inputs_hash(&root, false).unwrap();
+        assert_eq!(base, inputs_hash(&root, false).unwrap(), "stable");
         write("crates/server/tests/kind.rs", "b");
-        assert_eq!(base, inputs_hash(&root).unwrap(), "tests are not inputs");
+        assert_eq!(
+            base,
+            inputs_hash(&root, false).unwrap(),
+            "tests are not inputs"
+        );
         write("crates/server/src/main.rs", "fn main() { }");
-        let changed = inputs_hash(&root).unwrap();
+        let changed = inputs_hash(&root, false).unwrap();
         assert_ne!(base, changed, "a source edit rebuilds");
         write("crates/server/src/new.rs", "");
-        assert_ne!(changed, inputs_hash(&root).unwrap(), "a new file rebuilds");
+        assert_ne!(
+            changed,
+            inputs_hash(&root, false).unwrap(),
+            "a new file rebuilds"
+        );
+        let before = inputs_hash(&root, false).unwrap();
+        assert_ne!(
+            inputs_hash(&root, false).unwrap(),
+            inputs_hash(&root, true).unwrap(),
+            "BK_IMAGE_PREINSTALLED rebuilds"
+        );
+        write("xtask/src/image.rs", "flags");
+        assert_ne!(
+            before,
+            inputs_hash(&root, false).unwrap(),
+            "image.rs is an input"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
