@@ -49,8 +49,8 @@ pub enum ClientError {
 
 impl ClientError {
     /// True when the request did not reach the server, or the server answered
-    /// 503 with `Retry-After`. A caller may retry only in those cases, because
-    /// allocation is not idempotent.
+    /// 503 with `Retry-After`: the failures a retry of the same request is
+    /// expected to get past.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -101,9 +101,12 @@ impl Client {
     /// the allocation is pending, until it is bound or fails.
     ///
     /// The HTTP API requires `public_key` (400 `invalid_request` without it), so the
-    /// private key never leaves the caller. The POST is not idempotent, so retry it
-    /// only when [`ClientError::is_retryable`] is true. A poll that fails that way is
-    /// retried here, up to [`POLL_RETRIES`] times in a row.
+    /// private key never leaves the caller. The POST is idempotent per key: repeated
+    /// with the same `public_key`, it finds the allocation the first one made, so a
+    /// caller may retry it after a transport error or a 5xx. `pool_exhausted` and
+    /// `pod_lost` end that allocation, so a new one needs a new key. A poll that fails with
+    /// [`ClientError::is_retryable`] true is retried here, up to [`POLL_RETRIES`]
+    /// times in a row.
     pub async fn create_allocation(
         &self,
         req: &CreateAllocationRequest,

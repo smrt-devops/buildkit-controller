@@ -259,24 +259,14 @@ function queueTimeoutFor(queueTimeoutSeconds, remainingMs) {
 /** Total retry budget of a release or a pool listing: neither queues, so neither follows the queue timeout. */
 const SHORT_BUDGET_MS = 60000;
 
-// Error codes the controller answers 503 with Retry-After before it claims anything (start_timeout and
-// shutting_down: v0.1.0 only; v0.1.0 upgrade shim: remove them in the release after v3).
-const CLAIM_FREE_CODES = new Set(['pool_exhausted', 'start_timeout', 'shutting_down', 'upstream_error']);
 // Error codes that end a queued allocation's id for good: GET /v1/allocations/{id} will not change its answer.
 const TERMINAL_POLL_CODES = new Set(['pool_exhausted', 'pod_lost', 'not_found', 'forbidden']);
-
-/** True when a 503 body carries one of the controller's claim-free error codes. */
-function isClaimFree503(res) {
-  try {
-    const j = JSON.parse(res.body);
-    return CLAIM_FREE_CODES.has(j && j.error && j.error.code);
-  } catch { return false; }
-}
+// 503 codes that end the allocation a key names: a POST repeated with that key gets the same answer, so
+// the next attempt needs a new key. pool_exhausted is the queue timeout running out, pod_lost a worker gone.
+const ENDED_CODES = new Set(['pool_exhausted', 'pod_lost']);
 
 const MIN_WAIT_MS = 1000;
 const MAX_WAIT_MS = 30000;
-// Errors raised while connecting, before any byte of the request was written.
-const PRE_SEND_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH']);
 
 /** Retry-After header (delta-seconds or HTTP date) -> ms clamped to [1 s, 30 s]; undefined if absent or unusable. */
 function retryAfterMs(headers, now = Date.now()) {
@@ -292,23 +282,26 @@ function retryAfterMs(headers, now = Date.now()) {
   return Math.min(MAX_WAIT_MS, Math.max(MIN_WAIT_MS, ms));
 }
 
-/** True for a failure that happened before the request was sent. A reset or timeout is not. */
-function isPreSendError(err) {
-  return Boolean(err) && PRE_SEND_CODES.has(err.code);
-}
-
 /**
- * `request` with retries that cannot repeat a claim: only HTTP 503 with a usable Retry-After whose
- * body carries a claim-free error code (any 503 with Retry-After when `idempotent`, for GET and
- * DELETE), and connection errors raised before the request was sent. Everything else returns or throws at once.
- * `getToken` runs for every attempt (OIDC tokens are short-lived). Stops retrying when the next wait
- * would pass `budgetMs` from the first attempt, returning the last 503 or throwing the last error.
- * `opts` may be a function of `{remainingMs}` (budget left at the start of the attempt) so a retry can
- * shrink its queue timeout and socket timeout; a retry must not queue for a full timeout again.
- * `what` labels the log line; `log`, `sleep` and `now` are injectable for tests.
+ * `request` with retries. Every request the clients make is safe to repeat: GET and DELETE are
+ * idempotent, and a POST /v1/allocations repeated with the same publicKey finds the allocation the
+ * first one made instead of making another. So any transport failure (refused, reset, timeout) and any
+ * 5xx is retried, after Retry-After when the answer has one, else after 1, 2, 4 ... 30 s. A 5xx for
+ * which `final(res)` is true returns at once. `getToken` runs for every attempt (OIDC tokens are
+ * short-lived). Stops retrying when the next wait would pass `budgetMs` from the first attempt,
+ * returning the last 5xx or throwing the last error. `opts` may be a function of `{remainingMs}`
+ * (budget left at the start of the attempt) so a retry can shrink its queue timeout and socket
+ * timeout; a retry must not queue for a full timeout again. `what` labels the log line; `log`, `sleep`
+ * and `now` are injectable for tests.
  */
-async function requestWithRetry(url, opts, { what, getToken, budgetMs, idempotent = false, log = () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now } = {}) {
+async function requestWithRetry(url, opts, { what, getToken, budgetMs, final = () => false, log = () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now } = {}) {
   const start = now();
+  let backoff = MIN_WAIT_MS;
+  const next = () => {
+    const w = backoff;
+    backoff = Math.min(MAX_WAIT_MS, backoff * 2);
+    return w;
+  };
   for (let attempt = 1; ; attempt++) {
     let wait;
     let why;
@@ -317,15 +310,13 @@ async function requestWithRetry(url, opts, { what, getToken, budgetMs, idempoten
       if (getToken) headers.Authorization = `Bearer ${await getToken()}`;
       const o = typeof opts === 'function' ? opts({ remainingMs: budgetMs - (now() - start) }) : opts;
       const res = await request(url, { ...o, headers: { ...(o.headers || {}), ...headers } });
-      if (res.status !== 503 || !(idempotent || isClaimFree503(res))) return res;
-      wait = retryAfterMs(res.headers, now());
-      if (wait === undefined) return res;
-      why = `HTTP 503`;
+      if (res.status < 500 || final(res)) return res;
+      wait = retryAfterMs(res.headers, now()) ?? next();
+      why = `HTTP ${res.status}`;
       if (now() - start + wait > budgetMs) return res;
     } catch (e) {
-      if (!isPreSendError(e)) throw e;
-      wait = Math.min(MAX_WAIT_MS, 1000 * 2 ** (attempt - 1));
-      why = `${e.code} before send`;
+      wait = next();
+      why = e.code || e.message;
       if (now() - start + wait > budgetMs) throw e;
     }
     log(`${what || 'request'}: ${why}, retrying in ${Math.round(wait / 1000)}s (attempt ${attempt + 1})`);
@@ -372,39 +363,43 @@ async function pollAllocation(api, id, { ca, getToken, budgetMs, log = () => {},
 }
 
 /**
- * Allocate one worker. POST /v1/allocations answers 201 (bound) or 202 (queued, with an id); a 202
- * is polled until bound. The queue timeout can run out on a poll (terminal for that id): that starts
- * a fresh POST while the overall budget (`budgetMs`, from the call) allows, as a 503 pool_exhausted
- * from the POST itself does. `attemptOpts({remainingMs})` builds each POST's request options.
- * `onId(id)` fires as soon as an id is known and `onGone(id)` when that id ended for good, so the
- * caller can release exactly the ids that may still hold a worker. Resolves the AllocationResponse.
+ * Allocate one worker. The publicKey names the allocation, so a POST that fails in transit or with a
+ * 5xx is repeated with the same key and finds the allocation the first one made. POST answers 201
+ * (bound) or 202 (queued, with an id); a 202 is polled until bound. The queue timeout can run out, on
+ * a poll or on the POST itself (503 pool_exhausted): that ends the key's allocation, so a fresh POST
+ * with a new key from `newKey()` follows while the overall budget (`budgetMs`, from the call) allows.
+ * `attemptOpts({remainingMs, publicKey})` builds each POST's request options. `onId(id)` fires as
+ * soon as an id is known and `onGone(id)` when that id ended for good, so the caller can release
+ * exactly the ids that may still hold a worker. Resolves the AllocationResponse.
  */
-async function allocate(api, { what, ca, getToken, attemptOpts, budgetMs, onId = () => {}, onGone = () => {}, log = () => {}, sleep, now = Date.now }) {
+async function allocate(api, { what, ca, getToken, attemptOpts, budgetMs, newKey = generateKey, onId = () => {}, onGone = () => {}, log = () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now }) {
   const start = now();
   for (;;) {
-    const remaining = budgetMs - (now() - start);
-    const res = await requestWithRetry(`${api}/v1/allocations`, attemptOpts,
-      { what, getToken, budgetMs: remaining, log, sleep, now });
+    const { publicKey } = newKey();
+    const opts = typeof attemptOpts === 'function' ? ({ remainingMs }) => attemptOpts({ remainingMs, publicKey }) : attemptOpts;
+    let res = await requestWithRetry(`${api}/v1/allocations`, opts,
+      { what, getToken, budgetMs: budgetMs - (now() - start), final: (r) => ENDED_CODES.has(errorCode(r)), log, sleep, now });
     if (res.status === 201) return JSON.parse(res.body);
-    if (res.status !== 202) throw apiError(what, res);
     let id;
-    try { id = checkAllocationId(JSON.parse(res.body).id); } catch { throw new Error(`${what} failed: controller returned an invalid allocation id`); }
-    onId(id);
-    log(`${what}: queued as ${id}`);
-    const pr = await pollAllocation(api, id, { ca, getToken, budgetMs: budgetMs - (now() - start), log, sleep, now });
-    if (pr.status === 200) return JSON.parse(pr.body);
-    onGone(id);
-    const wait = retryAfterMs(pr.headers, now()) ?? 5000;
-    if (errorCode(pr) !== 'pool_exhausted' || now() - start + wait > budgetMs) throw apiError(what, pr);
-    log(`${what}: queue timeout ran out for ${id}, allocating again in ${Math.round(wait / 1000)}s`);
-    await (sleep || ((ms) => new Promise((r) => setTimeout(r, ms))))(wait);
+    if (res.status === 202) {
+      try { id = checkAllocationId(JSON.parse(res.body).id); } catch { throw new Error(`${what} failed: controller returned an invalid allocation id`); }
+      onId(id);
+      log(`${what}: queued as ${id}`);
+      res = await pollAllocation(api, id, { ca, getToken, budgetMs: budgetMs - (now() - start), log, sleep, now });
+      if (res.status === 200) return JSON.parse(res.body);
+      onGone(id);
+    }
+    const wait = retryAfterMs(res.headers, now()) ?? 5000;
+    if (errorCode(res) !== 'pool_exhausted' || now() - start + wait > budgetMs) throw apiError(what, res);
+    log(`${what}: queue timeout ran out${id ? ` for ${id}` : ''}, allocating again with a new key in ${Math.round(wait / 1000)}s`);
+    await sleep(wait);
   }
 }
 
 /** Release allocation `id`. 404 counts as released. Own short retry budget: a down API must not hold the job. */
 async function releaseAllocation({ api, ca, getToken, id, log, ...inject }) {
   const res = await requestWithRetry(`${api}/v1/allocations/${id}`, { method: 'DELETE', ca, timeoutMs: 30000 },
-    { what: `release ${id}`, getToken, budgetMs: SHORT_BUDGET_MS, idempotent: true, log, ...inject });
+    { what: `release ${id}`, getToken, budgetMs: SHORT_BUDGET_MS, log, ...inject });
   if (res.status !== 204 && res.status !== 404) throw apiError(`release ${id}`, res);
 }
 
@@ -426,5 +421,5 @@ async function fetchOidcToken(audience, setSecret) {
 module.exports = {
   parseList, parsePool, REQUEST_TIMEOUT_MS, postTimeoutMs, pollAllocation, allocate, errorCode, parseDuration, generateKey, allocationBody,
   validatePools, buildxCommands, parseCacheInputs, cacheFlags, checkAllocationId, createBuilder, writeMaterial, request, apiError,
-  effectiveQueueTimeout, retryBudgetMs, SHORT_BUDGET_MS, isClaimFree503, releaseAllocation, queueTimeoutFor, retryAfterMs, isPreSendError, requestWithRetry, fetchOidcToken,
+  effectiveQueueTimeout, retryBudgetMs, SHORT_BUDGET_MS, releaseAllocation, queueTimeoutFor, retryAfterMs, requestWithRetry, fetchOidcToken,
 };

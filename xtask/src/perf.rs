@@ -157,6 +157,12 @@ spec:
     )
 }
 
+/// A PEM as JSON string content: each line ends in `\n`, as the client pod's
+/// `sed` writes `pub.json`.
+fn pub_json(pem: &str) -> String {
+    pem.lines().flat_map(|l| [l, "\\n"]).collect()
+}
+
 fn pool_client() -> String {
     let sa = "apiVersion: v1\nkind: ServiceAccount\nmetadata: {name: perf-client, namespace: bk-perf}\n---\n";
     sa.to_owned()
@@ -287,12 +293,13 @@ impl Perf {
         Ok(())
     }
 
-    fn post(ttl: u32, out: &str, fmt: &str) -> String {
+    /// `POST /v1/allocations` with the public key in JSON file `key`.
+    fn post(ttl: u32, key: &str, out: &str, fmt: &str) -> String {
         format!(
             "curl -s -o {out} -w '{fmt}' --cacert /trust/ca.crt \
              -H \"Authorization: Bearer $(cat /var/run/secrets/bk/token)\" \
              -H 'Content-Type: application/json' \
-             -d '{{\"namespace\":\"{NS}\",\"pool\":\"{POOL}\",\"ttlSeconds\":{ttl},\"publicKey\":\"'\"$(cat /work/pub.json)\"'\"}}' {API}/v1/allocations"
+             -d '{{\"namespace\":\"{NS}\",\"pool\":\"{POOL}\",\"ttlSeconds\":{ttl},\"publicKey\":\"'\"$(cat {key})\"'\"}}' {API}/v1/allocations"
         )
     }
 
@@ -309,13 +316,30 @@ impl Perf {
         for b in 0..batches {
             self.wait_warm(BATCH)?;
             let files: Vec<String> = (0..BATCH).map(|i| format!("/work/a.{i}.json")).collect();
-            let script: String = files
+            // The key names the allocation, so every allocation gets a key no
+            // earlier batch used: a reused key would name a just-released claim.
+            let mut script = String::new();
+            for i in 0..BATCH {
+                let _ = writeln!(
+                    script,
+                    "printf '%s' '{}' > /work/pub.{i}.json",
+                    pub_json(&rcgen::KeyPair::generate()?.public_key_pem())
+                );
+            }
+            script += &files
                 .iter()
-                .map(|f| {
-                    Self::post(120, f, "%{http_code} %{time_total}")
-                        + &format!("; if grep -q clientCert {f}; then echo ' cert'; else echo ' nocert'; fi\n")
+                .enumerate()
+                .map(|(i, f)| {
+                    Self::post(
+                        120,
+                        &format!("/work/pub.{i}.json"),
+                        f,
+                        "%{http_code} %{time_total}",
+                    ) + &format!(
+                        "; if grep -q clientCert {f}; then echo ' cert'; else echo ' nocert'; fi\n"
+                    )
                 })
-                .collect();
+                .collect::<String>();
             let out = self.sh(NS, &script)?;
             let mut got = 0;
             for l in out.lines() {
@@ -561,7 +585,7 @@ pub(crate) fn perf(batches: usize, idle_secs: u64) -> Result<()> {
             "set -e\n{FIELD}{} >/dev/null\nfield clientCert /work/e.json > /work/e.crt\n\
              cp /work/key.pem /work/e.key\n{{ field caCert /work/e.json; cat /trust/ca.crt; }} > /work/e.ca\n\
              field id /work/e.json",
-            Perf::post(1800, "/work/e.json", "%{http_code}")
+            Perf::post(1800, "/work/pub.json", "/work/e.json", "%{http_code}")
         ),
     )?;
     let id = out.trim().to_owned();
@@ -757,10 +781,19 @@ mod tests {
         let pod = pool_client();
         assert!(pod.contains("openssl pkey -in /work/key.pem -pubout -out /work/pub.pem\n"));
         assert!(pod.contains("sed 's/$/\\\\n/' /work/pub.pem | tr -d '\\n' > /work/pub.json\n"));
-        let post = Perf::post(120, "/work/a.json", "%{http_code}");
+        let post = Perf::post(120, "/work/pub.0.json", "/work/a.json", "%{http_code}");
         assert!(
-            post.contains(r#""ttlSeconds":120,"publicKey":"'"$(cat /work/pub.json)"'"}'"#),
+            post.contains(r#""ttlSeconds":120,"publicKey":"'"$(cat /work/pub.0.json)"'"}'"#),
             "{post}"
+        );
+    }
+
+    /// A batch key goes into the script as the pod's `sed` would write it.
+    #[test]
+    fn pub_json_escapes_each_newline() {
+        assert_eq!(
+            pub_json("-----BEGIN\nAB\n-----END\n"),
+            r"-----BEGIN\nAB\n-----END\n"
         );
     }
 

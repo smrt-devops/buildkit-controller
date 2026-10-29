@@ -3,7 +3,7 @@
 //! keeps no queue; the claim is the allocation's whole state, so any replica
 //! answers for any allocation.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +14,7 @@ use buildkit_controller_api::dto::{
 use buildkit_controller_api::v1alpha1::{self as crd, BuildKitPool};
 use k8s_openapi::api::core::v1::Pod;
 use kube::runtime::reflector::{ObjectRef, Store};
+use time::OffsetDateTime;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -25,7 +26,7 @@ use super::certs::CertSource;
 use super::claims;
 use super::error::AllocError;
 use super::metrics::AllocMetrics;
-use super::pods::{ann, new_alloc_id, of_pool};
+use super::pods::{ann, fmt_ts, key_alloc_id, of_pool};
 use super::pool::{MIN_TTL, access_rules, pool_ready, seconds};
 use crate::auth::Identity;
 use crate::pki::{AllocId, ClientPublicKey, Namespace, PoolName};
@@ -109,6 +110,14 @@ impl Front {
 
     /// `POST /v1/allocations` after authentication: check the request, create
     /// the claim, wait up to [`CREATE_WAIT`] for it to bind.
+    ///
+    /// The claim is named after the request's public key, so the call is
+    /// idempotent per key: a repeated `POST` from the same caller finds the
+    /// claim the first one made and answers for it the same way, and never
+    /// makes a second one. A `POST` the client drops leaves its claim for the
+    /// retry to find, in its place in the queue. A client that never comes
+    /// back leaves a pending claim that fails at its queue timeout, or a bound
+    /// one that ends at its TTL, as it would had it crashed after the answer.
     pub async fn allocate(
         &self,
         who: &Identity,
@@ -137,38 +146,126 @@ impl Front {
         let id = claim.metadata.name.clone().unwrap_or_default();
         // Subscribed before the create, so the bind cannot slip past the wait.
         let mut sub = (self.subscribe)();
-        let mut guard = Abandon {
-            backend: Arc::clone(&self.backend),
-            namespace: self.namespace.clone(),
-            name: id.clone(),
-            armed: true,
-        };
-        match self.backend.create_claim(claim).await {
-            Write::Done => {}
-            Write::Unknown => return Err(AllocError::UpstreamError),
-            w => {
-                guard.armed = false;
-                error!(claim = %id, outcome = ?w, "creating claim");
-                return Err(AllocError::Internal);
-            }
+        let found = self.create_or_find(who, claim).await;
+        let repeat = matches!(found, Ok(Some(_)));
+        if let Ok(Some(c)) = &found {
+            self.touch(c).await;
         }
-        let found = self
-            .settle(&id, Instant::now() + CREATE_WAIT, &mut sub)
-            .await;
-        guard.armed = false;
         let r = match found {
-            // Bound, but this replica cannot name the CA yet: the client polls
-            // for the response rather than lose the id.
-            Some(c) => match self.outcome(&c) {
-                Err(AllocError::CaUnavailable) => Ok(pending(&id, None)),
-                r => r,
-            },
-            // Created, but not seen yet.
-            None => Ok(pending(&id, None)),
+            Err(e) => Err(e),
+            Ok(Some(c)) if claims::phase(&c) != ClaimPhase::Pending => {
+                self.answer(&id, Some(c)).await
+            }
+            Ok(c) => {
+                let at = Instant::now() + CREATE_WAIT;
+                let settled = self.settle(&id, at, &mut sub).await.or(c);
+                self.answer(&id, settled).await
+            }
         };
         info!(namespace = %req.namespace, pool = %req.pool, alloc_id = %id, owner = %who.owner(),
-            state = state_of(&r), duration_ms = started.elapsed().as_millis(), "allocation");
+            repeat, state = state_of(&r), duration_ms = started.elapsed().as_millis(), "allocation");
         r
+    }
+
+    /// Create `claim`, or find the claim of the same name (the same key) that
+    /// an earlier `POST` created: `Ok(None)` when created. Another caller's
+    /// claim is [`AllocError::Forbidden`] and reveals nothing about it.
+    async fn create_or_find(
+        &self,
+        who: &Identity,
+        claim: BuildKitClaim,
+    ) -> Result<Option<Arc<BuildKitClaim>>, AllocError> {
+        let id = claim.metadata.name.clone().unwrap_or_default();
+        let pool = claim.spec.pool_ref.clone();
+        match self.backend.create_claim(claim).await {
+            Write::Done => Ok(None),
+            Write::Exists => {
+                let c = match self.owned(who, &id).await {
+                    // Deleted since the create: the client's next try makes it anew.
+                    Err(AllocError::NotFound) => return Err(AllocError::UpstreamError),
+                    r => r?,
+                };
+                if c.spec.pool_ref != pool {
+                    return Err(AllocError::InvalidRequest(
+                        "publicKey belongs to an allocation from another pool".into(),
+                    ));
+                }
+                Ok(Some(c))
+            }
+            Write::Unknown => Err(AllocError::UpstreamError),
+            w => {
+                error!(claim = %id, outcome = ?w, "creating claim");
+                Err(AllocError::Internal)
+            }
+        }
+    }
+
+    /// The answer to a `POST` for claim `id` as found: pending while it is not
+    /// seen yet, or bound but this replica cannot name the CA yet, so the
+    /// client polls for the response rather than lose the id.
+    async fn answer(&self, id: &str, c: Option<Arc<BuildKitClaim>>) -> Result<Outcome, AllocError> {
+        let Some(c) = c else {
+            return Ok(pending(id, None));
+        };
+        match self.outcome(&c) {
+            Err(AllocError::CaUnavailable) => Ok(pending(id, None)),
+            r => self.deliver(&c, r).await,
+        }
+    }
+
+    /// Mark `c` delivered before its bound answer `r` goes out, so the leader
+    /// never takes it for abandoned while its client holds the certificate. A
+    /// mark that fails turns the answer into a 503 that the client retries.
+    async fn deliver(
+        &self,
+        c: &BuildKitClaim,
+        r: Result<Outcome, AllocError>,
+    ) -> Result<Outcome, AllocError> {
+        if !matches!(r, Ok(Outcome::Bound(_))) || claims::delivered(c) {
+            return r;
+        }
+        self.annotate(c, claims::ANN_DELIVERED, "true".into())
+            .await?;
+        r
+    }
+
+    /// Note that the caller of `c` asked for it, at most every
+    /// [`claims::SEEN_EVERY`]: the leader deletes an undelivered claim nobody
+    /// asks for. A failed write is retried on the next request.
+    async fn touch(&self, c: &BuildKitClaim) {
+        let now = OffsetDateTime::now_utc();
+        if !claims::seen_due(c, now) {
+            return;
+        }
+        if let Err(e) = self.annotate(c, claims::ANN_SEEN_AT, fmt_ts(now)).await {
+            warn!(claim = ?c.metadata.name, error = %e, "recording that a claim was asked for");
+        }
+    }
+
+    async fn annotate(
+        &self,
+        c: &BuildKitClaim,
+        key: &str,
+        value: String,
+    ) -> Result<(), AllocError> {
+        let (Some(name), Some(uid)) = (c.metadata.name.as_deref(), c.metadata.uid.as_deref())
+        else {
+            return Err(AllocError::Internal);
+        };
+        let set = BTreeMap::from([(key.to_owned(), value)]);
+        match self
+            .backend
+            .annotate_claim(&self.namespace, name, uid, set)
+            .await
+        {
+            Write::Done => Ok(()),
+            Write::Gone => Err(AllocError::NotFound),
+            Write::Unknown => Err(AllocError::UpstreamError),
+            w => {
+                error!(claim = name, outcome = ?w, "annotating claim");
+                Err(AllocError::Internal)
+            }
+        }
     }
 
     /// `GET /v1/allocations/{id}`: the allocation, after waiting up to `wait`
@@ -181,6 +278,7 @@ impl Front {
     ) -> Result<Outcome, AllocError> {
         let mut sub = (self.subscribe)();
         let c = self.owned(who, id).await?;
+        self.touch(&c).await;
         let c = if claims::phase(&c) == ClaimPhase::Pending && !wait.is_zero() {
             // A claim the store does not hold yet answers as last read.
             let at = Instant::now() + wait.min(MAX_WAIT);
@@ -188,7 +286,8 @@ impl Front {
         } else {
             c
         };
-        self.outcome(&c)
+        let r = self.outcome(&c);
+        self.deliver(&c, r).await
     }
 
     /// `DELETE /v1/allocations/{id}`: deletes the claim; the leader retires its pod.
@@ -413,10 +512,10 @@ impl Front {
             )));
         }
         let pem = req.public_key.clone().unwrap_or_default();
-        ClientPublicKey::from_pem(&pem).map_err(|_| {
+        let key = ClientPublicKey::from_pem(&pem).map_err(|_| {
             AllocError::InvalidRequest("publicKey must be a PEM SPKI ECDSA P-256 key".into())
         })?;
-        let id = new_alloc_id().ok_or(AllocError::Internal)?;
+        let id = key_alloc_id(&key).ok_or(AllocError::Internal)?;
         let mut c = BuildKitClaim::new(
             id.as_str(),
             BuildKitClaimSpec {
@@ -435,6 +534,10 @@ impl Front {
             },
         );
         c.metadata.namespace = Some(self.namespace.clone());
+        c.metadata.annotations = Some(BTreeMap::from([(
+            claims::ANN_SEEN_AT.to_owned(),
+            fmt_ts(OffsetDateTime::now_utc()),
+        )]));
         Ok(c)
     }
 
@@ -478,44 +581,5 @@ fn state_of(r: &Result<Outcome, AllocError>) -> &'static str {
         Ok(Outcome::Bound(_)) => "bound",
         Ok(Outcome::Pending(_)) => "pending",
         Err(e) => e.code().as_str(),
-    }
-}
-
-/// Deletes a claim whose creator went away before it could learn the id: the
-/// POST was cancelled (client gone) between sending the create and returning.
-struct Abandon {
-    backend: Arc<dyn Backend>,
-    namespace: String,
-    name: String,
-    armed: bool,
-}
-
-impl Drop for Abandon {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let Ok(rt) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let (backend, ns, name) = (
-            Arc::clone(&self.backend),
-            self.namespace.clone(),
-            self.name.clone(),
-        );
-        rt.spawn(async move {
-            // The create may still be in flight; one late retry covers it.
-            for gap in [0, 2] {
-                tokio::time::sleep(Duration::from_secs(gap)).await;
-                let Ok(Some(c)) = backend.get_claim(&ns, &name).await else {
-                    continue;
-                };
-                let uid = c.metadata.uid.unwrap_or_default();
-                if matches!(backend.delete_claim(&ns, &name, &uid).await, Write::Done) {
-                    info!(alloc_id = %name, "deleted the claim of an abandoned allocation");
-                    return;
-                }
-            }
-        });
     }
 }

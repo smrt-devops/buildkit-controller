@@ -22,7 +22,9 @@ pub struct CreateAllocationRequest {
     /// PEM SPKI ECDSA P-256 public key of a key pair the client generated. Required on the
     /// HTTP API (400 `invalid_request` without it), so the private key never leaves the
     /// client. Only the in-cluster `BuildKitClaim` controller allocates without one, and the
-    /// server then generates the key.
+    /// server then generates the key. The key names the allocation: a repeated request
+    /// with the same key from the same caller answers for the allocation the first one
+    /// made, so a client that lost the answer sends it again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
     /// Tag of the cache in the caller's scope, so one caller can keep several caches. Defaults to the pool name.
@@ -218,7 +220,8 @@ pub enum ErrorCode {
     InvalidRequest,
     /// HTTP 401 for a missing or invalid token.
     Unauthenticated,
-    /// HTTP 403 when a caller releases an allocation it does not own. A caller that
+    /// HTTP 403 when a caller reads or releases an allocation it does not own, or
+    /// sends a `publicKey` that already names another caller's allocation. A caller that
     /// matches no access rule gets [`ErrorCode::PoolNotFound`] instead, so callers cannot probe for pools.
     Forbidden,
     /// HTTP 404 when the pool is not in the store, is outside the watched scope, or no access rule matches the caller.

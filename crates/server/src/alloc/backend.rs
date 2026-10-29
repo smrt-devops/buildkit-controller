@@ -2,6 +2,7 @@
 //! the binder are testable without an API server. Every call is bounded by
 //! `kube.requestTimeout`.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use buildkit_controller_api::claim::{BuildKitClaim, BuildKitClaimStatus};
@@ -61,6 +62,24 @@ pub trait Backend: Send + Sync + 'static {
     ) -> BoxFuture<'static, Result<Option<BuildKitClaim>, Write>>;
     /// `DELETE` a claim with a uid precondition.
     fn delete_claim(&self, ns: &str, name: &str, uid: &str) -> BoxFuture<'static, Write>;
+    /// `DELETE` a claim if it still has `uid` and `resource_version`: a claim
+    /// changed since it was read is a 409, which is [`Write::Gone`].
+    fn delete_claim_at(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+        resource_version: &str,
+    ) -> BoxFuture<'static, Write>;
+    /// Merge `annotations` into a claim's metadata, if the claim still has
+    /// `uid` (a 409 otherwise, which is [`Write::Gone`]).
+    fn annotate_claim(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+        annotations: BTreeMap<String, String>,
+    ) -> BoxFuture<'static, Write>;
     /// Merge-patch a claim's status, if the claim is still at `resource_version`
     /// (a 409 otherwise, which is [`Write::Gone`]).
     fn patch_claim_status(
@@ -210,6 +229,36 @@ impl Backend for KubeBackend {
         let (api, name, t) = (self.api::<BuildKitClaim>(ns), name.to_owned(), self.timeout);
         let dp = delete_params(uid, None);
         Box::pin(async move { written(done(t, api.delete(&name, &dp)).await) })
+    }
+
+    fn delete_claim_at(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+        resource_version: &str,
+    ) -> BoxFuture<'static, Write> {
+        let (api, name, t) = (self.api::<BuildKitClaim>(ns), name.to_owned(), self.timeout);
+        let mut dp = delete_params(uid, None);
+        if let Some(p) = dp.preconditions.as_mut() {
+            p.resource_version = Some(resource_version.to_owned());
+        }
+        Box::pin(async move { written(done(t, api.delete(&name, &dp)).await) })
+    }
+
+    fn annotate_claim(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+        annotations: BTreeMap<String, String>,
+    ) -> BoxFuture<'static, Write> {
+        let (api, name, t) = (self.api::<BuildKitClaim>(ns), name.to_owned(), self.timeout);
+        // A uid in the patch is a precondition: a claim recreated since is a 409.
+        let body = Patch::Merge(json!({"metadata": {"uid": uid, "annotations": annotations}}));
+        Box::pin(
+            async move { written(done(t, api.patch(&name, &PatchParams::default(), &body)).await) },
+        )
     }
 
     fn patch_claim_status(

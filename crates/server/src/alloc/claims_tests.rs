@@ -42,12 +42,14 @@ fn served() -> HashSet<String> {
     HashSet::from([OWN.to_owned(), "ci".to_owned()])
 }
 
-fn pod(name: &str, claim: Option<&str>, alloc: &str) -> Pod {
+/// A pod; `claim` is the `(P claim, P claim-uid)` it carries.
+fn pod(name: &str, claim: Option<(&str, &str)>, alloc: &str) -> Pod {
     let mut p = Pod::default();
     p.metadata.name = Some(name.into());
     let mut a = BTreeMap::from([(ANN_ALLOC.to_owned(), alloc.to_owned())]);
-    if let Some(c) = claim {
+    if let Some((c, uid)) = claim {
         a.insert(ANN_CLAIM.to_owned(), c.to_owned());
+        a.insert(ANN_CLAIM_UID.to_owned(), uid.to_owned());
     }
     p.metadata.annotations = Some(a);
     p
@@ -165,7 +167,7 @@ fn a_bound_claim_is_lost_when_its_worker_goes() {
     let mut c = claim("ci", "build", "u1", "2026-10-21T12:00:00Z");
     c.status = Some(bound_status(&c, &binding("a1"), true));
     let at = |secs: u64| OffsetDateTime::now_utc() + LOST_GRACE + Duration::from_secs(secs);
-    let live = pod("default-0", Some("ci/build"), "a1");
+    let live = pod("default-0", Some(("ci/build", "u1")), "a1");
     assert!(!lost(&c, [&live], at(1)), "the worker is running");
     assert!(lost(&c, [], at(1)), "the worker pod was deleted");
     assert!(lost(&c, [&pod("default-0", None, "a2")], at(1)));
@@ -234,19 +236,29 @@ fn strays_are_pods_whose_claim_is_gone_ended_or_bound_elsewhere() {
         [bound, pending, ended].into_iter().map(Arc::new).collect();
     let cref = format!("{OWN}/{id}");
     let pods = vec![
-        pod("default-0", Some(&cref), &id),
-        pod("default-1", Some(&cref), &id),
-        pod("default-2", Some("ci/p"), &pending_id),
-        pod("default-3", Some("ci/e"), &ended_id),
-        pod("default-4", Some("ci/gone"), "zzzzzzzzzzzzzzzzzzzzzzzzzz"),
-        pod("default-5", Some("ci/p"), "yyyyyyyyyyyyyyyyyyyyyyyyyy"),
+        pod("default-0", Some((&cref, "u1")), &id),
+        pod("default-1", Some((&cref, "u1")), &id),
+        pod("default-2", Some(("ci/p", "u2")), &pending_id),
+        pod("default-3", Some(("ci/e", "u3")), &ended_id),
+        pod(
+            "default-4",
+            Some(("ci/gone", "u9")),
+            "zzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ),
+        pod(
+            "default-5",
+            Some(("ci/p", "u2")),
+            "yyyyyyyyyyyyyyyyyyyyyyyyyy",
+        ),
         pod("default-6", None, "xxxxxxxxxxxxxxxxxxxxxxxxxx"),
         pod(
             "default-7",
-            Some("unwatched/q"),
+            Some(("unwatched/q", "u8")),
             "wwwwwwwwwwwwwwwwwwwwwwwwww",
         ),
-        pod("default-8", Some("ci/gone"), FREE),
+        pod("default-8", Some(("ci/gone", "u9")), FREE),
+        // Released from an earlier claim of the same name; the pending one is another claim.
+        pod("default-9", Some(("ci/p", "u-old")), &pending_id),
     ];
     let got: Vec<&str> = strays(&pods, &claims, &served(), OWN)
         .into_iter()
@@ -254,8 +266,14 @@ fn strays_are_pods_whose_claim_is_gone_ended_or_bound_elsewhere() {
         .collect();
     assert_eq!(
         got,
-        ["default-1", "default-3", "default-4", "default-5"],
-        "bound elsewhere, ended, claim gone, replaced; kept: the bound pod, a pending bind, \
+        [
+            "default-1",
+            "default-3",
+            "default-4",
+            "default-5",
+            "default-9"
+        ],
+        "bound elsewhere, ended, claim gone, replaced, an earlier claim of the name; kept: the bound pod, a pending bind, \
          pre-v3 pods, unwatched namespaces and free pods"
     );
 }

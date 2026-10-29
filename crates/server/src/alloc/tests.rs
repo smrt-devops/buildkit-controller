@@ -53,6 +53,8 @@ struct World {
     status_out: VecDeque<Write>,
     /// Answers the next claim creates with these, unapplied.
     create_out: VecDeque<Write>,
+    /// Answers the next claim annotation writes with these, unapplied.
+    annotate_out: VecDeque<Write>,
     /// Answers the next claim deletes with these, unapplied.
     delete_out: VecDeque<Write>,
     rv: u64,
@@ -183,6 +185,12 @@ impl Backend for Fake {
         if let Some(out) = self.w.lock().unwrap().create_out.pop_front() {
             return ready(out);
         }
+        if self
+            .claim(c.metadata.namespace.as_deref().unwrap(), &name)
+            .is_some()
+        {
+            return ready(Write::Exists);
+        }
         let uid = {
             let mut w = self.w.lock().unwrap();
             w.uid += 1;
@@ -225,6 +233,48 @@ impl Backend for Fake {
             .apply_watcher_event(&watcher::Event::Delete(c.clone()));
         let _ = self.tx.send(ClaimEvent::Delete(Arc::new(c)));
         ready(Write::Done)
+    }
+
+    fn delete_claim_at(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+        resource_version: &str,
+    ) -> BoxFuture<'static, Write> {
+        let current = self.claim(ns, name);
+        if current
+            .as_ref()
+            .is_some_and(|c| c.metadata.resource_version.as_deref() != Some(resource_version))
+        {
+            self.call(format!("delete_claim {name} refused"));
+            return ready(Write::Gone);
+        }
+        self.delete_claim(ns, name, uid)
+    }
+
+    fn annotate_claim(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+        annotations: BTreeMap<String, String>,
+    ) -> BoxFuture<'static, Write> {
+        self.call(format!("annotate_claim {name}"));
+        if let Some(out) = self.w.lock().unwrap().annotate_out.pop_front() {
+            return ready(out);
+        }
+        match self.claim(ns, name) {
+            Some(mut c) if c.metadata.uid.as_deref() == Some(uid) => {
+                c.metadata
+                    .annotations
+                    .get_or_insert_default()
+                    .extend(annotations);
+                self.put_claim(c);
+                ready(Write::Done)
+            }
+            _ => ready(Write::Gone),
+        }
     }
 
     fn patch_claim_status(
@@ -932,29 +982,344 @@ async fn pending_allocation_is_polled_and_released_by_its_owner() {
     );
 }
 
-/// A POST abandoned after its create (the client went away) deletes its claim.
+fn post_req(key: &str) -> CreateAllocationRequest {
+    serde_json::from_value(json!({"namespace": POOL_NS, "pool": POOL, "publicKey": key})).unwrap()
+}
+
+fn claim_names(e: &Env) -> Vec<String> {
+    e.fake
+        .w
+        .lock()
+        .unwrap()
+        .claims
+        .keys()
+        .map(|(_, n)| n.clone())
+        .collect()
+}
+
+/// The claim is named after the public key. A repeated POST from the same
+/// caller answers for the claim the first one made: pending with its place,
+/// then bound. It never creates a second claim.
 #[tokio::test(start_paused = true)]
-async fn an_abandoned_allocation_deletes_its_claim() {
-    let e = Arc::new(env());
-    let req: CreateAllocationRequest = serde_json::from_value(json!({
-        "namespace": POOL_NS, "pool": POOL, "publicKey": *KEY
-    }))
-    .unwrap();
-    let task = {
-        let e = Arc::clone(&e);
-        tokio::spawn(async move { e.front.allocate(&sa("alice"), &req).await })
+async fn a_repeated_post_follows_the_same_claim() {
+    let e = env();
+    let req = post_req(&KEY);
+    let Outcome::Pending(first) = e.front.allocate(&sa("alice"), &req).await.unwrap() else {
+        panic!("bound without a pod")
     };
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(e.fake.w.lock().unwrap().claims.len(), 1);
-    task.abort();
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    assert!(
-        e.fake.w.lock().unwrap().claims.is_empty(),
-        "{:?}",
-        e.fake.calls()
+    assert_eq!(first.position, Some(1));
+    e.ci_claim(-5, "sa:x/behind");
+    let again = e.front.allocate(&sa("alice"), &req).await.unwrap();
+    assert_eq!(again, Outcome::Pending(first.clone()));
+    e.warm(0);
+    e.binder.pass(&key()).await;
+    let Outcome::Bound(r) = e.front.allocate(&sa("alice"), &req).await.unwrap() else {
+        panic!("not bound")
+    };
+    assert_eq!(r.id, first.id);
+    let creates = e
+        .fake
+        .calls()
+        .iter()
+        .filter(|c| c.starts_with("create_claim"))
+        .count();
+    assert_eq!(
+        (creates, claim_names(&e).len()),
+        (3, 2),
+        "one claim per key"
     );
 }
 
+/// Another caller presenting the same key gets 403 and learns nothing about
+/// the claim, pending or bound, and the claim is left as it was. A key that
+/// names a claim of another pool is a 400.
+#[tokio::test(start_paused = true)]
+async fn a_key_in_use_by_another_caller_is_forbidden() {
+    let e = env();
+    let req = post_req(&KEY);
+    let Outcome::Pending(p) = e.front.allocate(&sa("alice"), &req).await.unwrap() else {
+        panic!("bound without a pod")
+    };
+    let rv = |e: &Env| e.fake.claim(OWN, &p.id).unwrap().metadata.resource_version;
+    let before = rv(&e);
+    assert_eq!(
+        e.front.allocate(&sa("mallory"), &req).await,
+        Err(AllocError::Forbidden)
+    );
+    assert_eq!(rv(&e), before, "untouched");
+    e.warm(0);
+    e.binder.pass(&key()).await;
+    assert_eq!(
+        e.front.allocate(&sa("mallory"), &req).await,
+        Err(AllocError::Forbidden)
+    );
+    assert_eq!(claim_names(&e), vec![p.id.clone()]);
+    let other = rcgen::KeyPair::generate().unwrap().public_key_pem();
+    let id = key_alloc_id(&crate::pki::ClientPublicKey::from_pem(&other).unwrap()).unwrap();
+    e.claim(
+        OWN,
+        id.as_str(),
+        0,
+        json!({"poolRef": {"namespace": POOL_NS, "name": "elsewhere"},
+            "owner": "sa:render-verify/alice", "publicKey": other}),
+    );
+    assert!(matches!(
+        e.front.allocate(&sa("alice"), &post_req(&other)).await,
+        Err(AllocError::InvalidRequest(_))
+    ));
+}
+
+/// A POST dropped while it waits (the client's connection went) leaves its
+/// claim where it was. The client's retry with the same key finds it, still
+/// ahead of a claim made in between, and it binds first.
+#[tokio::test(start_paused = true)]
+async fn a_dropped_post_keeps_its_claim_for_the_retry() {
+    let e = Arc::new(env());
+    let req = post_req(&KEY);
+    let task = {
+        let (e, req) = (Arc::clone(&e), req.clone());
+        tokio::spawn(async move { e.front.allocate(&sa("alice"), &req).await })
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let [id] = &claim_names(&e)[..] else {
+        panic!("one claim")
+    };
+    let id = id.clone();
+    task.abort();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(e.fake.claim(OWN, &id).is_some(), "{:?}", e.fake.calls());
+    let later = e.ci_claim(-5, "sa:x/later");
+    let Outcome::Pending(p) = e.front.allocate(&sa("alice"), &req).await.unwrap() else {
+        panic!("bound without a pod")
+    };
+    assert_eq!((p.id.as_str(), p.position), (id.as_str(), Some(1)));
+    e.warm(0);
+    e.binder.pass(&key()).await;
+    assert_eq!(phase(&e.fake.status(OWN, &id)), ClaimPhase::Bound);
+    assert_eq!(phase(&e.fake.status(OWN, &later)), ClaimPhase::Pending);
+}
+
+/// A key reused after a release makes a new claim of the same name. The
+/// released pod, not yet retired, carries the old claim's uid: the new claim
+/// never adopts it, and tidy retires it.
+#[tokio::test(start_paused = true)]
+async fn a_claim_recreated_under_the_same_name_never_gets_the_released_pod() {
+    let e = env();
+    let req = post_req(&KEY);
+    let old = e.warm(0);
+    let Outcome::Pending(p) = e.front.allocate(&sa("alice"), &req).await.unwrap() else {
+        panic!("bound before the leader ran")
+    };
+    e.binder.pass(&key()).await;
+    assert_eq!(e.fake.status(OWN, &p.id).pod.as_deref(), Some(old.as_str()));
+    e.front.release(&sa("alice"), &p.id).await.unwrap();
+    let Outcome::Pending(again) = e.front.allocate(&sa("alice"), &req).await.unwrap() else {
+        panic!("bound to the released pod")
+    };
+    assert_eq!(again.id, p.id, "same key, same name");
+    let fresh = e.warm(1);
+    e.binder.pass(&key()).await;
+    assert_eq!(
+        e.fake.status(OWN, &p.id).pod.as_deref(),
+        Some(fresh.as_str()),
+        "the new claim takes a fresh pod"
+    );
+    let claims = e.fake.claims.lock().unwrap().as_reader().state();
+    let pods = e.fake.pods.lock().unwrap().as_reader().state();
+    super::leader::tidy_with(&e.binder, &claims, &pods, OffsetDateTime::now_utc()).await;
+    let calls = e.fake.calls();
+    assert!(
+        calls.contains(&format!("patch {old} draining")),
+        "{calls:?}"
+    );
+    assert!(
+        !calls.contains(&format!("patch {fresh} draining")),
+        "{calls:?}"
+    );
+}
+
+/// Backdate `seen-at` of claim `id` by `secs`, as if its caller last asked then.
+fn seen_ago(e: &Env, id: &str, secs: i64) {
+    let mut c = e.fake.claim(OWN, id).unwrap();
+    c.metadata.annotations.get_or_insert_default().insert(
+        claims::ANN_SEEN_AT.into(),
+        fmt_ts(OffsetDateTime::now_utc() - time::Duration::seconds(secs)),
+    );
+    e.fake.put_claim(c);
+}
+
+async fn tidy_at(e: &Env, now: OffsetDateTime) {
+    let claims = e.fake.claims.lock().unwrap().as_reader().state();
+    let pods = e.fake.pods.lock().unwrap().as_reader().state();
+    super::leader::tidy_with(&e.binder, &claims, &pods, now).await;
+}
+
+/// A client that gave up while its claim waited never asks for it again: a
+/// [`claims::ABANDON_AFTER`] after it was last seen, the leader deletes the
+/// pending claim.
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_pending_claim_is_deleted_after_three_minutes() {
+    let e = env();
+    let Outcome::Pending(p) = e
+        .front
+        .allocate(&sa("alice"), &post_req(&KEY))
+        .await
+        .unwrap()
+    else {
+        panic!("bound without a pod")
+    };
+    let now = OffsetDateTime::now_utc();
+    tidy_at(&e, now + time::Duration::seconds(170)).await;
+    assert!(e.fake.claim(OWN, &p.id).is_some(), "seen 170 s ago: kept");
+    tidy_at(&e, now + time::Duration::seconds(181)).await;
+    assert!(e.fake.claim(OWN, &p.id).is_none(), "{:?}", e.fake.calls());
+}
+
+/// A claim that bound after its client went, with the answer never
+/// delivered, is deleted the same way and its worker retired. A delivered
+/// claim is left to its TTL.
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_bound_claim_frees_its_worker_and_a_delivered_one_stays() {
+    let e = env();
+    let Outcome::Pending(gone) = e
+        .front
+        .allocate(&sa("alice"), &post_req(&KEY))
+        .await
+        .unwrap()
+    else {
+        panic!("bound without a pod")
+    };
+    let other = rcgen::KeyPair::generate().unwrap().public_key_pem();
+    let Outcome::Pending(kept) = e
+        .front
+        .allocate(&sa("bob"), &post_req(&other))
+        .await
+        .unwrap()
+    else {
+        panic!("bound without a pod")
+    };
+    let (a, b) = (e.warm(0), e.warm(1));
+    e.binder.pass(&key()).await;
+    let pod_of = |id: &str| e.fake.status(OWN, id).pod.unwrap();
+    let gone_pod = pod_of(&gone.id);
+    assert!([&a, &b].contains(&&gone_pod));
+    // Bob polls and gets his allocation: delivered.
+    let got = e
+        .front
+        .get(&sa("bob"), &kept.id, Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(matches!(got, Outcome::Bound(_)), "{got:?}");
+    assert!(claims::delivered(&e.fake.claim(OWN, &kept.id).unwrap()));
+    let later = OffsetDateTime::now_utc() + time::Duration::seconds(181);
+    tidy_at(&e, later).await;
+    assert!(
+        e.fake.claim(OWN, &gone.id).is_none(),
+        "undelivered: deleted"
+    );
+    assert!(e.fake.claim(OWN, &kept.id).is_some(), "delivered: kept");
+    tidy_at(&e, later).await;
+    let calls = e.fake.calls();
+    assert!(
+        calls.contains(&format!("patch {gone_pod} draining")),
+        "{calls:?}"
+    );
+    let kept_pod = pod_of(&kept.id);
+    assert!(
+        !calls.contains(&format!("patch {kept_pod} draining")),
+        "{calls:?}"
+    );
+}
+
+/// A client that comes back within three minutes, by POST with the same key or
+/// by GET, is seen again: its claim is not deleted and keeps its place.
+#[tokio::test(start_paused = true)]
+async fn a_claim_whose_client_comes_back_keeps_its_place() {
+    let e = env();
+    let req = post_req(&KEY);
+    let Outcome::Pending(p) = e.front.allocate(&sa("alice"), &req).await.unwrap() else {
+        panic!("bound without a pod")
+    };
+    let later = e.ci_claim(-5, "sa:x/later");
+    seen_ago(&e, &p.id, 150);
+    let Outcome::Pending(again) = e.front.allocate(&sa("alice"), &req).await.unwrap() else {
+        panic!("bound without a pod")
+    };
+    assert_eq!(
+        (again.id.as_str(), again.position),
+        (p.id.as_str(), Some(1))
+    );
+    tidy_at(&e, OffsetDateTime::now_utc() + time::Duration::seconds(100)).await;
+    assert!(e.fake.claim(OWN, &p.id).is_some(), "the retry was seen");
+    seen_ago(&e, &p.id, 150);
+    e.front
+        .get(&sa("alice"), &p.id, Duration::ZERO)
+        .await
+        .unwrap();
+    tidy_at(&e, OffsetDateTime::now_utc() + time::Duration::seconds(100)).await;
+    assert!(e.fake.claim(OWN, &p.id).is_some(), "the poll was seen");
+    e.warm(0);
+    e.binder.pass(&key()).await;
+    assert_eq!(phase(&e.fake.status(OWN, &p.id)), ClaimPhase::Bound);
+    assert_eq!(phase(&e.fake.status(OWN, &later)), ClaimPhase::Pending);
+}
+
+/// A claim last seen 60 to 170 s ago is a client between requests (a poll
+/// lost on the way, a `Retry-After`, clock skew): kept. Past
+/// [`claims::ABANDON_AFTER`] it goes.
+#[tokio::test(start_paused = true)]
+async fn a_claim_seen_within_three_minutes_is_kept() {
+    let e = env();
+    let Outcome::Pending(p) = e
+        .front
+        .allocate(&sa("alice"), &post_req(&KEY))
+        .await
+        .unwrap()
+    else {
+        panic!("bound without a pod")
+    };
+    for ago in [60, 120, 170] {
+        seen_ago(&e, &p.id, ago);
+        tidy_at(&e, OffsetDateTime::now_utc()).await;
+        assert!(e.fake.claim(OWN, &p.id).is_some(), "seen {ago} s ago: kept");
+    }
+    seen_ago(&e, &p.id, 181);
+    tidy_at(&e, OffsetDateTime::now_utc()).await;
+    assert!(
+        e.fake.claim(OWN, &p.id).is_none(),
+        "seen 181 s ago: deleted"
+    );
+}
+
+/// The leader decides from its store, which may predate the client coming
+/// back. The delete names the resourceVersion it decided on, so the client's
+/// new `seen-at` makes the API server refuse it, and the claim stays.
+#[tokio::test(start_paused = true)]
+async fn an_abandon_decided_on_a_stale_store_is_refused() {
+    let e = env();
+    let Outcome::Pending(p) = e
+        .front
+        .allocate(&sa("alice"), &post_req(&KEY))
+        .await
+        .unwrap()
+    else {
+        panic!("bound without a pod")
+    };
+    seen_ago(&e, &p.id, 200);
+    let stale = e.fake.claims.lock().unwrap().as_reader().state();
+    e.front
+        .get(&sa("alice"), &p.id, Duration::ZERO)
+        .await
+        .unwrap();
+    let pods = e.fake.pods.lock().unwrap().as_reader().state();
+    super::leader::tidy_with(&e.binder, &stale, &pods, OffsetDateTime::now_utc()).await;
+    assert!(e.fake.claim(OWN, &p.id).is_some(), "{:?}", e.fake.calls());
+    assert!(
+        e.fake
+            .calls()
+            .contains(&format!("delete_claim {} refused", p.id))
+    );
+}
 /// The tidy pass: refuses unserved namespaces, ends expired and lost claims,
 /// deletes finished CI claims after ten minutes, and retires pods whose claim
 /// is gone.

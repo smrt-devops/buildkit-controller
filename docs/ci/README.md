@@ -32,7 +32,7 @@ The edge needs no input: each allocation response carries the CA for the edge, a
 
 The Action and the script follow the same steps.
 
-1. `POST /v1/allocations` creates the allocation. If a worker binds within about 20 seconds, the answer is `201` with the full response, so a warm pool costs one round trip.
+1. `POST /v1/allocations` creates the allocation, named after the request's public key. If a worker binds within about 20 seconds, the answer is `201` with the full response, so a warm pool costs one round trip. A client that loses the answer sends the same `POST` again and finds the same allocation, in the same place in the queue.
 2. Otherwise the answer is `202` with `{"id", "state": "pending", "position"}`. The allocation is queued in the pool. The client keeps the id.
 3. The client calls `GET /v1/allocations/{id}?wait=25s` until it gets an answer. `200` is the full response. `202` means still pending, and the client asks again at once. No request stays open longer than 25 seconds, so gateway and load-balancer timeouts never cut the wait, and a client that loses its connection asks again and keeps its place.
 4. When the build ends, `DELETE /v1/allocations/{id}` releases the allocation.
@@ -41,25 +41,27 @@ The whole allocation, the first `POST`, every poll and any new `POST`, shares on
 
 ### Retries
 
+The client makes a new key pair for each allocation, and the public key names it: the controller derives the allocation id from the key. A `POST` repeated with the same key, by the same caller, finds the allocation the first one made and answers for it as for a new one (`201` when bound, otherwise `202` after up to 20 seconds). It never makes a second allocation. So a `POST` whose answer is lost, through a reset, a timeout or a `5xx` from a gateway, is safe to send again, and the allocation keeps its place in the queue. The same key from another caller gets `403 forbidden`. Retry within 3 minutes: the controller deletes an allocation whose caller has not asked for it (by `POST` or `GET`) for 3 minutes, unless it already answered with the bound allocation. The Action and the script never leave a gap that long while they keep trying. That frees the place and the worker of a job that was cancelled before it learned its id.
+
 Which answers the client repeats, and which end the step:
 
 | Answer | Client does |
 |---|---|
 | `201` on `POST`, `200` on `GET` | Done. |
 | `202` | Poll the id again. |
-| `503 pool_exhausted` on `POST` (`Retry-After: 5`) | The pool's queue timeout ran out. Wait, then `POST` again while the budget lasts. |
-| `503 pool_exhausted` on `GET` | The claim hit its queue timeout and the id is dead. Same as above: a new `POST` while the budget lasts, then fail. |
-| `503 upstream_error` (`Retry-After: 2`) | The controller could not reach the Kubernetes API or the issuer's keys (token review, JWKS). Repeat the request after `Retry-After`. It is retried on `POST`, `GET` and `DELETE`. |
+| Connection refused, reset or timed out on `POST`, and any other `5xx` on `POST` | Repeat the `POST` with the same key after `Retry-After`, else after 1, 2, 4 and up to 30 seconds. |
+| `503 pool_exhausted` on `POST` (`Retry-After: 5`) | The allocation hit its queue timeout and that key is spent. Wait, then `POST` again with a new key while the budget lasts. |
+| `503 pool_exhausted` on `GET` | The claim hit its queue timeout and the id is dead. Same as above: a new `POST` with a new key while the budget lasts, then fail. |
+| `503 upstream_error` (`Retry-After: 2`) | The controller could not reach the Kubernetes API or the issuer's keys (token review, JWKS). Repeat the request after `Retry-After`, on `POST`, `GET` and `DELETE`. |
 | Other `5xx` on `GET`, and connection failures while polling | Poll the same id again after `Retry-After`, else 2 seconds. |
-| `503 pod_lost` on `GET` | The worker is gone. The id is dead. Fail the step. |
+| `503 pod_lost` | The worker is gone. The id is dead. Fail the step. |
 | `404 not_found` and `403 forbidden` on `GET`, other `4xx` | Fail the step. |
-| Other `503`, for example `ca_unavailable`, with no `Retry-After` | Fail the step. |
 
-Two older `503` codes with `Retry-After`, for a worker that did not start in time and for a replica that was stopping, are no longer sent. The Action still retries them, so it works against an older controller. The script retries both.
+Every retry stops once the next wait would pass the budget. The client waits the `Retry-After` seconds (at least 1, at most 30), logs each retry, and the Action fetches a fresh OIDC token for every attempt. A retry asks for just the time left in the budget, so the total never doubles. With several pools, each pool allocates on its own; if one pool fails, the allocations that succeeded are released.
 
-The Action repeats `POST /v1/allocations` only on a 503 with `Retry-After` and one of the codes above, because an intermediary that adds its own `Retry-After` to a 503 may have forwarded the request. It also retries connection errors raised before the request was sent (connection refused, DNS failure). It waits the `Retry-After` seconds (at least 1, at most 30), logs each retry, and fetches a fresh OIDC token for every attempt. A retry asks for just the time left in the budget, so the total never doubles.
+Releases (`DELETE`; a 404 counts as released) and the pool listing (`GET /v1/pools`) retry connection failures and `5xx` the same way, since repeating them is safe. They have their own budget of 60 seconds, because neither queues.
 
-Nothing else is retried: a connection reset after the request was sent and a timeout waiting for the response of the `POST` fail the step, because the controller may have created an allocation whose id the client never saw. That allocation ends at its TTL. With several pools, each pool allocates on its own; if one pool fails, the allocations that succeeded are released. Releases (`DELETE`; a 404 counts as released) and the pool listing (`GET /v1/pools`) retry any 503 with `Retry-After`, since repeating them is safe. They have their own budget of 60 seconds, because neither queues.
+A v0.1.0 controller does not derive the id from the key, so a `POST` it received but whose answer was lost makes a second allocation when repeated. The first one ends at its TTL.
 
 ### Build cache
 

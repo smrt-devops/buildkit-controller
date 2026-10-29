@@ -18,7 +18,9 @@ use time::OffsetDateTime;
 use super::pods::{ann, derived_alloc_id, parse_ts};
 use crate::auth::Identity;
 use crate::pki::AllocId;
-use crate::render::{ANN_ALLOC, ANN_CLAIM, ANN_EXPIRES_AT, ANN_OWNER, DRAINING, FREE};
+use crate::render::{
+    ANN_ALLOC, ANN_CLAIM, ANN_CLAIM_UID, ANN_EXPIRES_AT, ANN_OWNER, DRAINING, FREE,
+};
 
 /// `(namespace, name)` of a pool.
 pub type PoolKey = (String, String);
@@ -32,6 +34,19 @@ pub const POOL_GRACE: Duration = Duration::from_secs(30);
 pub const LOST_GRACE: Duration = Duration::from_secs(30);
 /// How long a finished claim of a CI caller stays before the leader deletes it.
 pub const FINISHED_TTL: Duration = Duration::from_mins(10);
+/// How long a CI claim whose bound answer was never delivered may go without
+/// its caller asking for it before the leader deletes it: the client is gone.
+/// It covers the longest gap the shipped clients leave between requests that
+/// reach a replica (a 25 s poll, a 40 s client timeout on a poll lost on the
+/// way, a 30 s `Retry-After`), plus [`SEEN_EVERY`], plus clock skew between
+/// the replica that writes `seen-at` and the leader that reads it.
+pub const ABANDON_AFTER: Duration = Duration::from_mins(3);
+/// The API refreshes a claim's `seen-at` at most this often.
+pub const SEEN_EVERY: Duration = Duration::from_secs(15);
+/// Claim annotation: when the API last answered the claim's caller.
+pub const ANN_SEEN_AT: &str = "buildkit.smrt-devops.net/seen-at";
+/// Claim annotation `true` once the API has answered with the bound allocation.
+pub const ANN_DELIVERED: &str = "buildkit.smrt-devops.net/delivered";
 
 /// Condition reasons a claim can carry.
 pub mod reason {
@@ -313,9 +328,50 @@ pub fn collectable(c: &BuildKitClaim, own: &str, now: OffsetDateTime) -> bool {
         })
 }
 
-/// Pods whose allocation no longer has a claim to serve, by `(namespace, name)`
-/// of the pod: the claim is gone or replaced, has ended, or is bound to another
-/// pod (a bind a deposed leader made). Pods bound before every allocation was
+fn claim_ann<'a>(c: &'a BuildKitClaim, key: &str) -> Option<&'a str> {
+    c.metadata
+        .annotations
+        .as_ref()?
+        .get(key)
+        .map(String::as_str)
+}
+
+/// True once the API has answered with the bound allocation of `c`.
+#[must_use]
+pub fn delivered(c: &BuildKitClaim) -> bool {
+    claim_ann(c, ANN_DELIVERED) == Some("true")
+}
+
+/// Seconds since the API last answered the caller of `c`; `None` for a claim
+/// without `seen-at` (an in-cluster claim, or one made before it existed).
+fn unseen_for(c: &BuildKitClaim, now: OffsetDateTime) -> Option<u64> {
+    let at = parse_ts(claim_ann(c, ANN_SEEN_AT)?)?;
+    u64::try_from(now.unix_timestamp() - at.unix_timestamp()).ok()
+}
+
+/// True when the API should refresh `seen-at` of `c` at `now`.
+#[must_use]
+pub fn seen_due(c: &BuildKitClaim, now: OffsetDateTime) -> bool {
+    !delivered(c) && unseen_for(c, now).is_some_and(|s| s >= SEEN_EVERY.as_secs())
+}
+
+/// True when CI claim `c` of the controller's namespace `own` is pending, or
+/// bound with its answer never delivered, and its caller has not asked for it
+/// for [`ABANDON_AFTER`]: the client is gone, and the claim is deleted so it
+/// holds no place and no worker. A delivered claim lives to its TTL.
+#[must_use]
+pub fn abandoned(c: &BuildKitClaim, own: &str, now: OffsetDateTime) -> bool {
+    c.metadata.namespace.as_deref() == Some(own)
+        && c.metadata.deletion_timestamp.is_none()
+        && !phase(c).is_terminal()
+        && !delivered(c)
+        && unseen_for(c, now).is_some_and(|s| s >= ABANDON_AFTER.as_secs())
+}
+
+/// Pods whose allocation no longer has a claim to serve: the claim named by
+/// `(namespace, name)` is gone, is another claim of that name (another uid),
+/// has ended, or is bound to another pod (a bind a deposed leader made). Pods
+/// bound before every allocation was
 /// a claim carry no `P claim`: the ones an in-cluster claim owned count when
 /// that claim (by uid) is gone, has ended, or names another allocation id.
 /// Only served namespaces count; claims nobody watches, and pre-claim
@@ -351,6 +407,11 @@ pub fn strays<'a, S: std::hash::BuildHasher>(
             let Some(c) = by_ref.get(cref) else {
                 return true;
             };
+            // A claim of the same name made after the pod's claim went: the pod
+            // was released, and never serves the new one.
+            if ann(p, ANN_CLAIM_UID) != c.metadata.uid.as_deref() {
+                return true;
+            }
             if alloc_id(c, own).is_none_or(|a| a.as_str() != id) {
                 return true;
             }

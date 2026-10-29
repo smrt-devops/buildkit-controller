@@ -124,6 +124,12 @@ impl ClientPublicKey {
         on_curve(spki.der_bytes())?;
         Ok(Self(spki))
     }
+
+    /// The uncompressed point, 65 bytes: the same for every spelling of the key.
+    #[must_use]
+    pub fn point(&self) -> &[u8] {
+        self.0.der_bytes()
+    }
 }
 
 /// Rejects points that are not on P-256 (including the all-zero encoding).
