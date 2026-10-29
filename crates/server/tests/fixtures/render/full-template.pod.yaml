@@ -12,7 +12,7 @@ metadata:
     app.kubernetes.io/name: buildkitd
     buildkit.smrt-devops.net/pool: full-template
     buildkit.smrt-devops.net/state: free
-    buildkit.smrt-devops.net/template-hash: 64c0e854a9
+    buildkit.smrt-devops.net/template-hash: a5a151223c
     cost-center: "1234"
     team: ci
   name: full-template-0
@@ -83,6 +83,9 @@ spec:
         ephemeral-storage: 10Gi
         memory: 4Gi
     securityContext:
+      capabilities:
+        drop:
+        - NET_RAW
       privileged: false
     startupProbe:
       exec:

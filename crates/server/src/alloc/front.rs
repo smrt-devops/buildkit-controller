@@ -37,6 +37,13 @@ use crate::runtime::stores::{ClaimEvent, ClaimSubscription};
 pub const CREATE_WAIT: Duration = Duration::from_secs(20);
 /// The longest `wait` of `GET /v1/allocations/{id}`.
 pub const MAX_WAIT: Duration = Duration::from_secs(25);
+/// How long a lookup by id waits for a claim the store does not hold yet:
+/// one another replica created a moment ago. The watch delivers it within
+/// milliseconds.
+pub const MISS_WAIT: Duration = Duration::from_secs(2);
+/// The longest `publicKey`: the claim CRD's `maxLength`, so a key that
+/// parses never fails the create.
+const MAX_PUBLIC_KEY_BYTES: usize = 1024;
 
 /// What an allocation call found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +67,7 @@ pub struct Front {
     metrics: AllocMetrics,
     stopping: CancellationToken,
     /// Worker pods, for releasing allocations made before claims existed.
-    /// v0.1.0 upgrade shim: remove in the release after v3.
+    /// v0.1.0 upgrade shim: remove in the release after 0.2.0.
     pods: Option<Store<Pod>>,
 }
 
@@ -94,7 +101,7 @@ impl Front {
 
     /// Releases of allocations made before every allocation was a claim
     /// retire their pods from this store. v0.1.0 upgrade shim: remove in the
-    /// release after v3.
+    /// release after 0.2.0.
     #[must_use]
     pub fn with_pods(mut self, pods: Store<Pod>) -> Self {
         self.pods = Some(pods);
@@ -146,7 +153,7 @@ impl Front {
         let id = claim.metadata.name.clone().unwrap_or_default();
         // Subscribed before the create, so the bind cannot slip past the wait.
         let mut sub = (self.subscribe)();
-        let found = self.create_or_find(who, claim).await;
+        let found = self.create_or_find(who, claim, &mut sub).await;
         let repeat = matches!(found, Ok(Some(_)));
         if let Ok(Some(c)) = &found {
             self.touch(c).await;
@@ -174,13 +181,14 @@ impl Front {
         &self,
         who: &Identity,
         claim: BuildKitClaim,
+        sub: &mut ClaimSubscription,
     ) -> Result<Option<Arc<BuildKitClaim>>, AllocError> {
         let id = claim.metadata.name.clone().unwrap_or_default();
         let pool = claim.spec.pool_ref.clone();
         match self.backend.create_claim(claim).await {
             Write::Done => Ok(None),
             Write::Exists => {
-                let c = match self.owned(who, &id).await {
+                let c = match self.owned(who, &id, sub).await {
                     // Deleted since the create: the client's next try makes it anew.
                     Err(AllocError::NotFound) => return Err(AllocError::UpstreamError),
                     r => r?,
@@ -277,7 +285,7 @@ impl Front {
         wait: Duration,
     ) -> Result<Outcome, AllocError> {
         let mut sub = (self.subscribe)();
-        let c = self.owned(who, id).await?;
+        let c = self.owned(who, id, &mut sub).await.map_err(hide_owner)?;
         self.touch(&c).await;
         let c = if claims::phase(&c) == ClaimPhase::Pending && !wait.is_zero() {
             // A claim the store does not hold yet answers as last read.
@@ -292,9 +300,12 @@ impl Front {
 
     /// `DELETE /v1/allocations/{id}`: deletes the claim; the leader retires its pod.
     pub async fn release(&self, who: &Identity, id: &str) -> Result<(), AllocError> {
-        let c = match self.owned(who, id).await {
-            Err(AllocError::NotFound) => return self.release_unclaimed(who, id).await,
-            r => r?,
+        let mut sub = (self.subscribe)();
+        let c = match self.owned(who, id, &mut sub).await {
+            Err(AllocError::NotFound) => {
+                return self.release_unclaimed(who, id).await.map_err(hide_owner);
+            }
+            r => r.map_err(hide_owner)?,
         };
         let uid = c.metadata.uid.as_deref().unwrap_or_default();
         match self.backend.delete_claim(&self.namespace, id, uid).await {
@@ -314,7 +325,7 @@ impl Front {
     /// Release an allocation made before every allocation was a claim: its
     /// pods carry the id and the caller's owner but no `P claim`. Each retire
     /// tests the uid and `alloc == id`, so a look-alike pod is harmless.
-    /// v0.1.0 upgrade shim: remove in the release after v3.
+    /// v0.1.0 upgrade shim: remove in the release after 0.2.0.
     async fn release_unclaimed(&self, who: &Identity, id: &str) -> Result<(), AllocError> {
         let Some(pods) = &self.pods else {
             return Err(AllocError::NotFound);
@@ -377,25 +388,21 @@ impl Front {
             .is_some_and(|uid| of_pool(pod, ns, pool, &uid))
     }
 
-    /// The claim of allocation `id`, if `who` owns it. A claim created on
-    /// another replica a moment ago may not be in the store yet, so a miss
-    /// asks the API server.
-    async fn owned(&self, who: &Identity, id: &str) -> Result<Arc<BuildKitClaim>, AllocError> {
+    /// The claim of allocation `id`, if `who` owns it. Only the store is read:
+    /// any caller can name random ids, so a miss must cost no API call. A
+    /// claim created on another replica a moment ago may not be in the store
+    /// yet, so a miss waits up to [`MISS_WAIT`] for the watch to deliver it.
+    /// `sub` was opened before the store was read.
+    async fn owned(
+        &self,
+        who: &Identity,
+        id: &str,
+        sub: &mut ClaimSubscription,
+    ) -> Result<Arc<BuildKitClaim>, AllocError> {
         if id.parse::<AllocId>().is_err() {
             return Err(AllocError::NotFound);
         }
-        let c = match self.stored(id) {
-            Some(c) => c,
-            None => match self.backend.get_claim(&self.namespace, id).await {
-                Ok(Some(c)) => Arc::new(c),
-                Ok(None) => return Err(AllocError::NotFound),
-                Err(Write::Unknown) => return Err(AllocError::UpstreamError),
-                Err(w) => {
-                    error!(alloc_id = id, outcome = ?w, "reading claim");
-                    return Err(AllocError::Internal);
-                }
-            },
-        };
+        let c = self.arriving(id, sub).await?;
         let owner = claims::caller(&c, &self.namespace).map(|c| c.owner);
         if owner.as_deref().map(str::as_bytes) != Some(who.owner().as_bytes()) {
             warn!(
@@ -410,6 +417,29 @@ impl Front {
 
     fn stored(&self, id: &str) -> Option<Arc<BuildKitClaim>> {
         self.claims.get(&ObjectRef::new(id).within(&self.namespace))
+    }
+
+    /// The stored claim `id`, waiting up to [`MISS_WAIT`] for it to arrive:
+    /// [`AllocError::NotFound`] if it does not. A replica that starts stopping
+    /// answers [`AllocError::UpstreamError`] instead, so the client asks another.
+    async fn arriving(
+        &self,
+        id: &str,
+        sub: &mut ClaimSubscription,
+    ) -> Result<Arc<BuildKitClaim>, AllocError> {
+        let deadline = Instant::now() + MISS_WAIT;
+        loop {
+            if let Some(c) = self.stored(id) {
+                return Ok(c);
+            }
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => return Err(AllocError::NotFound),
+                () = self.stopping.cancelled() => return Err(AllocError::UpstreamError),
+                ev = sub.recv() => if ev.is_none() {
+                    return self.stored(id).ok_or(AllocError::NotFound);
+                },
+            }
+        }
     }
 
     /// The claim once it is no longer pending, or as it stands at `deadline`
@@ -452,7 +482,10 @@ impl Front {
             .filter(|_| claims::phase(c) == ClaimPhase::Bound);
         let Some(s) = s else {
             let all = self.claims.state();
-            return Ok(pending(&id, claims::position(&all, &self.served, c)));
+            return Ok(pending(
+                &id,
+                claims::position(&all, &self.served, &self.namespace, c),
+            ));
         };
         let bundle = self.certs.bundle().ok_or(AllocError::CaUnavailable)?;
         let field = |v: &Option<String>| v.clone().ok_or(AllocError::Internal);
@@ -512,6 +545,11 @@ impl Front {
             )));
         }
         let pem = req.public_key.clone().unwrap_or_default();
+        if pem.len() > MAX_PUBLIC_KEY_BYTES {
+            return Err(AllocError::InvalidRequest(format!(
+                "publicKey must be at most {MAX_PUBLIC_KEY_BYTES} bytes"
+            )));
+        }
         let key = ClientPublicKey::from_pem(&pem).map_err(|_| {
             AllocError::InvalidRequest("publicKey must be a PEM SPKI ECDSA P-256 key".into())
         })?;
@@ -574,6 +612,15 @@ fn pending(id: &str, position: Option<u32>) -> Outcome {
         state: AllocationState::Pending,
         position,
     })
+}
+
+/// `GET` and `DELETE` answer 404 for another caller's allocation, as for
+/// one that does not exist, so a leaked id tells nobody else whether it is live.
+fn hide_owner(e: AllocError) -> AllocError {
+    match e {
+        AllocError::Forbidden => AllocError::NotFound,
+        e => e,
+    }
 }
 
 fn state_of(r: &Result<Outcome, AllocError>) -> &'static str {

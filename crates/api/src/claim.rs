@@ -37,7 +37,6 @@ pub fn secret_name(name: &str) -> String {
     status = "BuildKitClaimStatus",
     printcolumn = r#"{"name":"Pool","type":"string","jsonPath":".spec.poolRef.name"}"#,
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
-    printcolumn = r#"{"name":"Position","type":"integer","jsonPath":".status.queuePosition"}"#,
     printcolumn = r#"{"name":"Secret","type":"string","jsonPath":".status.secretName"}"#,
     printcolumn = r#"{"name":"Expires","type":"string","jsonPath":".status.expiresAt"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#,
@@ -200,9 +199,6 @@ pub struct BuildKitClaimStatus {
     /// RFC 3339 UTC expiry of the allocation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
-    /// 1-based place in the pool's queue while `Pending`. Refreshed every few seconds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub queue_position: Option<i32>,
     /// Cache flags of the allocation, as in the `201` response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<crate::dto::CacheResponse>,
@@ -272,13 +268,15 @@ mod tests {
         assert_eq!(spec["publicKey"]["maxLength"], 1024);
         assert_eq!(spec["owner"]["minLength"], 1);
         let status = &schema["status"]["properties"];
-        for f in ["pod", "certificate", "queuePosition", "cache"] {
+        for f in ["pod", "certificate", "cache"] {
             assert!(status.get(f).is_some(), "status.{f}");
         }
+        // The queue place is computed from the store when asked, never stored.
+        assert!(status.get("queuePosition").is_none());
         let cols = &v["spec"]["versions"][0]["additionalPrinterColumns"];
         assert!(
             cols.as_array()
-                .is_some_and(|c| c.iter().any(|c| c["jsonPath"] == ".status.queuePosition")),
+                .is_some_and(|c| c.iter().all(|c| c["name"] != "Position")),
             "{cols}"
         );
     }

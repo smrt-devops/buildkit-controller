@@ -297,14 +297,30 @@ impl Backend for KubeBackend {
     }
 }
 
+/// Status fields a write may leave unset. A merge patch keeps a field it
+/// does not name, so each unset one is sent as `null`: an ended claim no
+/// longer names its deleted Secret.
+const CLEARABLE: [&str; 9] = [
+    "allocationId",
+    "endpoint",
+    "serverName",
+    "secretName",
+    "pod",
+    "certificate",
+    "expiresAt",
+    "cache",
+    "observedGeneration",
+];
+
 /// The merge patch of a claim status write, preconditioned on
-/// `resource_version`. A status without a queue place sends `queuePosition:
-/// null`, so a claim that leaves `Pending` loses its place; the other fields are
-/// always written in full.
+/// `resource_version`. Every field the status leaves unset is cleared, so the
+/// stored status is exactly `status`.
 pub(super) fn status_patch(resource_version: &str, status: &BuildKitClaimStatus) -> Value {
     let mut s = json!(status);
     if let Some(m) = s.as_object_mut() {
-        m.entry("queuePosition").or_insert(Value::Null);
+        for k in CLEARABLE {
+            m.entry(k).or_insert(Value::Null);
+        }
     }
     json!({"metadata": {"resourceVersion": resource_version}, "status": s})
 }
@@ -316,25 +332,29 @@ mod tests {
 
     use super::status_patch;
 
+    /// An ended claim's status drops `secretName`: the write must say so, or
+    /// the merge keeps the name of the Secret `end()` just deleted. Every
+    /// optional status field is covered, so a new one cannot be forgotten.
     #[test]
-    fn leaving_pending_clears_the_queue_position() {
-        let bound = BuildKitClaimStatus {
-            phase: Some(ClaimPhase::Bound),
+    fn unset_fields_are_cleared() {
+        let ended = BuildKitClaimStatus {
+            phase: Some(ClaimPhase::Expired),
             ..BuildKitClaimStatus::default()
         };
-        let p = status_patch("7", &bound);
-        assert_eq!(p["metadata"]["resourceVersion"], "7");
-        assert_eq!(p["status"]["queuePosition"], json!(null));
-        assert!(
-            p["status"]
-                .as_object()
-                .is_some_and(|m| m.contains_key("queuePosition"))
-        );
-        let pending = BuildKitClaimStatus {
-            phase: Some(ClaimPhase::Pending),
-            queue_position: Some(3),
-            ..BuildKitClaimStatus::default()
-        };
-        assert_eq!(status_patch("7", &pending)["status"]["queuePosition"], 3);
+        let p = status_patch("7", &ended);
+        assert_eq!(p["status"].get("secretName"), Some(&json!(null)));
+        let full: BuildKitClaimStatus = serde_json::from_value(json!({
+            "phase": "Bound", "allocationId": "a", "endpoint": "e", "serverName": "s",
+            "secretName": "x", "pod": "p", "certificate": "c", "expiresAt": "t",
+            "cache": {"key": "k"},
+            "observedGeneration": 1, "conditions": []
+        }))
+        .unwrap();
+        let mut set: Vec<String> = json!(full).as_object().unwrap().keys().cloned().collect();
+        set.retain(|k| k != "phase" && k != "conditions");
+        set.sort();
+        let mut clearable: Vec<String> = super::CLEARABLE.iter().map(|s| (*s).to_owned()).collect();
+        clearable.sort();
+        assert_eq!(set, clearable);
     }
 }

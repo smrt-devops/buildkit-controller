@@ -24,7 +24,7 @@ use tracing::{error, info, warn};
 use super::backend::{Backend, PatchOutcome, Write};
 use super::cache::{self, Plan};
 use super::certs::CertSource;
-use super::claims::{self, Binding, Caller, PoolKey, reason};
+use super::claims::{self, Binding, Caller, PoolKey, owner_hold_limit, reason};
 use super::metrics::AllocMetrics;
 use super::pods::{
     Bind, CERT_MARGIN, MAX_TRIES, Want, ann, claim_patch, fmt_ts, is_candidate, of_pool, parse_ts,
@@ -40,8 +40,6 @@ const RECENT: Duration = Duration::from_secs(30);
 /// After a lost or unknown pod patch, the pool's next pass comes this soon:
 /// the pod store lags, and no event may follow.
 const RETRY: Duration = Duration::from_secs(1);
-/// The shortest gap between two writes of a waiting claim's `queuePosition`.
-const POSITION_EVERY: Duration = Duration::from_secs(5);
 
 /// Static inputs from the config file.
 #[derive(Debug, Clone)]
@@ -97,14 +95,14 @@ struct Won {
 /// What a pass carries from claim to claim.
 #[derive(Default)]
 struct Pass {
-    /// Claims left waiting so far.
-    waiting: u32,
     /// The earliest queue deadline among the claims left waiting.
     until: Option<OffsetDateTime>,
     /// A pod patch was lost or its outcome is unknown.
     retry: bool,
     /// Pods this pass took or saw lost; never offered twice.
     taken: HashSet<String>,
+    /// Workers each owner holds in the pool, counting this pass's binds.
+    held: HashMap<String, usize>,
 }
 
 impl Pass {
@@ -119,8 +117,6 @@ struct Memory {
     bound: HashMap<String, Instant>,
     /// Pod uids taken recently.
     taken: HashMap<String, Instant>,
-    /// When each waiting claim's place was last written.
-    positions: HashMap<String, Instant>,
 }
 
 /// The leader's allocator for every pool.
@@ -183,7 +179,7 @@ impl Binder {
     /// The pools with waiting claims.
     #[must_use]
     pub fn pools_waiting(&self) -> Vec<PoolKey> {
-        claims::queues(&self.claims.state(), &self.cfg.served)
+        claims::pending(&self.claims.state(), &self.cfg.served)
             .into_keys()
             .collect()
     }
@@ -192,7 +188,8 @@ impl Binder {
     /// another pass without an event: at the next queue deadline, or soon
     /// after a contended patch.
     pub async fn pass(&self, key: &PoolKey) -> Option<Duration> {
-        let mut queue = claims::queues(&self.claims.state(), &self.cfg.served)
+        let all = self.claims.state();
+        let mut queue = claims::pending(&all, &self.cfg.served)
             .remove(key)
             .unwrap_or_default();
         if queue.is_empty() {
@@ -203,7 +200,6 @@ impl Binder {
             let mut m = self.memory();
             m.bound.retain(|_, t| t.elapsed() < RECENT);
             m.taken.retain(|_, t| t.elapsed() < RECENT);
-            m.positions.retain(|_, t| t.elapsed() < RECENT);
             queue.retain(|c| {
                 c.metadata
                     .uid
@@ -215,8 +211,49 @@ impl Binder {
             .pools
             .get(&ObjectRef::new(&key.1).within(&key.0))
             .filter(|p| p.metadata.uid.is_some());
-        let mut pass = Pass::default();
-        for c in &queue {
+        let mut pass = Pass {
+            held: self.held(&all, key),
+            ..Pass::default()
+        };
+        // Fair share: an owner at the hold limit lets a claim of another
+        // owner under it, waiting further back, go first. Its claim is served
+        // after the rest of the queue, so a worker nobody else took is never
+        // left idle. Once an owner yields, its later claims follow it, so
+        // one owner's claims keep their order.
+        let limit = pool.as_deref().map_or(usize::MAX, owner_hold_limit);
+        let own = self.cfg.namespace.as_str();
+        let owners: Vec<Option<String>> = queue
+            .iter()
+            .map(|c| claims::caller(c, own).map(|x| x.owner))
+            .collect();
+        let mut behind: HashMap<&str, usize> = HashMap::new();
+        for o in owners.iter().flatten() {
+            *behind.entry(o.as_str()).or_default() += 1;
+        }
+        let mut later = Vec::new();
+        let mut yielded: HashSet<&str> = HashSet::new();
+        for (c, owner) in queue.iter().zip(&owners) {
+            let Some(o) = owner.as_deref() else {
+                self.serve(c, pool.as_deref(), now, &mut pass).await;
+                continue;
+            };
+            if let Some(n) = behind.get_mut(o) {
+                *n -= 1;
+            }
+            let held = |x: &str| pass.held.get(x).copied().unwrap_or(0);
+            let yields = yielded.contains(o)
+                || (held(o) >= limit
+                    && behind
+                        .iter()
+                        .any(|(x, n)| *n > 0 && *x != o && held(x) < limit));
+            if yields {
+                yielded.insert(o);
+                later.push(c);
+            } else {
+                self.serve(c, pool.as_deref(), now, &mut pass).await;
+            }
+        }
+        for c in later {
             self.serve(c, pool.as_deref(), now, &mut pass).await;
         }
         let at = pass
@@ -307,6 +344,34 @@ impl Binder {
                     .await;
             }
         }
+    }
+
+    /// Workers each owner holds in pool `key`: its `Bound` claims, and the
+    /// claims this leader bound in the last [`RECENT`] that the store still
+    /// shows `Pending`.
+    fn held(&self, claims: &[Arc<BuildKitClaim>], key: &PoolKey) -> HashMap<String, usize> {
+        let own = self.cfg.namespace.as_str();
+        let m = self.memory();
+        let mut out: HashMap<String, usize> = HashMap::new();
+        for c in claims {
+            let holds = match claims::phase(c) {
+                ClaimPhase::Bound => true,
+                ClaimPhase::Pending => c
+                    .metadata
+                    .uid
+                    .as_ref()
+                    .is_some_and(|u| m.bound.contains_key(u)),
+                _ => false,
+            };
+            if holds
+                && claims::pool_key(c) == *key
+                && c.metadata.deletion_timestamp.is_none()
+                && let Some(x) = claims::caller(c, own)
+            {
+                *out.entry(x.owner).or_default() += 1;
+            }
+        }
+        out
     }
 
     /// A pod of `pool` that already carries this claim's allocation: a bind
@@ -495,6 +560,7 @@ impl Binder {
                 return;
             }
         }
+        *pass.held.entry(ask.caller.owner.clone()).or_default() += 1;
         if let Some(uid) = &c.metadata.uid {
             self.memory().bound.insert(uid.clone(), Instant::now());
         }
@@ -584,28 +650,13 @@ impl Binder {
             }
             pass.until(d);
         }
-        // Its place among the claims of this pass still waiting.
-        pass.waiting += 1;
-        let position = pass.waiting;
-        // The reason is written at once; a changed place at most every
-        // POSITION_EVERY, so a queue that moves does not cost a write per waiter per bind.
-        let uid = c.metadata.uid.clone().unwrap_or_default();
-        let same_reason = c.status.is_some() && claims::reason(c) == Some(why);
-        let at = c.status.as_ref().and_then(|s| s.queue_position);
-        if same_reason && at == i32::try_from(position).ok() {
+        // No place in the queue is stored: the API works it out from the
+        // store when asked. Only a new reason is written.
+        if c.status.is_some() && claims::reason(c) == Some(why) {
             return;
         }
-        if same_reason {
-            let last = self.memory().positions.get(&uid).copied();
-            if let Some(t) = last.filter(|t| t.elapsed() < POSITION_EVERY) {
-                let left = POSITION_EVERY.saturating_sub(t.elapsed());
-                pass.until(now + left);
-                return;
-            }
-        }
-        self.memory().positions.insert(uid, Instant::now());
         let (ns, name) = claim_names(c);
-        let status = claims::unbound_status(c, ClaimPhase::Pending, why, message, Some(position));
+        let status = claims::unbound_status(c, ClaimPhase::Pending, why, message);
         if !matches!(
             self.backend
                 .patch_claim_status(ns, name, rv(c), &status)
@@ -642,7 +693,7 @@ impl Binder {
     /// The claim fails for good.
     async fn fail(&self, c: &BuildKitClaim, why: &'static str, message: &str, result: &str) {
         let (ns, name) = claim_names(c);
-        let status = claims::unbound_status(c, ClaimPhase::Failed, why, message, None);
+        let status = claims::unbound_status(c, ClaimPhase::Failed, why, message);
         if let Some(uid) = &c.metadata.uid {
             self.memory().bound.insert(uid.clone(), Instant::now());
         }
@@ -708,8 +759,13 @@ fn ask(
     let qt = match &c.spec.queue_timeout {
         Some(t) => seconds(t)?,
         None => seconds(&a.queue_timeout)?,
+    };
+    if qt > seconds(&a.max_queue_timeout)? {
+        return Err(format!(
+            "queueTimeout must be at most {}",
+            a.max_queue_timeout.as_str()
+        ));
     }
-    .min(seconds(&a.max_queue_timeout)?);
     // The controller holds no Secret rights in its own namespace.
     let public_key = match &c.spec.public_key {
         Some(pem) => {

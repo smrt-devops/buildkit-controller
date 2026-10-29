@@ -52,7 +52,7 @@ const REG: &str = "registry.e2e-reg.svc.cluster.local:5000";
 /// The chart's cache registry, as workers reach it.
 const CACHE_HOST: &str = "buildkit-controller-registry.bk-system.svc:5000";
 /// A cache volume as v0.1.0 labelled it, created before install; the leader
-/// deletes it. v0.1.0 upgrade shim: remove in the release after v3.
+/// deletes it. v0.1.0 upgrade shim: remove in the release after 0.2.0.
 const OLD_VOLUME: &str = "v010-volume";
 const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const AUD: &str = "buildkit-controller";
@@ -554,13 +554,13 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
     )?;
-    // B waits as a claim in the controller's namespace, at the head of the queue.
+    // B waits as a claim in the controller's namespace.
     let pending = until("B pending as a claim", Duration::from_mins(1), || {
         let s = c.env.kubectl(&[
             "get", "bkc", "-n", NS, "-o",
-            "jsonpath={range .items[?(@.status.phase==\"Pending\")]}{.metadata.name} {.spec.poolRef.name} {.status.queuePosition}{\"\\n\"}{end}",
+            "jsonpath={range .items[?(@.status.phase==\"Pending\")]}{.metadata.name} {.spec.poolRef.name}{\"\\n\"}{end}",
         ])?;
-        let head = format!(" {host} 1");
+        let head = format!(" {host}");
         Ok(s.lines().find(|l| l.ends_with(&head)).map(str::to_owned))
     })?;
     ensure!(a.wait()?.success(), "allocation A failed");
@@ -578,7 +578,7 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
         "B did not wait (launched {b_launched}, started {b_start})"
     );
     println!(
-        "PASS d: second allocation queued {}s as claim {pending} (place 1) and ran after the first was released",
+        "PASS d: second allocation queued {}s as claim {pending} and ran after the first was released",
         b_start - b_launched
     );
 
@@ -666,7 +666,7 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
     println!("PASS h: another identity starts with an empty cache");
 
     // m. Upgrade: the cache volume of v0.1.0 created before install is gone.
-    // v0.1.0 upgrade shim: remove in the release after v3.
+    // v0.1.0 upgrade shim: remove in the release after 0.2.0.
     until(
         "the v0.1.0 cache volume is deleted",
         Duration::from_mins(2),

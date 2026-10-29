@@ -47,26 +47,38 @@ jobs:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
 
+  # The release build on both architectures, so an arm64 or cargo-auditable break shows
+  # here and not after a release tag exists. Keep the compile step the same as release.yml's.
   image:
-    name: Image build (no push)
-    runs-on: ubuntu-latest
+    name: Image build ${{ matrix.arch }} (no push)
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Compile in the pinned trixie rust image
+        env:
+          AUDITABLE_VERSION: "0.7.5"
         run: |
           set -euo pipefail
           mkdir -p dist
-          docker run --rm -v "$PWD:/src" -w /src -v "$PWD/dist:/out" "$(cat docker/builder-image)" \
-            sh -euc 'cargo build --release --locked -p buildkit-controller --bin buildkit-controller --target-dir /tmp/target
+          docker run --rm -e AUDITABLE_VERSION -v "$PWD:/src" -w /src -v "$PWD/dist:/out" "$(cat docker/builder-image)" \
+            sh -euc 'cargo install cargo-auditable --version "${AUDITABLE_VERSION}" --locked
+              cargo auditable build --release --locked -p buildkit-controller --bin buildkit-controller --target-dir /tmp/target
               cp /tmp/target/release/buildkit-controller /out/buildkit-controller'
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: dist
           file: docker/Dockerfile
-          platforms: linux/amd64
+          platforms: linux/${{ matrix.arch }}
           push: false
 
   # The chart matches the code: the generated CRD is current, and helm lint, the golden

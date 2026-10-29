@@ -93,7 +93,10 @@ impl Settings {
             source,
         })?;
         let config = match Config::from_yaml(&text) {
-            Ok(c) => c,
+            Ok(c) => {
+                problems.extend(c.own_namespace_problems(&cli.pod_namespace));
+                c
+            }
             Err(ConfigError::Invalid(mut more)) => {
                 problems.append(&mut more);
                 return Err(ConfigError::Invalid(problems));
@@ -220,9 +223,10 @@ impl ProxyProtocol {
         for c in &self.trusted_cidrs {
             match c.parse::<crate::net::Cidr>() {
                 Err(e) => p.push(format!("{field}.trustedCIDRs: {e}")),
-                // Trusting every address lets any client choose its own address.
-                Ok(n) if n.prefix() == 0 => p.push(format!(
-                    "{field}.trustedCIDRs: `{c}` would trust every address"
+                // Trusting a huge range lets most clients choose their own
+                // address, for the per-address caps and the logs.
+                Ok(n) if n.prefix() < min_trusted_prefix(c) => p.push(format!(
+                    "{field}.trustedCIDRs: `{c}` is too broad for a gateway range (the shortest allowed prefix is /{MIN_TRUSTED_V4} for IPv4, /{MIN_TRUSTED_V6} for IPv6)"
                 )),
                 Ok(_) => {}
             }
@@ -449,11 +453,6 @@ pub struct ServiceAccountAuth {
     pub max_concurrent_reviews: u32,
     /// `TokenReview` calls in flight for one client address; more get 503. 0: no cap.
     pub max_reviews_per_ip: u32,
-    /// `TokenReview` slots (of `max_concurrent_reviews`) held back for service accounts that
-    /// passed a review within `recent_subject_ttl`. Cut to fit below `max_concurrent_reviews`.
-    pub reserved_reviews: u32,
-    /// How long a service account that passed a review counts as recently seen.
-    pub recent_subject_ttl: CrdDuration,
 }
 
 impl Default for ServiceAccountAuth {
@@ -463,8 +462,6 @@ impl Default for ServiceAccountAuth {
             audiences: vec!["buildkit-controller".into()],
             max_concurrent_reviews: 32,
             max_reviews_per_ip: 4,
-            reserved_reviews: 8,
-            recent_subject_ttl: CrdDuration::new("10m"),
         }
     }
 }
@@ -607,14 +604,65 @@ impl ElectionTiming {
 }
 
 fn secs(d: &CrdDuration, field: &str, problems: &mut Vec<String>) -> Duration {
+    capped(d, field, MAX_DURATION, problems)
+}
+
+/// The longest any duration in the file may be. It keeps the instant
+/// arithmetic on every duration far from overflow.
+const MAX_DURATION: Duration = Duration::from_hours(366 * 24);
+/// The longest `leaderElection.leaseDuration`: a replica waits this long for
+/// a Lease whose holder vanished.
+pub const MAX_LEASE_DURATION: Duration = Duration::from_mins(10);
+/// The longest `shutdown.delay`.
+const MAX_SHUTDOWN_DELAY: Duration = Duration::from_hours(1);
+/// The longest `shutdown.drainTimeout`.
+const MAX_DRAIN_TIMEOUT: Duration = Duration::from_hours(48);
+/// Shortest `trustedCIDRs` prefix for IPv4 and for IPv6.
+const MIN_TRUSTED_V4: u8 = 8;
+const MIN_TRUSTED_V6: u8 = 32;
+
+fn min_trusted_prefix(c: &str) -> u8 {
+    if c.contains(':') {
+        MIN_TRUSTED_V6
+    } else {
+        MIN_TRUSTED_V4
+    }
+}
+
+/// [`secs`] with a field-specific upper bound `max`; zero past it.
+fn capped(d: &CrdDuration, field: &str, max: Duration, problems: &mut Vec<String>) -> Duration {
     if let Ok(s) = d.seconds() {
-        return Duration::from_secs(s);
+        let d = Duration::from_secs(s);
+        if d <= max {
+            return d;
+        }
+        problems.push(format!("{field}: must be at most {max:?}"));
+        return Duration::ZERO;
     }
     problems.push(format!(
         "{field}: `{}` is not a duration like 5s, 2m, 1h30m",
         d.as_str()
     ));
     Duration::ZERO
+}
+
+/// `deniedCIDRs` plus each [`ALWAYS_DENIED`](crate::render::ALWAYS_DENIED)
+/// range that `deniedCIDRs`, `extraDeniedCIDRs` and `clusterCIDRs` do not
+/// already cover. Helm replaces a list it is given, so an override that adds
+/// one range must not reopen the metadata endpoints.
+fn denied_with_protected(n: &WorkerNetwork) -> Vec<String> {
+    let denied: Vec<crate::net::Cidr> = n
+        .denied_cidrs
+        .iter()
+        .chain(&n.extra_denied_cidrs)
+        .chain(&n.cluster_cidrs)
+        .filter_map(|c| c.parse().ok())
+        .collect();
+    let missing = crate::render::ALWAYS_DENIED
+        .into_iter()
+        .filter(|r| !r.parse().is_ok_and(|r| denied.iter().any(|d| d.covers(&r))))
+        .map(String::from);
+    n.denied_cidrs.iter().cloned().chain(missing).collect()
 }
 
 /// A validated duration as `time::Duration` (zero if unparsable, which
@@ -720,9 +768,10 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut p = Vec::new();
         let rt = secs(&self.kube.request_timeout, "kube.requestTimeout", &mut p);
-        let ld = secs(
+        let ld = capped(
             &self.leader_election.lease_duration,
             "leaderElection.leaseDuration",
+            MAX_LEASE_DURATION,
             &mut p,
         );
         let ri = secs(
@@ -747,9 +796,14 @@ impl Config {
                 p.push(format!("{f} must be positive"));
             }
         }
-        secs(&self.shutdown.delay, "shutdown.delay", &mut p);
+        capped(
+            &self.shutdown.delay,
+            "shutdown.delay",
+            MAX_SHUTDOWN_DELAY,
+            &mut p,
+        );
         if let Some(d) = &self.shutdown.drain_timeout {
-            secs(d, "shutdown.drainTimeout", &mut p);
+            capped(d, "shutdown.drainTimeout", MAX_DRAIN_TIMEOUT, &mut p);
         }
         if rt.is_zero() {
             p.push("kube.requestTimeout must be positive".into());
@@ -774,7 +828,7 @@ impl Config {
                 "leaderElection.fenceMargin ({fm:?}) must be >= kube.requestTimeout ({rt:?})"
             ));
         }
-        if ri + rt >= ld.saturating_sub(fm) {
+        if ri.saturating_add(rt) >= ld.saturating_sub(fm) {
             p.push(format!(
                 "renewInterval + requestTimeout must be < leaseDuration - fenceMargin ({ri:?} + {rt:?} >= {ld:?} - {fm:?})"
             ));
@@ -935,11 +989,6 @@ impl Config {
         {
             p.push("auth.serviceAccount.maxConcurrentReviews must be at least 1".into());
         }
-        secs(
-            &self.auth.service_account.recent_subject_ttl,
-            "auth.serviceAccount.recentSubjectTtl",
-            p,
-        );
     }
 
     fn validate_network(&self, p: &mut Vec<String>) {
@@ -976,6 +1025,38 @@ impl Config {
         if n.dns.pod_labels.is_empty() && n.dns.cidrs.is_empty() {
             p.push("workerNetwork.dns needs non-empty podLabels or cidrs".into());
         }
+        // Port 53 to these ranges is open for every pool, `internet: Deny` included.
+        for c in &n.dns.cidrs {
+            if let Ok(d) = c.parse::<crate::net::Cidr>()
+                && let Some(r) = crate::render::ALWAYS_DENIED
+                    .into_iter()
+                    .find(|r| r.parse().is_ok_and(|r| d.covers(&r)))
+            {
+                p.push(format!(
+                    "workerNetwork.dns.cidrs: `{c}` holds the whole of {r}; list the DNS servers' own addresses"
+                ));
+            }
+        }
+    }
+
+    /// Problems with the namespace lists given the controller's own namespace
+    /// `own`. It holds the CA Secret, so no pool runs there, and it is always
+    /// served for API claims, whose `owner`, `cacheScope` and `cacheTier` the
+    /// leader trusts, so only cluster admins may create claims there.
+    #[must_use]
+    pub fn own_namespace_problems(&self, own: &str) -> Vec<String> {
+        let mut p = Vec::new();
+        if self.watch_namespaces.iter().any(|n| n == own) {
+            p.push(format!(
+                "watchNamespaces must not include the controller's namespace {own}: it holds the CA Secret, which a pool's workers could mount"
+            ));
+        }
+        if self.claims.namespaces.iter().any(|n| n == own) {
+            p.push(format!(
+                "claims.namespaces must not include the controller's namespace {own}: it is always served for API claims, and creating claims there must stay limited to cluster admins"
+            ));
+        }
+        p
     }
 
     fn validate_test_leaf(&self, p: &mut Vec<String>) {
@@ -1065,7 +1146,7 @@ impl Config {
         crate::render::RenderConfig {
             controller_namespace: controller_namespace.to_owned(),
             worker_network: crate::render::WorkerNetwork {
-                denied_cidrs: n.denied_cidrs.clone(),
+                denied_cidrs: denied_with_protected(n),
                 extra_denied_cidrs: n.extra_denied_cidrs.clone(),
                 cluster_cidrs: n.cluster_cidrs.clone(),
                 permitted_cidrs: n.permitted_cidrs.clone(),

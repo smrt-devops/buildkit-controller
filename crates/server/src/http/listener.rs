@@ -46,7 +46,8 @@ pub struct Limits {
     /// `api.maxConnections`: open API connections; more are closed on accept.
     pub max_connections: usize,
     /// `api.maxConnectionsPerIp`: open connections from one client address
-    /// ([`PeerKey`](crate::edge::PeerKey)); more are closed on accept. 0 disables the cap.
+    /// (an IPv6 address counts as its /56, see [`crate::net::client_group`]);
+    /// more are closed on accept. 0 disables the cap.
     pub max_connections_per_ip: usize,
     /// TLS handshake.
     pub handshake_timeout: Duration,
@@ -172,7 +173,7 @@ pub async fn serve_with_proxy(
                     // From here on `peer` is the client: the PROXY source behind a
                     // trusted gateway, else the socket's peer.
                     let Some((tcp, peer)) = client(tcp, peer, &proxy).await else { return };
-                    let Some(slot) = per_peer.try_take(peer.ip()) else {
+                    let Some(slot) = per_peer.try_take(crate::net::client_group(peer.ip())) else {
                         debug!(peer = %peer, "API per-address connection limit reached; closing");
                         return;
                     };

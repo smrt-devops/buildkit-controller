@@ -35,6 +35,8 @@ struct Fake {
     fail: HashMap<String, OpError>,
     statuses: Mutex<Vec<BuildKitPoolStatus>>,
     deletes: Mutex<Vec<Delete>>,
+    /// Every Secret passed to `create_secret`.
+    secrets: Mutex<Vec<Secret>>,
     /// When set, every apply waits for a permit first.
     gate: Option<Arc<tokio::sync::Notify>>,
 }
@@ -125,6 +127,7 @@ impl KubeOps for Fake {
         self.call("status".into())
     }
     async fn create_secret(&self, s: &Secret) -> OpResult {
+        self.secrets.lock().unwrap().push(s.clone());
         let name = s.metadata.name.clone().unwrap_or_default();
         let labelled = s.metadata.labels.as_ref().is_some_and(|l| {
             l.get("app.kubernetes.io/component").map(String::as_str) == Some("ca-replaced")
@@ -360,22 +363,14 @@ async fn create_outcomes_are_classified() {
     let (p, ca) = (pool(), valid_ca());
     let fake = Fake::failing(&[
         ("create:p-0", OpError::Conflict("exists".into())),
-        ("create:p-1", OpError::Other("quota".into())),
+        ("create:p-2", OpError::Other("quota".into())),
     ]);
-    let creates = vec![
-        Action::CreatePod {
-            slot: 0,
-            name: "p-0".into(),
-        },
-        Action::CreatePod {
-            slot: 1,
-            name: "p-1".into(),
-        },
-        Action::CreatePod {
-            slot: 2,
-            name: "p-2".into(),
-        },
-    ];
+    let creates = (0..4)
+        .map(|slot| Action::CreatePod {
+            slot,
+            name: format!("p-{slot}"),
+        })
+        .collect();
     let r = execute(
         &fake,
         &CaGuard::default(),
@@ -385,28 +380,31 @@ async fn create_outcomes_are_classified() {
     .await;
     let results: Vec<_> = r.creates.iter().map(|c| c.result.clone()).collect();
     assert_eq!(results[0], CreateResult::SlotTaken);
-    assert!(matches!(results[1], CreateResult::Failed { .. }));
-    assert_eq!(results[2], CreateResult::Created);
+    assert_eq!(results[1], CreateResult::Created);
+    assert!(matches!(results[2], CreateResult::Failed { .. }));
     assert_eq!(r.created.len(), 1);
     // A refused create gets no Secret. An unknown outcome is read back first,
     // and no pod of this create means no Secret. The created pod owns its
-    // Secret from the start.
+    // Secret from the start. After a failed create the pass creates nothing
+    // more, so a full quota costs one refused POST per create backoff.
     assert_eq!(
         fake.calls_n(),
         [
             "create:p-0",
             "create:p-1",
-            "get_pod:p-1",
+            "secret_create:p-1-N:Pod/uid-p-1",
             "create:p-2",
-            "secret_create:p-2-N:Pod/uid-p-2",
+            "get_pod:p-2",
         ]
     );
+    assert_eq!(results.len(), 3);
+    assert!(r.trace.contains(&"skip_create:p-3".to_owned()));
 }
 
 #[tokio::test]
-async fn a_refused_secret_create_leaves_a_pod_that_cannot_start() {
+async fn a_refused_secret_create_deletes_the_pod_at_once() {
     let (p, ca) = (pool(), valid_ca());
-    let fake = Fake::failing(&[("secret_create", OpError::Other("forbidden".into()))]);
+    let fake = Fake::failing(&[("secret_create", OpError::Other("exists".into()))]);
     let create = vec![Action::CreatePod {
         slot: 0,
         name: "p-0".into(),
@@ -418,13 +416,22 @@ async fn a_refused_secret_create_leaves_a_pod_that_cannot_start() {
         &plan(create),
     )
     .await;
-    // The pod exists (the planner retires it at startTimeout), and the
-    // failure counts toward the create backoff.
+    // A Secret of the same name planted by someone else would let the pod
+    // start, so it is deleted (uid-preconditioned, grace 0) in the same pass,
+    // and the failure counts toward the create backoff.
     assert_eq!(r.created.len(), 1);
     assert!(matches!(r.creates[0].result, CreateResult::Failed { .. }));
     assert_eq!(
         fake.calls_n(),
-        ["create:p-0", "secret_create:p-0-N:Pod/uid-p-0"]
+        [
+            "create:p-0",
+            "secret_create:p-0-N:Pod/uid-p-0",
+            "delete:p-0"
+        ]
+    );
+    assert_eq!(
+        *fake.deletes.lock().unwrap(),
+        [("p-0".to_owned(), None, Some(0))]
     );
 }
 
@@ -503,6 +510,15 @@ async fn invalid_ca_is_backed_up_then_replaced() {
     let invalid = LoadOutcome::Missing; // the executor only reads the Secret object here
     let mut cur = Secret::default();
     cur.metadata.resource_version = Some("41".into());
+    let keys = CaBundle::generate(super::exec::odt(now()))
+        .unwrap()
+        .to_secret_data();
+    cur.data = Some(
+        keys.into_iter()
+            .map(|(k, v)| (k, k8s_openapi::ByteString(v)))
+            .collect(),
+    );
+    cur.string_data = Some([(crate::pki::CLIENT_CA_KEY.to_owned(), "k".to_owned())].into());
     let fake = Fake::default();
     let r = execute(
         &fake,
@@ -516,6 +532,16 @@ async fn invalid_ca_is_backed_up_then_replaced() {
         ["create_secret:backup", "replace_secret", "event:CAReplaced"]
     );
     assert_eq!(r.ca_replacements, ["invalid"]);
+    // The backup keeps the CA certificates and no private key.
+    let backup = fake.secrets.lock().unwrap()[0].clone();
+    let kept: Vec<&str> = backup
+        .data
+        .iter()
+        .flatten()
+        .map(|(k, _)| k.as_str())
+        .collect();
+    assert_eq!(kept, ["client-ca.crt", "generated-by", "internal-ca.crt"]);
+    assert!(backup.string_data.is_none_or(|s| s.is_empty()));
     // A failed backup stops the replace.
     let fake = Fake::failing(&[("create_secret:backup", OpError::Other("forbidden".into()))]);
     execute(

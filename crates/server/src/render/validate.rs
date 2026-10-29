@@ -50,6 +50,29 @@ pub(super) fn single_arch(platforms: &[String]) -> Option<&str> {
     }
 }
 
+/// Annotation key domains that CNI plugins read to attach networks or pick
+/// addresses, which the worker `NetworkPolicy` does not cover.
+const NETWORK_ANNOTATION_DOMAINS: [&str; 4] = [
+    "k8s.v1.cni.cncf.io",
+    "v1.multus-cni.io",
+    "cni.projectcalico.org",
+    "k8s.ovn.org",
+];
+/// Annotation key prefixes that container runtimes read to change the sandbox.
+const RUNTIME_ANNOTATION_PREFIXES: [&str; 2] = ["io.katacontainers.", "io.kubernetes.cri-o."];
+
+/// The annotation reconfigures the pod's network (Multus, Calico, Cilium,
+/// OVN) or its runtime sandbox (Kata, CRI-O), outside the controller's view.
+fn sandbox_annotation(key: &str) -> bool {
+    let domain = key.split_once('/').map_or("", |(d, _)| d);
+    NETWORK_ANNOTATION_DOMAINS.contains(&domain)
+        || domain == "cilium.io"
+        || domain.ends_with(".cilium.io")
+        || RUNTIME_ANNOTATION_PREFIXES
+            .iter()
+            .any(|p| key.starts_with(p))
+}
+
 /// Every template conflict, in a fixed order. Empty means the template is valid.
 #[must_use]
 pub fn validate_template(spec: &BuildKitPoolSpec) -> Vec<Conflict> {
@@ -70,6 +93,12 @@ pub fn validate_template(spec: &BuildKitPoolSpec) -> Vec<Conflict> {
                 &mut out,
                 format!("spec.template.metadata.annotations[{k}]"),
                 "annotation key prefix buildkit.smrt-devops.net/ is reserved",
+            );
+        } else if sandbox_annotation(k) {
+            conflict(
+                &mut out,
+                format!("spec.template.metadata.annotations[{k}]"),
+                "annotation key changes the pod's network or runtime outside the worker sandbox",
             );
         }
     }
@@ -305,6 +334,24 @@ pub const PROTECTED_CIDRS: [&str; 12] = [
     "64:ff9b:1::/48",
 ];
 
+/// Ranges the internet rule of every pool leaves out, whatever `deniedCIDRs`
+/// says: [`PROTECTED_CIDRS`] without loopback, which never leaves the pod, plus
+/// the NAT64 well-known prefix, which reaches every IPv4 address through a
+/// NAT64 gateway.
+pub const ALWAYS_DENIED: [&str; 11] = [
+    "169.254.0.0/16",
+    "fe80::/10",
+    "168.63.129.16/32",
+    "100.100.100.200/32",
+    "fd00:ec2::254/128",
+    "fd20:ce::254/128",
+    "fd00:a9fe:a9fe::1/128",
+    "fd00:c1::a9fe:a9fe/128",
+    "fd00:42::42/128",
+    "64:ff9b:1::/48",
+    "64:ff9b::/96",
+];
+
 /// One address range, IPv4 or IPv6, with host bits cleared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Net {
@@ -392,7 +439,9 @@ fn first_overlap<'s>(list: impl IntoIterator<Item = &'s str>, e: Net) -> Option<
 /// An entry is refused when it is not a CIDR range, when it spans a whole
 /// address family, or when it overlaps (holds or lies inside) a
 /// [`PROTECTED_CIDRS`] range, one of `net.cluster_cidrs` or one of
-/// `net.extra_denied_cidrs` (the operator's explicit deny), unless a
+/// `net.extra_denied_cidrs` (the operator's explicit deny), or, when
+/// `net.cluster_cidrs` holds no range of the entry's family, when it is IPv6 or
+/// overlaps one of `net.denied_cidrs` (it may reach the cluster), unless a
 /// `net.permitted_cidrs` range holds the whole entry. The whole-family check
 /// has no exception.
 #[must_use]
@@ -413,7 +462,7 @@ pub fn refused_allow_cidr(entry: &str, net: &WorkerNetwork) -> Option<String> {
     }
     let protected = first_overlap(PROTECTED_CIDRS, e)
         .map(|c| ("the link-local, metadata, loopback or NAT64 range", c));
-    let (what, c) = protected
+    let denied = protected
         .or_else(|| {
             first_overlap(net.cluster_cidrs.iter().map(String::as_str), e)
                 .map(|c| ("the cluster range", c))
@@ -421,10 +470,38 @@ pub fn refused_allow_cidr(entry: &str, net: &WorkerNetwork) -> Option<String> {
         .or_else(|| {
             first_overlap(net.extra_denied_cidrs.iter().map(String::as_str), e)
                 .map(|c| ("the operator-denied range", c))
-        })?;
-    Some(format!(
-        "overlaps {what} {c}; an operator can permit it in workerNetwork.permittedCIDRs"
-    ))
+        });
+    if let Some((what, c)) = denied {
+        return Some(format!(
+            "overlaps {what} {c}; an operator can permit it in workerNetwork.permittedCIDRs"
+        ));
+    }
+    // Without a cluster range of the entry's family the controller cannot tell
+    // cluster addresses from others: IPv4 clusters use the private ranges, and
+    // IPv6 clusters often global unicast.
+    let family_known = net
+        .cluster_cidrs
+        .iter()
+        .filter_map(|c| Net::parse(c))
+        .any(|c| {
+            matches!(
+                (c, e),
+                (Net::V4(..), Net::V4(..)) | (Net::V6(..), Net::V6(..))
+            )
+        });
+    if family_known {
+        return None;
+    }
+    let unknown = "and workerNetwork.clusterCIDRs holds no range of its family to tell \
+                   cluster addresses apart; an operator can list the cluster's ranges there \
+                   or permit it in workerNetwork.permittedCIDRs";
+    // Only the IPv4 entries: the NAT64 blocks embed all of IPv4.
+    let denied_v4 = net.denied_cidrs.iter().filter(|c| !c.contains(':'));
+    match e {
+        Net::V6(..) => Some(format!("is IPv6, {unknown}")),
+        Net::V4(..) => first_overlap(denied_v4.map(String::as_str), e)
+            .map(|c| format!("overlaps the denied range {c}, {unknown}")),
+    }
 }
 
 /// Every refused `spec.network.egress.allowCIDRs` entry, in spec order.

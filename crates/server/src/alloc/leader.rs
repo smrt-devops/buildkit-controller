@@ -28,7 +28,7 @@ use super::claims::{self, reason};
 use super::pods::{ann, is_ready};
 use super::{BindConfig, Binder, Shared};
 use crate::reconcile::driver::{Trigger, schedule};
-use crate::render::{ANN_ALLOC, FREE, LABEL_POOL};
+use crate::render::{ANN_ALLOC, ANN_CLAIM, ANN_OWNER, FREE, LABEL_POOL};
 use crate::runtime::AppContext;
 use crate::runtime::hooks::{BoxResult, Component, LeaderWork};
 use crate::runtime::leader::{BoxFut, supervise};
@@ -147,14 +147,7 @@ async fn run_term(t: Term, term: u64) {
     info!(term, component = "allocator", "allocator running");
     let claim_triggers = stream::unfold(t.ctx.claim_events(), |mut sub| async move {
         let ev = sub.recv().await?;
-        let trigger = match &ev {
-            ClaimEvent::Apply(c) if claims::phase(c) == ClaimPhase::Pending => {
-                Some(Trigger::Pool(claims::pool_key(c)))
-            }
-            ClaimEvent::Resync => Some(Trigger::All),
-            _ => None,
-        };
-        Some((trigger, sub))
+        Some((claim_trigger(&ev), sub))
     });
     let pod_triggers = stream::unfold(t.ctx.pod_events(), |mut sub| async move {
         let ev = sub.recv().await?;
@@ -193,6 +186,30 @@ async fn run_term(t: Term, term: u64) {
     tokio::join!(passes, tidy_loop(&t));
 }
 
+/// The pass a claim event calls for. A pending claim needs one when it is
+/// new or its spec changed. Once the leader has written its status, further
+/// events are the leader's own status writes and the API's `seen-at` and
+/// `delivered` marks, and a pass for each would cost a pass per waiter per write.
+/// A claim that ends or goes away changes what its owner holds, and so who
+/// goes first under fair share, so it calls for a pass of its pool too.
+pub(super) fn claim_trigger(ev: &ClaimEvent) -> Option<Trigger> {
+    match ev {
+        ClaimEvent::Apply(c) if claims::phase(c) == ClaimPhase::Pending => {
+            let seen = c
+                .status
+                .as_ref()
+                .is_some_and(|s| s.observed_generation == c.metadata.generation);
+            (!seen).then(|| Trigger::Pool(claims::pool_key(c)))
+        }
+        ClaimEvent::Apply(c) if claims::phase(c).is_terminal() => {
+            Some(Trigger::Pool(claims::pool_key(c)))
+        }
+        ClaimEvent::Delete(c) => Some(Trigger::Pool(claims::pool_key(c))),
+        ClaimEvent::Resync => Some(Trigger::All),
+        ClaimEvent::Apply(_) => None,
+    }
+}
+
 /// A pod a waiting claim could take.
 fn offered(p: &Pod) -> bool {
     ann(p, ANN_ALLOC) == Some(FREE) && is_ready(p) && p.metadata.deletion_timestamp.is_none()
@@ -218,10 +235,14 @@ async fn tidy_loop(t: &Term) {
     }
 }
 
-/// One tidy pass over the claim store.
+/// One tidy pass over the claim store, leaving out the namespaces the claim
+/// watch cannot list.
 async fn tidy(t: &Term) {
-    let claims = t.ctx.claims().state();
-    let pods = t.ctx.pods().state();
+    let (claims, pods) = listed_only(
+        t.ctx.claims().state(),
+        t.ctx.pods().state(),
+        &t.ctx.unlisted_claim_namespaces(),
+    );
     let outcomes = tidy_with(&t.binder, &claims, &pods, OffsetDateTime::now_utc()).await;
     for o in outcomes {
         t.metrics.count(o);
@@ -278,6 +299,35 @@ pub(crate) async fn tidy_with(
     done
 }
 
+/// `claims` and `pods` without the claims of `unlisted` namespaces and the
+/// workers bound to them. Those claims are as last listed or absent, so their
+/// workers would look like strays of a gone claim.
+fn listed_only(
+    mut claims: Vec<Arc<BuildKitClaim>>,
+    mut pods: Vec<Arc<Pod>>,
+    unlisted: &HashSet<String>,
+) -> (Vec<Arc<BuildKitClaim>>, Vec<Arc<Pod>>) {
+    if unlisted.is_empty() {
+        return (claims, pods);
+    }
+    let listed = |ns: Option<&str>| !ns.is_some_and(|ns| unlisted.contains(ns));
+    claims.retain(|c| listed(c.metadata.namespace.as_deref()));
+    pods.retain(|p| {
+        listed(
+            // Workers bound by an earlier version name the claim only in the owner.
+            ann(p, ANN_CLAIM)
+                .and_then(|r| r.split_once('/'))
+                .map(|(ns, _)| ns)
+                .or_else(|| {
+                    ann(p, ANN_OWNER)
+                        .and_then(claims::claim_owner)
+                        .map(|(ns, _)| ns)
+                }),
+        )
+    });
+    (claims, pods)
+}
+
 /// Fail a claim from a namespace the controller does not serve. The chart
 /// grants Secret access only in served namespaces, so binding would end in a
 /// 403 after allocating.
@@ -289,13 +339,7 @@ async fn refuse(b: &Binder, c: &BuildKitClaim) -> Option<&'static str> {
         "namespace {} is not in the controller's claims.namespaces",
         c.metadata.namespace.as_deref().unwrap_or_default()
     );
-    let s = claims::unbound_status(
-        c,
-        ClaimPhase::Failed,
-        reason::NAMESPACE_NOT_SERVED,
-        &msg,
-        None,
-    );
+    let s = claims::unbound_status(c, ClaimPhase::Failed, reason::NAMESPACE_NOT_SERVED, &msg);
     write_status(b, c, &s).await.then_some("failed")
 }
 
@@ -425,4 +469,123 @@ fn names(c: &BuildKitClaim) -> Option<(&str, &str, &str)> {
         c.metadata.name.as_deref()?,
         c.metadata.uid.as_deref()?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::sync::Arc;
+
+    use buildkit_controller_api::claim::{BuildKitClaim, BuildKitClaimStatus, ClaimPhase};
+    use serde_json::json;
+
+    use super::{ClaimEvent, Trigger, claim_trigger};
+
+    fn claim(status: Option<(ClaimPhase, Option<i64>)>, generation: i64) -> ClaimEvent {
+        let mut c = BuildKitClaim::new(
+            "c",
+            serde_json::from_value(json!({"poolRef": {"namespace": "p", "name": "x"}})).unwrap(),
+        );
+        c.metadata.generation = Some(generation);
+        c.status = status.map(|(phase, observed)| BuildKitClaimStatus {
+            phase: Some(phase),
+            observed_generation: observed,
+            ..BuildKitClaimStatus::default()
+        });
+        ClaimEvent::Apply(Arc::new(c))
+    }
+
+    /// A new or changed pending claim calls for a pass. The leader's own status
+    /// writes and the API's annotations on a claim it has seen do not, or each
+    /// waiter would cost a pass per write.
+    #[test]
+    fn only_new_or_changed_pending_claims_trigger_a_pass() {
+        let pass = |ev: &ClaimEvent| matches!(claim_trigger(ev), Some(Trigger::Pool(_)));
+        assert!(pass(&claim(None, 1)));
+        assert!(pass(&claim(Some((ClaimPhase::Pending, Some(1))), 2)));
+        assert!(!pass(&claim(Some((ClaimPhase::Pending, Some(1))), 1)));
+        assert!(!pass(&claim(Some((ClaimPhase::Bound, Some(1))), 1)));
+        // An ended or deleted claim may free its owner to bind another.
+        assert!(pass(&claim(Some((ClaimPhase::Expired, Some(1))), 1)));
+        let ClaimEvent::Apply(c) = claim(Some((ClaimPhase::Bound, Some(1))), 1) else {
+            unreachable!()
+        };
+        assert!(pass(&ClaimEvent::Delete(c)));
+        assert!(matches!(
+            claim_trigger(&ClaimEvent::Resync),
+            Some(Trigger::All)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod listed_tests {
+    use super::*;
+    use kube::api::ObjectMeta;
+
+    fn claim(ns: &str) -> Arc<BuildKitClaim> {
+        let mut c: BuildKitClaim = serde_json::from_value(serde_json::json!({
+            "apiVersion": "buildkit.smrt-devops.net/v1alpha1",
+            "kind": "BuildKitClaim",
+            "metadata": {"name": "c", "namespace": ns},
+            "spec": {"poolRef": {"namespace": "ci", "name": "p"}}
+        }))
+        .unwrap();
+        c.metadata.namespace = Some(ns.into());
+        Arc::new(c)
+    }
+
+    fn worker(claim_ns: Option<&str>) -> Arc<Pod> {
+        Arc::new(Pod {
+            metadata: ObjectMeta {
+                name: Some(format!("w-{}", claim_ns.unwrap_or("none"))),
+                annotations: claim_ns.map(|ns| [(ANN_CLAIM.to_owned(), format!("{ns}/c"))].into()),
+                ..ObjectMeta::default()
+            },
+            ..Pod::default()
+        })
+    }
+
+    /// A worker bound by an earlier version: the claim is named only in the owner.
+    fn owned_worker(claim_ns: &str) -> Arc<Pod> {
+        Arc::new(Pod {
+            metadata: ObjectMeta {
+                name: Some(format!("old-{claim_ns}")),
+                annotations: Some(
+                    [(ANN_OWNER.to_owned(), format!("claim:{claim_ns}/c#u1"))].into(),
+                ),
+                ..ObjectMeta::default()
+            },
+            ..Pod::default()
+        })
+    }
+
+    /// A claims namespace given up (its `RoleBinding` was deleted) must not
+    /// make its bound workers look like strays to release.
+    #[test]
+    fn an_unlisted_claim_namespace_is_left_alone() {
+        let unlisted = HashSet::from(["b".to_owned()]);
+        let (claims, pods) = listed_only(
+            vec![claim("a"), claim("b")],
+            vec![
+                worker(Some("a")),
+                worker(Some("b")),
+                worker(None),
+                owned_worker("a"),
+                owned_worker("b"),
+            ],
+            &unlisted,
+        );
+        let ns: Vec<_> = claims
+            .iter()
+            .map(|c| c.metadata.namespace.clone().unwrap())
+            .collect();
+        assert_eq!(ns, ["a"]);
+        let names: Vec<_> = pods
+            .iter()
+            .map(|p| p.metadata.name.clone().unwrap())
+            .collect();
+        assert_eq!(names, ["w-a", "w-none", "old-a"]);
+    }
 }

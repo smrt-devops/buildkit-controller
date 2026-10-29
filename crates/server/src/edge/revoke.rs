@@ -28,6 +28,13 @@ type Index = HashMap<String, HashMap<u64, Live>>;
 /// single cert from taking the replica's whole `edge.maxConnections`.
 pub const MAX_CONNECTIONS_PER_ALLOCATION: usize = 64;
 
+/// The share of `edge.maxConnections` one pool namespace may hold on a
+/// replica: a quarter, so one tenant's allocations together cannot fill it.
+#[must_use]
+pub fn namespace_cap(max_connections: usize) -> usize {
+    (max_connections / 4).max(1)
+}
+
 /// Open proxied connections, by pod uid.
 pub struct Registry {
     next: AtomicU64,

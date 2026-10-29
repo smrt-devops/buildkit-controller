@@ -109,10 +109,13 @@ fn allocation_ids_are_fixed_for_the_claim() {
 }
 
 #[test]
-fn queues_are_fifo_by_creation_then_name_and_hold_only_waiting_served_claims() {
+fn queues_are_fifo_by_creation_then_uid_and_hold_only_waiting_served_claims() {
     let claims: Vec<Arc<BuildKitClaim>> = [
         claim("ci", "c", "u3", "2026-10-21T12:00:02Z"),
-        claim("ci", "b", "u2", "2026-10-21T12:00:01Z"),
+        with_phase(
+            claim("ci", "b", "u2", "2026-10-21T12:00:01Z"),
+            ClaimPhase::Pending,
+        ),
         claim(OWN, "a", "u1", "2026-10-21T12:00:01Z"),
         with_phase(
             claim("ci", "bound", "u4", "2026-10-21T11:00:00Z"),
@@ -127,15 +130,65 @@ fn queues_are_fifo_by_creation_then_name_and_hold_only_waiting_served_claims() {
     deleting.metadata.deletion_timestamp = Some(Time("2026-10-21T12:00:03Z".parse().unwrap()));
     let mut all = claims.clone();
     all.push(Arc::new(deleting));
-    let q = queues(&all, &served());
-    let names: Vec<&str> = q[&("pools".into(), "default".into())]
-        .iter()
-        .map(|c| c.metadata.name.as_deref().unwrap())
+    let pool = ("pools".to_owned(), "default".to_owned());
+    let names = |q: &HashMap<PoolKey, Vec<Arc<BuildKitClaim>>>| -> Vec<String> {
+        q.get(&pool)
+            .into_iter()
+            .flatten()
+            .map(|c| c.metadata.name.clone().unwrap())
+            .collect()
+    };
+    assert_eq!(names(&pending(&all, &served())), ["a", "b", "c"]);
+    // Only claims the leader admitted (it wrote a status) are demand.
+    assert_eq!(names(&queues(&all, &served())), ["b"]);
+    // An API claim counts ahead without a status; tenant claim c does not.
+    assert_eq!(position(&all, &served(), OWN, &claims[0]), Some(3));
+    assert_eq!(position(&all, &served(), OWN, &claims[2]), Some(1));
+    assert_eq!(position(&all, &served(), OWN, &claims[3]), None, "bound");
+    let late = claim(OWN, "z", "u9", "2026-10-21T12:00:05Z");
+    assert_eq!(
+        position(&all, &served(), OWN, &late),
+        Some(3),
+        "c is not ahead"
+    );
+}
+
+/// Equal creation times go by uid, which the API server picks, never by the
+/// name a client can grind its key for.
+#[test]
+fn ties_go_by_uid_not_name() {
+    let early_name = claim(
+        OWN,
+        "22222aaaaaaaaaaaaaaaaaaaaa",
+        "u2",
+        "2026-10-21T12:00:00Z",
+    );
+    let late_name = claim(
+        OWN,
+        "zzzzzaaaaaaaaaaaaaaaaaaaaa",
+        "u1",
+        "2026-10-21T12:00:00Z",
+    );
+    assert_eq!(queue_order(&late_name, &early_name), Ordering::Less);
+}
+
+/// A tenant claim that names a pool which does not admit it gets no status
+/// from the leader, so it never counts as demand nor pushes anyone back.
+#[test]
+fn a_claim_the_pool_refuses_is_not_demand() {
+    let refused: Vec<Arc<BuildKitClaim>> = (0..5)
+        .map(|i| {
+            Arc::new(claim(
+                "ci",
+                &format!("r{i}"),
+                &format!("r{i}"),
+                "2026-10-21T11:00:00Z",
+            ))
+        })
         .collect();
-    assert_eq!(names, ["a", "b", "c"]);
-    assert_eq!(position(&all, &served(), &claims[0]), Some(3));
-    assert_eq!(position(&all, &served(), &claims[2]), Some(1));
-    assert_eq!(position(&all, &served(), &claims[3]), None, "bound");
+    assert!(queues(&refused, &served()).is_empty());
+    let mine = claim(OWN, "m", "m", "2026-10-21T12:00:00Z");
+    assert_eq!(position(&refused, &served(), OWN, &mine), Some(1));
 }
 
 #[test]
@@ -200,7 +253,6 @@ fn finished_ci_claims_are_collected_after_ten_minutes() {
         ClaimPhase::Failed,
         reason::QUEUE_TIMEOUT,
         "",
-        None,
     ));
     let ended = c.status.as_ref().unwrap().conditions[0]
         .last_transition_time
@@ -274,7 +326,7 @@ fn strays_are_pods_whose_claim_is_gone_ended_or_bound_elsewhere() {
             "default-9"
         ],
         "bound elsewhere, ended, claim gone, replaced, an earlier claim of the name; kept: the bound pod, a pending bind, \
-         pre-v3 pods, unwatched namespaces and free pods"
+         v0.1.0 pods, unwatched namespaces and free pods"
     );
 }
 
@@ -283,7 +335,7 @@ fn finished_claims_answer_with_their_api_error() {
     let c = claim(OWN, "a", "u1", "2026-10-21T12:00:00Z");
     let failed = |r: &str| {
         let mut x = c.clone();
-        x.status = Some(unbound_status(&c, ClaimPhase::Failed, r, "msg", None));
+        x.status = Some(unbound_status(&c, ClaimPhase::Failed, r, "msg"));
         api_error(&x).unwrap().0
     };
     assert_eq!(failed(reason::QUEUE_TIMEOUT), ErrorCode::PoolExhausted);
@@ -317,10 +369,10 @@ fn statuses_and_the_secret() {
         (Some("default-0"), Some("CERT"))
     );
     assert_eq!(bound_status(&c, &binding("a1"), false).secret_name, None);
-    let p = unbound_status(&c, ClaimPhase::Pending, reason::QUEUED, "waiting", Some(4));
+    let p = unbound_status(&c, ClaimPhase::Pending, reason::QUEUED, "waiting");
     assert_eq!(
-        (p.queue_position, p.conditions[0].status.as_str()),
-        (Some(4), "False")
+        (p.phase, p.conditions[0].status.as_str()),
+        (Some(ClaimPhase::Pending), "False")
     );
     let s = secret(&c, &binding("a1"), "KEY", Some("CA")).unwrap();
     assert_eq!(s.metadata.name.as_deref(), Some("build-buildkit"));
@@ -337,7 +389,7 @@ fn statuses_and_the_secret() {
 /// Pods bound for in-cluster claims before every allocation was a claim have
 /// no `P claim`: they are strays once their claim (by uid) is gone, has ended
 /// or names another allocation; API callers' pods are left to `DELETE`.
-/// v0.1.0 upgrade shim: remove in the release after v3.
+/// v0.1.0 upgrade shim: remove in the release after 0.2.0.
 #[test]
 fn pre_claim_pods_of_ended_claims_are_strays() {
     let owned = |name: &str, owner: &str, alloc: &str| {

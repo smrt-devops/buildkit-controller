@@ -112,6 +112,7 @@ impl Component for EdgeComponent {
                         "edge.upstreamConnectTimeout",
                     )?,
                     upstream_port: u16::try_from(BUILDKIT_PORT)?,
+                    max_per_namespace: revoke::namespace_cap(options.max_connections),
                 },
             );
             let revoke_stop = CancellationToken::new();

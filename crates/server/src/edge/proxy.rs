@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use super::handler::{Accepted, ConnectionHandler, Refusal};
+use super::listener::PerKey;
 use super::metrics::{Direction, EdgeMetrics, Revocation};
 use super::pods::PodView;
 use super::revoke::{MAX_CONNECTIONS_PER_ALLOCATION, Registry};
@@ -42,6 +43,9 @@ pub struct ProxyOptions {
     pub upstream_connect_timeout: Duration,
     /// The worker's buildkitd port (1234; tests override it).
     pub upstream_port: u16,
+    /// Proxied connections one pool namespace (from the allocation
+    /// certificate) may hold on this replica; 0 disables the cap.
+    pub max_per_namespace: usize,
 }
 
 /// The [`ConnectionHandler`] the binary runs.
@@ -56,6 +60,7 @@ struct Inner {
     metrics: EdgeMetrics,
     options: ProxyOptions,
     live: Arc<Registry>,
+    namespaces: PerKey<String>,
 }
 
 impl ProxyHandler {
@@ -75,6 +80,7 @@ impl ProxyHandler {
                 metrics,
                 options,
                 live: Arc::new(Registry::new(MAX_CONNECTIONS_PER_ALLOCATION)),
+                namespaces: PerKey::new(options.max_per_namespace),
             }),
         }
     }
@@ -141,6 +147,13 @@ impl Inner {
                 let _ = tokio::time::timeout(CLOSE_GRACE, client.shutdown()).await;
                 return;
             }
+        };
+        // One tenant's allocations together may not fill the replica.
+        let Some(_ns) = self.namespaces.try_take(id.namespace.as_str()) else {
+            self.metrics.outcome(Some(id), "namespace_limit");
+            warn!("edge per-namespace connection limit reached; closing");
+            let _ = tokio::time::timeout(CLOSE_GRACE, client.shutdown()).await;
+            return;
         };
         let start = Instant::now();
         let addr = SocketAddr::new(target.ip, self.options.upstream_port);

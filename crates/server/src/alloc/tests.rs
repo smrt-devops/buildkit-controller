@@ -371,7 +371,7 @@ struct Env {
     pool: BuildKitPool,
     ca: Arc<CaBundle>,
     metrics: AllocMetrics,
-    _pools: Writer<BuildKitPool>,
+    pools: Writer<BuildKitPool>,
     _ca_tx: watch::Sender<CertMaterial>,
 }
 
@@ -425,7 +425,7 @@ fn env() -> Env {
         pool,
         ca,
         metrics,
-        _pools: pools,
+        pools,
         _ca_tx: ca_tx,
     }
 }
@@ -439,6 +439,7 @@ fn sa(name: &str) -> Identity {
         namespace: POOL_NS.into(),
         name: name.into(),
         uid: "u".into(),
+        pod_uid: None,
     }
 }
 
@@ -501,10 +502,10 @@ fn why(s: &BuildKitClaimStatus) -> String {
         .unwrap_or_default()
 }
 
-/// Pending claims bind oldest first; equal creation times go by name. The
-/// claim left over waits `Queued` at place 1, and binds once a pod frees.
+/// Pending claims bind oldest first. The claim left over waits `Queued` and
+/// binds once a pod frees.
 #[tokio::test]
-async fn claims_bind_oldest_first_ties_by_name() {
+async fn claims_bind_oldest_first() {
     let e = env();
     e.warm(0);
     e.warm(1);
@@ -529,10 +530,7 @@ async fn claims_bind_oldest_first_ties_by_name() {
         (phase(&a), phase(&b), phase(&n)),
         (ClaimPhase::Bound, ClaimPhase::Bound, ClaimPhase::Pending)
     );
-    assert_eq!(
-        (why(&n).as_str(), n.queue_position),
-        (reason::QUEUED, Some(1))
-    );
+    assert_eq!(why(&n).as_str(), reason::QUEUED);
     // The first in line got the first pod tried; both pods carry their claims.
     for (s, owner) in [(&a, "sa:x/a"), (&b, "sa:x/b")] {
         let pod = e.fake.pod(s.pod.as_deref().unwrap());
@@ -924,7 +922,8 @@ async fn pending_allocation_is_polled_and_released_by_its_owner() {
             .get(&sa("mallory"), &p.id, Duration::ZERO)
             .await
             .unwrap_err(),
-        AllocError::Forbidden
+        AllocError::NotFound,
+        "another caller learns nothing about a live id"
     );
     assert_eq!(
         e.front
@@ -947,7 +946,6 @@ async fn pending_allocation_is_polled_and_released_by_its_owner() {
         ClaimPhase::Failed,
         reason::QUEUE_TIMEOUT,
         "no worker became free",
-        None,
     ));
     e.fake.put_claim(failed);
     let err = e
@@ -962,7 +960,7 @@ async fn pending_allocation_is_polled_and_released_by_its_owner() {
     // Release: owner only; transient failures are 503 upstream_error.
     assert_eq!(
         e.front.release(&sa("mallory"), &p.id).await.unwrap_err(),
-        AllocError::Forbidden
+        AllocError::NotFound
     );
     e.fake
         .w
@@ -1346,7 +1344,7 @@ async fn tidy_ends_claims_and_retires_strays() {
     e.fake.put_claim(expired);
     let old = e.ci_claim(0, "sa:x/old");
     let mut done = e.fake.claim(OWN, &old).unwrap();
-    let mut st = claims::unbound_status(&done, ClaimPhase::Failed, reason::QUEUE_TIMEOUT, "", None);
+    let mut st = claims::unbound_status(&done, ClaimPhase::Failed, reason::QUEUE_TIMEOUT, "");
     st.conditions[0].last_transition_time = Time(
         k8s_openapi::jiff::Timestamp::now() - k8s_openapi::jiff::SignedDuration::from_mins(11),
     );
@@ -1375,8 +1373,8 @@ async fn tidy_ends_claims_and_retires_strays() {
 }
 
 /// An allocation made before every allocation was a claim has no claim: its
-/// owner's DELETE retires its pod; anyone else gets 403, an unknown id 404.
-#[tokio::test]
+/// owner's DELETE retires its pod; anyone else, like an unknown id, gets 404.
+#[tokio::test(start_paused = true)]
 async fn release_retires_a_pod_allocated_before_claims() {
     let e = env();
     let name = e.warm(0);
@@ -1388,7 +1386,7 @@ async fn release_retires_a_pod_allocated_before_claims() {
     e.fake.put_pod(pod);
     assert_eq!(
         e.front.release(&sa("mallory"), &id).await,
-        Err(AllocError::Forbidden)
+        Err(AllocError::NotFound)
     );
     assert_eq!(
         e.fake.pod(&name).metadata.annotations.unwrap()[ANN_ALLOC],
@@ -1446,7 +1444,7 @@ async fn a_bound_claim_without_a_ca_answers_pending() {
     let tx = e.fake.tx.clone();
     let front = Front::new(
         Arc::clone(&e.fake) as Arc<dyn Backend>,
-        e._pools.as_reader(),
+        e.pools.as_reader(),
         e.fake.claims.lock().unwrap().as_reader(),
         Box::new(move || ClaimSubscription::new(tx.subscribe())),
         Arc::new(CaOnce(
@@ -1484,3 +1482,187 @@ async fn a_bound_claim_without_a_ca_answers_pending() {
 
 #[path = "tests_cache.rs"]
 mod cache_tests;
+
+fn fresh_key() -> String {
+    rcgen::KeyPair::generate().unwrap().public_key_pem()
+}
+
+/// Any caller can name random ids. A lookup reads the store only, never the
+/// API server, and waits briefly for a claim another replica just created.
+#[tokio::test(start_paused = true)]
+async fn a_lookup_by_id_never_reads_the_api_server() {
+    let e = env();
+    let random = new_alloc_id().unwrap().to_string();
+    assert_eq!(
+        e.front.get(&sa("alice"), &random, Duration::ZERO).await,
+        Err(AllocError::NotFound)
+    );
+    assert_eq!(
+        e.front.release(&sa("alice"), &random).await,
+        Err(AllocError::NotFound)
+    );
+    assert!(
+        !e.fake.calls().iter().any(|c| c.starts_with("get_claim")),
+        "{:?}",
+        e.fake.calls()
+    );
+    // A claim that reaches the store during the wait is found.
+    let id = new_alloc_id().unwrap().to_string();
+    let fake = Arc::clone(&e.fake);
+    let late = id.clone();
+    let mut c = BuildKitClaim::new(
+        &late,
+        serde_json::from_value(json!({"poolRef": {"namespace": POOL_NS, "name": POOL},
+            "owner": sa("alice").owner(), "publicKey": *KEY}))
+        .unwrap(),
+    );
+    c.metadata.namespace = Some(OWN.into());
+    c.metadata.uid = Some("33333333-0000-4000-8000-000000000001".into());
+    c.metadata.creation_timestamp = Some(Time(k8s_openapi::jiff::Timestamp::now()));
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        fake.put_claim(c);
+    });
+    assert!(matches!(
+        e.front.get(&sa("alice"), &id, Duration::ZERO).await,
+        Ok(Outcome::Pending(_))
+    ));
+}
+
+/// The front refuses no claim for its owner's count: a CI matrix wider than
+/// the pool (4 here) queues instead of failing.
+#[tokio::test(start_paused = true)]
+async fn one_owner_may_queue_more_claims_than_the_pool_holds() {
+    let e = env();
+    for _ in 0..6 {
+        let req = post_req(&fresh_key());
+        let r = e.front.allocate(&sa("alice"), &req).await;
+        assert!(matches!(r, Ok(Outcome::Pending(_))), "{r:?}");
+    }
+    assert_eq!(claim_names(&e).len(), 6);
+}
+
+/// With nobody else waiting, one owner may fill the whole pool.
+#[tokio::test]
+async fn a_single_owner_may_fill_the_pool_when_nobody_else_waits() {
+    let e = env();
+    for slot in 0..4 {
+        e.warm(slot);
+    }
+    let ids: Vec<String> = (0..5).map(|i| e.ci_claim(30 - i, "sa:x/a")).collect();
+    e.binder.pass(&key()).await;
+    let phases: Vec<ClaimPhase> = ids
+        .iter()
+        .map(|id| phase(&e.fake.status(OWN, id)))
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            ClaimPhase::Bound,
+            ClaimPhase::Bound,
+            ClaimPhase::Bound,
+            ClaimPhase::Bound,
+            ClaimPhase::Pending
+        ]
+    );
+}
+
+/// An owner holding half of `scaling.max` yields to another owner waiting
+/// behind it, then takes what is left. A second pass, before the store shows
+/// the binds, still counts them.
+#[tokio::test]
+async fn an_owner_at_the_hold_limit_yields_to_another_waiting_owner() {
+    let e = env();
+    for slot in 0..3 {
+        e.warm(slot);
+    }
+    let ids: Vec<String> = (0..3).map(|i| e.ci_claim(30 - i, "sa:x/a")).collect();
+    let other = e.ci_claim(1, "sa:x/b");
+    e.binder.pass(&key()).await;
+    let phases: Vec<ClaimPhase> = ids
+        .iter()
+        .map(|id| phase(&e.fake.status(OWN, id)))
+        .collect();
+    assert_eq!(
+        phases,
+        [ClaimPhase::Bound, ClaimPhase::Bound, ClaimPhase::Pending]
+    );
+    assert_eq!(phase(&e.fake.status(OWN, &other)), ClaimPhase::Bound);
+    let third = e.ci_claim(0, "sa:x/c");
+    e.warm(3);
+    e.binder.pass(&key()).await;
+    assert_eq!(phase(&e.fake.status(OWN, &ids[2])), ClaimPhase::Pending);
+    assert_eq!(phase(&e.fake.status(OWN, &third)), ClaimPhase::Bound);
+}
+
+/// An owner that yields keeps its own claims in order: with A at the limit,
+/// the queue A1, B1, A2 and two free workers, B1 and then A1 bind, not A2.
+#[tokio::test]
+async fn an_owner_that_yields_keeps_its_claims_in_order() {
+    let e = env();
+    e.warm(0);
+    e.warm(1);
+    for ago in [60, 59] {
+        e.ci_claim(ago, "sa:x/a");
+    }
+    e.binder.pass(&key()).await;
+    let a1 = e.ci_claim(50, "sa:x/a");
+    let b1 = e.ci_claim(40, "sa:x/b");
+    let a2 = e.ci_claim(30, "sa:x/a");
+    e.warm(2);
+    e.warm(3);
+    e.binder.pass(&key()).await;
+    assert_eq!(
+        [&a1, &b1, &a2].map(|id| phase(&e.fake.status(OWN, id))),
+        [ClaimPhase::Bound, ClaimPhase::Bound, ClaimPhase::Pending]
+    );
+}
+
+/// An in-cluster claim asking for a longer queue wait than the pool allows
+/// fails `InvalidRequest`, as the HTTP API refuses it, instead of being cut.
+#[tokio::test]
+async fn an_in_cluster_queue_timeout_over_the_max_is_refused() {
+    let e = env();
+    e.claim(CI, "long", 0, json!({"queueTimeout": "1h"}));
+    e.binder.pass(&key()).await;
+    let s = e.fake.status(CI, "long");
+    assert_eq!(
+        (phase(&s), why(&s).as_str()),
+        (ClaimPhase::Failed, reason::INVALID_REQUEST)
+    );
+}
+
+/// A key padded past the claim CRD's `maxLength` would parse and then fail
+/// the create; it is a 400, never a 500.
+#[tokio::test]
+async fn an_oversized_public_key_is_a_bad_request() {
+    let e = env();
+    let padded = format!("{}\n{}", "x".repeat(2000), *KEY);
+    let r = e.front.allocate(&sa("alice"), &post_req(&padded)).await;
+    assert!(matches!(r, Err(AllocError::InvalidRequest(_))), "{r:?}");
+    assert!(claim_names(&e).is_empty());
+}
+
+/// Pool max 2, so the hold limit is 1. A worker that frees goes to another
+/// owner waiting behind, not to the older claim of an owner at the limit; a
+/// worker nobody else can take still goes to that owner.
+#[tokio::test]
+async fn a_free_worker_goes_first_to_an_owner_under_the_hold_limit() {
+    let mut e = env();
+    e.pool.spec.scaling.max = 2;
+    e.pools
+        .apply_watcher_event(&watcher::Event::Apply(e.pool.clone()));
+    e.warm(0);
+    let a = e.ci_claim(30, "sa:x/a");
+    let b = e.ci_claim(20, "sa:x/a");
+    let c = e.ci_claim(10, "sa:x/c");
+    e.binder.pass(&key()).await;
+    assert_eq!(phase(&e.fake.status(OWN, &a)), ClaimPhase::Bound);
+    e.warm(1);
+    e.binder.pass(&key()).await;
+    assert_eq!(phase(&e.fake.status(OWN, &b)), ClaimPhase::Pending);
+    assert_eq!(phase(&e.fake.status(OWN, &c)), ClaimPhase::Bound);
+    e.warm(2);
+    e.binder.pass(&key()).await;
+    assert_eq!(phase(&e.fake.status(OWN, &b)), ClaimPhase::Bound);
+}

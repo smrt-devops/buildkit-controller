@@ -73,9 +73,11 @@ impl TlsBuilder {
         &self.provider
     }
 
-    /// TLS 1.2 + 1.3, default suites, one serving cert for every SNI,
+    /// TLS 1.3 only, default suites, one serving cert for every SNI,
     /// mandatory client auth against `client_ca` only, ALPN `h2`, and no
     /// session resumption of any kind (rustls skips the verifier on resume).
+    /// TLS 1.2 would send the client certificate, and with it the allocation
+    /// identity, in cleartext; buildx and buildctl both negotiate 1.3.
     pub fn build(
         &self,
         serving: Arc<CertifiedKey>,
@@ -91,7 +93,7 @@ impl TlsBuilder {
             metrics: self.metrics.clone(),
         };
         let mut server = ServerConfig::builder_with_provider(Arc::clone(&self.provider))
-            .with_safe_default_protocol_versions()?
+            .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_client_cert_verifier(Arc::new(verifier))
             .with_cert_resolver(Arc::new(OneCert(serving)));
         server.session_storage = Arc::new(NoServerSessionStorage {});

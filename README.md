@@ -12,7 +12,7 @@ Long-lived BuildKit daemons share caches and CPU between unrelated jobs, and a c
 - A pool keeps `scaling.min` warm pods (zero by default, or a time-of-day schedule) and grows to `scaling.max`. When the pool is full, requests wait in one first-in, first-out queue per pool, up to the pool's `queueTimeout`. The queue is a list of `BuildKitClaim` objects, so it survives restarts and `kubectl get bkc -A` shows it. No HTTP request stays open longer than 25 seconds: the client polls for its place.
 - One install serves any number of pools in the namespaces you list in `watchNamespaces`, so amd64, arm64 and per-team pools live side by side. Outside them, its own namespace and `claims.namespaces` the controller can write nothing.
 - The GitHub Action allocates builders for one or more pools and releases them when the job finishes, even after a failure.
-- Builds get a cache with nothing to set up. The chart runs a small registry that only worker pods can reach, and the allocation response carries the `--cache-from` and `--cache-to` values for it. Each repository has its own cache. Pushes, schedules and manual runs read and write it. Fork pull requests read it and cannot write it, so they start warm and cannot poison it ([details](docs/architecture.md#build-cache)).
+- Builds get a cache with nothing to set up. The chart runs a small registry that only worker pods can reach, and the allocation response carries the `--cache-from` and `--cache-to` values for it. Each repository has its own cache. Pushes, schedules and manual runs on protected branches read and write it. Fork pull requests read it and cannot write it, so they start warm and cannot poison it ([details](docs/architecture.md#build-cache)).
 
 ## Requirements
 
@@ -25,7 +25,7 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 
 ## Quickstart
 
-You need a cluster that meets the requirements above, `helm`, and a GitHub repository that can run Actions. The chart exposes the controller through a Gateway API Gateway you run: an HTTPS listener for the API and a TLS passthrough listener for the edge, with the Gateway API v1.5.0 or later CRDs ([the chart README](helm/buildkit-controller/README.md#exposure) has an example and the implementations that support it). Without one, add `--set service.type=LoadBalancer`. [docs/quickstart.md](docs/quickstart.md) has the kind version.
+You need a cluster that meets the requirements above, `helm`, and a GitHub repository that can run Actions. The chart exposes the controller through a Gateway API Gateway you run: an HTTPS listener for the API and a TLS passthrough listener for the edge, with the Gateway API v1.5.0 or later CRDs ([the chart README](helm/buildkit-controller/README.md#exposure) has an example and the implementations that support it). Without one, replace the two `parentRefs` flags with `--set service.type=LoadBalancer`. [docs/quickstart.md](docs/quickstart.md) has the kind version.
 
 ```sh
 # 1. Create the pool namespace, then install the controller and its CRD, attached to the Gateway bk in gateway-system.
@@ -43,7 +43,8 @@ helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
 # 2. Create a pool that accepts your GitHub organization.
 #    Edit the access rules in the example first: set repository_owner_id to your
 #    organization's id (gh api orgs/<org> --jq .id) and replace the sample repository. The
-#    first rule allows the main branch only; to allow pull requests, replace its `ref` and `event_name` claims with `event_name: pull_request`.
+#    first rule allows pushes to the main branch only. Pull requests from forks run untrusted
+#    code: admit them to a separate pool on isolated nodes (docs/operations.md, "Running untrusted builds").
 kubectl apply -f examples/pool-github-oidc.yaml
 
 # 3. Check that the pool is ready.
@@ -61,12 +62,14 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: smrt-devops/buildkit-controller/action@v0
+      - uses: smrt-devops/buildkit-controller/action@v0.2.0   # or a commit SHA
         with:
           url: https://bk.example.com
           pools: ci/amd64
       - run: docker buildx build --platform linux/amd64 .
 ```
+
+Pin the Action to a release tag such as `@v0.2.0`, or to a commit SHA. The `@v0` tag moves to each new 0.x release.
 
 Replace `bk.example.com` with a DNS name that points at the Gateway, and use the port of its HTTPS listener in `url` if it is not 443. The Gateway terminates the API's TLS with its own certificate, so with a publicly trusted one the Action needs no `ca-cert`. The edge passes through to the controller, and the Action takes its CA from each allocation.
 

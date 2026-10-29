@@ -16,13 +16,19 @@
 # GET /v1/allocations/{id}?wait=25s until it is bound. All of it is bounded by
 # QUEUE_TIMEOUT (the pool default when unset) plus 60 s.
 #
-# Env: API, POOL (<namespace>/<pool>), TOKEN; optional TTL (seconds),
+# Env: API, POOL (<namespace>/<pool>), TOKEN or TOKEN_FILE; optional TTL (seconds),
 # QUEUE_TIMEOUT (seconds), API_CA (PEM file trusted for the API listener),
 # CACHE_KEY (cache tag, default the pool name) and CACHE (auto or none). A build
 # the pool does not trust to write the cache gets --cache-from only.
+#
+# TOKEN is read once and unset, so the command does not inherit it. TOKEN_FILE names a file
+# that holds the token and is read again before every request, including the release at the
+# end: use it when the token is short-lived (a CI OIDC token, kubectl create token) and the
+# build outlasts it. The token must be valid when the release runs.
 set -eu
 
-: "${API:?set API}" "${POOL:?set POOL}" "${TOKEN:?set TOKEN}"
+: "${API:?set API}" "${POOL:?set POOL}"
+[ -n "${TOKEN:-}" ] || [ -n "${TOKEN_FILE:-}" ] || { echo "set TOKEN or TOKEN_FILE" >&2; exit 2; }
 [ "$#" -gt 0 ] || { echo "usage: $0 command [args...]" >&2; exit 2; }
 NS=${POOL%%/*}; NAME=${POOL#*/}
 case $POOL in */*) ;; *) echo "POOL must be <namespace>/<pool>" >&2; exit 2 ;; esac
@@ -35,14 +41,28 @@ D=$(mktemp -d)
 chmod 700 "$D"
 # Header file keeps the token out of curl's argv (visible in ps); needs curl >= 7.55
 # (-H @file); --proto needs 7.52.
-( umask 077; printf "Authorization: Bearer %s\n" "$TOKEN" > "$D/auth" )
+# write_auth : with TOKEN_FILE, rewrite $D/auth from the file. An empty or unreadable file keeps the
+# last header.
+write_auth() {
+  [ -n "${TOKEN_FILE:-}" ] || return 0
+  _t=$(tr -d '\r\n' < "$TOKEN_FILE" 2>/dev/null || :)
+  [ -z "$_t" ] || ( umask 077; printf "Authorization: Bearer %s\n" "$_t" > "$D/auth.new" && mv "$D/auth.new" "$D/auth" )
+}
+if [ -n "${TOKEN_FILE:-}" ]; then
+  write_auth
+  [ -s "$D/auth" ] || { echo "TOKEN_FILE is empty or unreadable" >&2; rm -rf "$D"; exit 2; }
+else
+  ( umask 077; printf "Authorization: Bearer %s\n" "$TOKEN" > "$D/auth" )
+fi
+unset TOKEN
 ID=
 BUILDER=
 CMD=
 CA_OPT=
 [ -z "${API_CA:-}" ] || CA_OPT=$API_CA
 
-curl_api() { # curl_api args... ; honours API_CA
+curl_api() { # curl_api args... ; honours API_CA, re-reads TOKEN_FILE
+  write_auth
   if [ -n "$CA_OPT" ]; then curl -sS --proto =https --cacert "$CA_OPT" "$@"; else curl -sS --proto =https "$@"; fi
 }
 
@@ -101,15 +121,19 @@ trap 'exit 143' TERM
 
 # Without QUEUE_TIMEOUT, the pool default from GET /v1/pools takes its place, so the retries below
 # stay inside the default + 60 s. A server that does not report it leaves QUEUE_TIMEOUT unset.
-if [ -z "${QUEUE_TIMEOUT:-}" ]; then
-  QUEUE_TIMEOUT=
+# A pool entry with queueTimeoutSeconds marks the current server (CURRENT=1), which answers a POST
+# within about 20 s: its POST gets a 40 s limit. v0.1.0 holds the POST open through the queue wait, so
+# without the field the POST keeps the whole budget (upgrade shim; drop it in the release after 0.2.0).
+POOL_QT=
 idem "list pools" 60 "$API/v1/pools"
-  if [ "$code" = 200 ]; then
-    QUEUE_TIMEOUT=$(jq -r --arg ns "$NS" --arg name "$NAME" \
-      '.pools[]? | select(.namespace == $ns and .name == $name) | .queueTimeoutSeconds // empty' "$D/io" 2>/dev/null || :)
-  fi
-  case $QUEUE_TIMEOUT in *[!0-9]*) QUEUE_TIMEOUT= ;; esac
+if [ "$code" = 200 ]; then
+  POOL_QT=$(jq -r --arg ns "$NS" --arg name "$NAME" \
+    '.pools[]? | select(.namespace == $ns and .name == $name) | .queueTimeoutSeconds // empty' "$D/io" 2>/dev/null || :)
 fi
+case $POOL_QT in *[!0-9]*) POOL_QT= ;; esac
+CURRENT=
+[ -z "$POOL_QT" ] || CURRENT=1
+[ -n "${QUEUE_TIMEOUT:-}" ] || QUEUE_TIMEOUT=$POOL_QT
 # Total time for retries: queue timeout (1 h, the largest allowed, if unknown) + 60 s.
 RETRY_BUDGET=$(( ${QUEUE_TIMEOUT:-3600} + 60 ))
 
@@ -165,23 +189,28 @@ poll_alloc() {
     _mt=$(( _left + 5 ))
     [ "$_mt" -le 40 ] || _mt=40
     _rc=0
-    curl_api --max-time "$_mt" -H @"$D/auth" -D "$D/hdr" -o "$D/alloc.json" -w '%{http_code}' \
+    curl_api --max-time "$_mt" -H @"$D/auth" -D "$D/hdr" -o "$D/alloc.json" -w '%{http_code} %{time_total}' \
       "$API/v1/allocations/$ID?wait=25s" > "$D/status" &
     CMD=$!
     wait "$CMD" || _rc=$?
     CMD=
-    code=$(cat "$D/status" 2>/dev/null || :)
+    _tt=
+    read -r code _tt < "$D/status" 2>/dev/null || :
     [ -n "$code" ] || code=000
     _wait=
     case $code in
       200) return 0 ;;
-      202) continue ;;
+      202)
+        # A poll answered in under 1 s was not held for its wait: pause 1-2 s before asking again.
+        case $_tt in 0[.,]*) sleep $(( 1 + $(od -An -N1 -tu1 /dev/urandom) % 2 )) ;; esac
+        continue ;;
       000) ;;
       503)
         case $(jq -r '.error.code // empty' "$D/alloc.json" 2>/dev/null || :) in
           pool_exhausted|pod_lost) ID=; return 0 ;;
         esac
         _wait=$(retry_wait "$D/hdr") ;;
+      401) return 0 ;; # may be the token, not the allocation: keep ID for the release
       4??) ID=; return 0 ;;
       *) _wait=$(retry_wait "$D/hdr") ;;
     esac
@@ -206,6 +235,7 @@ while :; do
   # In the background, so a TERM runs the release trap at once instead of after the request.
   _pt=$(( RETRY_BUDGET - ( $(date +%s) - start ) ))
   [ "$_pt" -ge 1 ] || _pt=1
+  [ -z "$CURRENT" ] || [ "$_pt" -le 40 ] || _pt=40
   curl_api --max-time "$_pt" -H @"$D/auth" -D "$D/hdr" -o "$D/alloc.json" -w '%{http_code}' \
     -H 'Content-Type: application/json' --data-binary @"$D/req.json" "$API/v1/allocations" > "$D/status" &
   CMD=$!
@@ -243,6 +273,8 @@ while :; do
     *) break ;;
   esac
   [ $(( $(date +%s) - start + wait )) -le "$RETRY_BUDGET" ] || break
+  # A fresh POST would carry queue timeout 0 and fail at once: end with the last answer instead.
+  [ -z "$fresh" ] || [ "${QUEUE_TIMEOUT:-0}" -eq 0 ] || [ $(( $(date +%s) - start + wait )) -lt "$QUEUE_TIMEOUT" ] || break
   attempt=$(( attempt + 1 ))
   if [ -n "$fresh" ]; then
     echo "allocate $POOL: queue timeout ran out, allocating again with a new key in ${wait}s (attempt $attempt)" >&2

@@ -1,9 +1,11 @@
 //! Upgrade from v0.1.0: delete the per-slot cache volumes it created.
 //!
 //! v0.1.0 kept build cache on one PVC per worker slot. Workers are stateless
-//! now, so the leader deletes every PVC with that release's cache labels once,
-//! at its first term, and logs each one. v0.1.0 upgrade shim: remove in the
-//! release after v3, with the PVC `list` and `delete` rights in the chart.
+//! now, so the leader deletes those PVCs at the first term of each process and
+//! logs each one; once they are gone the sweep is a list that finds nothing.
+//! A PVC is swept when it carries that release's cache labels and no
+//! controller other than a `BuildKitPool` holds it. v0.1.0 upgrade shim: remove
+//! in the release after 0.2.0, with the PVC `list` and `delete` rights in the chart.
 
 use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 use kube::api::{Api, DeleteParams, ListParams, Preconditions};
@@ -35,11 +37,24 @@ pub async fn old_cache_volumes(client: &Client, namespaces: &[String]) -> bool {
                 continue;
             }
         };
-        for pvc in pvcs {
-            done &= delete(client, &pvc).await;
+        for pvc in pvcs.iter().filter(|p| is_old_cache_volume(p)) {
+            done &= delete(client, pvc).await;
         }
     }
     done
+}
+
+/// No controller other than a `BuildKitPool` holds the PVC. v0.1.0 made each
+/// cache volume's pool its controller; a volume another controller holds
+/// (a `StatefulSet`, an operator) only shares the labels and is kept.
+fn is_old_cache_volume(pvc: &PersistentVolumeClaim) -> bool {
+    pvc.owner_references()
+        .iter()
+        .filter(|o| o.controller == Some(true))
+        .all(|o| {
+            o.kind == "BuildKitPool"
+                && o.api_version.split('/').next() == Some("buildkit.smrt-devops.net")
+        })
 }
 
 async fn delete(client: &Client, pvc: &PersistentVolumeClaim) -> bool {
@@ -62,5 +77,55 @@ async fn delete(client: &Client, pvc: &PersistentVolumeClaim) -> bool {
             warn!(namespace = %ns, volume = %name, %error, "deleting a cache volume of v0.1.0");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+
+    use super::is_old_cache_volume;
+
+    fn pvc(v: serde_json::Value) -> PersistentVolumeClaim {
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// A labelled volume held by a pool, or by no controller, is swept; one
+    /// that another controller holds only shares the labels and is kept.
+    #[test]
+    fn volumes_of_other_controllers_are_kept() {
+        let with = |owners: serde_json::Value| {
+            pvc(serde_json::json!({
+                "metadata": { "name": "cache-local-cache-0", "ownerReferences": owners }
+            }))
+        };
+        let owner = |api: &str, kind: &str, controller: bool| {
+            serde_json::json!([{
+                "apiVersion": api, "kind": kind, "name": "x", "uid": "u",
+                "controller": controller,
+            }])
+        };
+        let pool = "buildkit.smrt-devops.net/v1alpha1";
+        assert!(is_old_cache_volume(&with(owner(
+            pool,
+            "BuildKitPool",
+            true
+        ))));
+        assert!(is_old_cache_volume(&with(serde_json::json!([]))));
+        assert!(is_old_cache_volume(&with(owner(
+            "apps/v1",
+            "StatefulSet",
+            false
+        ))));
+        assert!(!is_old_cache_volume(&with(owner(
+            "apps/v1",
+            "StatefulSet",
+            true
+        ))));
+        assert!(!is_old_cache_volume(&with(owner(
+            "example.com/v1",
+            "BuildKitPool",
+            true
+        ))));
     }
 }

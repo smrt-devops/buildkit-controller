@@ -16,6 +16,8 @@
 //!   [`Observed::recent_creates`], and the executor arms
 //!   [`Plan::requeue_after_outcomes`]: a 409 requeues the pool at once, any
 //!   other failure under the error backoff (neither produces a pod event);
+//! - a failed `CreatePod` skips the later ones and starts or doubles the create
+//!   backoff, as [`BackoffSignal::Bump`] does;
 //! - [`Plan::slot_holds`] is kept per pool for the leadership term and passed
 //!   back in [`Observed::slot_holds`].
 //!
@@ -50,7 +52,8 @@ const MESSAGE_MAX: usize = 1024;
 
 /// How long an applied `ServiceAccount`, `NetworkPolicy` or CA bundle
 /// `ConfigMap` counts as current. Nothing watches them, so the leader applies
-/// them again this often; an out-of-band delete or edit lasts at most this long.
+/// them again this often, and the sandbox before any pod create. An out-of-band
+/// delete or edit lasts at most this long for running pods and never covers a new one.
 pub const REAPPLY_AFTER: SignedDuration = SignedDuration::from_mins(5);
 
 /// `Degraded=True` reasons by precedence.
@@ -515,7 +518,20 @@ impl<'a> Planner<'_, 'a> {
         if fp.is_some() && apply_sandbox {
             self.plan_applies();
         }
-        let counts = Some(self.plan_pods(fp.as_deref(), spec_block.is_none(), waiting));
+        let ca_lasts = self.ca_outlasts_new_workers(ca);
+        let counts = Some(self.plan_pods(fp.as_deref(), spec_block.is_none() && ca_lasts, waiting));
+        // A pod is created only under a policy applied in this pass, so one
+        // deleted or edited out of band never covers a new pod.
+        let first_create = self
+            .actions
+            .iter()
+            .position(|a| matches!(a, Action::CreatePod { .. }));
+        if let Some(i) = first_create
+            && !self.actions.contains(&Action::ApplyNetworkPolicy)
+        {
+            self.actions
+                .splice(i..i, [Action::ApplySa, Action::ApplyNetworkPolicy]);
+        }
         if let Some(fp) = &fp {
             self.ca_replaced_check(fp);
         }
@@ -570,6 +586,25 @@ impl<'a> Planner<'_, 'a> {
             LoadOutcome::Valid(b) => Some(b),
             LoadOutcome::Missing | LoadOutcome::Invalid(_) => None,
         }
+    }
+
+    /// A worker cert ends no later than either CA. Within
+    /// `worker_cert_min_left` of the earlier CA's end every new pod would be
+    /// retired as `CertExpiring` in the pass that first sees it, and replaced
+    /// in the next, so no pod is created until the CA is replaced; the pool is
+    /// passed again just after the CA ends. `CAExpiringSoon` is True by then.
+    fn ca_outlasts_new_workers(&mut self, ca: Option<&CaBundle>) -> bool {
+        let Some(end) = ca
+            .and_then(|c| c.expiries().into_iter().map(|(_, t)| t).min())
+            .and_then(|t| Timestamp::from_second(t.unix_timestamp()).ok())
+        else {
+            return true;
+        };
+        let lasts = end >= add(self.now, self.cfg.worker_cert_min_left);
+        if !lasts {
+            self.at(add(end, SignedDuration::from_secs(1)));
+        }
+        lasts
     }
 
     /// Sandbox objects (step 4).

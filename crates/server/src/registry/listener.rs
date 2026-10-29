@@ -53,8 +53,11 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_connections: 1024,
-            max_connections_per_ip: 256,
-            handshake_timeout: Duration::from_secs(10),
+            // A worker opens about as many as containerd transfers in
+            // parallel. The cap is taken before the handshake, so it must be
+            // well below the total: at 256, four addresses filled it.
+            max_connections_per_ip: 64,
+            handshake_timeout: Duration::from_secs(5),
             header_timeout: Duration::from_secs(30),
             drain_timeout: Duration::from_secs(30),
         }

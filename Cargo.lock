@@ -329,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "buildkit-controller"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "buildkit-controller-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "buildkit-controller-api",
@@ -3384,7 +3384,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

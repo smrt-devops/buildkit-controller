@@ -199,6 +199,7 @@ async fn edge(bundle: &CaBundle, worker_port: u16, stop: &CancellationToken) -> 
         ProxyOptions {
             upstream_connect_timeout: Duration::from_secs(5),
             upstream_port: worker_port,
+            max_per_namespace: 500,
         },
     );
     let builder = TlsBuilder::new(Arc::new(proxy.clone()), metrics.clone());

@@ -459,19 +459,31 @@ async fn unknown_kid_refetches_once_then_rate_limits() {
         .unwrap();
     assert_eq!(iss.fetches(), 2, "unknown kid triggered one refetch");
     // k1 was rotated out; another unknown kid inside 30 s does not refetch.
+    // Nothing looked for it, so the answer is a retryable 503, not a 401:
+    // anyone can set the backoff off, and the kid may be a real new key.
     let k4 = Signer::es256("k4");
-    assert_invalid(
-        auth.authenticate(&k4.token(&claims(&iss.url))).await,
-        "unknown kid",
-    );
-    assert_invalid(
-        auth.authenticate(&k1.token(&claims(&iss.url))).await,
-        "unknown kid",
-    );
+    for k in [&k4, &k1] {
+        let e = auth
+            .authenticate(&k.token(&claims(&iss.url)))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, AuthError::KeysUnavailable), "{e:?}");
+        assert_eq!(
+            (e.status(), e.retry_after()),
+            (503, Some(REFETCH_INTERVAL.as_secs()))
+        );
+    }
     assert_eq!(iss.fetches(), 2);
     auth.authenticate(&k3.token(&claims(&iss.url)))
         .await
         .unwrap();
+    // A kid the fetch looked for and did not find is refused.
+    let k5 = Signer::es256("k5");
+    let fresh = iss.auth(None);
+    assert_invalid(
+        fresh.authenticate(&k5.token(&claims(&iss.url))).await,
+        "unknown kid",
+    );
 }
 
 #[tokio::test]
@@ -611,7 +623,8 @@ async fn token_review_outcomes() {
         Identity::ServiceAccount {
             namespace: "ci".into(),
             name: "builder".into(),
-            uid: "uid-1".into()
+            uid: "uid-1".into(),
+            pod_uid: None,
         }
     );
 
@@ -801,8 +814,7 @@ async fn concurrent_reviews_are_bounded() {
             gate: Some(Arc::clone(&gate)),
             ..sa_ok()
         })
-        .with_max_concurrent_reviews(2)
-        .with_reserved_reviews(0, DEFAULT_RECENT_SUBJECT_TTL),
+        .with_max_concurrent_reviews(2),
     );
     let mut held = Vec::new();
     for i in 0..2 {
@@ -1189,7 +1201,7 @@ fn legit(n: usize) -> String {
 /// A flood of unique forged SA-shaped tokens from one address holds at most
 /// the per-address review cap, so a legitimate caller from another address
 /// still gets a review; and refusals never stop identities being cached.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn forged_flood_from_one_address_cannot_starve_others() {
     let attacker = Some("203.0.113.9".parse().unwrap());
     let ci = Some("198.51.100.4".parse().unwrap());
@@ -1234,121 +1246,22 @@ async fn forged_flood_from_one_address_cannot_starve_others() {
         let _ = auth.authenticate_from(&forged(i), attacker).await;
     }
     assert!(auth.reviews.negatives() > 0);
-    // A new identity is still cached after the flood.
+    // A new identity is still cached after the flood, once the review rate
+    // the flood spent has refilled.
+    tokio::time::advance(Duration::from_secs(1)).await;
     let token = legit(1);
     auth.authenticate_from(&token, ci).await.unwrap();
     auth.authenticate_from(&token, ci).await.unwrap();
     assert_eq!(auth.reviewer.legit_calls.load(Ordering::SeqCst), 2);
 }
 
-// ---------- reserved review slots ----------
+// ---------- per-address review cap ----------
 
 fn sub_token(sub: &str, jti: usize) -> String {
     let mut c = sa_claims();
     c["sub"] = json!(format!("system:serviceaccount:{sub}"));
     c["jti"] = json!(jti);
     sa_token(&c)
-}
-
-/// A gated authenticator where `ci/builder` has passed a review, then forged
-/// `evil/x` tokens from 16 addresses (2 each) hold all 24 shared slots.
-async fn flooded() -> (
-    Arc<Authenticator<FakeReviewer>>,
-    Arc<tokio::sync::Semaphore>,
-) {
-    let gate = Arc::new(tokio::sync::Semaphore::new(1));
-    let auth = Arc::new(sa_auth(FakeReviewer {
-        gate: Some(Arc::clone(&gate)),
-        ..sa_ok()
-    }));
-    auth.authenticate(&sub_token("ci:builder", 0))
-        .await
-        .unwrap();
-    for i in 0..32_u16 {
-        let a = Arc::clone(&auth);
-        let ip: std::net::IpAddr = format!("10.0.0.{}", i % 16).parse().unwrap();
-        tokio::spawn(async move {
-            a.authenticate_from(&sub_token("evil:x", 1 + usize::from(i)), Some(ip))
-                .await
-        });
-    }
-    while auth.reviewer.calls.load(Ordering::SeqCst) < 25 {
-        tokio::task::yield_now().await;
-    }
-    (auth, gate)
-}
-
-/// A flood of forged unknown-subject tokens from 16 addresses fills the shared
-/// slots but not the reserve, so a known service account is still reviewed.
-#[tokio::test(start_paused = true)]
-async fn forged_unknown_subjects_cannot_starve_a_known_one() {
-    let (auth, gate) = flooded().await;
-    let ip = Some("10.9.9.9".parse().unwrap());
-    let e = tokio::time::timeout(
-        Duration::from_secs(1),
-        auth.authenticate_from(&sub_token("evil:y", 99), ip),
-    )
-    .await
-    .expect("an unknown subject must be refused at once, not reviewed")
-    .unwrap_err();
-    assert_eq!((e.status(), e.code()), (503, "upstream_error"));
-    let a = Arc::clone(&auth);
-    let known =
-        tokio::spawn(async move { a.authenticate_from(&sub_token("ci:builder", 100), ip).await });
-    while auth.reviewer.calls.load(Ordering::SeqCst) < 26 {
-        tokio::task::yield_now().await;
-    }
-    gate.add_permits(64);
-    assert_eq!(known.await.unwrap().unwrap().owner(), "sa:ci/builder");
-}
-
-/// Forging a known `sub` takes at most that subject's share of the reserve.
-#[tokio::test(start_paused = true)]
-async fn forged_known_subject_is_capped_per_subject() {
-    let (auth, gate) = flooded().await;
-    let mut tasks = Vec::new();
-    for i in 0..8_u8 {
-        let a = Arc::clone(&auth);
-        let ip: std::net::IpAddr = format!("10.1.0.{i}").parse().unwrap();
-        tasks.push(tokio::spawn(async move {
-            a.authenticate_from(&sub_token("ci:builder", 200 + usize::from(i)), Some(ip))
-                .await
-        }));
-    }
-    for _ in 0..50 {
-        tokio::task::yield_now().await;
-    }
-    // 1 setup review + 24 flood reviews (the shared slots) + the 2 reserved slots of one subject.
-    assert_eq!(auth.reviewer.calls.load(Ordering::SeqCst), 27);
-    assert_eq!(auth.review_slots.reserve_free(), 6);
-    gate.add_permits(64);
-    let ok = futures_ok(tasks).await;
-    assert_eq!(ok, 2);
-    assert_eq!(auth.review_slots.reserve_free(), 8);
-}
-
-async fn futures_ok(tasks: Vec<tokio::task::JoinHandle<Result<Identity, AuthError>>>) -> usize {
-    let mut ok = 0;
-    for t in tasks {
-        ok += usize::from(t.await.unwrap().is_ok());
-    }
-    ok
-}
-
-/// A subject unseen for `recentSubjectTtl` loses its reserve.
-#[tokio::test(start_paused = true)]
-async fn recently_seen_subjects_expire() {
-    let (auth, gate) = flooded().await;
-    tokio::time::advance(DEFAULT_RECENT_SUBJECT_TTL).await;
-    let e = tokio::time::timeout(
-        Duration::from_secs(1),
-        auth.authenticate_from(&sub_token("ci:builder", 300), None),
-    )
-    .await
-    .expect("an expired subject must be refused at once, not reviewed")
-    .unwrap_err();
-    assert_eq!(e.status(), 503);
-    gate.add_permits(64);
 }
 
 /// IPv6 peers are grouped at /56 for the review cap; IPv4 and mapped IPv4
@@ -1418,55 +1331,6 @@ async fn review_cap_groups_ipv6_at_56() {
     }
     first.await.unwrap().unwrap();
     second.await.unwrap().unwrap();
-}
-
-/// A returned reserved slot gives its subject's share back.
-#[tokio::test(start_paused = true)]
-async fn reserved_slots_return_to_their_subject() {
-    let slots = token_review::ReviewSlots::new(32, 8, DEFAULT_RECENT_SUBJECT_TTL);
-    let now = tokio::time::Instant::now();
-    slots.note_authenticated("ci/builder", now);
-    let shared: Vec<_> = (0..24).map(|_| slots.acquire("other", now)).collect();
-    assert!(shared.iter().all(Option::is_some));
-    for _ in 0..2 {
-        let a = slots.acquire("ci/builder", now).expect("first share");
-        let b = slots.acquire("ci/builder", now).expect("second share");
-        assert!(slots.acquire("ci/builder", now).is_none());
-        assert_eq!(slots.reserve_free(), 6);
-        drop((a, b));
-        assert_eq!(slots.reserve_free(), 8);
-    }
-    assert!(slots.acquire("evil/x", now).is_none());
-}
-
-/// Only a review that authenticated marks a subject as seen, so a refused
-/// token naming `ci/builder` wins it no reserve.
-#[tokio::test(start_paused = true)]
-async fn refused_review_does_not_mark_a_subject_seen() {
-    let refusing = sa_auth(FakeReviewer::replying(
-        false,
-        &[AUD],
-        "system:serviceaccount:ci:builder",
-    ));
-    refusing
-        .authenticate(&sub_token("ci:builder", 1))
-        .await
-        .unwrap_err();
-    let now = tokio::time::Instant::now();
-    let _shared: Vec<_> = (0..24)
-        .map(|_| refusing.review_slots.acquire("other", now))
-        .collect();
-    assert!(refusing.review_slots.acquire("ci/builder", now).is_none());
-
-    let accepting = sa_auth(sa_ok());
-    accepting
-        .authenticate(&sub_token("ci:builder", 1))
-        .await
-        .unwrap();
-    let _shared: Vec<_> = (0..24)
-        .map(|_| accepting.review_slots.acquire("other", now))
-        .collect();
-    assert!(accepting.review_slots.acquire("ci/builder", now).is_some());
 }
 
 // ---------- owner ----------
@@ -1573,6 +1437,7 @@ fn service_account_and_claim_owners_are_unchanged() {
         namespace: "ci".into(),
         name: "builder".into(),
         uid: "u".into(),
+        pod_uid: None,
     };
     assert_eq!(sa.owner(), "sa:ci/builder");
     let claim = Identity::Claim {
@@ -1626,4 +1491,91 @@ fn issuer_hash_cannot_forge_another_issuers_owner() {
     assert_eq!(real, "oidc:https://a#x#run_id=1");
     assert_eq!(forged, "oidc:https://a%23x#run_id=1");
     assert_eq!(owner(GH, "s", json!({})), format!("oidc:{GH}#s"));
+}
+
+// ---------- review rate, pod owner ----------
+
+/// Slots bound concurrency only: a refused review is quick, so forged tokens
+/// could still drive reviews at thousands a second. The bucket caps the rate.
+#[tokio::test(start_paused = true)]
+async fn forged_tokens_are_reviewed_at_most_at_the_review_rate() {
+    let auth = sa_auth(FakeReviewer::replying(
+        false,
+        &[AUD],
+        "system:serviceaccount:evil:x",
+    ));
+    let mut busy = 0;
+    for i in 0..60 {
+        let e = auth
+            .authenticate(&sub_token("evil:x", 1000 + i))
+            .await
+            .unwrap_err();
+        busy += usize::from(e.status() == 503);
+    }
+    assert_eq!(auth.reviewer.calls.load(Ordering::SeqCst), 50);
+    assert_eq!(busy, 10);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    for i in 0..60 {
+        let _ = auth.authenticate(&sub_token("evil:x", 2000 + i)).await;
+    }
+    assert_eq!(auth.reviewer.calls.load(Ordering::SeqCst), 100);
+}
+
+/// Naming a service account that just passed a review buys a forger nothing:
+/// every uncached token shares the one rate, so a flood of forged tokens with
+/// a known `sub`, from many addresses, still gets at most that many reviews.
+#[tokio::test(start_paused = true)]
+async fn a_known_subject_cannot_exceed_the_review_rate() {
+    let auth = sa_auth(sa_ok());
+    auth.authenticate(&sub_token("ci:builder", 0))
+        .await
+        .unwrap();
+    let mut busy = 0;
+    for i in 0..200_u16 {
+        let ip: std::net::IpAddr = format!("10.2.{}.{}", i / 250, i % 250).parse().unwrap();
+        let r = auth
+            .authenticate_from(&sub_token("ci:builder", 1 + usize::from(i)), Some(ip))
+            .await;
+        busy += usize::from(r.is_err_and(|e| e.status() == 503));
+    }
+    assert_eq!(auth.reviewer.calls.load(Ordering::SeqCst), 50);
+    assert_eq!(busy, 151);
+}
+/// A bound token's review names its pod; pods sharing a service account are
+/// then different owners and cannot release each other's allocations.
+#[test]
+fn a_bound_token_owner_names_its_pod() {
+    let status = |extra: Option<Vec<&str>>| TokenReviewStatus {
+        authenticated: Some(true),
+        audiences: Some(vec![AUD.to_owned()]),
+        user: Some(UserInfo {
+            username: Some("system:serviceaccount:ci:runner".into()),
+            uid: Some("sa-uid".into()),
+            extra: extra.map(|v| {
+                std::collections::BTreeMap::from([(
+                    "authentication.kubernetes.io/pod-uid".to_owned(),
+                    v.into_iter().map(str::to_owned).collect(),
+                )])
+            }),
+            ..UserInfo::default()
+        }),
+        ..TokenReviewStatus::default()
+    };
+    let owner = |s: &TokenReviewStatus| {
+        token_review::identity_from_status(s, &[AUD.to_owned()])
+            .unwrap()
+            .owner()
+    };
+    let pod = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    assert_eq!(
+        owner(&status(Some(vec![pod]))),
+        format!("sa:ci/runner#pod={pod}")
+    );
+    assert_eq!(owner(&status(None)), "sa:ci/runner");
+    assert_eq!(
+        owner(&status(Some(vec!["a#b"]))),
+        "sa:ci/runner",
+        "not a uid"
+    );
+    assert_eq!(owner(&status(Some(vec![pod, pod]))), "sa:ci/runner");
 }

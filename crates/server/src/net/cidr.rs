@@ -60,6 +60,12 @@ impl Cidr {
         }
     }
 
+    /// Whether every address of `other` is inside this block.
+    #[must_use]
+    pub fn covers(&self, other: &Self) -> bool {
+        self.prefix <= other.prefix && self.contains(other.addr)
+    }
+
     /// The prefix length.
     #[must_use]
     pub fn prefix(&self) -> u8 {

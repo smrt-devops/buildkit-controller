@@ -3,7 +3,7 @@
 
 image:
   repository: ghcr.io/smrt-devops/buildkit-controller
-  tag: ""            # defaults to .Chart.AppVersion
+  tag: ""            # defaults to .Chart.AppVersion; "0.2.0@sha256:<digest>" pins the digest
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 nameOverride: ""
@@ -47,7 +47,8 @@ edge:
   handshakeTimeout: 10s
   maxConnections: 2000       # established connections per replica; taken after the handshake
   maxHandshakes: 1024        # connections still in the TLS handshake, per replica
-  maxHandshakesPerIp: 32     # in-handshake connections from one client address (IPv4, or IPv6 /64); 0 = no cap
+  maxHandshakesPerIp: 32     # in-handshake connections from one client address (IPv4, or IPv6 /64); 0 = no cap.
+                             # Over it the oldest is closed. Rendered as 0 behind a Gateway without edge.proxyProtocol.
   # PROXY protocol v2 from a gateway or load balancer, off by default. When on, a
   # connection from trustedCIDRs (the gateway's own source addresses, never the
   # clients') must open with a v2 header, and its source address replaces the
@@ -82,17 +83,18 @@ auth:
     audiences: [buildkit-controller]   # never the API server audience (https://kubernetes.default.svc...)
     maxConcurrentReviews: 32           # TokenReview calls in flight per replica; more callers get 503
     maxReviewsPerIp: 4                 # TokenReview calls in flight per client address; 0 = no cap
-    reservedReviews: 8                 # of maxConcurrentReviews, held for service accounts that passed a review recently
-    recentSubjectTtl: 10m              # how long a service account that passed a review counts as recently seen
 
 workerNetwork:
+  # Ranges the internet rule of every pool leaves out. Helm replaces a list it is given,
+  # so add ranges in extraDeniedCIDRs. The link-local, cloud metadata and NAT64 ranges
+  # are always left out, whatever this list says.
   deniedCIDRs: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, 127.0.0.0/8, 168.63.129.16/32, "fc00::/7", "fe80::/10", "64:ff9b::/96", "64:ff9b:1::/48"]
   extraDeniedCIDRs: []
   # Pod, service and node ranges of this cluster, both families. IPv6 egress stays
-  # closed until an IPv6 range is listed here. Set this: while it is empty the controller
-  # cannot tell cluster addresses from outside ones, so a pool allowCIDRs entry that
-  # covers pod or service addresses (10.0.0.0/16, say) can open the whole cluster to
-  # builds. NOTES.txt warns while it is empty. The chart has no default because the
+  # closed until an IPv6 range is listed here. Set this: while it holds no range of a
+  # family, the controller cannot tell cluster addresses from outside ones, so it refuses
+  # every IPv6 allowCIDRs entry and every IPv4 one that overlaps deniedCIDRs. NOTES.txt
+  # warns while it is empty. The chart has no default because the
   # ranges differ per cluster.
   clusterCIDRs: []
   # Ranges a pool's allowCIDRs may open although they overlap link-local, metadata,
@@ -129,9 +131,10 @@ service:
 # TLSRoute (v1.5+), all in the standard channel. You bring the Gateway and its listeners.
 #
 # Behind a gateway the controller sees the gateway's addresses, not the clients', so
-# every client shares edge.maxHandshakesPerIp (32), api.maxConnectionsPerIp (128) and
-# auth.serviceAccount.maxReviewsPerIp (4). Turn on PROXY protocol (edge.proxyProtocol,
-# api.proxyProtocol, and gateway.envoy.proxyProtocol on Envoy Gateway) so they count
+# every client shares api.maxConnectionsPerIp (128) and
+# auth.serviceAccount.maxReviewsPerIp (4), and the chart renders edge.maxHandshakesPerIp
+# as 0 unless edge.proxyProtocol is on. Turn on PROXY protocol (edge.proxyProtocol,
+# api.proxyProtocol, and gateway.envoy.proxyProtocol on Envoy Gateway) so the caps count
 # clients again, or raise them, or set them to 0, to match the number of CI jobs that
 # can start at once.
 gateway:
@@ -214,6 +217,8 @@ priorityClassName: ""
 # reads claims in every namespace (with watchNamespaces set, in these only), gets a Role for
 # Secret get/create/delete in each of them, and refuses claims from any other namespace. Pools
 # still admit claims with an access rule `claims: {namespaces: [...]}`. [] = API claims only.
+# Never the release namespace: the API's claims live there, the leader trusts their owner and
+# cache fields, and only cluster admins may create claims there.
 claims:
   namespaces: []
 

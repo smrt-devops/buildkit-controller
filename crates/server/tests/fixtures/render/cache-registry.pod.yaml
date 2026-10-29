@@ -11,7 +11,7 @@ metadata:
     app.kubernetes.io/name: buildkitd
     buildkit.smrt-devops.net/pool: cache-registry
     buildkit.smrt-devops.net/state: free
-    buildkit.smrt-devops.net/template-hash: e2d7eed739
+    buildkit.smrt-devops.net/template-hash: e2cec1327a
   name: cache-registry-0
   namespace: render-verify
   ownerReferences:
@@ -58,6 +58,9 @@ spec:
         ephemeral-storage: 1Gi
         memory: 1Gi
     securityContext:
+      capabilities:
+        drop:
+        - NET_RAW
       privileged: false
     startupProbe:
       exec:

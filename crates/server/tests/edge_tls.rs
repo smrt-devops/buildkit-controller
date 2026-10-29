@@ -419,10 +419,8 @@ async fn resumption_is_never_granted() {
     let b = CaBundle::generate(now()).unwrap();
     let mut e = start(Some(&b)).await;
     let ca = b.client_ca().cert_der().clone();
-    for versions in [
-        &[&rustls::version::TLS13][..],
-        &[&rustls::version::TLS12][..],
-    ] {
+    // The edge speaks TLS 1.3 only.
+    for versions in [&[&rustls::version::TLS13][..]] {
         let mut store = RootCertStore::empty();
         store.add(ca.clone()).unwrap();
         let (crt, key) = valid_cert(&b);
@@ -618,10 +616,10 @@ async fn idle_connects_cannot_take_established_slots() {
     assert_eq!(conn.id, ID.parse().unwrap());
 }
 
-/// Connections over the per-address or the global handshake cap are closed
-/// on accept; a freed slot admits the next client.
+/// A connection over the per-address or the global handshake cap evicts the
+/// oldest one it competes with, so idle connects cannot lock out a client.
 #[tokio::test]
-async fn handshake_caps_close_extra_connects() {
+async fn handshake_caps_evict_the_oldest_connect() {
     for (global, per_ip) in [(64, 2), (2, 16)] {
         let b = CaBundle::generate(now()).unwrap();
         let mut e = start_with(
@@ -635,27 +633,16 @@ async fn handshake_caps_close_extra_connects() {
         )
         .await;
         // The accept loop takes handshake slots in accept order, so with two
-        // idle connects in, the next connect is over the cap.
+        // idle connects in, the next connect evicts the first.
         let mut held = idle_connects(e.addr, 2).await;
-        let mut extra = TcpStream::connect(e.addr).await.unwrap();
-        assert!(
-            closed_at_once(&mut extra).await,
-            "cap ({global}, {per_ip}) not enforced"
-        );
-        held.clear();
-        // Slots free asynchronously; retry until a valid client is admitted.
         let ca = b.client_ca().cert_der().clone();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let _s = loop {
-            match dial(e.addr, client(&ca, Some(valid_cert(&b)), &[b"h2"]), HOST).await {
-                Ok(s) => break s,
-                Err(err) => assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "freed slot never admitted a client: {err}"
-                ),
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
+        let _s = dial(e.addr, client(&ca, Some(valid_cert(&b)), &[b"h2"]), HOST)
+            .await
+            .unwrap_or_else(|err| panic!("cap ({global}, {per_ip}) locked out a client: {err}"));
         e.conns.recv().await.unwrap();
+        assert!(
+            closed_at_once(&mut held[0]).await,
+            "cap ({global}, {per_ip}) did not evict the oldest"
+        );
     }
 }

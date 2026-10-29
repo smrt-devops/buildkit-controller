@@ -10,6 +10,7 @@ use buildkit_controller_api::claim::{
     BuildKitClaim, BuildKitClaimStatus, CacheTier, ClaimPhase, secret_name,
 };
 use buildkit_controller_api::dto::{CacheResponse, ErrorCode};
+use buildkit_controller_api::v1alpha1::BuildKitPool;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::{Pod, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, ObjectMeta, OwnerReference, Time};
@@ -198,12 +199,15 @@ pub fn waits<S: std::hash::BuildHasher>(c: &BuildKitClaim, served_ns: &HashSet<S
 }
 
 /// Queue order: oldest `creationTimestamp` first (the API server's clock, so
-/// no replica can jump the queue), then name, then namespace.
+/// no replica can jump the queue), then `uid`, then name and namespace. The
+/// API server picks the uid at random; the name of an API claim derives from
+/// the client's key, so a client could grind keys to win every tie.
 #[must_use]
 pub fn queue_order(a: &BuildKitClaim, b: &BuildKitClaim) -> Ordering {
     let key = |c: &BuildKitClaim| {
         (
             c.metadata.creation_timestamp.as_ref().map(|t| t.0),
+            c.metadata.uid.clone(),
             c.metadata.name.clone(),
             c.metadata.namespace.clone(),
         )
@@ -211,14 +215,20 @@ pub fn queue_order(a: &BuildKitClaim, b: &BuildKitClaim) -> Ordering {
     key(a).cmp(&key(b))
 }
 
-/// The waiting claims of every pool, each queue in [`queue_order`].
+/// True once the leader has admitted waiting claim `c`: it writes a status
+/// only after the pool's access rules admit the claim, and tenants cannot
+/// write status. A claim naming a pool that refuses it never counts as a
+/// waiter, so it can neither grow that pool nor push its queue back.
 #[must_use]
-pub fn queues<S: std::hash::BuildHasher>(
-    claims: &[Arc<BuildKitClaim>],
-    served_ns: &HashSet<String, S>,
+pub fn admitted(c: &BuildKitClaim) -> bool {
+    c.status.is_some()
+}
+
+fn by_pool<'a>(
+    claims: impl Iterator<Item = &'a Arc<BuildKitClaim>>,
 ) -> HashMap<PoolKey, Vec<Arc<BuildKitClaim>>> {
     let mut out: HashMap<PoolKey, Vec<Arc<BuildKitClaim>>> = HashMap::new();
-    for c in claims.iter().filter(|c| waits(c, served_ns)) {
+    for c in claims {
         out.entry(pool_key(c)).or_default().push(Arc::clone(c));
     }
     for q in out.values_mut() {
@@ -227,11 +237,34 @@ pub fn queues<S: std::hash::BuildHasher>(
     out
 }
 
-/// The 1-based place of `c` among the waiting claims of its pool.
+/// Every waiting claim of every pool, admitted or not, each queue in
+/// [`queue_order`]: what the leader serves, so it can bind or refuse each.
+#[must_use]
+pub fn pending<S: std::hash::BuildHasher>(
+    claims: &[Arc<BuildKitClaim>],
+    served_ns: &HashSet<String, S>,
+) -> HashMap<PoolKey, Vec<Arc<BuildKitClaim>>> {
+    by_pool(claims.iter().filter(|c| waits(c, served_ns)))
+}
+
+/// The admitted waiting claims of every pool ([`admitted`]), each queue in
+/// [`queue_order`]: the demand a pool scales for.
+#[must_use]
+pub fn queues<S: std::hash::BuildHasher>(
+    claims: &[Arc<BuildKitClaim>],
+    served_ns: &HashSet<String, S>,
+) -> HashMap<PoolKey, Vec<Arc<BuildKitClaim>>> {
+    by_pool(claims.iter().filter(|c| waits(c, served_ns) && admitted(c)))
+}
+
+/// The 1-based place of `c` among the waiting claims of its pool. Only
+/// [`admitted`] claims, and claims of the controller's namespace `own` (the
+/// API admitted their callers), count as ahead of it.
 #[must_use]
 pub fn position<S: std::hash::BuildHasher>(
     claims: &[Arc<BuildKitClaim>],
     served_ns: &HashSet<String, S>,
+    own: &str,
     c: &BuildKitClaim,
 ) -> Option<u32> {
     if !waits(c, served_ns) {
@@ -241,9 +274,19 @@ pub fn position<S: std::hash::BuildHasher>(
     let ahead = claims
         .iter()
         .filter(|o| waits(o, served_ns) && pool_key(o) == key)
+        .filter(|o| admitted(o) || o.metadata.namespace.as_deref() == Some(own))
         .filter(|o| queue_order(o, c) == Ordering::Less)
         .count();
     u32::try_from(ahead + 1).ok()
+}
+
+/// Workers one owner (an OIDC run, a service account or pod, a claim) may
+/// hold in `pool` while another owner waits for one: half of `scaling.max`,
+/// at least 1. With nobody else waiting an owner may take the whole pool, so
+/// a single tenant or one CI matrix is not capped at half. The leader
+/// enforces it when binding.
+pub(super) fn owner_hold_limit(pool: &BuildKitPool) -> usize {
+    (usize::try_from(pool.spec.scaling.max).unwrap_or(0) / 2).max(1)
 }
 
 /// When a waiting claim's queue timeout ends, given its timeout in seconds.
@@ -429,7 +472,7 @@ pub fn strays<'a, S: std::hash::BuildHasher>(
 /// A pod bound for an in-cluster claim before every allocation was a claim
 /// (owner `claim:<ns>/<name>#<uid>`, no `P claim`) whose claim is gone, has
 /// ended, or records another allocation id. v0.1.0 upgrade shim: remove in
-/// the release after v3.
+/// the release after 0.2.0.
 fn unclaimed_stray<S: std::hash::BuildHasher>(
     p: &Pod,
     id: &str,
@@ -449,7 +492,7 @@ fn unclaimed_stray<S: std::hash::BuildHasher>(
 }
 
 /// `(namespace, uid)` of a claim owner string `claim:<ns>/<name>#<uid>`.
-fn claim_owner(s: &str) -> Option<(&str, &str)> {
+pub(crate) fn claim_owner(s: &str) -> Option<(&str, &str)> {
     let (ns, rest) = s.strip_prefix("claim:")?.split_once('/')?;
     let (name, uid) = rest.split_once('#')?;
     (!ns.is_empty() && !name.is_empty() && !uid.is_empty()).then_some((ns, uid))
@@ -473,12 +516,10 @@ pub fn unbound_status(
     phase: ClaimPhase,
     reason: &str,
     message: &str,
-    position: Option<u32>,
 ) -> BuildKitClaimStatus {
     BuildKitClaimStatus {
         phase: Some(phase),
         observed_generation: c.metadata.generation,
-        queue_position: position.and_then(|p| i32::try_from(p).ok()),
         conditions: vec![condition(false, reason, message, c.metadata.generation)],
         ..BuildKitClaimStatus::default()
     }
@@ -520,7 +561,6 @@ pub fn bound_status(c: &BuildKitClaim, b: &Binding, secret: bool) -> BuildKitCla
         pod: Some(b.pod.clone()),
         certificate: Some(b.certificate.clone()),
         expires_at: Some(b.expires_at.clone()),
-        queue_position: None,
         cache: b.cache.clone(),
         observed_generation: c.metadata.generation,
         conditions: vec![condition(

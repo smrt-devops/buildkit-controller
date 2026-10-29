@@ -12,9 +12,10 @@ use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::super::handler::Refusal;
+use super::super::listener::PerKey;
 use super::super::metrics::{Direction, EdgeMetrics, Revocation};
 use super::super::pods::{PodView, revocation};
-use super::super::revoke::Registry;
+use super::super::revoke::{Registry, namespace_cap};
 use super::{End, pump};
 use crate::pki::AllocationId;
 use crate::runtime::metrics::Metrics;
@@ -413,6 +414,11 @@ fn each_allocation_is_capped_and_a_closed_connection_frees_its_slot() {
 
 /// The proxy's back half over `pods`, with no TLS generation loaded.
 fn inner(pods: Vec<Pod>, max_per_pod: usize) -> super::Inner {
+    inner_capped(pods, max_per_pod, 0)
+}
+
+/// [`inner`] with at most `max_per_namespace` connections per owner.
+fn inner_capped(pods: Vec<Pod>, max_per_pod: usize, max_per_namespace: usize) -> super::Inner {
     super::Inner {
         view: view(pods),
         tls: tokio::sync::watch::channel(None).1,
@@ -420,8 +426,10 @@ fn inner(pods: Vec<Pod>, max_per_pod: usize) -> super::Inner {
         options: super::ProxyOptions {
             upstream_connect_timeout: Duration::from_secs(1),
             upstream_port: 1,
+            max_per_namespace,
         },
         live: Arc::new(Registry::new(max_per_pod)),
+        namespaces: PerKey::new(max_per_namespace),
     }
 }
 
@@ -494,4 +502,68 @@ async fn a_revoked_relay_is_counted_once_under_its_reason() {
     assert_eq!(m.revocation_count(Revocation::Released), 1);
     assert_eq!(m.revocation_count(Revocation::Drain), 0);
     assert_eq!(m.active(&id()).get(), 0);
+}
+
+#[test]
+fn each_namespace_is_capped_and_a_closed_connection_frees_its_slot() {
+    let namespaces = PerKey::<String>::new(2);
+    let a = namespaces.try_take("team-a").unwrap();
+    let _b = namespaces.try_take("team-a").unwrap();
+    assert!(
+        namespaces.try_take("team-a").is_none(),
+        "third in one namespace"
+    );
+    assert!(
+        namespaces.try_take("team-b").is_some(),
+        "another namespace has its own"
+    );
+    drop(a);
+    assert!(namespaces.try_take("team-a").is_some());
+    assert_eq!(namespace_cap(2000), 500);
+    assert_eq!(namespace_cap(1), 1);
+}
+
+/// The cap is per pool namespace, whatever the pod's `P owner` says: four
+/// owners in one namespace share one budget.
+#[tokio::test]
+async fn four_owners_in_one_namespace_are_capped_together() {
+    let uids = [
+        "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "1f8fad5b-d9cb-469f-a165-70867728950e",
+        "2f8fad5b-d9cb-469f-a165-70867728950e",
+        "3f8fad5b-d9cb-469f-a165-70867728950e",
+    ];
+    let pods = uids
+        .iter()
+        .enumerate()
+        .map(|(i, uid)| {
+            pod(|v| {
+                v["metadata"]["uid"] = json!(uid);
+                v["metadata"]["name"] = json!(format!("pool-1-{i}"));
+                v["metadata"]["annotations"]["buildkit.smrt-devops.net/owner"] =
+                    json!(format!("sa:team-a/owner-{i}"));
+                v["status"]["podIP"] = json!(format!("10.0.0.{}", 10 + i));
+            })
+        })
+        .collect();
+    let p = inner_capped(pods, 64, 3);
+    let ids: Vec<AllocationId> = uids
+        .iter()
+        .map(|u| {
+            format!("buildkit://team-a/pool-1/{u}/{ALLOC}")
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    let _held: Vec<_> = (0..3)
+        .map(|_| p.namespaces.try_take("team-a").unwrap())
+        .collect();
+    for id in &ids {
+        let (client, _c) = tokio::io::duplex(1024);
+        p.forward(client, id, None).await;
+    }
+    // Outcomes are labelled by namespace and pool, so all four count together.
+    assert_eq!(p.metrics.outcome_count(Some(&ids[0]), "namespace_limit"), 4);
+    assert_eq!(p.metrics.outcome_count(Some(&ids[0]), "upstream_error"), 0);
+    assert_eq!(p.live.len(), 0, "unregistered once closed");
 }

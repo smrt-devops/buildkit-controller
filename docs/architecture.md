@@ -1,4 +1,4 @@
-| Registry (`buildkit-controller registry`) | 5000 (mTLS), 8080 (ops) | Stores BuildKit cache for the workers | one StatefulSet pod |# Architecture
+# Architecture
 
 This page is the short version of how the controller works. Day-two tasks are in [operations.md](operations.md) and a first install is in [quickstart.md](quickstart.md).
 
@@ -11,13 +11,13 @@ The `buildkit-controller` binary (`crates/server`) runs as one Deployment with t
 | API | 8443 (HTTPS) | Authenticates callers, creates and reads allocation claims, answers with the certificate once a claim is bound | every replica |
 | Edge | 8444 (mTLS) | Proxies a build connection to its worker | every replica |
 | Reconciler and allocator | none | Keeps warm pods, binds queued claims to pods, signs allocation certificates, retires expired pods, manages CAs and worker certificates, writes status | the Lease holder only |
-| Cache (`buildkit-controller cache`) | 5000 (mTLS), 8080 (ops) | Stores BuildKit cache for the workers | one StatefulSet pod |
+| Registry (`buildkit-controller registry`) | 5000 (mTLS), 8080 (ops) | Stores BuildKit cache for the workers | one StatefulSet pod |
 
 Two names stay apart in this project. "Cache" is the user feature: the Helm values `cache.*`, the pool field `spec.workers.cache` and the `cache` field of an allocation. "Registry" is the component that stores it: the `registry` role, the `<fullname>-registry` objects and the `buildkit_registry_*` metrics.
 
 Clients reach the API and edge ports through a Gateway by default: the API through an HTTPRoute, where the gateway terminates TLS and re-encrypts to the controller, and the edge through a TLS passthrough TLSRoute, so that the edge itself checks the client certificate. A LoadBalancer Service is the alternative. See [Exposure](operations.md#exposure).
 
-A separate ops port (8080, plain HTTP, on its own ClusterIP Service) serves `/healthz`, `/readyz` and `/metrics`. All replicas share in-memory watch caches of pools, claims and pods, so the API and edge read from memory. The API replicas hold no queue and sign nothing. They authenticate the caller, check the pool's access rules, and write or read a claim.
+A separate ops port (8080, plain HTTP, on its own ClusterIP Service) serves `/healthz`, `/readyz` and `/metrics`. All replicas share in-memory watch caches of pools, claims and pods, so the API and edge read from memory. The API replicas hold no queue. They authenticate the caller, check the pool's access rules, and write or read a claim. Every replica loads both CA keys, because each issues its own serving certificate and edge client certificate, so a compromise of any replica exposes both CAs.
 
 ## Two CRDs
 
@@ -95,14 +95,14 @@ Each worker pod has its own serving certificate, issued by the internal CA. Its 
 
 ## Allocation owner
 
-Every allocation records its caller as the owner, and only the same owner can release it early. A service account is `sa:<namespace>/<name>` and a claim is `claim:<namespace>/<name>#<uid>`. An OIDC caller is `oidc:<iss>#<sub>`, plus the run claims `run_id`, `run_attempt` and `job_workflow_ref` when the token carries them, as `#run_id=<value>` and so on. `%` and `#` in `iss`, in `sub` and in each value are percent-encoded, with or without run claims, so a `sub` that contains `#run_id=1` cannot match another caller's owner. GitHub Actions tokens carry all three. Their `sub` alone is the same for every run of a repository and ref, and for every `pull_request` run, so without the run claims one run could release another's worker.
+Every allocation records its caller as the owner, and only the same owner can release it early. A service account is `sa:<namespace>/<name>`, plus `#pod=<uid>` when its token is bound to a pod, so pods that share a ServiceAccount are different owners. A claim is `claim:<namespace>/<name>#<uid>`. An OIDC caller is `oidc:<iss>#<sub>`, plus the run claims `run_id`, `run_attempt` and `job_workflow_ref` when the token carries them, as `#run_id=<value>` and so on. `%` and `#` in `iss`, in `sub` and in each value are percent-encoded, with or without run claims, so a `sub` that contains `#run_id=1` cannot match another caller's owner. GitHub Actions tokens carry all three. Their `sub` alone is the same for every run of a repository and ref, and for every `pull_request` run, so without the run claims one run could release another's worker.
 
 The owner is per run attempt, not per job. All jobs of one attempt, such as the legs of a matrix, have the same `run_id`, `run_attempt` and `job_workflow_ref`, so they share one owner, and any of them can release another's allocation if it learns the allocation id. Jobs of one workflow run are in one trust domain, so the controller does not separate them further. A token from the same job, such as the one the Action fetches in its post step, gives the same owner. A re-run attempt is a different owner and cannot release the earlier attempt's worker, which ends at its expiry.
 
 
 ## Build cache
 
-Builds get a cache from the cache registry, a built-in role of the controller binary. It runs as a one-replica StatefulSet `<fullname>-registry` with one volume, and the chart turns it on by default (`cache.enabled`). It serves the part of the OCI distribution API that BuildKit's registry cache exporter and importer use: blob upload (including cross-repository mount), blob and manifest read, and manifest write. It serves nothing else, and it verifies each blob against its digest as the blob streams in.
+Builds get a cache from the cache registry, a built-in role of the controller binary. It runs as a one-replica StatefulSet `<fullname>-registry` with one volume, and the chart turns it on by default (`cache.enabled`). It serves the part of the OCI distribution API that BuildKit's registry cache exporter and importer use: blob upload, blob and manifest read, and manifest write. It serves nothing else, and it verifies each blob against its digest as the blob streams in.
 
 The allocation response carries the cache flags, and the client passes them to buildx:
 
@@ -111,7 +111,7 @@ The allocation response carries the cache flags, and the client passes them to b
 --cache-to   type=registry,ref=<registry>/<namespace>/<pool>/<scope>:<tag>,mode=max,ignore-error=true,oci-mediatypes=true
 ```
 
-`<tag>` is the request's `cacheKey`, or the pool name when there is none. `ignore-error=true` means a cache outage slows a build and never fails it. A client that does not pass the flags builds without a cache. A request that sets `cache: none` gets no flags.
+`<tag>` is the request's `cacheKey`, or the pool name when there is none. `ignore-error=true` covers the export: a cache that cannot take the export never fails the build. The import is different. BuildKit reads the cache manifest at the start and fetches the layers it matched later, so a registry that restarts, or garbage collection that removes those layers, during the build can fail it. A client that does not pass the flags builds without a cache. A request that sets `cache: none` gets no flags.
 
 ### Who may reach it
 
@@ -124,7 +124,7 @@ The registry identifies the worker by its certificate and finds the pod in its w
 | Pull from `<namespace>/<pool>/<scope>` | the pod holds a live allocation of that pool and scope |
 | Push to it | the same, and the allocation's tier is `trusted` |
 
-A worker with no live allocation gets nothing. A build cannot read or write another scope's cache, whatever `--cache-to` it passes.
+A worker with no live allocation gets nothing. A build cannot read or write another scope's cache, whatever `--cache-to` it passes. The registry trusts the annotations on the pod, so anyone who may patch pods in a pool namespace can write any cache of that pool. Grant `pods/patch` there only to cluster admins.
 
 ### Scope and trust tiers
 
@@ -135,17 +135,18 @@ The scope says whose cache it is. `spec.workers.cache.scope` sets how scopes are
 
 The tier says whether the caller may write. `spec.workers.cache.writers` lists the callers that may, in the syntax of `access.rules`. Everyone else reads only.
 
-- Unset, a GitHub Actions caller is trusted when its `event_name` claim is `push`, `schedule`, `workflow_dispatch` or `merge_group`. Every ServiceAccount and `BuildKitClaim` caller is trusted. A pull request is not, so a fork build starts warm from its own repository's cache and cannot change it. A caller whose token has no `event_name` claim, such as a GitLab job, reads only until you list it in `writers`.
-- Builds from `pull_request`, `pull_request_target`, `workflow_run`, `issue_comment`, `pull_request_review` and `pull_request_review_comment` events are always read-only, whatever `writers` says. Pin `event_name` in `writers` rules.
+- Unset, a GitHub Actions caller is trusted when its `event_name` claim is `push`, `schedule` or `workflow_dispatch` and its `ref_protected` claim is `true`. Every branch shares the repository's scope, so an unprotected branch that anyone with push access can write must not feed the protected branch's builds. `merge_group` is not trusted by default, because its queue ref is never protected. Every ServiceAccount and `BuildKitClaim` caller is trusted. A pull request is not, so a fork build starts warm from its own repository's cache and cannot change it. A caller whose token has no `event_name` claim, such as a GitLab job, reads only until you list it in `writers`.
+- Builds from `pull_request`, `pull_request_target`, `workflow_run`, `issue_comment`, `pull_request_review`, `pull_request_review_comment`, `deployment` and `deployment_status` events are always read-only, whatever `writers` says, and so are GitLab pipelines whose `pipeline_source` is `merge_request_event`, `external_pull_request_event` or `parent_pipeline`.
+- Pin `event_name` and `ref_protected` in every `writers` rule. A rule without them lets any branch write the cache that the protected branch reads.
 - `writers: []` trusts nobody.
 - A trusted allocation gets `--cache-to` and `--cache-from`. An untrusted one gets `--cache-from` only, and the Action logs that the cache is read only for the build.
 
 ### Limits and garbage collection
 
 - `spec.workers.cache.maxSize` caps what a pool's caches hold together. A pool without it gets the chart's `cache.poolMaxSize`. The chart's `cache.maxSize` caps the whole volume.
-- Every manifest records its last pull or push time. Over a budget, the oldest manifests go first. A periodic mark and sweep (`cache.gcInterval`, 10 minutes by default) then deletes the blobs that no manifest references.
+- Every manifest records its last pull or push time. Garbage collection (`cache.gcInterval`, 10 minutes by default) keeps the newest first while they fit the budget: manifests by last use, and blobs of uploads that no manifest references yet by upload time, which count against the budget too. An item that does not fit is removed and the scan goes on, so one oversized push cannot empty a pool. A mark and sweep then deletes the blobs that nothing references. While the registry cannot list pools, it evicts nothing for a pool budget.
 - A blob over `cache.maxBlobSize` is refused. Upload sessions expire after 1 hour idle. `cache.maxUploadSize` bounds the bytes that uploads in progress hold together, so size the volume to `cache.maxSize` plus `cache.maxUploadSize` ([sizing](operations.md#sizing)).
-- One replica means one volume. While the cache pod restarts, builds run uncached. The cache is an accelerator, so the allocation does not wait for it.
+- One replica means one volume. Builds that start while the cache pod restarts run uncached, and a build that imported from it before the restart can fail when it fetches a layer. The cache is an accelerator, so the allocation does not wait for it.
 
 ## BuildKitClaim
 
@@ -166,7 +167,7 @@ spec:
   cache: auto          # optional: auto or none
 ```
 
-The spec is immutable, so a different builder is a different claim. The leader binds both kinds through the same queue. `kubectl get bkc -A` shows the pool, the phase, the queue position, the Secret and the expiry. An in-cluster claim must be admitted by a pool access rule `claims: {namespaces: [...]}`. A claim's identity is its namespace, name and UID, which the API server sets, so a tenant cannot forge another namespace. A claim for a pool that is missing or does not admit its namespace fails with reason `PoolNotFound`. A claim under 30 seconds old stays Pending with that reason first, so a pool that is created together with the claim has time to appear.
+The spec is immutable, so a different builder is a different claim. The leader binds both kinds through the same queue. `kubectl get bkc -A` shows the pool, the phase, the Secret and the expiry; sorted by creation time it lists the queue in order. An in-cluster claim must be admitted by a pool access rule `claims: {namespaces: [...]}`. A claim's identity is its namespace, name and UID, which the API server sets, so a tenant cannot forge another namespace. A claim for a pool that is missing or does not admit its namespace fails with reason `PoolNotFound`. A claim under 30 seconds old stays Pending with that reason first, so a pool that is created together with the claim has time to appear.
 
 When the worker is ready the controller creates a Secret `<claim>-buildkit` owned by the claim with `tls.crt`, `tls.key`, `ca.crt` (omitted when the edge uses public roots), `endpoint` and `server-name`, and sets `status.phase` to `Bound`. A claim ends as `Expired` at `status.expiresAt` or `Lost` if its worker pod disappears (the controller does not rebind it). A claim that cannot be served is `Failed`. All three are final: delete the claim and create a new one. Deleting a claim deletes its Secret, and the controller releases the worker within a few seconds.
 
@@ -175,4 +176,4 @@ When the worker is ready the controller creates a Secret `<claim>-buildkit` owne
 - Leader loss. Another replica takes the Lease within the lease duration (15 s by default). API and edge traffic on other replicas continues, and queued claims wait for the new leader.
 - Replica stop. A stopping replica releases the Lease first, so leadership moves within seconds. `shutdown.delay` (5 s) after the signal, which lets endpoints converge, it closes the API listener. A long poll in flight returns `202` at once, and the claim stays queued for the client's next poll to find on another replica. The edge then stops accepting and keeps each open connection until it ends on its own (release, expiry, worker gone, certificate `notAfter`), at most 24h5m unless `shutdown.drainTimeout` caps it. Rollouts, scale-in and node drains therefore do not cut running builds; see [Stopping a replica](operations.md#stopping-a-replica).
 - Lost response. If a client drops its `POST` while it waits, or loses the answer, the claim stays where it is, and the client sends the same `POST` again with the same key. The retry finds the claim and keeps its place in the queue. The API stamps the claim with `seen-at` each time its caller asks for it (`POST` or `GET`, at most every 15 seconds), and with `delivered` once it answers with the bound allocation. The leader deletes a claim that was never delivered and has not been asked for in 3 minutes, pending or bound, so a client that is really gone holds no place and no worker for longer than that. The 3 minutes cover the longest gap a client leaves between requests that arrive (a 25 second poll, a 40 second client timeout on a poll lost on the way, a 30 second `Retry-After`), the 15 second refresh, and clock skew. The delete names the `resourceVersion` the leader decided on, so a client that came back since keeps its claim. `seen-at` is written with the clock of the API replica and read against the clock of the leader, so the rule assumes the nodes' clocks are synchronized (NTP) to well within a minute. A delivered claim lives to its TTL or its release, because the controller cannot tell a client that lost the `201` from one that holds it. A client that lost a poll still has its id and can `GET` the allocation again, because the allocation is a stored claim.
-- Cache outage. Builds run without the cache and do not fail.
+- Cache outage. Builds that start during it run without the cache. A running build that already imported from the cache can fail when it fetches a matched layer.
