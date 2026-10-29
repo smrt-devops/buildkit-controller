@@ -5,7 +5,7 @@
 //! logs each one; once they are gone the sweep is a list that finds nothing.
 //! A PVC is swept when it carries that release's cache labels and no
 //! controller other than a `BuildKitPool` holds it. v0.1.0 upgrade shim: remove
-//! in the release after v3, with the PVC `list` and `delete` rights in the chart.
+//! in the release after 0.2.0, with the PVC `list` and `delete` rights in the chart.
 
 use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 use kube::api::{Api, DeleteParams, ListParams, Preconditions};
