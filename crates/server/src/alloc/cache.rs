@@ -16,8 +16,16 @@ use crate::render::{self, ANN_SCOPE, ANN_TIER};
 /// GitHub Actions events whose builds may write the cache by default.
 pub const TRUSTED_EVENTS: [&str; 4] = ["push", "schedule", "workflow_dispatch", "merge_group"];
 /// GitHub Actions events whose builds never write the cache, whatever
-/// `cache.writers` says: they run code from forks.
-pub const READ_ONLY_EVENTS: [&str; 2] = ["pull_request", "pull_request_target"];
+/// `cache.writers` says: they can run code from forks, and `workflow_run` and
+/// the comment and review events do so from the base repository's own ref.
+pub const READ_ONLY_EVENTS: [&str; 6] = [
+    "pull_request",
+    "pull_request_target",
+    "workflow_run",
+    "issue_comment",
+    "pull_request_review",
+    "pull_request_review_comment",
+];
 
 /// The cache of one allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]

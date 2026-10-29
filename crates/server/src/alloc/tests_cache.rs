@@ -68,7 +68,8 @@ fn writers_replace_the_default() {
     assert_eq!(cache::tier(&p, &claim_id(CI)), CacheTier::Untrusted);
 }
 
-/// Pull request builds run fork code: no writers rule makes them trusted.
+/// Pull request builds, and the `workflow_run`, comment and review jobs that can
+/// run their code, are never trusted, whatever the writers say.
 #[test]
 fn pull_requests_never_write_whatever_the_writers_say() {
     let mut p = pool();
@@ -79,7 +80,15 @@ fn pull_requests_never_write_whatever_the_writers_say() {
         ]))
         .unwrap(),
     );
-    for e in ["pull_request", "pull_request_target"] {
+    // Jobs that run in the base repository's context but can check out fork code.
+    for e in [
+        "pull_request",
+        "pull_request_target",
+        "workflow_run",
+        "issue_comment",
+        "pull_request_review",
+        "pull_request_review_comment",
+    ] {
         assert_eq!(cache::tier(&p, &oidc(e)), CacheTier::Untrusted, "{e}");
     }
     // The same caller on a push is trusted by the repository rule.
