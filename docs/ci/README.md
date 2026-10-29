@@ -37,7 +37,7 @@ The Action and the script follow the same steps.
 3. The client calls `GET /v1/allocations/{id}?wait=25s` until it gets an answer. `200` is the full response. `202` means still pending, and the client asks again at once. No request stays open longer than 25 seconds, so gateway and load-balancer timeouts never cut the wait, and a client that loses its connection asks again and keeps its place.
 4. When the build ends, `DELETE /v1/allocations/{id}` releases the allocation.
 
-The whole allocation, the first `POST`, every poll and any new `POST`, shares one budget: the queue timeout plus 60 seconds. The queue timeout is `queue-timeout` (`QUEUE_TIMEOUT` for the script), or, when that is unset, the pool's default `queueTimeoutSeconds` from `GET /v1/pools`. A controller too old to report the default leaves the budget at 1 hour (the largest queue timeout a pool allows) plus 60 seconds. Each request has a 40 second timeout.
+The whole allocation, the first `POST`, every poll and any new `POST`, shares one budget: the queue timeout plus 60 seconds. The queue timeout is `queue-timeout` (`QUEUE_TIMEOUT` for the script), or, when that is unset, the pool's default `queueTimeoutSeconds` from `GET /v1/pools`. A controller too old to report the default leaves the budget at 1 hour (the largest queue timeout a pool allows) plus 60 seconds. A poll has a 40 second timeout. A `POST` waits for the whole remaining budget, so a v0.1.0 controller, which holds the request open through the queue wait, still works.
 
 ### Retries
 
@@ -55,7 +55,7 @@ Which answers the client repeats, and which end the step:
 | `404 not_found` and `403 forbidden` on `GET`, other `4xx` | Fail the step. |
 | Other `503`, for example `ca_unavailable`, with no `Retry-After` | Fail the step. |
 
-Two older `503` codes with `Retry-After`, for a worker that did not start in time and for a replica that was stopping, are no longer sent. The Action still retries them, so it works against an older controller. The script retries only the older start-timeout code.
+Two older `503` codes with `Retry-After`, for a worker that did not start in time and for a replica that was stopping, are no longer sent. The Action still retries them, so it works against an older controller. The script retries both.
 
 The Action repeats `POST /v1/allocations` only on a 503 with `Retry-After` and one of the codes above, because an intermediary that adds its own `Retry-After` to a 503 may have forwarded the request. It also retries connection errors raised before the request was sent (connection refused, DNS failure). It waits the `Retry-After` seconds (at least 1, at most 30), logs each retry, and fetches a fresh OIDC token for every attempt. A retry asks for just the time left in the budget, so the total never doubles.
 

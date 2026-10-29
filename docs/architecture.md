@@ -134,7 +134,7 @@ The scope says whose cache it is. `spec.workers.cache.scope` sets how scopes are
 The tier says whether the caller may write. `spec.workers.cache.writers` lists the callers that may, in the syntax of `access.rules`. Everyone else reads only.
 
 - Unset, a GitHub Actions caller is trusted when its `event_name` claim is `push`, `schedule`, `workflow_dispatch` or `merge_group`. Every ServiceAccount and `BuildKitClaim` caller is trusted. A pull request is not, so a fork build starts warm from its own repository's cache and cannot change it. A caller whose token has no `event_name` claim, such as a GitLab job, reads only until you list it in `writers`.
-- `pull_request` and `pull_request_target` builds are always read-only, whatever `writers` says. A rule that would match one is ignored for it.
+- Builds from `pull_request`, `pull_request_target`, `workflow_run`, `issue_comment`, `pull_request_review` and `pull_request_review_comment` events are always read-only, whatever `writers` says. Pin `event_name` in `writers` rules.
 - `writers: []` trusts nobody.
 - A trusted allocation gets `--cache-to` and `--cache-from`. An untrusted one gets `--cache-from` only, and the Action logs that the cache is read only for the build.
 
@@ -172,5 +172,5 @@ When the worker is ready the controller creates a Secret `<claim>-buildkit` owne
 
 - Leader loss. Another replica takes the Lease within the lease duration (15 s by default). API and edge traffic on other replicas continues, and queued claims wait for the new leader.
 - Replica stop. A stopping replica releases the Lease first, so leadership moves within seconds. `shutdown.delay` (5 s) after the signal, which lets endpoints converge, it closes the API listener. A long poll in flight returns `202` at once, and the claim stays queued for the client's next poll to find on another replica. The edge then stops accepting and keeps each open connection until it ends on its own (release, expiry, worker gone, certificate `notAfter`), at most 24h5m unless `shutdown.drainTimeout` caps it. Rollouts, scale-in and node drains therefore do not cut running builds; see [Stopping a replica](operations.md#stopping-a-replica).
-- Lost response. A client that never saw the answer to its `POST` can read it again with `GET /v1/allocations/{id}`, because the allocation is a stored claim. If the client never returns, the claim ends at its TTL and the leader retires the pod.
+- Lost response. If a client drops its `POST` while it waits, the API deletes the claim. If the claim was already bound, the client has no id to release it with, and the allocation ends at its TTL. A client that lost a poll still has its id and can `GET` the allocation again, because the allocation is a stored claim.
 - Cache outage. Builds run without the cache and do not fail.

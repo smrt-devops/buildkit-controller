@@ -8,7 +8,7 @@ v3 replaces the per-replica allocation queues with one claim queue and replaces 
 
 ### Breaking
 
-- `spec.workers.cache.local` and `spec.workers.cache.registry` of `BuildKitPool` are removed, with their CEL rules, defaults and status fields. A pool that still sets them is refused by the new CRD. `spec.workers.cache` now holds `sizeLimit`, `scope`, `writers` and `maxSize`.
+- `spec.workers.cache.local` and `spec.workers.cache.registry` of `BuildKitPool` are removed, with their CEL rules, defaults and status fields. A pool that still sets them has the fields pruned by the API server, and kubectl's strict field validation refuses the apply. `spec.workers.cache` now holds `sizeLimit`, `scope`, `writers` and `maxSize`.
 - Workers have no volumes. The PVC per slot, the `cache-init` init container, scope binding on pods, soft affinity, spill and the wipe markers are gone. BuildKit build history is no longer turned off on any pool.
 - The external cache registry layer is removed. A team that wants its own registry passes its own buildx flags.
 - Helm values `cacheDefaults` and the `cache` key of a `pools` item are removed, and the chart rejects them. The chart gains a `cache` block for the registry (`cache.enabled`, `maxSize`, `poolMaxSize`, `maxBlobSize`, `maxUploadSize`, `gcInterval`, `persistence`, `resources`).
@@ -36,7 +36,8 @@ v3 replaces the per-replica allocation queues with one claim queue and replaces 
 ### Changed
 
 - Each worker gets a second certificate, a clientAuth-only leaf from the client CA, which the pool's `buildkitd.toml` presents to the cache registry. The serving certificate stays serverAuth only. The registry trusts the client CA for clients, and mTLS is its boundary.
-- `pull_request` and `pull_request_target` builds never write the cache, whatever `spec.workers.cache.writers` says.
+- Builds from `pull_request`, `pull_request_target`, `workflow_run`, `issue_comment`, `pull_request_review` and `pull_request_review_comment` events never write the cache, whatever `spec.workers.cache.writers` says.
+- A `POST` from the Action and the script waits for the whole remaining budget (queue timeout plus 60 seconds) instead of 40 seconds, so a slow allocation against a v0.1.0 controller completes. Polls keep a 40 second timeout.
 - The claim CRD is always installed. `claims.enabled` only adds the tenant namespaces whose claims the controller serves.
 - A draining replica no longer hands queued requests off. Pending claims stay pending and another replica answers the client's next poll.
 - Removed from the allocator: per-replica queues and wake-ups, API replicas creating pre-claimed pods, the provisional-expiry commit and its orphan guard, and the commit-on-body step.
