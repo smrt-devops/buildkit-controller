@@ -94,9 +94,7 @@
             "enabled": {"type": "boolean"},
             "audiences": {"type": "array", "items": {"type": "string", "not": {"pattern": "^https://kubernetes\\.default\\.svc"}}},
             "maxConcurrentReviews": {"type": "integer", "minimum": 1},
-            "maxReviewsPerIp": {"type": "integer", "minimum": 0},
-            "reservedReviews": {"type": "integer", "minimum": 0},
-            "recentSubjectTtl": {"type": "string", "pattern": "^([0-9]+h)?([0-9]+m)?([0-9]+s)?$", "minLength": 2}
+            "maxReviewsPerIp": {"type": "integer", "minimum": 0}
           }
         }
       }

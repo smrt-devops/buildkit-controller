@@ -82,8 +82,6 @@ auth:
     audiences: [buildkit-controller]   # never the API server audience (https://kubernetes.default.svc...)
     maxConcurrentReviews: 32           # TokenReview calls in flight per replica; more callers get 503
     maxReviewsPerIp: 4                 # TokenReview calls in flight per client address; 0 = no cap
-    reservedReviews: 8                 # of maxConcurrentReviews, held for service accounts that passed a review recently
-    recentSubjectTtl: 10m              # how long a service account that passed a review counts as recently seen
 
 workerNetwork:
   deniedCIDRs: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, 127.0.0.0/8, 168.63.129.16/32, "fc00::/7", "fe80::/10", "64:ff9b::/96", "64:ff9b:1::/48"]

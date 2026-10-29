@@ -127,8 +127,6 @@ data:
         enabled: true
         maxConcurrentReviews: 32
         maxReviewsPerIp: 0
-        recentSubjectTtl: 10m
-        reservedReviews: 8
     claims:
       namespaces: []
     edge:
@@ -529,7 +527,7 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: buildkit-controller-0.1.0
       annotations:
-        checksum/config: 5595f7690bdf2bf8b80064c3b8f8495252c1c2aa81b403e48a860a8d9d4f9999
+        checksum/config: d28b4791fd3e22657a3884dd09a5f9aff199bdbba49b0eac8cc05743668e13f4
     spec:
       serviceAccountName: buildkit-controller
       terminationGracePeriodSeconds: 86715
