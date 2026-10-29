@@ -371,7 +371,7 @@ struct Env {
     pool: BuildKitPool,
     ca: Arc<CaBundle>,
     metrics: AllocMetrics,
-    _pools: Writer<BuildKitPool>,
+    pools: Writer<BuildKitPool>,
     _ca_tx: watch::Sender<CertMaterial>,
 }
 
@@ -425,7 +425,7 @@ fn env() -> Env {
         pool,
         ca,
         metrics,
-        _pools: pools,
+        pools,
         _ca_tx: ca_tx,
     }
 }
@@ -1446,7 +1446,7 @@ async fn a_bound_claim_without_a_ca_answers_pending() {
     let tx = e.fake.tx.clone();
     let front = Front::new(
         Arc::clone(&e.fake) as Arc<dyn Backend>,
-        e._pools.as_reader(),
+        e.pools.as_reader(),
         e.fake.claims.lock().unwrap().as_reader(),
         Box::new(move || ClaimSubscription::new(tx.subscribe())),
         Arc::new(CaOnce(
@@ -1609,4 +1609,41 @@ async fn an_oversized_public_key_is_a_bad_request() {
     let r = e.front.allocate(&sa("alice"), &post_req(&padded)).await;
     assert!(matches!(r, Err(AllocError::InvalidRequest(_))), "{r:?}");
     assert!(claim_names(&e).is_empty());
+}
+
+/// Pool max 2, so one owner binds one worker at a time. Its second claim waits
+/// next to a free pod; once the first is released, the pass its deletion
+/// calls for binds the second, with no pod event needed.
+#[tokio::test]
+async fn releasing_an_owners_worker_lets_its_waiting_claim_bind() {
+    let mut e = env();
+    e.pool.spec.scaling.max = 2;
+    e.pools
+        .apply_watcher_event(&watcher::Event::Apply(e.pool.clone()));
+    e.warm(0);
+    let a = e.ci_claim(30, "sa:x/a");
+    let b = e.ci_claim(20, "sa:x/a");
+    e.warm(1);
+    e.binder.pass(&key()).await;
+    assert_eq!(phase(&e.fake.status(OWN, &a)), ClaimPhase::Bound);
+    assert_eq!(phase(&e.fake.status(OWN, &b)), ClaimPhase::Pending);
+    let gone = e
+        .fake
+        .w
+        .lock()
+        .unwrap()
+        .claims
+        .remove(&(OWN.to_owned(), a.clone()))
+        .unwrap();
+    e.fake
+        .claims
+        .lock()
+        .unwrap()
+        .apply_watcher_event(&watcher::Event::Delete(gone.clone()));
+    assert!(matches!(
+        super::leader::claim_trigger(&ClaimEvent::Delete(Arc::new(gone))),
+        Some(crate::reconcile::driver::Trigger::Pool(k)) if k == key()
+    ));
+    e.binder.pass(&key()).await;
+    assert_eq!(phase(&e.fake.status(OWN, &b)), ClaimPhase::Bound);
 }

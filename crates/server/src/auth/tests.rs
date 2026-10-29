@@ -1247,9 +1247,8 @@ async fn forged_flood_from_one_address_cannot_starve_others() {
         let _ = auth.authenticate_from(&forged(i), attacker).await;
     }
     assert!(auth.reviews.negatives() > 0);
-    // A new identity is still cached after the flood, once the review rate
-    // (spent by forged tokens naming the same subject) has refilled.
-    tokio::time::advance(Duration::from_secs(1)).await;
+    // A new identity is still cached after the flood: with the shared rate
+    // spent, a subject seen recently still gets its reserved share.
     let token = legit(1);
     auth.authenticate_from(&token, ci).await.unwrap();
     auth.authenticate_from(&token, ci).await.unwrap();
@@ -1670,53 +1669,6 @@ async fn forged_tokens_are_reviewed_at_most_at_the_review_rate() {
         let _ = auth.authenticate(&sub_token("evil:x", 2000 + i)).await;
     }
     assert_eq!(auth.reviewer.calls.load(Ordering::SeqCst), 100);
-}
-
-/// Behind a gateway every client shares one address. Forged reviews holding
-/// that address's cap must not lock out a service account seen recently: it
-/// goes through the reserve.
-#[tokio::test(start_paused = true)]
-async fn a_busy_shared_address_still_reaches_the_reserve() {
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let auth = Arc::new(
-        sa_auth(FakeReviewer {
-            gate: Some(Arc::clone(&gate)),
-            ..sa_ok()
-        })
-        .with_max_reviews_per_ip(1),
-    );
-    let gw: Option<std::net::IpAddr> = Some("10.0.0.1".parse().unwrap());
-    let known = {
-        let a = Arc::clone(&auth);
-        tokio::spawn(async move { a.authenticate(&sub_token("ci:builder", 0)).await })
-    };
-    while auth.reviewer.calls.load(Ordering::SeqCst) < 1 {
-        tokio::task::yield_now().await;
-    }
-    gate.add_permits(1);
-    known.await.unwrap().unwrap();
-    let forged = {
-        let a = Arc::clone(&auth);
-        tokio::spawn(async move { a.authenticate_from(&sub_token("evil:x", 1), gw).await })
-    };
-    while auth.reviewer.calls.load(Ordering::SeqCst) < 2 {
-        tokio::task::yield_now().await;
-    }
-    let e = auth
-        .authenticate_from(&sub_token("evil:y", 2), gw)
-        .await
-        .unwrap_err();
-    assert_eq!(e.status(), 503, "an unknown subject stays capped");
-    let legit = {
-        let a = Arc::clone(&auth);
-        tokio::spawn(async move { a.authenticate_from(&sub_token("ci:builder", 3), gw).await })
-    };
-    while auth.reviewer.calls.load(Ordering::SeqCst) < 3 {
-        tokio::task::yield_now().await;
-    }
-    gate.add_permits(8);
-    assert_eq!(legit.await.unwrap().unwrap().owner(), "sa:ci/builder");
-    forged.await.unwrap().unwrap();
 }
 
 /// A bound token's review names its pod; pods sharing a service account are

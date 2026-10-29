@@ -190,7 +190,9 @@ async fn run_term(t: Term, term: u64) {
 /// new or its spec changed. Once the leader has written its status, further
 /// events are the leader's own status writes and the API's `seen-at` and
 /// `delivered` marks, and a pass for each would cost a pass per waiter per write.
-fn claim_trigger(ev: &ClaimEvent) -> Option<Trigger> {
+/// A claim that ends or goes away may free its owner to bind a waiting claim
+/// (the per-owner limit), so it calls for a pass of its pool too.
+pub(super) fn claim_trigger(ev: &ClaimEvent) -> Option<Trigger> {
     match ev {
         ClaimEvent::Apply(c) if claims::phase(c) == ClaimPhase::Pending => {
             let seen = c
@@ -199,8 +201,12 @@ fn claim_trigger(ev: &ClaimEvent) -> Option<Trigger> {
                 .is_some_and(|s| s.observed_generation == c.metadata.generation);
             (!seen).then(|| Trigger::Pool(claims::pool_key(c)))
         }
+        ClaimEvent::Apply(c) if claims::phase(c).is_terminal() => {
+            Some(Trigger::Pool(claims::pool_key(c)))
+        }
+        ClaimEvent::Delete(c) => Some(Trigger::Pool(claims::pool_key(c))),
         ClaimEvent::Resync => Some(Trigger::All),
-        _ => None,
+        ClaimEvent::Apply(_) => None,
     }
 }
 
@@ -473,6 +479,12 @@ mod tests {
         assert!(pass(&claim(Some((ClaimPhase::Pending, Some(1))), 2)));
         assert!(!pass(&claim(Some((ClaimPhase::Pending, Some(1))), 1)));
         assert!(!pass(&claim(Some((ClaimPhase::Bound, Some(1))), 1)));
+        // An ended or deleted claim may free its owner to bind another.
+        assert!(pass(&claim(Some((ClaimPhase::Expired, Some(1))), 1)));
+        let ClaimEvent::Apply(c) = claim(Some((ClaimPhase::Bound, Some(1))), 1) else {
+            unreachable!()
+        };
+        assert!(pass(&ClaimEvent::Delete(c)));
         assert!(matches!(
             claim_trigger(&ClaimEvent::Resync),
             Some(Trigger::All)

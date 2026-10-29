@@ -45,8 +45,8 @@ const POSITIVE_ENTRIES: usize = 4096;
 const NEGATIVE_ENTRIES: usize = 1024;
 /// `TokenReview` calls in flight per client address unless configured otherwise.
 pub const DEFAULT_MAX_REVIEWS_PER_IP: usize = 4;
-/// `TokenReview` calls a second through the shared slots; the reserve gets its
-/// proportional part. Legitimate callers reuse a token for its cache lifetime,
+/// `TokenReview` calls a second through the shared slots. Legitimate callers
+/// reuse a token for its cache lifetime,
 /// so this is far above their need and far below what a flood could send.
 const REVIEWS_PER_SEC: u32 = 50;
 /// Slots of the global pool reserved for recently seen subjects unless configured otherwise.
@@ -300,10 +300,10 @@ pub(crate) fn review_peer(ip: IpAddr) -> IpAddr {
 ///
 /// Slots bound concurrency, not rate: a refused review takes about a
 /// millisecond, so a few slots kept busy with forged tokens would still send
-/// thousands of reviews a second. Each pool therefore also has a token
-/// bucket. The shared pool gets [`REVIEWS_PER_SEC`] reviews a second and the
-/// reserve its proportional part, so a flood of forged tokens costs the API
-/// server at most that much.
+/// thousands of reviews a second. The shared pool therefore also has a token
+/// bucket of [`REVIEWS_PER_SEC`]. The reserve has none: a bucket there would
+/// be keyed off the unverified `sub`, so forgers could drain it; the
+/// per-subject share bounds it instead.
 pub(crate) struct ReviewSlots {
     max: usize,
     reserved: usize,
@@ -311,7 +311,6 @@ pub(crate) struct ReviewSlots {
     shared: Semaphore,
     reserve: Semaphore,
     shared_rate: Bucket,
-    reserve_rate: Bucket,
     /// Reserved slots held per subject.
     held: Mutex<HashMap<String, usize>>,
     recent: Mutex<HashMap<String, Instant>>,
@@ -371,20 +370,16 @@ impl Drop for ReviewSlot<'_> {
 }
 
 impl ReviewSlots {
-    #[allow(clippy::cast_precision_loss, reason = "slot counts are small")]
     pub(crate) fn new(max: usize, reserved: usize, ttl: Duration) -> Self {
-        let rate = f64::from(REVIEWS_PER_SEC);
         let max = max.max(1);
         let reserved = reserved.min(max - 1);
-        let reserve_rate = rate * reserved as f64 / (max - reserved) as f64;
         Self {
             max,
             reserved,
             ttl,
             shared: Semaphore::new(max - reserved),
             reserve: Semaphore::new(reserved),
-            shared_rate: Bucket::new(rate),
-            reserve_rate: Bucket::new(reserve_rate),
+            shared_rate: Bucket::new(f64::from(REVIEWS_PER_SEC)),
             held: Mutex::default(),
             recent: Mutex::default(),
         }
@@ -410,8 +405,9 @@ impl ReviewSlots {
         (self.reserved / 4).max(1)
     }
 
-    /// A slot for a review of `subject`, or `None` when none is open to it:
-    /// a shared one, else a reserved one ([`Self::acquire_reserved`]).
+    /// A slot for a review of `subject`, or `None` when none is open to it: a
+    /// shared one while the shared slots and rate allow, else a reserved one
+    /// for a subject seen recently that holds less than its share.
     pub(crate) fn acquire(&self, subject: &str, now: Instant) -> Option<ReviewSlot<'_>> {
         if let Ok(permit) = self.shared.try_acquire()
             && self.shared_rate.take(now)
@@ -421,12 +417,6 @@ impl ReviewSlots {
                 reserved_for: None,
             });
         }
-        self.acquire_reserved(subject, now)
-    }
-
-    /// A reserved slot for a review of `subject`, which must have been seen
-    /// recently and hold less than its share.
-    pub(crate) fn acquire_reserved(&self, subject: &str, now: Instant) -> Option<ReviewSlot<'_>> {
         if !self.seen_recently(subject, now) {
             return None;
         }
@@ -436,9 +426,6 @@ impl ReviewSlots {
             return None;
         }
         let permit = self.reserve.try_acquire().ok()?;
-        if !self.reserve_rate.take(now) {
-            return None;
-        }
         held.insert(subject.to_owned(), n + 1);
         Some(ReviewSlot {
             _permit: permit,

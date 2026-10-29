@@ -396,23 +396,19 @@ impl<R: TokenReviewer> Authenticator<R> {
         if let Some(hit) = self.reviews.get(&key, now) {
             return hit;
         }
-        let peer_slot = peer.map(|ip| self.review_peers.try_take(token_review::review_peer(ip)));
-        // An address over its cap may still use the reserve for a subject seen
-        // recently: behind a gateway every client shares one address, and the
-        // reserve exists for exactly those callers. Its per-subject share bounds them.
-        let (_peer_slot, _slot) = match peer_slot {
-            Some(None) => match self.review_slots.acquire_reserved(&subject, now) {
-                Some(s) => (None, s),
+        let _peer_slot = match peer {
+            Some(ip) => match self.review_peers.try_take(token_review::review_peer(ip)) {
+                Some(s) => Some(s),
                 None => {
                     return Err(AuthError::Upstream(
                         "tokenreview busy for this address".into(),
                     ));
                 }
             },
-            p => match self.review_slots.acquire(&subject, now) {
-                Some(s) => (p.flatten(), s),
-                None => return Err(AuthError::Upstream("tokenreview saturated".into())),
-            },
+            None => None,
+        };
+        let Some(_slot) = self.review_slots.acquire(&subject, now) else {
+            return Err(AuthError::Upstream("tokenreview saturated".into()));
         };
         let status = self
             .reviewer
