@@ -16,6 +16,8 @@
 //!   [`Observed::recent_creates`], and the executor arms
 //!   [`Plan::requeue_after_outcomes`]: a 409 requeues the pool at once, any
 //!   other failure under the error backoff (neither produces a pod event);
+//! - a failed `CreatePod` skips the later ones and starts or doubles the create
+//!   backoff, as [`BackoffSignal::Bump`] does;
 //! - [`Plan::slot_holds`] is kept per pool for the leadership term and passed
 //!   back in [`Observed::slot_holds`].
 //!
