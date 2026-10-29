@@ -10,9 +10,10 @@
 //!    for the rollout to reach the carrier late.
 //! b. The Lease moves to a live replica within 15 s of SIGTERM to the leader,
 //!    while the old leader is still in its `shutdown.delay`.
-//! c. With the one worker held, a second allocation queued on a replica that is
-//!    then deleted gets HTTP 503 `shutting_down` with `Retry-After`, not a reset,
-//!    and a retry after the first allocation is released succeeds.
+//! c. With the one worker held, a second allocation answers 202 pending. Its
+//!    claim survives a rollout of both replicas, stays counted once in the
+//!    pool's `status.waiting`, and binds (a long poll answers 200) once the
+//!    first allocation is released.
 //!
 //! The client is the real curl recipe `docs/ci/buildkit-allocate.sh` and real
 //! `docker buildx` on the host, through the API and edge that kind publishes on
@@ -121,7 +122,7 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
     };
     build_survives_rollout(&c, &ctx)?;
     lease_moves_on_sigterm(env)?;
-    queued_request_gets_503(&c)?;
+    pending_claim_survives_rollout(&c)?;
     println!("drain-verify: all checks passed");
     Ok(())
 }
@@ -351,6 +352,19 @@ impl Client<'_> {
         v["id"].as_str().map(str::to_owned).context("allocation id")
     }
 
+    /// `GET /v1/allocations/{id}?wait=25s`: the status code and body.
+    fn get(&self, id: &str) -> Result<(String, String)> {
+        let out = self.work.join("get.body");
+        let code = output(
+            self.curl()?
+                .arg("-o")
+                .arg(&out)
+                .args(["-w", "%{http_code}", "--max-time", "40"])
+                .arg(format!("{}/v1/allocations/{id}?wait=25s", *API)),
+        )?;
+        Ok((code, std::fs::read_to_string(&out).unwrap_or_default()))
+    }
+
     fn release(&self, id: &str) -> Result<()> {
         let code = output(
             self.curl()?
@@ -539,148 +553,78 @@ fn lease_moves_on_sigterm(env: &Cluster) -> Result<()> {
     Ok(())
 }
 
-/// c. A request queued on a stopping replica gets 503 `shutting_down`.
-fn queued_request_gets_503(c: &Client<'_>) -> Result<()> {
+/// c. A pending allocation is a claim, so it survives a rollout of every
+/// replica, is counted once in the pool's `status.waiting` throughout, and
+/// binds once the held worker is released.
+fn pending_claim_survives_rollout(c: &Client<'_>) -> Result<()> {
     let env = c.env;
     wait_pool_warm(env)?;
     let held = c.allocate_ok("a", 0)?;
     println!("holding the only worker with allocation {held}");
-    let mut queued = Spawned::spawn(&mut c.allocate("b", 300)?)?;
-    let replica = until(
-        "the second request to queue",
-        Duration::from_mins(1),
-        || {
-            if let Some(s) = queued.try_wait()? {
-                bail!(
-                    "request b ended before it queued: {s} {}",
-                    c.read("b", "code")
-                );
-            }
-            let w = env.kubectl(&[
-                "get",
-                "buildkitpool",
-                POOL,
-                "-n",
-                POOL_NS,
-                "-o",
-                "jsonpath={range .status.waiters[*]}{.replica} {.count}{\"\\n\"}{end}",
-            ])?;
-            Ok(w.lines().find_map(|l| {
-                let (r, n) = l.split_once(' ')?;
-                (n.trim().parse::<i32>().ok()? > 0).then(|| r.to_owned())
-            }))
-        },
-    )?;
-    env.kubectl(&["delete", "pod", &replica, "-n", NS, "--wait=false"])?;
-    let t0 = Instant::now();
-    let exit = loop {
-        if let Some(s) = queued.try_wait()? {
-            break s;
-        }
-        if t0.elapsed() > Duration::from_mins(1) {
-            queued.kill();
-            bail!("the queued request got no answer within 60s of SIGTERM");
-        }
-        std::thread::sleep(Duration::from_millis(200));
+    status(&mut c.allocate("b", 300)?)?;
+    let (code, body) = (c.read("b", "code"), c.read("b", "body"));
+    ensure!(code == "202", "request b: HTTP {code} {body}");
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    ensure!(
+        v["state"] == "pending" && v["position"] == 1,
+        "request b: {body}"
+    );
+    let id = v["id"].as_str().context("allocation id")?.to_owned();
+    let claim = |field: &str| {
+        env.kubectl(&[
+            "get",
+            "bkc",
+            &id,
+            "-n",
+            NS,
+            "-o",
+            &format!("jsonpath={field}"),
+        ])
     };
-    let answered = t0.elapsed();
-    let (code, hdr, body) = (c.read("b", "code"), c.read("b", "hdr"), c.read("b", "body"));
-    ensure!(
-        exit.success(),
-        "curl failed ({exit}): the connection was cut, not answered"
-    );
-    ensure!(code == "503", "queued request got HTTP {code}: {body}");
-    let retry_after = hdr
-        .lines()
-        .find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            k.trim()
-                .eq_ignore_ascii_case("retry-after")
-                .then(|| v.trim().to_owned())
-        })
-        .context("no Retry-After header")?;
-    ensure!(body.contains("\"shutting_down\""), "body: {body}");
-    println!(
-        "PASS c: request queued on {replica} answered 503 shutting_down, Retry-After {retry_after}, {}ms after SIGTERM",
-        answered.as_millis()
-    );
-    retry_is_counted_once(c, &replica, t0, &held)
-}
-
-/// c, continued: the retry of the refused request queues on a live replica and is
-/// counted once, and it gets 201 once the held worker is released.
-fn retry_is_counted_once(c: &Client<'_>, replica: &str, t0: Instant, held: &str) -> Result<()> {
-    let env = c.env;
-    // The client retries at once, while the worker is still held, so it queues
-    // on a live replica. The stopping replica's entry must already read 0, or
-    // the leader counts the request twice and plans surplus workers.
-    let mut retry = Spawned::spawn(&mut c.allocate("b2", 120)?)?;
-    let cleared = until(
-        "the stopping replica's waiters entry to clear and the retry to queue",
-        Duration::from_secs(30),
-        || {
-            if let Some(s) = retry.try_wait()? {
-                bail!(
-                    "the retry ended before it queued: {s} {}",
-                    c.read("b2", "code")
-                );
-            }
-            let w = waiters(env)?;
-            let old = w.get(replica).copied().unwrap_or(0);
-            let queued_elsewhere = w.iter().any(|(r, n)| r != replica && *n > 0);
-            Ok((old == 0 && queued_elsewhere).then_some(w))
-        },
-    )?;
-    let cleared_after = t0.elapsed();
+    let uid = claim("{.metadata.uid}")?;
+    println!("PASS c: request b answered 202 pending at place 1 after the POST's wait ({id})");
+    env.kubectl(&["rollout", "restart", DEPLOY, "-n", NS])?;
+    let t0 = Instant::now();
     let (max_waiting, max_pods) = watch_for_surplus(env)?;
+    env.kubectl(&["rollout", "status", DEPLOY, "-n", NS, "--timeout=300s"])?;
+    let rolled = t0.elapsed();
+    let now = claim("{.metadata.uid} {.status.phase} {.status.queuePosition}")?;
     ensure!(
-        max_waiting <= 1,
-        "status.waiting reached {max_waiting} with one queued request"
+        now == format!("{uid} Pending 1"),
+        "the pending claim did not survive the rollout: {now}"
+    );
+    ensure!(
+        max_waiting == 1,
+        "status.waiting reached {max_waiting} with one pending claim"
     );
     ensure!(max_pods <= 1, "{max_pods} worker pods with scaling.max 1");
     println!(
-        "PASS c: {replica}'s status.waiters entry read 0 {}ms after SIGTERM ({cleared:?}); over 20s with the retry queued, status.waiting max {max_waiting}, worker pods max {max_pods}",
-        cleared_after.as_millis()
+        "PASS c: after a rollout of {}s the claim is still Pending at place 1 (uid unchanged); status.waiting stayed 1, worker pods max {max_pods}",
+        rolled.as_secs()
     );
-    c.release(held)?;
+    c.release(&held)?;
     let started = Instant::now();
     loop {
-        if let Some(s) = retry.try_wait()? {
-            ensure!(s.success(), "the retry failed: {s}");
-            break;
+        let (code, body) = c.get(&id)?;
+        match code.as_str() {
+            "200" => {
+                let v: serde_json::Value = serde_json::from_str(&body)?;
+                ensure!(v["id"] == id.as_str(), "bound: {body}");
+                break;
+            }
+            "202" => {}
+            _ => bail!("poll of {id}: HTTP {code} {body}"),
         }
         ensure!(
             started.elapsed() < Duration::from_mins(3),
-            "the retry was not served after the release"
+            "the pending claim was not bound after the release"
         );
-        std::thread::sleep(Duration::from_millis(500));
     }
-    let (code, body) = (c.read("b2", "code"), c.read("b2", "body"));
-    ensure!(code == "201", "retry: HTTP {code} {body}");
-    let v: serde_json::Value = serde_json::from_str(&body)?;
-    let retried = v["id"].as_str().context("allocation id")?.to_owned();
-    c.release(&retried)?;
-    println!("PASS c: the queued retry got 201 after the release ({retried})");
-    Ok(())
-}
-
-/// `status.waiters` of the pool, by replica.
-fn waiters(env: &Cluster) -> Result<BTreeMap<String, i32>> {
-    let w = env.kubectl(&[
-        "get",
-        "buildkitpool",
-        POOL,
-        "-n",
-        POOL_NS,
-        "-o",
-        "jsonpath={range .status.waiters[*]}{.replica} {.count}{\"\\n\"}{end}",
-    ])?;
-    Ok(w.lines()
-        .filter_map(|l| {
-            let (r, n) = l.split_once(' ')?;
-            Some((r.to_owned(), n.trim().parse().ok()?))
-        })
-        .collect())
+    println!(
+        "PASS c: the claim bound {}ms after the held worker was released",
+        started.elapsed().as_millis()
+    );
+    c.release(&id)
 }
 
 /// Highest `status.waiting` and live worker pod count seen over 20 s.

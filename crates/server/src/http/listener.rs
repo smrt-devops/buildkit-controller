@@ -29,10 +29,6 @@ use crate::edge::{PerPeer, tune_socket};
 use crate::net::ProxyProtocol;
 use crate::runtime::listen::canonical;
 
-/// Request extension that fires when the replica starts shutting down.
-#[derive(Clone, Debug)]
-pub struct Stopping(pub CancellationToken);
-
 /// Serving cert material: `None` until the first valid cert is loaded.
 pub type ServingCerts = watch::Receiver<Option<Arc<CertifiedKey>>>;
 
@@ -121,9 +117,7 @@ impl Configs {
 }
 
 /// Serve `app` on `listener` until `shutdown`, then stop accepting and let open
-/// connections finish. Requests carry a [`Stopping`] extension; once it fires,
-/// the API refuses new allocations with 503 `shutting_down` (see [`drive`] for
-/// how each protocol closes).
+/// connections finish (see [`drive`] for how each protocol closes).
 pub async fn serve(
     listener: TcpListener,
     app: Router,
@@ -239,10 +233,7 @@ async fn connection(
     };
     // The protocol comes from ALPN, so there is no sniffing phase without a deadline.
     let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
-    let inner = TowerToHyperService::new(
-        app.layer(axum::Extension(Peer(peer)))
-            .layer(axum::Extension(Stopping(shutdown.clone()))),
-    );
+    let inner = TowerToHyperService::new(app.layer(axum::Extension(Peer(peer))));
     let flight = Arc::new(InFlight::default());
     let svc = {
         let (flight, stop) = (Arc::clone(&flight), shutdown.clone());
@@ -324,13 +315,13 @@ impl Drop for Active {
 /// connection to close (HTTP/2 GOAWAY, so a stream that raced in still
 /// completes). If the connection is still idle one more `idle_timeout` later,
 /// the server drops it. This function never bounds an open request, because a
-/// POST may wait in the queue.
+/// POST waits up to 20 s for its allocation and a GET up to 25 s.
 ///
 /// On `shutdown` an HTTP/2 connection gets GOAWAY at once, and is dropped once
 /// it has had no request open for `idle_timeout`. An HTTP/1 connection keeps
 /// running, its responses carry `Connection: close` from then on, and the idle
 /// bound closes it if no request comes. So a request already on the wire gets
-/// an answer (503 `shutting_down` for an allocation), not a reset.
+/// an answer, not a reset: a waiting allocation answers at once with its state.
 async fn drive<C>(
     conn: C,
     peer: SocketAddr,

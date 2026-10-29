@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 pub use api::{Allocator, ApiState, Authenticate, EdgeInfo, router};
-pub use listener::{Limits, ServingCerts, Stopping, serve, serve_with_proxy, server_config};
+pub use listener::{Limits, ServingCerts, serve, serve_with_proxy, server_config};
 pub use metrics::HttpMetrics;
 
 use crate::alloc::AllocService;

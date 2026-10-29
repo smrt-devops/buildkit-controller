@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitClaim
+metadata: {name: claim-no-pool-ref, namespace: default}
+spec:
+  ttl: 10m

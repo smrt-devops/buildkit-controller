@@ -238,6 +238,24 @@ mod tests {
         assert!(y.contains("self.metadata.name.size() <= 244"));
         assert!(y.contains("duration(self) >= duration('60s')"));
         assert!(!y.contains("not supported yet"));
+        let v = serde_json::to_value(crd()).unwrap_or_default();
+        let schema = &v["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"];
+        let spec = &schema["spec"]["properties"];
+        for f in ["queueTimeout", "publicKey", "owner", "cacheScope"] {
+            assert!(spec.get(f).is_some(), "spec.{f}");
+        }
+        assert_eq!(spec["publicKey"]["maxLength"], 1024);
+        assert_eq!(spec["owner"]["minLength"], 1);
+        let status = &schema["status"]["properties"];
+        for f in ["pod", "certificate", "queuePosition", "cache"] {
+            assert!(status.get(f).is_some(), "status.{f}");
+        }
+        let cols = &v["spec"]["versions"][0]["additionalPrinterColumns"];
+        assert!(
+            cols.as_array()
+                .is_some_and(|c| c.iter().any(|c| c["jsonPath"] == ".status.queuePosition")),
+            "{cols}"
+        );
     }
 
     #[test]

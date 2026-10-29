@@ -275,14 +275,9 @@ fn crd_verify() -> Result<()> {
             .collect::<Vec<_>>()
             .join("\n")
     );
-    let crd_file = root.join(CRD_PATH);
-    let crd_arg = crd_file.to_string_lossy().into_owned();
     cluster
-        .kubectl(&["apply", "--server-side", "-f", &crd_arg])
-        .context("CRD rejected")?;
-    cluster
-        .wait_crd_established()
-        .context("CRD not established")?;
+        .apply_crds()
+        .context("CRDs rejected or not established")?;
     let (mut passed, mut failed) = (0usize, Vec::new());
     for (dir, want_ok) in [("accept", true), ("reject", false)] {
         for file in yaml_files(&root.join(FIXTURES).join(dir))? {

@@ -68,9 +68,8 @@ const DEGRADED_ORDER: [&str; 6] = [
 pub struct PlanConfig {
     /// How long a slot that answered 409 stays held before one retry (10 min).
     pub slot_hold: SignedDuration,
-    /// A new hold reports `SlotTaken` only once it is this old (2 s), so the
-    /// usual race with an API replica's cold create, whose pod reaches the
-    /// store a moment later, does not flap `Degraded`.
+    /// A new hold reports `SlotTaken` only once it is this old (2 s), so a
+    /// create whose pod reaches the store a moment later does not flap `Degraded`.
     pub slot_taken_grace: SignedDuration,
     /// A terminating pod (free, allocated or draining) is force-deleted this
     /// long after `deletionTimestamp + grace` (2 min).

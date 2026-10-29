@@ -32,7 +32,7 @@ use buildkit_controller::render::{
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::{CRD_PATH, root};
+use super::root;
 use crate::image::WORKER_IMAGE;
 use crate::kube::Cluster;
 use crate::proc::{Spawned, status};
@@ -264,9 +264,7 @@ pub(crate) fn edge_verify() -> Result<()> {
     crate::image::ensure_worker()?;
     status(&mut crate::kube::kind_load(WORKER_IMAGE, env.name()))?;
 
-    let crd = root.join(CRD_PATH).to_string_lossy().into_owned();
-    env.kubectl(&["apply", "--server-side", "-f", &crd])?;
-    env.wait_crd_established()?;
+    env.apply_crds()?;
     env.kubectl(&["create", "namespace", SYSTEM_NS])?;
     // The controller pod must pass PodSecurity "restricted".
     env.kubectl(&[
