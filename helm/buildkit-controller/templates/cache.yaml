@@ -1,0 +1,179 @@
+{{- if .Values.cache.enabled }}
+{{- $fn := include "bkc.fullname" . -}}
+{{- $ns := .Release.Namespace -}}
+{{- $name := printf "%s-registry" $fn -}}
+{{- $watch := include "bkc.watchNamespaces" . | fromJsonArray -}}
+{{- $labels := printf "%s\napp.kubernetes.io/component: cache\napp.kubernetes.io/managed-by: %s\napp.kubernetes.io/version: %s\nhelm.sh/chart: %s" (include "bkc.registrySelectorLabels" .) .Release.Service (.Chart.AppVersion | quote) (printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-") -}}
+{{- $read := list
+  (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitpools") "verbs" (list "get" "list" "watch"))
+  (dict "apiGroups" (list "") "resources" (list "pods") "verbs" (list "get" "list" "watch")) -}}
+{{- $subjects := list (dict "kind" "ServiceAccount" "name" $name "namespace" $ns) -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels: {{- $labels | nindent 4 }}
+---
+{{- /* The registry reads worker pods and pools to authorize each worker: in watchNamespaces, or cluster-wide. */}}
+{{- range $i, $wns := $watch }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}-{{ $ns }}
+  namespace: {{ $wns }}
+  labels: {{- $labels | nindent 4 }}
+rules: {{- toYaml $read | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}-{{ $ns }}
+  namespace: {{ $wns }}
+  labels: {{- $labels | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: {{ $name }}-{{ $ns }}}
+subjects: {{- toYaml $subjects | nindent 2 }}
+---
+{{- else }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}-{{ $ns }}
+  labels: {{- $labels | nindent 4 }}
+rules: {{- toYaml $read | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}-{{ $ns }}
+  labels: {{- $labels | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: {{ $name }}-{{ $ns }}}
+subjects: {{- toYaml $subjects | nindent 2 }}
+---
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels: {{- $labels | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector: {{- include "bkc.registrySelectorLabels" . | nindent 4 }}
+  ports:
+    - {name: registry, port: 5000, targetPort: registry}
+    - {name: metrics, port: {{ .Values.metrics.port }}, targetPort: ops}
+---
+{{- /* Worker pods only reach the registry port; the ops port serves probes and metrics. */}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels: {{- $labels | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "bkc.registrySelectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/managed-by: buildkit-controller
+              app.kubernetes.io/name: buildkitd
+      ports:
+        - {protocol: TCP, port: 5000}
+    - ports:
+        - {protocol: TCP, port: {{ .Values.metrics.port }}}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels: {{- $labels | nindent 4 }}
+spec:
+  replicas: 1
+  serviceName: {{ $name }}
+  selector:
+    matchLabels: {{- include "bkc.registrySelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- $labels | nindent 8 }}
+      {{- with .Values.cache.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ $name }}
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: registry
+          image: {{ include "bkc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [cache]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: [ALL]}
+          env:
+            - {name: LOG_LEVEL, value: {{ .Values.logLevel | quote }}}
+            - {name: LOG_FORMAT, value: {{ .Values.logFormat | quote }}}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: BUILDKIT_CACHE_OPS_LISTEN, value: {{ printf "0.0.0.0:%d" (int .Values.metrics.port) | quote }}}
+            - {name: BUILDKIT_CACHE_MAX_SIZE, value: {{ .Values.cache.maxSize | quote }}}
+            - {name: BUILDKIT_CACHE_POOL_MAX_SIZE, value: {{ .Values.cache.poolMaxSize | quote }}}
+            - {name: BUILDKIT_CACHE_MAX_BLOB_SIZE, value: {{ .Values.cache.maxBlobSize | quote }}}
+            - {name: BUILDKIT_CACHE_MAX_UPLOAD_SIZE, value: {{ .Values.cache.maxUploadSize | quote }}}
+            - {name: BUILDKIT_CACHE_GC_INTERVAL, value: {{ .Values.cache.gcInterval | quote }}}
+            {{- with $watch }}
+            - {name: BUILDKIT_CACHE_WATCH_NAMESPACES, value: {{ join "," . | quote }}}
+            {{- end }}
+          ports:
+            - {name: registry, containerPort: 5000}
+            - {name: ops, containerPort: {{ .Values.metrics.port }}}
+          livenessProbe:
+            httpGet: {path: /healthz, port: ops}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: ops}
+            periodSeconds: 5
+          resources: {{- toYaml .Values.cache.resources | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/buildkit-cache}
+            - {name: tls, mountPath: /etc/buildkit-cache/tls, readOnly: true}
+      volumes:
+        - name: tls
+          {{- /* The leader writes this Secret; the pod starts once it exists. */}}
+          secret: {secretName: {{ $name }}-tls, defaultMode: 0440}
+      {{- with .Values.cache.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.cache.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.cache.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.cache.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests: {storage: {{ .Values.cache.persistence.size | quote }}}
+{{- end }}

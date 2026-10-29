@@ -67,18 +67,6 @@ metadata:
   name: {{ .name }}
   namespace: {{ $ns }}
   labels: {{- include "bkc.labels" $ | nindent 4 }}
-{{- /* cache goes over spec.workers.cache; cacheDefaults fills a missing registry repository. */}}
-{{- $spec := deepCopy (default (dict) .spec) }}
-{{- $workers := default (dict) (get $spec "workers") }}
-{{- $cache := mergeOverwrite (deepCopy (default (dict) (get $workers "cache"))) (deepCopy (default (dict) .cache)) }}
-{{- $defaultRepo := dig "registry" "repository" "" $.Values.cacheDefaults }}
-{{- if and $defaultRepo (not (dig "registry" "repository" "" $cache)) }}
-{{- $_ := set $cache "registry" (merge (dict "repository" $defaultRepo) (default (dict) (get $cache "registry"))) }}
-{{- end }}
-{{- if $cache }}
-{{- $_ := set $workers "cache" $cache }}
-{{- $_ := set $spec "workers" $workers }}
-{{- end }}
-spec: {{- toYaml $spec | nindent 2 }}
+spec: {{- toYaml (default (dict) .spec) | nindent 2 }}
 ---
 {{- end }}

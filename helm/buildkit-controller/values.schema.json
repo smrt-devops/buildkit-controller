@@ -254,27 +254,33 @@
         "properties": {
           "name": {"type": "string", "minLength": 1},
           "namespace": {"type": "string"},
-          "spec": {"type": "object"},
-          "cache": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "registry": {"$ref": "#/definitions/registryCache"},
-              "local": {"$ref": "#/definitions/localCache"}
-            }
-          }
+          "spec": {"type": "object"}
         }
       }
     },
-    "cacheDefaults": {
+    "cache": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "registry": {
+        "enabled": {"type": "boolean"},
+        "maxSize": {"$ref": "#/definitions/size"},
+        "poolMaxSize": {"$ref": "#/definitions/size"},
+        "maxBlobSize": {"$ref": "#/definitions/size"},
+        "maxUploadSize": {"$ref": "#/definitions/size"},
+        "gcInterval": {"type": "string", "pattern": "^[1-9][0-9]*[smh]$"},
+        "persistence": {
           "type": "object",
           "additionalProperties": false,
-          "properties": {"repository": {"type": "string", "maxLength": 255}}
-        }
+          "properties": {
+            "size": {"$ref": "#/definitions/quantity"},
+            "storageClass": {"type": "string", "maxLength": 253}
+          }
+        },
+        "resources": {"type": "object"},
+        "podAnnotations": {"type": "object"},
+        "nodeSelector": {"type": "object"},
+        "tolerations": {"type": "array"},
+        "affinity": {"type": "object"}
       }
     }
   },
@@ -310,30 +316,6 @@
     "gatewayHostname": {"type": "string", "pattern": "^(\\*\\.)?[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", "maxLength": 253},
     "gatewayDuration": {"type": "string", "pattern": "^([0-9]{1,5}(h|m|s|ms)){1,4}$"},
     "quantity": {"type": ["string", "integer"]},
-    "registryCache": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "repository": {"type": "string", "maxLength": 255},
-        "enabled": {"type": "boolean"},
-        "mode": {"enum": ["max", "min"]},
-        "ref": {"type": "string", "minLength": 1, "maxLength": 255},
-        "defaultKey": {"type": "string", "pattern": "^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$", "maxLength": 63},
-        "importFrom": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1}}
-      }
-    },
-    "localCache": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "scope": {"enum": ["identity", "pool"]},
-        "size": {"$ref": "#/definitions/quantity"},
-        "storageClass": {"type": "string", "maxLength": 253},
-        "maxVolumes": {"type": "integer", "minimum": 1, "maximum": 500},
-        "affinity": {"enum": ["soft", "off"]},
-        "keysPerVolume": {"type": "integer", "minimum": 1, "maximum": 32},
-        "gcKeepStorage": {"$ref": "#/definitions/quantity"}
-      }
-    }
+    "size": {"type": "string", "pattern": "^[0-9]+(Ki|Mi|Gi|Ti)?$"}
   }
 }
