@@ -11,7 +11,7 @@ metadata:
     app.kubernetes.io/name: buildkitd
     buildkit.smrt-devops.net/pool: egress-deny
     buildkit.smrt-devops.net/state: free
-    buildkit.smrt-devops.net/template-hash: 4c1f8691b9
+    buildkit.smrt-devops.net/template-hash: 5a34d0538a
   name: egress-deny-0
   namespace: render-verify
   ownerReferences:
@@ -58,6 +58,9 @@ spec:
         ephemeral-storage: 1Gi
         memory: 1Gi
     securityContext:
+      capabilities:
+        drop:
+        - NET_RAW
       privileged: false
     startupProbe:
       exec:

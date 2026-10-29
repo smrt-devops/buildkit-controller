@@ -5,9 +5,10 @@
 //! The Secret is born owned by the pod, so the garbage collector removes it
 //! with the pod and no other owner ever holds a worker's private key. Until
 //! the Secret exists the kubelet cannot mount it, so the pod does not start.
-//! A pod whose Secret never arrives (the create failed, the creator crashed)
-//! stays unready and is retired at `workers.startTimeout`, taking nothing with
-//! it. A pod create whose outcome is unknown is confirmed with a read of the
+//! When the Secret create fails the caller deletes the pod at once, since a
+//! Secret of that name planted by someone else would let it start. A pod whose
+//! Secret never arrives because the creator crashed stays unready and is retired
+//! at `workers.startTimeout`, taking nothing with it. A pod create whose outcome is unknown is confirmed with a read of the
 //! pod before any Secret is created.
 
 use std::future::Future;
@@ -117,8 +118,8 @@ pub struct Spawned<T> {
     /// The pod as resolved: an unknown create outcome is confirmed by a read
     /// of the pod (and its nonce), so `Unknown` here means the read failed too.
     pub pod: PodCreated,
-    /// `Err` when the pod exists but its Secret was not created. That pod
-    /// never starts and is retired at `workers.startTimeout`.
+    /// `Err` when the pod exists but its Secret was not created. The caller
+    /// deletes that pod.
     pub secret: Result<(), String>,
 }
 
