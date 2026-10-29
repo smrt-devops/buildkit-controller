@@ -41,7 +41,7 @@ A pool's `spec.network.egress.allowCIDRs` opens ranges such as a private registr
 - metadata endpoints outside link-local: Alibaba 100.100.100.200 and the IPv6 endpoints of AWS (`fd00:ec2::254`), GCE (`fd20:ce::254`), Akamai (`fd00:a9fe:a9fe::1`), Oracle (`fd00:c1::a9fe:a9fe`) and Scaleway (`fd00:42::42`);
 - 64:ff9b:1::/48, the local-use NAT64 prefix.
 
-Every pool's NetworkPolicy denies the protected ranges, whatever `workerNetwork.deniedCIDRs` says. The list does not cover every provider's metadata endpoint. If your cloud serves metadata from another address, add it to `workerNetwork.extraDeniedCIDRs`. To deny more, add to `extraDeniedCIDRs` rather than replacing `deniedCIDRs`, because Helm replaces a list you set.
+Every pool's NetworkPolicy denies the protected ranges other than loopback, whatever `workerNetwork.deniedCIDRs` says. The list does not cover every provider's metadata endpoint. If your cloud serves metadata from another address, add it to `workerNetwork.extraDeniedCIDRs`. To deny more, add to `extraDeniedCIDRs` rather than replacing `deniedCIDRs`, because Helm replaces a list you set.
 
 Overlap means either range holds the other. An IPv4-mapped IPv6 entry (`::ffff:a.b.c.d`) and an entry in the NAT64 well-known prefix 64:ff9b::/96 count as the IPv4 range they reach.
 

@@ -126,13 +126,12 @@ longest edge connection lifetime (24h maxTTL cap + 5m cert margin = 86700 s). */
 {{- end -}}
 
 {{/*
-Helm applies crds/ on first install only. On an upgrade against a cluster, fail when a
-served CRD predates this chart: the API server would prune the new fields, so pools would
-lose cache.writers and every API claim its publicKey. Probes: a field each CRD gained in
-0.2.0. Offline renders (helm template) see no CRDs and skip the check.
+Helm skips crds/ when the CRDs exist: on an upgrade, or on an install over CRDs that an
+earlier release left. Against a cluster, fail when a served CRD predates this chart: the
+API server would prune the new fields, so pools would lose cache.writers and every API
+claim its publicKey. Probes: a field each CRD gained in 0.2.0. Offline renders (helm template) see no CRDs and skip the check.
 */}}
 {{- define "bkc.crdGuard" -}}
-{{- if .Release.IsUpgrade -}}
 {{- $pools := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "buildkitpools.buildkit.smrt-devops.net" -}}
 {{- if $pools -}}
   {{- $claims := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "buildkitclaims.buildkit.smrt-devops.net" -}}
@@ -153,6 +152,5 @@ lose cache.writers and every API claim its publicKey. Probes: a field each CRD g
   {{- if not (and $poolOk $claimOk) -}}
     {{- fail "the BuildKitPool or BuildKitClaim CRD in this cluster is older than this chart. Helm does not upgrade crds/, so apply them first: kubectl apply --server-side --force-conflicts -f helm/buildkit-controller/crds/ (see docs/operations.md, Upgrades)" -}}
   {{- end -}}
-{{- end -}}
 {{- end -}}
 {{- end -}}

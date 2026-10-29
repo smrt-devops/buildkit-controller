@@ -72,7 +72,7 @@ All notable changes are listed here, newest first.
 - The API's per-address caps count an IPv6 client by its /56.
 - Every TokenReview shares one limit of 50 a second per replica. Over a limit, the caller gets the retryable `503 upstream_error`.
 - An OIDC token signed with a key id that the controller has not fetched yet, while a recent fetch holds the next one back, gets `503 upstream_error` instead of `401`.
-- Every pool's NetworkPolicy denies the protected link-local, loopback, metadata and NAT64 ranges, whatever `workerNetwork.deniedCIDRs` says.
+- Every pool's NetworkPolicy denies the protected link-local, metadata and NAT64 ranges, whatever `workerNetwork.deniedCIDRs` says.
 - The leader applies a pool's ServiceAccount and NetworkPolicy before every pass that creates pods, and again every 5 minutes.
 - After a refused pod create, the pass creates nothing more and the create backoff starts. A pod whose Secret create failed is deleted at once.
 - In the last 25 hours of either CA's life the leader creates no worker pods.
