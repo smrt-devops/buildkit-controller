@@ -18,7 +18,7 @@ All notable changes are listed here, newest first.
 - `spec.workers.cache.sizeLimit` moves to `spec.workers.stateSizeLimit`. It sizes the buildkitd state `emptyDir`, not the cache.
 - Helm value `claims.enabled` is removed, and the chart rejects it. A non-empty `claims.namespaces` turns on in-cluster claims.
 - Helm value `watchNamespace` and the controller config key of the same name are removed. Use `watchNamespaces: [<namespace>]`.
-- Helm values and config keys `auth.serviceAccount.reservedReviews` and `auth.serviceAccount.recentSubjectTtl` are removed, and the chart and the controller reject them.
+- The TokenReview reserve for recently seen service accounts is removed, with its two Helm values and config keys under `auth.serviceAccount`. The chart and the controller reject them.
 - The claim CRD moves from a chart template to `crds/`, beside the pool CRD. Helm installs both on first install and upgrades neither, so apply `crds/` yourself before `helm upgrade`. A claim CRD that v0.1.0 installed as a template carries `helm.sh/resource-policy: keep`, so the upgrade does not delete it.
 - The cache registry runs as `buildkit-controller registry`, its chart template is `registry.yaml` with the label `app.kubernetes.io/component: registry`, and the controller config keys are `registry.host` and `registry.tlsSecretName`. The chart writes them; only a hand-written config needs them.
 - The error codes `shutting_down` and `start_timeout` are gone from the API. The Action and `buildkit-allocate.sh` still retry them, so they keep working against a v0.1.0 controller during the upgrade.
