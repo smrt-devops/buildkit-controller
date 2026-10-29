@@ -14,11 +14,27 @@ This page installs the controller, creates a pool and runs one build with the Gi
 The chart is also a release asset. Wherever a command below says `helm install bk helm/buildkit-controller`, you can install the packaged chart instead, without a checkout:
 
 ```sh
-helm install bk https://github.com/smrt-devops/buildkit-controller/releases/download/v0.1.0/buildkit-controller-0.1.0.tgz \
+helm install bk https://github.com/smrt-devops/buildkit-controller/releases/download/v0.2.0/buildkit-controller-0.2.0.tgz \
   -n buildkit-system --create-namespace   # plus the same --set flags as below
 ```
 
-That release predates some features and fixes in this repository. A setting or behavior these docs describe may need a newer release, so use the chart from a checkout of the matching tag or commit when a `--set` flag is rejected.
+A checkout installs the image of its `Chart.yaml` `appVersion`, so check out the release tag (`git checkout v0.2.0`), not a branch.
+
+### Verify a release
+
+The release workflow signs the image with cosign (keyless, GitHub OIDC) and attaches build provenance to the image and the chart. Each release's notes give the image digest and these commands with the values filled in:
+
+```sh
+IMAGE=ghcr.io/smrt-devops/buildkit-controller DIGEST=sha256:<digest from the release notes>
+cosign verify "$IMAGE@$DIGEST" \
+  --certificate-identity https://github.com/smrt-devops/buildkit-controller/.github/workflows/release.yml@refs/tags/v0.2.0 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+gh attestation verify "oci://$IMAGE@$DIGEST" -R smrt-devops/buildkit-controller
+curl -sSfLO https://github.com/smrt-devops/buildkit-controller/releases/download/v0.2.0/buildkit-controller-0.2.0.tgz
+gh attestation verify buildkit-controller-0.2.0.tgz -R smrt-devops/buildkit-controller
+```
+
+To run exactly the image you verified, pin its digest: `--set image.tag=0.2.0@sha256:<digest>`.
 
 ### On a real cluster
 
@@ -41,7 +57,7 @@ kubectl get httproute,tlsroute -n buildkit-system
 
 `watchNamespaces` lists the namespaces that hold pools (`ci`, created before the install). The chart grants the controller pod and Secret access in those namespaces only, and the controller ignores pools anywhere else. Leave it out and the controller serves every namespace through a ClusterRole that can create pods and Secrets anywhere, kube-system included. The chart refuses to render without `edge.endpoint`, `edge.serverName` and `gateway.parentRefs`. The API URL is `https://bk.example.com`, and `edge.endpoint` must be the Gateway's edge listener. Without `auth.oidc`, only ServiceAccount tokens authenticate.
 
-Behind a gateway every client reaches the controller from the gateway's addresses, so the per-address caps apply to all clients together. Raise `edge.maxHandshakesPerIp`, `api.maxConnectionsPerIp` and `auth.serviceAccount.maxReviewsPerIp`, or set them to 0, before many jobs start at once (see [operations.md](operations.md#exposure)).
+Behind a gateway every client reaches the controller from the gateway's addresses. The chart then turns off the edge's per-address handshake cap, but `api.maxConnectionsPerIp` and `auth.serviceAccount.maxReviewsPerIp` apply to all clients together. Raise them or set them to 0 before many jobs start at once, or turn on PROXY protocol (see [operations.md](operations.md#exposure)).
 
 Without a Gateway, or where the managed gateway has no TLS passthrough (GKE's managed Gateway, the AWS Load Balancer Controller), use a load balancer instead: replace the two `parentRefs` flags with `--set service.type=LoadBalancer`, point the DNS name at the Service address from `kubectl get svc -n buildkit-system`, and use `https://bk.example.com:8443` as the API URL. Some load balancers need a higher idle timeout. See [the chart README](../helm/buildkit-controller/README.md#load-balancer-idle-timeout).
 
@@ -98,7 +114,7 @@ permissions:
   contents: read
 steps:
   - uses: actions/checkout@v4
-  - uses: smrt-devops/buildkit-controller/action@v0
+  - uses: smrt-devops/buildkit-controller/action@v0.2.0   # pin a release tag or a commit SHA
     with:
       url: https://bk.example.com   # https://bk.example.com:8443 with a LoadBalancer
       pools: ci/amd64
@@ -157,7 +173,7 @@ export API_CA=/tmp/bk-ca.pem
 sh docs/ci/buildkit-allocate.sh sh -c 'docker buildx build --builder "$BUILDER" .'
 ```
 
-The `TTL` and `QUEUE_TIMEOUT` variables (seconds) are optional. Mask `TOKEN` in any CI log.
+The `TTL` and `QUEUE_TIMEOUT` variables (seconds) are optional. Mask `TOKEN` in any CI log. The token must still be valid when the script releases the allocation at the end, and `kubectl create token` lasts 1 hour by default. For a longer build, pass `--duration`, or keep a fresh token in a file and set `TOKEN_FILE`, which the script reads before every request.
 
 ## Clean up
 
