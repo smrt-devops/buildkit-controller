@@ -1305,10 +1305,10 @@ fn sandbox_is_applied_again_after_the_reapply_period() {
             .count()
     };
     let mut f = fx();
-    f.sandbox = Some((1, ago(60)));
+    f.sandbox = Some((1, ago(30)));
     let p = f.plan();
     assert_eq!(applies(&p), 0);
-    assert_eq!(p.requeue_at, Some(ago(60) + REAPPLY_AFTER));
+    assert_eq!(p.requeue_at, Some(ago(30) + REAPPLY_AFTER));
     f.sandbox = Some((1, *NOW - REAPPLY_AFTER));
     assert_eq!(applies(&f.plan()), 2);
 }
@@ -1352,4 +1352,31 @@ fn no_creates_when_the_ca_ends_before_a_new_worker_could_serve() {
     // With a day more the pool scales as usual.
     f.ca = &OLD;
     assert_eq!(creates(&f.plan()), vec![0, 1]);
+}
+
+/// RECON-7: a pass that creates pods applies the sandbox first, even when it
+/// was applied moments ago, so a NetworkPolicy deleted out of band never
+/// covers a new pod. A pass with no creates applies nothing.
+#[test]
+fn creates_follow_a_fresh_sandbox_apply() {
+    let mut f = fx().scale(2, 10);
+    let p = f.plan();
+    let kinds: Vec<&str> = p
+        .actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::ApplySa => Some("sa"),
+            Action::ApplyNetworkPolicy => Some("np"),
+            Action::CreatePod { .. } => Some("create"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kinds, ["sa", "np", "create", "create"]);
+    f.pods = vec![pod(0), pod(1)];
+    assert!(
+        !f.plan()
+            .actions
+            .iter()
+            .any(|a| matches!(a, Action::ApplySa | Action::ApplyNetworkPolicy))
+    );
 }

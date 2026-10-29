@@ -52,8 +52,9 @@ const MESSAGE_MAX: usize = 1024;
 
 /// How long an applied `ServiceAccount`, `NetworkPolicy` or CA bundle
 /// `ConfigMap` counts as current. Nothing watches them, so the leader applies
-/// them again this often; an out-of-band delete or edit lasts at most this long.
-pub const REAPPLY_AFTER: SignedDuration = SignedDuration::from_mins(5);
+/// them again this often, and the sandbox before any pod create. An out-of-band
+/// delete or edit lasts at most this long for running pods and never covers a new one.
+pub const REAPPLY_AFTER: SignedDuration = SignedDuration::from_mins(1);
 
 /// `Degraded=True` reasons by precedence.
 const DEGRADED_ORDER: [&str; 6] = [
@@ -527,6 +528,18 @@ impl<'a> Planner<'_, 'a> {
         }
         let ca_lasts = self.ca_outlasts_new_workers(ca);
         let counts = Some(self.plan_pods(fp.as_deref(), spec_block.is_none() && ca_lasts, waiting));
+        // A pod is created only under a policy applied in this pass, so one
+        // deleted or edited out of band never covers a new pod.
+        let first_create = self
+            .actions
+            .iter()
+            .position(|a| matches!(a, Action::CreatePod { .. }));
+        if let Some(i) = first_create
+            && !self.actions.contains(&Action::ApplyNetworkPolicy)
+        {
+            self.actions
+                .splice(i..i, [Action::ApplySa, Action::ApplyNetworkPolicy]);
+        }
         if let Some(fp) = &fp {
             self.ca_replaced_check(fp);
         }
