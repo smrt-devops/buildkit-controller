@@ -151,10 +151,11 @@ impl HostPorts {
 static LIVE: Mutex<Vec<(String, PathBuf)>> = Mutex::new(Vec::new());
 
 fn delete_cluster(name: &str, kubeconfig: &Path) {
-    let _ = tool("kind", kubeconfig)
-        .args(["delete", "cluster", "--name", name, "--kubeconfig"])
-        .arg(kubeconfig)
-        .status();
+    let mut c = tool("kind", kubeconfig);
+    c.args(["delete", "cluster", "--name", name, "--kubeconfig"])
+        .arg(kubeconfig);
+    let _t = crate::proc::Timed::start(&c);
+    let _ = c.status();
 }
 
 /// A throwaway kind cluster with a private kubeconfig. Dropping it deletes the

@@ -221,6 +221,7 @@ fn compile(root: &Path, work: &Path, image: &str, out: &Path) -> Result<()> {
 /// Build the image, tag it, and optionally load it into a kind cluster.
 pub(crate) fn image(tag: &str, load_kind: Option<&str>) -> Result<()> {
     let _lock = host_lock()?;
+    let _t = crate::proc::Timed::named("image build");
     let root = root();
     let work = root.join("target/image");
     let ctx = work.join("ctx");
