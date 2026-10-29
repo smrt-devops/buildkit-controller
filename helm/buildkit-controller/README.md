@@ -146,15 +146,16 @@ The controller caps work per client address: `edge.maxHandshakesPerIp` (32 TLS
 handshakes in progress), `api.maxConnectionsPerIp` (128 open API connections) and
 `auth.serviceAccount.maxReviewsPerIp` (4 TokenReviews in flight). Behind a gateway
 the controller sees the gateway's pod addresses, not the clients', so all clients
-share each cap. Turn on PROXY protocol so the controller reads the client address
+share each cap. The edge cap closes the oldest handshake of an address to make room,
+so behind a Gateway without `edge.proxyProtocol` the chart renders it as 0. Turn on PROXY protocol so the controller reads the client address
 from the gateway: `api.proxyProtocol` and `edge.proxyProtocol` with `trustedCIDRs` set
 to the gateway's source addresses (the gateway pods as /32s, or a range only the
 gateway uses, never the pod CIDR), plus `gateway.envoy.proxyProtocol: true` on Envoy
 Gateway. Only connections from `trustedCIDRs` are parsed, and each must carry a v2
 header. The trust model is in
 [docs/operations.md](../../docs/operations.md#proxy-protocol). Without PROXY protocol,
-raise the caps to the number of jobs that can start at once, or set them to 0 to turn
-them off, and enforce per-client limits at the gateway instead.
+raise the API caps to the number of jobs that can start at once, or set them to 0 to
+turn them off, and enforce per-client limits at the gateway instead.
 
 #### Implementation extras
 
@@ -206,13 +207,13 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 
 | Value | Meaning |
 |---|---|
-| `image.repository`, `image.tag` | `ghcr.io/smrt-devops/buildkit-controller`, tag defaults to the chart appVersion |
+| `image.repository`, `image.tag` | `ghcr.io/smrt-devops/buildkit-controller`, tag defaults to the chart appVersion. `0.2.0@sha256:<digest>` pins the digest |
 | `replicaCount`, `autoscaling.*` | Deployment size; HPA on CPU (off by default) |
 | `resources` | 100m CPU and 128Mi memory requested, 512Mi memory limit. An established edge connection holds about 200 KiB and an idle replica about 14 MiB, so 512Mi holds about 2300 connections. Raise `resources.limits.memory` and `edge.maxConnections` together |
 | `affinity`, `topologySpreadConstraints` | when both are empty, a soft hostname anti-affinity spreads replicas |
 | `podDisruptionBudget.*` | rendered only when replicas exceed `minAvailable` |
 | `watchNamespaces` | namespaces whose pools the controller serves; recommended. The chart renders a Role and RoleBinding in each for pods, Secrets, ServiceAccounts, NetworkPolicies and PVCs (PVCs: `list` and `delete`, only for the one-time sweep of v0.1.0 cache volumes), and only TokenReview stays cluster-wide. Every namespace listed must exist before `helm install`, because the chart creates a Role and RoleBinding in it; the chart does not create namespaces. The list may not include the release namespace (the chart fails to render). The Role in each namespace is named `<fullname>-<release namespace>-workload` and grants `create` on Secrets only; Kubernetes garbage collection deletes a worker Secret with its pod. Pools elsewhere are ignored. `[]` (the default) = every namespace through a ClusterRole that can create pods and Secrets in any namespace, kube-system included; NOTES.txt warns about it |
-| `edge.*` | `endpoint`, `serverName`, `allocationDomain`, `extraNames`, `tls.secretName` (user serving cert, a `kubernetes.io/tls` Secret in the release namespace), `handshakeTimeout` (10s), `maxConnections` (2000 established, sized to the 512Mi memory limit), `maxHandshakes` (1024), `maxHandshakesPerIp` (32; 0 = no cap), `proxyProtocol.enabled` (false), `.trustedCIDRs` (required when enabled), `.headerTimeout` (5s) |
+| `edge.*` | `endpoint`, `serverName`, `allocationDomain`, `extraNames`, `tls.secretName` (user serving cert, a `kubernetes.io/tls` Secret in the release namespace), `handshakeTimeout` (10s), `maxConnections` (2000 established, sized to the 512Mi memory limit), `maxHandshakes` (1024), `maxHandshakesPerIp` (32; 0 = no cap; rendered as 0 when the edge route is on a Gateway and `edge.proxyProtocol` is off), `proxyProtocol.enabled` (false), `.trustedCIDRs` (required when enabled), `.headerTimeout` (5s) |
 | `api.*` | `maxConnections` (4096), `maxConnectionsPerIp` (128; 0 = no cap), `proxyProtocol` (as `edge.proxyProtocol`) |
 | `auth.oidc[]` | `url`, `audiences`, `jwksUrl`, and at most one of `caBundle` (inline PEM), `caBundleFile` (path), `caBundleConfigMap: {name, key}` (mounted, sets the file) |
 | `auth.serviceAccount` | `enabled`, `audiences` (never the API server audience), `maxConcurrentReviews` (32), `maxReviewsPerIp` (4; 0 = no cap), `reservedReviews` (8; slots held for recently seen service accounts), `recentSubjectTtl` (10m) |
@@ -238,9 +239,9 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 StatefulSet with one volume (`cache.persistence`) that only worker pods reach,
 over mTLS with the internal CA. Allocations carry `--cache-to` and
 `--cache-from` flags for it. A caller that a pool's `spec.workers.cache.writers`
-rules do not trust gets `--cache-from` only. By default pushes, schedules,
-`workflow_dispatch`, `merge_group` and in-cluster callers write, and pull
-requests read. Each repository has its own cache unless the pool sets
+rules do not trust gets `--cache-from` only. By default pushes, schedules and
+`workflow_dispatch` runs on a protected ref and in-cluster callers write, and
+pull requests read. Each repository has its own cache unless the pool sets
 `spec.workers.cache.scope: pool`. `cache.maxSize` bounds the volume and
 `cache.poolMaxSize` each pool without `spec.workers.cache.maxSize`. The volume
 needs room for `cache.maxSize` plus `cache.maxUploadSize`.

@@ -83,9 +83,10 @@ PROXY protocol is on for the API and the edge, so the per-address caps count the
 addresses in the gateway's PROXY headers.
 {{- else }}
 Every client now reaches the controller from the gateway's addresses, so the per-address
-caps (edge.maxHandshakesPerIp {{ .Values.edge.maxHandshakesPerIp }}, api.maxConnectionsPerIp {{ .Values.api.maxConnectionsPerIp }},
-auth.serviceAccount.maxReviewsPerIp {{ .Values.auth.serviceAccount.maxReviewsPerIp }}) apply to all clients together. Raise them or set 0,
-or turn on PROXY protocol (api.proxyProtocol, edge.proxyProtocol) so they count clients.
+caps api.maxConnectionsPerIp {{ .Values.api.maxConnectionsPerIp }} and auth.serviceAccount.maxReviewsPerIp {{ .Values.auth.serviceAccount.maxReviewsPerIp }} apply to all
+clients together. Raise them or set 0, or turn on PROXY protocol (api.proxyProtocol,
+edge.proxyProtocol) so they count clients.
+{{- if not .Values.edge.proxyProtocol.enabled }} The chart turned off edge.maxHandshakesPerIp.{{ end }}
 {{- end }}
 {{- else if eq .Values.service.type "LoadBalancer" }}
 Reach the edge on the same load balancer, port {{ .Values.service.ports.edge }}. Point DNS for {{ .Values.edge.serverName }}
@@ -115,9 +116,10 @@ https://token.actions.githubusercontent.com with an audience under auth.oidc.
 {{- $watch := include "bkc.watchNamespaces" . | fromJsonArray }}
 {{- if not $watch }}
 
-WARNING: watchNamespaces is empty, so the controller serves pools in every namespace
-and its ClusterRole can create and delete pods, Secrets and ServiceAccounts in any
-namespace, kube-system included. A compromised controller can take over the cluster.
+WARNING: watchNamespaces is empty, so the controller serves pools in every namespace.
+Its ClusterRole can create and delete pods, create Secrets, ServiceAccounts and
+NetworkPolicies, and list and delete PVCs in any namespace, kube-system included, and
+the cache registry can read every pod. A compromised controller can take over the cluster.
 List the pool namespaces instead:
   helm upgrade {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} --reuse-values \
     --set 'watchNamespaces={ci-builders}'
@@ -128,8 +130,8 @@ Watching pools in: {{ join ", " $watch }}. A pool in any other namespace is igno
 {{- if not .Values.workerNetwork.clusterCIDRs }}
 
 WARNING: workerNetwork.clusterCIDRs is empty, so the controller cannot tell this cluster's
-pod, service and node addresses from outside ones. A pool allowCIDRs entry that overlaps
-them (10.0.0.0/16, say) can open the whole cluster to builds, and IPv6 egress stays closed.
+pod, service and node addresses from outside ones. It refuses every IPv6 and private IPv4
+pool allowCIDRs entry, and IPv6 egress stays closed.
 List this cluster's pod, service and node ranges:
   helm upgrade {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} --reuse-values \
     --set 'workerNetwork.clusterCIDRs={10.244.0.0/16,10.96.0.0/12}'
