@@ -85,7 +85,7 @@ Behind a gateway, the API and edge connections come from the gateway. With PROXY
 
 ## Two CAs
 
-The CA Secret holds two CAs. The client CA signs allocation certificates and the self-issued edge and API serving certificate. The internal CA signs the worker serving certificates and the edge-to-worker client certificate. buildkitd trusts only the internal CA, so an allocation certificate cannot talk to a worker directly.
+The CA Secret holds two CAs. The client CA signs allocation certificates and the self-issued edge and API serving certificate, and the workers' clientAuth-only registry leaves. The internal CA signs the worker serving certificates, the cache registry's serving certificate and the edge-to-worker client certificate. buildkitd trusts only the internal CA, so an allocation certificate cannot talk to a worker directly.
 
 ## Worker identity
 
