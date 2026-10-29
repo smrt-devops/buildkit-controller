@@ -98,7 +98,7 @@ impl Component for EdgeComponent {
             let addr = ctx.config().listen.edge;
             let listener = crate::runtime::listen::bind(addr)?;
             let (tx, rx) = watch::channel(None);
-            let proxy = ProxyHandler::with_owner_cap(
+            let proxy = ProxyHandler::with_namespace_cap(
                 PodView {
                     pods: ctx.pods(),
                     pools: ctx.pools(),
@@ -113,7 +113,7 @@ impl Component for EdgeComponent {
                     )?,
                     upstream_port: u16::try_from(BUILDKIT_PORT)?,
                 },
-                revoke::owner_cap(options.max_connections),
+                revoke::namespace_cap(options.max_connections),
             );
             let revoke_stop = CancellationToken::new();
             let revoker = tokio::spawn({

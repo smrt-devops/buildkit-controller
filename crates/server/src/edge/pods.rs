@@ -14,8 +14,7 @@ use super::handler::Refusal;
 use super::metrics::Revocation;
 use crate::pki::{AllocId, AllocationId, WorkerIdentity, is_worker_nonce};
 use crate::render::{
-    ANN_ALLOC, ANN_EXPIRES_AT, ANN_OWNER, ANN_WORKER_NONCE, CONTROLLER, LABEL_MANAGED_BY,
-    LABEL_POOL,
+    ANN_ALLOC, ANN_EXPIRES_AT, ANN_WORKER_NONCE, CONTROLLER, LABEL_MANAGED_BY, LABEL_POOL,
 };
 use crate::runtime::stores::StoreFreshness;
 
@@ -36,8 +35,6 @@ pub struct Target {
     pub ip: IpAddr,
     /// The pod's name and `P worker-nonce`.
     pub worker: WorkerIdentity,
-    /// Who holds the allocation (`P owner`); the namespace when unset.
-    pub owner: String,
 }
 
 impl PodView {
@@ -98,8 +95,6 @@ impl PodView {
                 pod: pod.metadata.name.clone().ok_or(Refusal::PodNotFound)?,
                 nonce: nonce.to_owned(),
             },
-            owner: annotation(&pod, ANN_OWNER)
-                .map_or_else(|| id.namespace.to_string(), str::to_owned),
         })
     }
 

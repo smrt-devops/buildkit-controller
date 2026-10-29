@@ -28,39 +28,40 @@ type Index = HashMap<String, HashMap<u64, Live>>;
 /// single cert from taking the replica's whole `edge.maxConnections`.
 pub const MAX_CONNECTIONS_PER_ALLOCATION: usize = 64;
 
-/// The share of `edge.maxConnections` one owner may hold on a replica: a
-/// quarter, so one caller's allocations together cannot fill the replica.
+/// The share of `edge.maxConnections` one pool namespace may hold on a
+/// replica: a quarter, so one tenant's allocations together cannot fill it.
 #[must_use]
-pub fn owner_cap(max_connections: usize) -> usize {
+pub fn namespace_cap(max_connections: usize) -> usize {
     (max_connections / 4).max(1)
 }
 
-/// Open proxied connections per owner (`P owner`), capped at `max` each.
-pub struct Owners {
+/// Open proxied connections per pool namespace, capped at `max` each. The
+/// namespace comes from the verified allocation certificate.
+pub struct Namespaces {
     max: usize,
     open: Mutex<HashMap<String, usize>>,
 }
 
-/// One connection's share of its owner's cap; released on drop.
-pub struct OwnerSlot {
-    owners: Arc<Owners>,
-    owner: String,
+/// One connection's share of its namespace's cap; released on drop.
+pub struct NamespaceSlot {
+    namespaces: Arc<Namespaces>,
+    ns: String,
 }
 
-impl Drop for OwnerSlot {
+impl Drop for NamespaceSlot {
     fn drop(&mut self) {
-        let mut open = self.owners.lock();
-        if let Some(n) = open.get_mut(&self.owner) {
+        let mut open = self.namespaces.lock();
+        if let Some(n) = open.get_mut(&self.ns) {
             *n -= 1;
             if *n == 0 {
-                open.remove(&self.owner);
+                open.remove(&self.ns);
             }
         }
     }
 }
 
-impl Owners {
-    /// At most `max` connections per owner; 0 disables the cap.
+impl Namespaces {
+    /// At most `max` connections per namespace; 0 disables the cap.
     #[must_use]
     pub fn new(max: usize) -> Self {
         Self {
@@ -73,16 +74,16 @@ impl Owners {
         self.open.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A slot for `owner`, or `None` when it already holds `max`.
-    pub fn try_take(self: &Arc<Self>, owner: &str) -> Option<OwnerSlot> {
+    /// A slot for namespace `ns`, or `None` when it already holds `max`.
+    pub fn try_take(self: &Arc<Self>, ns: &str) -> Option<NamespaceSlot> {
         let mut open = self.lock();
-        if self.max != 0 && open.get(owner).copied().unwrap_or(0) >= self.max {
+        if self.max != 0 && open.get(ns).copied().unwrap_or(0) >= self.max {
             return None;
         }
-        *open.entry(owner.to_owned()).or_insert(0) += 1;
-        Some(OwnerSlot {
-            owners: Arc::clone(self),
-            owner: owner.to_owned(),
+        *open.entry(ns.to_owned()).or_insert(0) += 1;
+        Some(NamespaceSlot {
+            namespaces: Arc::clone(self),
+            ns: ns.to_owned(),
         })
     }
 }
