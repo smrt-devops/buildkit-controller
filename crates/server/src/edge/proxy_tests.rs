@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::handler::Refusal;
 use super::super::metrics::{Direction, EdgeMetrics, Revocation};
 use super::super::pods::{PodView, revocation};
-use super::super::revoke::Registry;
+use super::super::revoke::{Owners, Registry, owner_cap};
 use super::{End, pump};
 use crate::pki::AllocationId;
 use crate::runtime::metrics::Metrics;
@@ -413,6 +413,11 @@ fn each_allocation_is_capped_and_a_closed_connection_frees_its_slot() {
 
 /// The proxy's back half over `pods`, with no TLS generation loaded.
 fn inner(pods: Vec<Pod>, max_per_pod: usize) -> super::Inner {
+    inner_owned(pods, max_per_pod, 0)
+}
+
+/// [`inner`] with at most `max_per_owner` connections per owner.
+fn inner_owned(pods: Vec<Pod>, max_per_pod: usize, max_per_owner: usize) -> super::Inner {
     super::Inner {
         view: view(pods),
         tls: tokio::sync::watch::channel(None).1,
@@ -422,6 +427,7 @@ fn inner(pods: Vec<Pod>, max_per_pod: usize) -> super::Inner {
             upstream_port: 1,
         },
         live: Arc::new(Registry::new(max_per_pod)),
+        owners: Arc::new(Owners::new(max_per_owner)),
     }
 }
 
@@ -494,4 +500,54 @@ async fn a_revoked_relay_is_counted_once_under_its_reason() {
     assert_eq!(m.revocation_count(Revocation::Released), 1);
     assert_eq!(m.revocation_count(Revocation::Drain), 0);
     assert_eq!(m.active(&id()).get(), 0);
+}
+
+#[test]
+fn each_owner_is_capped_and_a_closed_connection_frees_its_slot() {
+    let owners = Arc::new(Owners::new(2));
+    let a = owners.try_take("sa:x/a").unwrap();
+    let _b = owners.try_take("sa:x/a").unwrap();
+    assert!(owners.try_take("sa:x/a").is_none(), "third for one owner");
+    assert!(
+        owners.try_take("sa:x/b").is_some(),
+        "another owner has its own"
+    );
+    drop(a);
+    assert!(owners.try_take("sa:x/a").is_some());
+    assert_eq!(owner_cap(2000), 500);
+    assert_eq!(owner_cap(1), 1);
+}
+
+#[test]
+fn the_owner_comes_from_the_pod_and_defaults_to_the_namespace() {
+    let owned = pod(|v| {
+        v["metadata"]["annotations"]["buildkit.smrt-devops.net/owner"] = json!("sa:x/a");
+    });
+    let t = view(vec![owned])
+        .resolve(&id(), OffsetDateTime::now_utc())
+        .unwrap();
+    assert_eq!(t.owner, "sa:x/a");
+    let t = view(vec![pod(|_| {})])
+        .resolve(&id(), OffsetDateTime::now_utc())
+        .unwrap();
+    assert_eq!(t.owner, "team-a");
+}
+
+/// One owner's allocations together cannot take more than its share: a
+/// connection on another of its pods is refused once the owner is at its cap.
+#[tokio::test]
+async fn an_owner_at_its_cap_is_refused_and_counted() {
+    let owned = pod(|v| {
+        v["metadata"]["annotations"]["buildkit.smrt-devops.net/owner"] = json!("sa:x/a");
+    });
+    let p = inner_owned(vec![owned], 64, 1);
+    let _held = p.owners.try_take("sa:x/a").unwrap();
+    let (client, mut c) = tokio::io::duplex(1024);
+    p.forward(client, &id(), None).await;
+    assert_eq!(p.metrics.outcome_count(Some(&id()), "owner_limit"), 1);
+    assert_eq!(p.metrics.outcome_count(Some(&id()), "upstream_error"), 0);
+    let mut b = Vec::new();
+    c.read_to_end(&mut b).await.unwrap();
+    assert!(b.is_empty(), "closed without a byte");
+    assert_eq!(p.live.len(), 0, "unregistered once closed");
 }

@@ -28,6 +28,65 @@ type Index = HashMap<String, HashMap<u64, Live>>;
 /// single cert from taking the replica's whole `edge.maxConnections`.
 pub const MAX_CONNECTIONS_PER_ALLOCATION: usize = 64;
 
+/// The share of `edge.maxConnections` one owner may hold on a replica: a
+/// quarter, so one caller's allocations together cannot fill the replica.
+#[must_use]
+pub fn owner_cap(max_connections: usize) -> usize {
+    (max_connections / 4).max(1)
+}
+
+/// Open proxied connections per owner (`P owner`), capped at `max` each.
+pub struct Owners {
+    max: usize,
+    open: Mutex<HashMap<String, usize>>,
+}
+
+/// One connection's share of its owner's cap; released on drop.
+pub struct OwnerSlot {
+    owners: Arc<Owners>,
+    owner: String,
+}
+
+impl Drop for OwnerSlot {
+    fn drop(&mut self) {
+        let mut open = self.owners.lock();
+        if let Some(n) = open.get_mut(&self.owner) {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&self.owner);
+            }
+        }
+    }
+}
+
+impl Owners {
+    /// At most `max` connections per owner; 0 disables the cap.
+    #[must_use]
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            open: Mutex::default(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
+        self.open.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A slot for `owner`, or `None` when it already holds `max`.
+    pub fn try_take(self: &Arc<Self>, owner: &str) -> Option<OwnerSlot> {
+        let mut open = self.lock();
+        if self.max != 0 && open.get(owner).copied().unwrap_or(0) >= self.max {
+            return None;
+        }
+        *open.entry(owner.to_owned()).or_insert(0) += 1;
+        Some(OwnerSlot {
+            owners: Arc::clone(self),
+            owner: owner.to_owned(),
+        })
+    }
+}
+
 /// Open proxied connections, by pod uid.
 pub struct Registry {
     next: AtomicU64,
