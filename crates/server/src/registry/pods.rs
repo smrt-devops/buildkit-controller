@@ -79,8 +79,10 @@ pub fn grant_of(
 }
 
 /// Budgets from the Pool watch: `cache.maxSize` of the pool, else `default`.
-/// A pool that is gone gets nothing, so its caches go at the next collection;
-/// until the store is current every pool gets `default`.
+/// A pool that is gone gets nothing, so its caches go at the next collection.
+/// Until the store is current no pool budget evicts anything: a guess would
+/// trim a pool larger than `default`, and eviction cannot be undone. The
+/// volume budget still holds.
 pub struct PoolBudgets {
     pub pools: Store<BuildKitPool>,
     pub fresh: StoreFreshness,
@@ -93,7 +95,7 @@ pub struct PoolBudgets {
 impl Budgets for PoolBudgets {
     fn pool(&self, pool: &str) -> u64 {
         if !self.fresh.is_fresh() {
-            return self.default;
+            return u64::MAX;
         }
         let Some((ns, name)) = pool.split_once('/') else {
             return 0;
@@ -291,8 +293,10 @@ mod tests {
         assert_eq!(fresh.total(), 1000);
         assert_eq!(
             b(false).pool("ci/gone"),
-            100,
-            "unknown until the store is current"
+            u64::MAX,
+            "no pool budget until the store is current"
         );
+        assert_eq!(b(false).pool("ci/sized"), u64::MAX);
+        assert_eq!(b(false).total(), 1000);
     }
 }
