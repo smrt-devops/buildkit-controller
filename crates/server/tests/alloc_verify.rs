@@ -610,8 +610,14 @@ async fn alloc_verify() {
     h.gone(&names).await;
     println!(
         "SCENARIO metrics: allocations ok {}, pool_exhausted {}",
-        metric(&h.leader.metrics, "result=\"ok\""),
-        metric(&h.leader.metrics, "result=\"pool_exhausted\"")
+        metric(
+            &h.leader.metrics,
+            "buildkit_allocations_total{namespace=\"bk-alloc\",pool=\"p\",result=\"ok\"}"
+        ),
+        metric(
+            &h.leader.metrics,
+            "buildkit_allocations_total{namespace=\"bk-alloc\",pool=\"p\",result=\"pool_exhausted\"}"
+        )
     );
 
     cold(&stop).await;
