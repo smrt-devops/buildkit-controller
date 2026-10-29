@@ -51,7 +51,8 @@ pub(crate) const REGISTRY_IMAGE: &str = "registry:2";
 const REG: &str = "registry.e2e-reg.svc.cluster.local:5000";
 /// The chart's cache registry, as workers reach it.
 const CACHE_HOST: &str = "buildkit-controller-registry.bk-system.svc:5000";
-/// A cache volume as v0.1.0 labelled it, created before install; the leader deletes it.
+/// A cache volume as v0.1.0 labelled it, created before install; the leader
+/// deletes it. v0.1.0 upgrade shim: remove in the release after v3.
 const OLD_VOLUME: &str = "v010-volume";
 const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const AUD: &str = "buildkit-controller";
@@ -665,6 +666,7 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
     println!("PASS h: another identity starts with an empty cache");
 
     // m. Upgrade: the cache volume of v0.1.0 created before install is gone.
+    // v0.1.0 upgrade shim: remove in the release after v3.
     until(
         "the v0.1.0 cache volume is deleted",
         Duration::from_mins(2),

@@ -2,8 +2,8 @@
 //!
 //! v0.1.0 kept build cache on one PVC per worker slot. Workers are stateless
 //! now, so the leader deletes every PVC with that release's cache labels once,
-//! at its first term, and logs each one. Remove this module (and the PVC
-//! `list` and `delete` rights in the chart) in the next release.
+//! at its first term, and logs each one. v0.1.0 upgrade shim: remove in the
+//! release after v3, with the PVC `list` and `delete` rights in the chart.
 
 use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 use kube::api::{Api, DeleteParams, ListParams, Preconditions};

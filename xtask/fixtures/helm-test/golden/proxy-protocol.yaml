@@ -701,7 +701,7 @@ spec:
     probes: 3
   timeout:
     tcp: {connectTimeout: 10s}
-    http: {streamIdleTimeout: 15m}
+    http: {streamIdleTimeout: 60s}
   # The controller accepts it from api.proxyProtocol.trustedCIDRs.
   proxyProtocol: {version: V2}
 
@@ -754,8 +754,8 @@ spec:
     - backendRefs:
         - {name: buildkit-controller, port: 8443}
       timeouts:
-        backendRequest: 15m
-        request: 15m
+        backendRequest: 60s
+        request: 60s
 
 ---
 # Source: buildkit-controller/templates/gateway.yaml

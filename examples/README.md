@@ -11,7 +11,7 @@ Every pool example uses the `ci` namespace, which you create first and label for
 | [pool-gitlab-oidc.yaml](pool-gitlab-oidc.yaml) | Access rules for a GitLab or other generic OIDC issuer. |
 | [pool-cache.yaml](pool-cache.yaml) | Cache settings of a pool: who may write the built-in cache (here only pushes to main), and its size. |
 | [helm-values.yaml](helm-values.yaml) | Chart values with an OIDC issuer, routes on a Gateway (or a LoadBalancer Service) and a pool. |
-| [claim-pod.yaml](claim-pod.yaml) | A `BuildKitClaim` and a pod that runs `buildctl` with the Secret it gets, both in the namespace `apps`. Needs `claims.enabled: true`, `apps` in `claims.namespaces`, and a pool rule `claims: {namespaces: [apps]}`. |
+| [claim-pod.yaml](claim-pod.yaml) | A `BuildKitClaim` and a pod that runs `buildctl` with the Secret it gets, both in the namespace `apps`. Needs `apps` in `claims.namespaces` and a pool rule `claims: {namespaces: [apps]}`. |
 
 A multi-platform build needs `edge.allocationDomain` set in the Helm values, with wildcard DNS for that domain pointing at the edge address. See [docs/operations.md](../docs/operations.md).
 

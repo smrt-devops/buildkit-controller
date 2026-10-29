@@ -689,8 +689,8 @@ spec:
     - backendRefs:
         - {name: buildkit-controller, port: 8443}
       timeouts:
-        backendRequest: 15m
-        request: 15m
+        backendRequest: 60s
+        request: 60s
 
 ---
 # Source: buildkit-controller/templates/gateway.yaml

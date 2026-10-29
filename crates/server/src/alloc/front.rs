@@ -59,6 +59,7 @@ pub struct Front {
     metrics: AllocMetrics,
     stopping: CancellationToken,
     /// Worker pods, for releasing allocations made before claims existed.
+    /// v0.1.0 upgrade shim: remove in the release after v3.
     pods: Option<Store<Pod>>,
 }
 
@@ -91,7 +92,8 @@ impl Front {
     }
 
     /// Releases of allocations made before every allocation was a claim
-    /// retire their pods from this store.
+    /// retire their pods from this store. v0.1.0 upgrade shim: remove in the
+    /// release after v3.
     #[must_use]
     pub fn with_pods(mut self, pods: Store<Pod>) -> Self {
         self.pods = Some(pods);
@@ -213,6 +215,7 @@ impl Front {
     /// Release an allocation made before every allocation was a claim: its
     /// pods carry the id and the caller's owner but no `P claim`. Each retire
     /// tests the uid and `alloc == id`, so a look-alike pod is harmless.
+    /// v0.1.0 upgrade shim: remove in the release after v3.
     async fn release_unclaimed(&self, who: &Identity, id: &str) -> Result<(), AllocError> {
         let Some(pods) = &self.pods else {
             return Err(AllocError::NotFound);

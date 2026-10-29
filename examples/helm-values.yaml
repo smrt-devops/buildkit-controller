@@ -41,7 +41,7 @@ gateway:
 #   service:
 #     type: LoadBalancer
 #     annotations:
-#       # AWS NLB: keep idle connections open longer than a queued request can stay silent.
+#       # AWS NLB: keep idle connections open longer than your longest quiet build step.
 #       service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-8443: tcp.idle_timeout.seconds=900
 #       service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-8444: tcp.idle_timeout.seconds=900
 

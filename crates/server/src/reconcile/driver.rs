@@ -114,7 +114,8 @@ async fn sleep_until(t: Option<Instant>) {
 pub struct Reconciler {
     ctx: AppContext,
     metrics: ReconcileMetrics,
-    /// The v0.1.0 cache volumes are gone ([`super::sweep`]).
+    /// The v0.1.0 cache volumes are gone ([`super::sweep`]). v0.1.0 upgrade
+    /// shim: remove in the release after v3.
     swept: Arc<AtomicBool>,
 }
 
@@ -286,7 +287,8 @@ async fn run_term(ctx: AppContext, metrics: ReconcileMetrics, side: impl Future<
 }
 
 /// Leader work beside the passes: the one-time sweep of v0.1.0 cache
-/// volumes, then the cache registry certificate. Never returns.
+/// volumes (v0.1.0 upgrade shim: remove in the release after v3), then the
+/// cache registry certificate. Never returns.
 async fn side_work(ctx: AppContext, swept: Arc<AtomicBool>) {
     let client = ctx.client();
     if !swept.load(Ordering::Relaxed)

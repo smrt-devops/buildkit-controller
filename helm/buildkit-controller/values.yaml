@@ -155,12 +155,11 @@ gateway:
     mode: terminate
     parentRefs: []         # e.g. [{name: shared, namespace: gateway-system, sectionName: https}]
     hostnames: []          # [] = [edge.serverName]
-    # HTTPRoute timeouts (terminate mode). A queued allocation request is silent until a
-    # worker is free: up to the pool's maxQueueTimeout + workers.startTimeout + 10s, which
-    # is 12m10s with default pool settings. Keep both above that.
+    # HTTPRoute timeouts (terminate mode). API requests last at most 25 s: a queued
+    # allocation answers 202 and the client polls. Keep both above that.
     timeouts:
-      request: 15m
-      backendRequest: 15m
+      request: 60s
+      backendRequest: 60s
     # How the gateway verifies the controller (terminate mode).
     backendTLS:
       hostname: ""                 # name checked in the controller's certificate; "" = edge.serverName
