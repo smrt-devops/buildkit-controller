@@ -21,6 +21,7 @@ use axum::body::Body;
 use axum::extract::Query;
 use axum::http::header::{
     ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderName, RANGE,
+    RETRY_AFTER,
 };
 use axum::http::{HeaderValue, Method, Request, Response, StatusCode};
 use futures::StreamExt;
@@ -36,8 +37,14 @@ use crate::pki::WorkerIdentity;
 
 /// Largest manifest accepted (the reference registry's limit).
 pub const MAX_MANIFEST: usize = 4 << 20;
-/// Manifest bodies buffered at once (each up to [`MAX_MANIFEST`]); more wait.
-static MANIFEST_PUTS: Semaphore = Semaphore::const_new(16);
+/// Manifest bodies buffered at once, each up to [`MAX_MANIFEST`].
+pub const MANIFEST_PUTS: usize = 16;
+/// How long a manifest PUT waits for one of the [`MANIFEST_PUTS`] before it
+/// is answered 429.
+pub const MANIFEST_WAIT: Duration = Duration::from_secs(5);
+/// The whole manifest body must arrive within this, so a slow sender holds
+/// one of the [`MANIFEST_PUTS`] for no longer.
+pub const MANIFEST_BODY: Duration = Duration::from_secs(30);
 /// Longest gap between two chunks of a request body.
 pub const BODY_IDLE: Duration = Duration::from_mins(1);
 
@@ -49,6 +56,8 @@ pub struct Registry {
     pub store: Store,
     pub auth: Arc<dyn Authorizer>,
     pub metrics: RegistryMetrics,
+    /// [`MANIFEST_PUTS`] permits.
+    pub manifest_puts: Semaphore,
 }
 
 /// A distribution error response.
@@ -659,24 +668,38 @@ async fn put_manifest(
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_owned);
-    let _permit = MANIFEST_PUTS
-        .acquire()
+    let busy = || {
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "TOOMANYREQUESTS",
+            "too many manifest pushes in progress",
+        )
+        .with(RETRY_AFTER, "1".to_owned())
+    };
+    let _permit = tokio::time::timeout(MANIFEST_WAIT, reg.manifest_puts.acquire())
         .await
-        .map_err(|e| internal(&std::io::Error::other(e)))?;
+        .map_err(|_| busy())?
+        .map_err(|_| busy())?;
     let mut body = req.into_body().into_data_stream();
     let mut buf = Vec::new();
-    loop {
-        let chunk = match tokio::time::timeout(BODY_IDLE, body.next()).await {
-            Err(_) => return Err(StoreError::Stalled.into()),
-            Ok(None) => break,
-            Ok(Some(Err(e))) => return Err(upload_invalid(e.to_string())),
-            Ok(Some(Ok(c))) => c,
-        };
-        if buf.len() + chunk.len() > MAX_MANIFEST {
-            return Err(too_large(MAX_MANIFEST as u64));
+    let read = async {
+        loop {
+            let chunk = match tokio::time::timeout(BODY_IDLE, body.next()).await {
+                Err(_) => return Err(StoreError::Stalled.into()),
+                Ok(None) => break,
+                Ok(Some(Err(e))) => return Err(upload_invalid(e.to_string())),
+                Ok(Some(Ok(c))) => c,
+            };
+            if buf.len() + chunk.len() > MAX_MANIFEST {
+                return Err(too_large(MAX_MANIFEST as u64));
+            }
+            buf.extend_from_slice(&chunk);
         }
-        buf.extend_from_slice(&chunk);
-    }
+        Ok::<(), ApiError>(())
+    };
+    tokio::time::timeout(MANIFEST_BODY, read)
+        .await
+        .map_err(|_| ApiError::from(StoreError::Stalled))??;
     reg.metrics.received(buf.len() as u64);
     let d = reg
         .store

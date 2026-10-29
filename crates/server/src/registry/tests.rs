@@ -65,6 +65,7 @@ fn registry(dir: &std::path::Path, max_blob: u64) -> Registry {
         .unwrap(),
         auth: Arc::new(grants()),
         metrics: RegistryMetrics::default(),
+        manifest_puts: tokio::sync::Semaphore::new(super::api::MANIFEST_PUTS),
     }
 }
 
@@ -759,6 +760,7 @@ async fn open_uploads_are_bounded_in_bytes_per_worker_and_in_total() {
         .unwrap(),
         auth: Arc::new(grants()),
         metrics: RegistryMetrics::default(),
+        manifest_puts: tokio::sync::Semaphore::new(super::api::MANIFEST_PUTS),
     };
     let reg = &reg;
     let patch = async |pod: &str, repo: &str, data: &[u8]| {
@@ -1057,4 +1059,47 @@ async fn a_new_incarnation_of_a_pod_has_its_own_upload_quota() {
         .body(Body::empty())
         .unwrap();
     assert_eq!(handle(reg, &next, req).await.status(), StatusCode::ACCEPTED);
+}
+
+/// Workers that drip manifest bodies cannot hold up another worker's
+/// manifest push: it is answered 429 within `MANIFEST_WAIT` while they hold
+/// every permit, and they are cut off at `MANIFEST_BODY`.
+#[tokio::test(start_paused = true)]
+async fn slow_manifest_pushes_cannot_block_others() {
+    use super::api::{MANIFEST_BODY, MANIFEST_PUTS, MANIFEST_WAIT};
+    use futures::StreamExt;
+    let dir = dir("slow-manifest");
+    let reg = Arc::new(registry(&dir, 1 << 20));
+    let d = push_blob(&reg, "writer", "ns/p/app", b"layer").await;
+    let mut drips = Vec::new();
+    for _ in 0..MANIFEST_PUTS {
+        let reg = Arc::clone(&reg);
+        drips.push(tokio::spawn(async move {
+            let body =
+                futures::stream::once(async { Ok::<_, std::io::Error>(Bytes::from_static(b"{")) })
+                    .chain(futures::stream::pending());
+            let req = Request::builder()
+                .method(Method::PUT)
+                .uri("/v2/ns/p/app/manifests/slow")
+                .header("content-type", INDEX)
+                .body(Body::from_stream(body))
+                .unwrap();
+            handle(&reg, &worker("writer"), req).await.status()
+        }));
+    }
+    while reg.manifest_puts.available_permits() > 0 {
+        tokio::task::yield_now().await;
+    }
+    let started = tokio::time::Instant::now();
+    let r = put_index(&reg, "other", "ns/p/other", "t", &[]).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(r.header("retry-after"), "1");
+    assert!(started.elapsed() <= MANIFEST_WAIT + Duration::from_secs(1));
+    for d in drips {
+        assert_eq!(d.await.unwrap(), StatusCode::REQUEST_TIMEOUT);
+    }
+    assert!(started.elapsed() <= MANIFEST_BODY + Duration::from_secs(1));
+    let r = put_index(&reg, "writer", "ns/p/app", "t", &[&d]).await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    std::fs::remove_dir_all(dir).unwrap();
 }
