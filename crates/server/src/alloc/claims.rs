@@ -10,6 +10,7 @@ use buildkit_controller_api::claim::{
     BuildKitClaim, BuildKitClaimStatus, CacheTier, ClaimPhase, secret_name,
 };
 use buildkit_controller_api::dto::{CacheResponse, ErrorCode};
+use buildkit_controller_api::v1alpha1::BuildKitPool;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::{Pod, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, ObjectMeta, OwnerReference, Time};
@@ -277,6 +278,20 @@ pub fn position<S: std::hash::BuildHasher>(
         .filter(|o| queue_order(o, c) == Ordering::Less)
         .count();
     u32::try_from(ahead + 1).ok()
+}
+
+/// Workers one owner (an OIDC run, a service account or pod, a claim) may
+/// hold in `pool` at once: half of `scaling.max`, at least 1, so no single
+/// caller can take the whole pool. The leader enforces it when binding.
+pub(super) fn owner_hold_limit(pool: &BuildKitPool) -> usize {
+    (usize::try_from(pool.spec.scaling.max).unwrap_or(0) / 2).max(1)
+}
+
+/// Claims one owner may hold or wait for in `pool`, as [`active_of`] counts
+/// them: the hold limit, and as many again waiting behind it. The front
+/// refuses a new claim at this limit.
+pub(super) fn owner_active_limit(pool: &BuildKitPool) -> usize {
+    2 * owner_hold_limit(pool)
 }
 
 /// Claims of the controller's namespace `own` that `owner` holds or waits

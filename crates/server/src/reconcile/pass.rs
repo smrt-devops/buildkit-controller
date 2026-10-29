@@ -222,7 +222,6 @@ pub async fn run<O: KubeOps>(
         time_zone: TimeZone::get(&pool.spec.scaling.time_zone).ok(),
         template: template_check(pool),
         network: &settings.render.worker_network,
-        controller_namespace: &settings.render.controller_namespace,
         platforms: platforms(pool),
         ca: &loaded,
         ca_bundle_current: guard.bundle_current(ca.epoch, now),

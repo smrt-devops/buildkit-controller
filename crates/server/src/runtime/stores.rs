@@ -925,19 +925,8 @@ fn claim_watch(
 
 /// The worker stores: every `BuildKitPool` and every controller-managed pod
 /// in `namespaces` (`[]` = all), with the `pool_store` and `pod_store`
-/// readiness checks, and the pod event broadcast.
-#[must_use]
-pub fn worker_watches(
-    client: &Client,
-    namespaces: &[String],
-    metrics: &Arc<Metrics>,
-    readiness: &Arc<Readiness>,
-    shutdown: &CancellationToken,
-) -> (Store<BuildKitPool>, Store<Pod>, broadcast::Sender<PodEvent>) {
-    worker_watches_except(client, namespaces, None, metrics, readiness, shutdown)
-}
-
-/// [`worker_watches`] whose Pool store leaves out the pools of namespace `except`.
+/// readiness checks, and the pod event broadcast. The Pool store leaves out
+/// the pools of namespace `except`.
 #[must_use]
 pub fn worker_watches_except(
     client: &Client,

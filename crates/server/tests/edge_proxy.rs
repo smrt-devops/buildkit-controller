@@ -188,6 +188,7 @@ async fn rig_serving(pods: Vec<Pod>, serves: &WorkerIdentity) -> Rig {
         ProxyOptions {
             upstream_connect_timeout: Duration::from_secs(2),
             upstream_port: worker_port,
+            max_per_namespace: 500,
         },
     );
     let builder = TlsBuilder::new(Arc::new(proxy.clone()), metrics.clone());

@@ -175,8 +175,14 @@ async fn authorizer(
         .cloned()
         .collect();
     info!(?namespaces, "watching worker pods, [] = all namespaces");
-    let (pools, pods, _) =
-        crate::runtime::stores::worker_watches(&client, &namespaces, metrics, readiness, stop);
+    let (pools, pods, _) = crate::runtime::stores::worker_watches_except(
+        &client,
+        &namespaces,
+        None,
+        metrics,
+        readiness,
+        stop,
+    );
     let fresh = || {
         StoreFreshness::new(
             readiness.register("pool_store").subscribe(),

@@ -12,9 +12,10 @@ use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::super::handler::Refusal;
+use super::super::listener::PerKey;
 use super::super::metrics::{Direction, EdgeMetrics, Revocation};
 use super::super::pods::{PodView, revocation};
-use super::super::revoke::{Namespaces, Registry, namespace_cap};
+use super::super::revoke::{Registry, namespace_cap};
 use super::{End, pump};
 use crate::pki::AllocationId;
 use crate::runtime::metrics::Metrics;
@@ -425,9 +426,10 @@ fn inner_capped(pods: Vec<Pod>, max_per_pod: usize, max_per_namespace: usize) ->
         options: super::ProxyOptions {
             upstream_connect_timeout: Duration::from_secs(1),
             upstream_port: 1,
+            max_per_namespace,
         },
         live: Arc::new(Registry::new(max_per_pod)),
-        namespaces: Arc::new(Namespaces::new(max_per_namespace)),
+        namespaces: PerKey::new(max_per_namespace),
     }
 }
 
@@ -504,7 +506,7 @@ async fn a_revoked_relay_is_counted_once_under_its_reason() {
 
 #[test]
 fn each_namespace_is_capped_and_a_closed_connection_frees_its_slot() {
-    let namespaces = Arc::new(Namespaces::new(2));
+    let namespaces = PerKey::<String>::new(2);
     let a = namespaces.try_take("team-a").unwrap();
     let _b = namespaces.try_take("team-a").unwrap();
     assert!(

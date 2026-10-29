@@ -28,7 +28,8 @@ pub use hash::{config_hash, template_hash};
 pub use objects::{ca_bundle_config_map, network_policy, service_account, worker_secret};
 pub use pod::{pod_spec, worker_pod};
 pub use validate::{
-    Conflict, PROTECTED_CIDRS, refused_allow_cidr, refused_allow_cidrs, validate_template,
+    ALWAYS_DENIED, Conflict, PROTECTED_CIDRS, refused_allow_cidr, refused_allow_cidrs,
+    validate_template,
 };
 
 pub use crate::pki::worker_secret_name;
