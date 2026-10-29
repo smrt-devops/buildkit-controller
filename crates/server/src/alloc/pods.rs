@@ -8,8 +8,9 @@ use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
 use crate::pki::{AllocId, ClientPublicKey};
 use crate::render::{
-    ANN_ALLOC, ANN_ALLOCATED_AT, ANN_CLAIM, ANN_EXPIRES_AT, ANN_INTERNAL_CA, ANN_OWNER,
-    ANN_WORKER_CERT_NOT_AFTER, DRAINING, FREE, LABEL_POOL, LABEL_STATE, LABEL_TEMPLATE_HASH,
+    ANN_ALLOC, ANN_ALLOCATED_AT, ANN_CLAIM, ANN_CLAIM_UID, ANN_EXPIRES_AT, ANN_INTERNAL_CA,
+    ANN_OWNER, ANN_WORKER_CERT_NOT_AFTER, DRAINING, FREE, LABEL_POOL, LABEL_STATE,
+    LABEL_TEMPLATE_HASH,
 };
 
 /// At most this many warm candidates per claim.
@@ -100,6 +101,8 @@ pub struct Bind<'a> {
     pub owner: &'a str,
     /// `<namespace>/<name>` of the claim.
     pub claim: &'a str,
+    /// The claim's uid.
+    pub claim_uid: &'a str,
     /// `allocated-at`.
     pub now: &'a str,
     /// `expires-at`, the allocation's expiry.
@@ -117,6 +120,7 @@ pub fn claim_patch(uid: &str, b: &Bind<'_>) -> Value {
         {"op": "replace", "path": ptr("labels", LABEL_STATE), "value": "allocated"},
         {"op": "add", "path": ptr("annotations", ANN_OWNER), "value": b.owner},
         {"op": "add", "path": ptr("annotations", ANN_CLAIM), "value": b.claim},
+        {"op": "add", "path": ptr("annotations", ANN_CLAIM_UID), "value": b.claim_uid},
         {"op": "add", "path": ptr("annotations", ANN_ALLOCATED_AT), "value": b.now},
         {"op": "add", "path": ptr("annotations", ANN_EXPIRES_AT), "value": b.expires},
     ])

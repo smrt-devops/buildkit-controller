@@ -1054,6 +1054,45 @@ async fn a_dropped_post_keeps_its_claim_for_the_retry() {
     assert_eq!(phase(&e.fake.status(OWN, &id)), ClaimPhase::Bound);
     assert_eq!(phase(&e.fake.status(OWN, &later)), ClaimPhase::Pending);
 }
+
+/// A key reused after a release makes a new claim of the same name. The
+/// released pod, not yet retired, carries the old claim's uid: the new claim
+/// never adopts it, and tidy retires it.
+#[tokio::test(start_paused = true)]
+async fn a_claim_recreated_under_the_same_name_never_gets_the_released_pod() {
+    let e = env();
+    let req = post_req(&KEY);
+    let old = e.warm(0);
+    let Outcome::Pending(p) = e.front.allocate(&sa("alice"), &req).await.unwrap() else {
+        panic!("bound before the leader ran")
+    };
+    e.binder.pass(&key()).await;
+    assert_eq!(e.fake.status(OWN, &p.id).pod.as_deref(), Some(old.as_str()));
+    e.front.release(&sa("alice"), &p.id).await.unwrap();
+    let Outcome::Pending(again) = e.front.allocate(&sa("alice"), &req).await.unwrap() else {
+        panic!("bound to the released pod")
+    };
+    assert_eq!(again.id, p.id, "same key, same name");
+    let fresh = e.warm(1);
+    e.binder.pass(&key()).await;
+    assert_eq!(
+        e.fake.status(OWN, &p.id).pod.as_deref(),
+        Some(fresh.as_str()),
+        "the new claim takes a fresh pod"
+    );
+    let claims = e.fake.claims.lock().unwrap().as_reader().state();
+    let pods = e.fake.pods.lock().unwrap().as_reader().state();
+    super::leader::tidy_with(&e.binder, &claims, &pods, OffsetDateTime::now_utc()).await;
+    let calls = e.fake.calls();
+    assert!(
+        calls.contains(&format!("patch {old} draining")),
+        "{calls:?}"
+    );
+    assert!(
+        !calls.contains(&format!("patch {fresh} draining")),
+        "{calls:?}"
+    );
+}
 /// The tidy pass: refuses unserved namespaces, ends expired and lost claims,
 /// deletes finished CI claims after ten minutes, and retires pods whose claim
 /// is gone.

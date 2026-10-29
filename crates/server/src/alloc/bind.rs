@@ -79,6 +79,9 @@ struct Ask {
     caller: Caller,
     alloc_id: AllocId,
     claim_ref: String,
+    /// The claim's uid, written on the pod: a later claim of the same name is
+    /// another claim and never takes this one's pod.
+    claim_uid: String,
     ttl: time::Duration,
     /// A PEM key that parses.
     public_key: Option<String>,
@@ -234,10 +237,11 @@ impl Binder {
         pass: &mut Pass,
     ) {
         let own = self.cfg.namespace.as_str();
-        let (Some(caller), Some(alloc_id), Some(claim_ref)) = (
+        let (Some(caller), Some(alloc_id), Some(claim_ref), Some(claim_uid)) = (
             claims::caller(c, own),
             claims::alloc_id(c, own),
             claims::claim_ref(c),
+            c.metadata.uid.clone(),
         ) else {
             return;
         };
@@ -254,7 +258,7 @@ impl Binder {
             return self.no_pool(c, now, pass).await;
         };
         let host = self.cfg.registry_host.as_deref();
-        let ask = match ask(c, pool, own, host, caller, alloc_id, claim_ref) {
+        let ask = match ask(c, pool, own, host, caller, alloc_id, (claim_ref, claim_uid)) {
             Ok(a) => a,
             Err(message) => {
                 return self
@@ -313,6 +317,7 @@ impl Binder {
             let ok = of_pool(&p, ns, name, uid)
                 && ann(&p, ANN_ALLOC) == Some(ask.alloc_id.as_str())
                 && ann(&p, rnd::ANN_CLAIM) == Some(ask.claim_ref.as_str())
+                && ann(&p, rnd::ANN_CLAIM_UID) == Some(ask.claim_uid.as_str())
                 && claims::serves(&p, ask.alloc_id.as_str());
             let expires = ann(&p, ANN_EXPIRES_AT).and_then(parse_ts)?;
             ok.then(|| ((*p).clone(), expires))
@@ -359,6 +364,7 @@ impl Binder {
             alloc_id: ask.alloc_id.as_str(),
             owner: &ask.caller.owner,
             claim: &ask.claim_ref,
+            claim_uid: &ask.claim_uid,
             now: &now_s,
             expires: &expires,
         };
@@ -685,7 +691,7 @@ fn ask(
     registry_host: Option<&str>,
     caller: Caller,
     alloc_id: AllocId,
-    claim_ref: String,
+    (claim_ref, claim_uid): (String, String),
 ) -> Result<Ask, String> {
     let a = &pool.spec.allocation;
     let max_ttl = seconds(&a.max_ttl)?;
@@ -740,6 +746,7 @@ fn ask(
         caller,
         alloc_id,
         claim_ref,
+        claim_uid,
         ttl: time::Duration::seconds(i64::try_from(ttl).map_err(|e| e.to_string())?),
         public_key,
         plan,

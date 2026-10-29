@@ -137,10 +137,6 @@ spec:
           openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out /work/key.pem
           openssl pkey -in /work/key.pem -pubout -out /work/pub.pem
           sed 's/$/\\\\n/' /work/pub.pem | tr -d '\\n' > /work/pub.json
-          # The key names the allocation, so each allocation of a batch has its own.
-          for i in $(seq 0 $(({BATCH} - 1))); do
-            openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 | openssl pkey -pubout | sed 's/$/\\\\n/' | tr -d '\\n' > /work/pub.$i.json
-          done
       securityContext: &sc
         allowPrivilegeEscalation: false
         capabilities: {{drop: [ALL]}}
@@ -159,6 +155,12 @@ spec:
     - {{name: work, emptyDir: {{}}}}
 {volumes}"
     )
+}
+
+/// A PEM as JSON string content: each line ends in `\n`, as the client pod's
+/// `sed` writes `pub.json`.
+fn pub_json(pem: &str) -> String {
+    pem.lines().flat_map(|l| [l, "\\n"]).collect()
 }
 
 fn pool_client() -> String {
@@ -314,7 +316,17 @@ impl Perf {
         for b in 0..batches {
             self.wait_warm(BATCH)?;
             let files: Vec<String> = (0..BATCH).map(|i| format!("/work/a.{i}.json")).collect();
-            let script: String = files
+            // The key names the allocation, so every allocation gets a key no
+            // earlier batch used: a reused key would name a just-released claim.
+            let mut script = String::new();
+            for i in 0..BATCH {
+                let _ = writeln!(
+                    script,
+                    "printf '%s' '{}' > /work/pub.{i}.json",
+                    pub_json(&rcgen::KeyPair::generate()?.public_key_pem())
+                );
+            }
+            script += &files
                 .iter()
                 .enumerate()
                 .map(|(i, f)| {
@@ -327,7 +339,7 @@ impl Perf {
                         "; if grep -q clientCert {f}; then echo ' cert'; else echo ' nocert'; fi\n"
                     )
                 })
-                .collect();
+                .collect::<String>();
             let out = self.sh(NS, &script)?;
             let mut got = 0;
             for l in out.lines() {
@@ -773,6 +785,15 @@ mod tests {
         assert!(
             post.contains(r#""ttlSeconds":120,"publicKey":"'"$(cat /work/pub.0.json)"'"}'"#),
             "{post}"
+        );
+    }
+
+    /// A batch key goes into the script as the pod's `sed` would write it.
+    #[test]
+    fn pub_json_escapes_each_newline() {
+        assert_eq!(
+            pub_json("-----BEGIN\nAB\n-----END\n"),
+            r"-----BEGIN\nAB\n-----END\n"
         );
     }
 
