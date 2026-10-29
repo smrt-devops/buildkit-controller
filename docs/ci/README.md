@@ -55,7 +55,7 @@ Which answers the client repeats, and which end the step:
 | `404 not_found` and `403 forbidden` on `GET`, other `4xx` | Fail the step. |
 | Other `503`, for example `ca_unavailable`, with no `Retry-After` | Fail the step. |
 
-Two older `503` codes with `Retry-After`, for a worker that did not start in time and for a replica that was stopping, are no longer sent. A client still treats them like `upstream_error`, so it works against an older controller.
+Two older `503` codes with `Retry-After`, for a worker that did not start in time and for a replica that was stopping, are no longer sent. The Action still retries them, so it works against an older controller. The script retries only the older start-timeout code.
 
 The Action repeats `POST /v1/allocations` only on a 503 with `Retry-After` and one of the codes above, because an intermediary that adds its own `Retry-After` to a 503 may have forwarded the request. It also retries connection errors raised before the request was sent (connection refused, DNS failure). It waits the `Retry-After` seconds (at least 1, at most 30), logs each retry, and fetches a fresh OIDC token for every attempt. A retry asks for just the time left in the budget, so the total never doubles.
 

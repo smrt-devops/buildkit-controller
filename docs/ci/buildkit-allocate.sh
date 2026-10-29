@@ -215,7 +215,7 @@ while :; do
     # Only the codes the controller sends with Retry-After before it claims a worker; an intermediary
     # that adds Retry-After to its own 503 may have forwarded the request.
     case $(jq -r '.error.code // empty' "$D/alloc.json" 2>/dev/null || :) in
-      pool_exhausted|start_timeout|shutting_down|upstream_error) wait=$(retry_wait "$D/hdr") ;;
+      pool_exhausted|start_timeout|upstream_error) wait=$(retry_wait "$D/hdr") ;;
     esac
     why="HTTP 503"
   elif [ "$rc" = 6 ] || [ "$rc" = 7 ]; then
