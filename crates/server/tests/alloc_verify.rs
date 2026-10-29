@@ -619,6 +619,7 @@ async fn alloc_verify() {
         )
     );
 
+    upgrade(&h).await;
     cold(&stop).await;
     stop.cancel();
 }
@@ -733,5 +734,53 @@ async fn cold(stop: &CancellationToken) {
     println!(
         "SCENARIO cold: claim Expired at {}; pod and Secret collected",
         a.expires_at
+    );
+}
+
+/// Scenario 7, an upgrade: pods allocated before every allocation was a claim
+/// carry no `P claim`. An API caller's is released by its owner's DELETE, and
+/// an in-cluster claim's whose claim is gone is retired by the leader's sweep.
+async fn upgrade(h: &H) {
+    let names = h.warm("u", 2).await;
+    let (api_id, claim_id) = (
+        "aaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        "bbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+    );
+    for (name, id, owner) in [
+        (&names[0], &api_id, "sa:bk-alloc/legacy".to_owned()),
+        (
+            &names[1],
+            &claim_id,
+            format!("claim:{NS}/old#00000000-0000-4000-8000-00000000dead"),
+        ),
+    ] {
+        let patch = json!({"metadata": {
+            "labels": {"buildkit.smrt-devops.net/state": "allocated"},
+            "annotations": {ANN_ALLOC: id, ANN_OWNER: owner,
+                "buildkit.smrt-devops.net/expires-at": "2099-01-01T00:00:00Z"}}});
+        h.pods
+            .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+            .unwrap();
+    }
+    let svc = &h.leader.svc;
+    assert_eq!(
+        svc.release(&sa(NS, "intruder"), &api_id).await,
+        Err(AllocError::Forbidden)
+    );
+    // The store may lag the patch by a moment.
+    let end = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match svc.release(&sa(NS, "legacy"), &api_id).await {
+            Ok(()) => break,
+            Err(AllocError::NotFound) if tokio::time::Instant::now() < end => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            r => panic!("release of a pre-claim allocation: {r:?}"),
+        }
+    }
+    h.gone(&names).await;
+    println!(
+        "SCENARIO upgrade: a pre-claim allocation released by its owner's DELETE (others 403); a pre-claim pod of a deleted in-cluster claim retired by the sweep"
     );
 }

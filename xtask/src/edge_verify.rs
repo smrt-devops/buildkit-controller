@@ -514,38 +514,7 @@ fn scenarios(env: &Cluster, pod_ip: &str, r: &mut Report) -> Result<Vec<f64>> {
         ),
     );
 
-    // f. No certificate a worker holds opens a buildkitd: the client pod in the
-    // controller namespace passes the worker NetworkPolicy, so only TLS decides.
-    // The edge client cert is the control that the path is open.
-    let (ok, out) = client_in(
-        env,
-        SYSTEM_NS,
-        &format!("timeout 30 {} debug workers", direct("direct")),
-    )?;
-    r.check(
-        "f/edge client cert direct to worker accepted",
-        ok,
-        last_line(&out),
-    );
-    for (cert, what) in [
-        ("w2serve", "another worker's serving cert"),
-        ("w2client", "another worker's registry client cert"),
-        ("w1client", "the worker's own registry client cert"),
-    ] {
-        let (ok, out) = client_in(
-            env,
-            SYSTEM_NS,
-            &format!(
-                "timeout 30 {} debug workers; rc=$?; echo rc=$rc; exit $rc",
-                direct(cert)
-            ),
-        )?;
-        r.check(
-            &format!("f/{what} refused by buildkitd"),
-            !ok && out.contains("rc=1") && !out.contains("connection refused"),
-            last_line(&out),
-        );
-    }
+    worker_certs_refused(env, &direct, r)?;
 
     // e. Runs before d, which deletes the worker.
     let mut rates = Vec::new();
@@ -777,6 +746,47 @@ fn worker_identity() -> Result<WorkerIdentity> {
         pod: format!("{POOL}-0"),
         nonce: NONCE.into(),
     })
+}
+
+/// Scenario f. No certificate a worker holds opens a buildkitd: the client pod in
+/// the controller namespace passes the worker `NetworkPolicy`, so only TLS decides.
+/// The edge client cert is the control that the path is open.
+fn worker_certs_refused(
+    env: &Cluster,
+    direct: &dyn Fn(&str) -> String,
+    r: &mut Report,
+) -> Result<()> {
+    let (ok, out) = client_in(
+        env,
+        SYSTEM_NS,
+        &format!("timeout 30 {} debug workers", direct("direct")),
+    )?;
+    r.check(
+        "f/edge client cert direct to worker accepted",
+        ok,
+        last_line(&out),
+    );
+    for (cert, what) in [
+        ("w2serve", "another worker's serving cert"),
+        ("w2client", "another worker's registry client cert"),
+        ("w1client", "the worker's own registry client cert"),
+    ] {
+        let (ok, out) = client_in(
+            env,
+            SYSTEM_NS,
+            &format!(
+                "timeout 30 {} debug workers; rc=$?; echo rc=$rc; exit $rc",
+                direct(cert)
+            ),
+        )?;
+        r.check(
+            &format!("f/{what} refused by buildkitd"),
+            !ok && out.contains("rc=1") && !out.contains("connection refused"),
+            last_line(&out),
+        );
+    }
+
+    Ok(())
 }
 
 /// Another worker of the pool: credentials of the same CA the target worker

@@ -344,7 +344,7 @@ fn env() -> Env {
     let served: HashSet<String> = [OWN, CI].into_iter().map(str::to_owned).collect();
     let binder = Binder::new(
         Arc::clone(&fake) as Arc<dyn Backend>,
-        (pools.as_reader(), pods, claims.clone()),
+        (pools.as_reader(), pods.clone(), claims.clone()),
         Arc::clone(&certs) as Arc<dyn super::CertSource>,
         BindConfig {
             endpoint: "tcp://bk.example.com:8444".into(),
@@ -366,7 +366,8 @@ fn env() -> Env {
         OWN.into(),
         served,
         metrics.clone(),
-    );
+    )
+    .with_pods(pods);
     Env {
         fake,
         binder,
@@ -1006,6 +1007,114 @@ async fn tidy_ends_claims_and_retires_strays() {
     // The metric counts the release.
     let mut reg = prometheus_client::registry::Registry::default();
     e.metrics.register(&mut reg);
+}
+
+/// An allocation made before every allocation was a claim has no claim: its
+/// owner's DELETE retires its pod; anyone else gets 403, an unknown id 404.
+#[tokio::test]
+async fn release_retires_a_pod_allocated_before_claims() {
+    let e = env();
+    let name = e.warm(0);
+    let id = new_alloc_id().unwrap().to_string();
+    let mut pod = e.fake.pod(&name);
+    let a = pod.metadata.annotations.as_mut().unwrap();
+    a.insert(ANN_ALLOC.into(), id.clone());
+    a.insert(ANN_OWNER.into(), "sa:render-verify/alice".into());
+    e.fake.put_pod(pod);
+    assert_eq!(
+        e.front.release(&sa("mallory"), &id).await,
+        Err(AllocError::Forbidden)
+    );
+    assert_eq!(
+        e.fake.pod(&name).metadata.annotations.unwrap()[ANN_ALLOC],
+        id
+    );
+    e.front.release(&sa("alice"), &id).await.unwrap();
+    let calls = e.fake.calls();
+    assert!(
+        calls.contains(&format!("patch {name} draining")),
+        "{calls:?}"
+    );
+    assert!(calls.contains(&format!("delete_pod {name}")), "{calls:?}");
+    assert_eq!(
+        e.front.release(&sa("alice"), &id).await,
+        Err(AllocError::NotFound)
+    );
+    // A pod bound for a claim is never released this way.
+    let name = e.warm(1);
+    let other = new_alloc_id().unwrap().to_string();
+    let mut pod = e.fake.pod(&name);
+    let a = pod.metadata.annotations.as_mut().unwrap();
+    a.insert(ANN_ALLOC.into(), other.clone());
+    a.insert(ANN_OWNER.into(), "sa:render-verify/alice".into());
+    a.insert(ANN_CLAIM.into(), format!("{OWN}/{other}"));
+    e.fake.put_pod(pod);
+    assert_eq!(
+        e.front.release(&sa("alice"), &other).await,
+        Err(AllocError::NotFound)
+    );
+}
+
+/// A CA source whose bundle is gone after the first call: the replica checked
+/// the CA before the create, then lost it.
+struct CaOnce(Arc<CaBundle>, std::sync::atomic::AtomicBool);
+
+impl super::CertSource for CaOnce {
+    fn bundle(&self) -> Option<Arc<CaBundle>> {
+        (!self.1.swap(true, std::sync::atomic::Ordering::SeqCst)).then(|| Arc::clone(&self.0))
+    }
+    fn ca_cert_pem(&self, _: &CaBundle) -> Option<String> {
+        None
+    }
+}
+
+/// A bound claim whose response this replica cannot finish (no CA right now)
+/// answers pending with the id, so the client polls instead of losing it.
+#[tokio::test]
+#[allow(
+    clippy::used_underscore_binding,
+    reason = "the pool store kept alive by Env"
+)]
+async fn a_bound_claim_without_a_ca_answers_pending() {
+    let e = Arc::new(env());
+    e.warm(0);
+    let tx = e.fake.tx.clone();
+    let front = Front::new(
+        Arc::clone(&e.fake) as Arc<dyn Backend>,
+        e._pools.as_reader(),
+        e.fake.claims.lock().unwrap().as_reader(),
+        Box::new(move || ClaimSubscription::new(tx.subscribe())),
+        Arc::new(CaOnce(
+            Arc::clone(&e.ca),
+            std::sync::atomic::AtomicBool::new(false),
+        )),
+        OWN.into(),
+        HashSet::from([OWN.to_owned()]),
+        AllocMetrics::default(),
+    );
+    let leader = {
+        let e = Arc::clone(&e);
+        let mut sub = ClaimSubscription::new(e.fake.tx.subscribe());
+        tokio::spawn(async move {
+            while sub.recv().await.is_some() {
+                e.binder.pass(&key()).await;
+            }
+        })
+    };
+    let req: CreateAllocationRequest = serde_json::from_value(json!({
+        "namespace": POOL_NS, "pool": POOL, "publicKey": *KEY
+    }))
+    .unwrap();
+    let out = front.allocate(&sa("alice"), &req).await.unwrap();
+    leader.abort();
+    let Outcome::Pending(p) = out else {
+        panic!("{out:?}")
+    };
+    let c = e
+        .fake
+        .claim(OWN, &p.id)
+        .expect("the claim is kept for the client to poll");
+    assert_eq!(c.status.and_then(|s| s.phase), Some(ClaimPhase::Bound));
 }
 
 #[path = "tests_cache.rs"]

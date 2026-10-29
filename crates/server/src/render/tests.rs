@@ -372,7 +372,14 @@ fn worker_secret_keys() {
     let data = s.data.unwrap();
     assert_eq!(
         data.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["buildkitd.toml", "ca.crt", "client.crt", "client.key", "tls.crt", "tls.key"]
+        [
+            "buildkitd.toml",
+            "ca.crt",
+            "client.crt",
+            "client.key",
+            "tls.crt",
+            "tls.key"
+        ]
     );
     assert_eq!(data["buildkitd.toml"].0, b"debug = true\n");
     assert_eq!(s.type_.as_deref(), Some("Opaque"));

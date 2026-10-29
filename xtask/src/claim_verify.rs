@@ -164,7 +164,31 @@ fn verify(env: &Cluster) -> Result<()> {
         ])?;
         Ok(s.starts_with("True warm=1").then_some(()))
     })?;
-    println!("installed chart with claims.enabled; pool Ready");
+    // The build reaches the edge through the controller's Service: wait until a
+    // ready replica backs it, or the first connect may be refused.
+    env.kubectl(&[
+        "rollout",
+        "status",
+        "deploy/bkc",
+        "-n",
+        NS,
+        "--timeout=300s",
+    ])?;
+    until("edge Service endpoints", Duration::from_mins(2), || {
+        let ips = env.kubectl(&[
+            "get",
+            "endpoints",
+            "bkc",
+            "-n",
+            NS,
+            "-o",
+            "jsonpath={.subsets[*].addresses[*].ip}",
+        ])?;
+        Ok((!ips.trim().is_empty()).then_some(()))
+    })?;
+    println!(
+        "installed chart with claims.enabled; pool Ready, controller in the Service endpoints"
+    );
 
     // 7. A cacheKey that starts with a hyphen is rejected at admission.
     let path = work.join("cache-key.yaml");
