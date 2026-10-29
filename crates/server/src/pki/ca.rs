@@ -401,6 +401,25 @@ impl CaBundle {
         let base = secret_name.get(..max).unwrap_or(secret_name);
         format!("{}{suffix}", base.trim_end_matches(['-', '.']))
     }
+
+    /// The part of a CA Secret's data (`data` or `stringData`) that a backup
+    /// keeps: the two CA certificates and the `generated-by` marker, and only
+    /// those whose value holds no private key. A backup outlives the CA it
+    /// copies, and the old client CA keeps the trust of clients not yet
+    /// updated, so its key must not survive in a Secret nobody rotates.
+    #[must_use]
+    pub fn backup_data<V: Clone>(
+        data: &BTreeMap<String, V>,
+        bytes: impl Fn(&V) -> &[u8],
+    ) -> BTreeMap<String, V> {
+        const KEPT: [&str; 3] = [CLIENT_CA_CRT, INTERNAL_CA_CRT, GENERATED_BY];
+        data.iter()
+            .filter(|(k, v)| {
+                KEPT.contains(&k.as_str()) && !bytes(v).windows(11).any(|w| w == b"PRIVATE KEY")
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
 }
 
 pub(super) fn hex(d: &[u8]) -> String {
@@ -909,6 +928,34 @@ mod tests {
             CaBundle::generate(PrimitiveDateTime::MIN.assume_utc()),
             Err(IssueError::TimeOverflow)
         ));
+    }
+
+    #[test]
+    fn a_backup_keeps_the_certificates_and_no_private_key() {
+        let now = OffsetDateTime::now_utc();
+        let mut data = CaBundle::generate(now).unwrap().to_secret_data();
+        data.insert("tls.key".into(), b"stray".to_vec());
+        let combined = [
+            data[CLIENT_CA_CRT].as_slice(),
+            data[CLIENT_CA_KEY].as_slice(),
+        ]
+        .concat();
+        let mut with_combined = data.clone();
+        with_combined.insert(INTERNAL_CA_CRT.into(), combined);
+        let kept = CaBundle::backup_data(&data, Vec::as_slice);
+        assert_eq!(
+            kept.keys().map(String::as_str).collect::<Vec<_>>(),
+            [CLIENT_CA_CRT, GENERATED_BY, INTERNAL_CA_CRT]
+        );
+        assert_eq!(kept[CLIENT_CA_CRT], data[CLIENT_CA_CRT]);
+        let kept = CaBundle::backup_data(&with_combined, Vec::as_slice);
+        assert!(
+            !kept.contains_key(INTERNAL_CA_CRT),
+            "a certificate entry carrying a key is dropped"
+        );
+        let strings: BTreeMap<String, String> =
+            BTreeMap::from([(CLIENT_CA_KEY.into(), "k".into())]);
+        assert!(CaBundle::backup_data(&strings, String::as_bytes).is_empty());
     }
 
     #[test]
