@@ -11,7 +11,7 @@ use crate::render::{ANN_SCOPE, ANN_TIER, is_scope_id, scope_id};
 
 /// A GitHub Actions token for `event` on the protected `main`.
 fn oidc(event: &str) -> Identity {
-    with_claims(oidc_unprotected(event), json!({"ref_protected": "true"}))
+    with_claims(oidc_unprotected(event), &json!({"ref_protected": "true"}))
 }
 
 fn oidc_unprotected(event: &str) -> Identity {
@@ -249,7 +249,7 @@ async fn a_tenant_claim_is_scoped_to_its_namespace() {
 }
 
 /// `who` with `extra` claims added or replaced.
-fn with_claims(who: Identity, extra: serde_json::Value) -> Identity {
+fn with_claims(who: Identity, extra: &serde_json::Value) -> Identity {
     let Identity::Oidc {
         issuer,
         subject,
@@ -279,10 +279,10 @@ fn by_default_only_protected_refs_write() {
             "{e}"
         );
         for v in [json!("false"), json!(""), json!(null), json!(1)] {
-            let who = with_claims(oidc(e), json!({ "ref_protected": v }));
+            let who = with_claims(oidc(e), &json!({ "ref_protected": v }));
             assert_eq!(cache::tier(&p, &who), CacheTier::Untrusted, "{e} {v}");
         }
-        let who = with_claims(oidc(e), json!({"ref_protected": true}));
+        let who = with_claims(oidc(e), &json!({"ref_protected": true}));
         assert_eq!(cache::tier(&p, &who), CacheTier::Trusted, "{e}");
     }
     // A writers rule decides on its own claims.
