@@ -1,4 +1,4 @@
-//! Creating one worker, shared by the reconciler and the API's cold path:
+//! Creating one worker for the reconciler:
 //! issue the pod's serving cert, create the pod, then create the pod's Secret
 //! owned by the pod.
 //!

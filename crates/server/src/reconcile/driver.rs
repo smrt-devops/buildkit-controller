@@ -1,9 +1,10 @@
 //! The leader's reconcile loop. One task per leadership term that runs pool
 //! passes on Pool events, Pod events, CA Secret changes and requeue
-//! deadlines. Nothing is polled. Every pass runs
+//! deadlines, and on claim events (a pool is sized for its pending claims).
+//! Nothing is polled. Every pass runs
 //! inside the term's future, so dropping it (leadership lost) stops them all.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -24,12 +25,13 @@ use super::ops::{KubeClient, Timed};
 use super::pass::{self, CaView, PoolMemory, Settings};
 use super::plan::{PlanConfig, REAPPLY_AFTER};
 use super::pods::WorkerPod;
+use crate::claim::logic as claims;
 use crate::config::ElectionTiming;
 use crate::render::LABEL_POOL;
 use crate::runtime::AppContext;
 use crate::runtime::hooks::LeaderWork;
 use crate::runtime::leader::BoxFut;
-use crate::runtime::stores::{NamespaceReport, PodEvent, tolerant_watch};
+use crate::runtime::stores::{ClaimEvent, NamespaceReport, PodEvent, tolerant_watch};
 
 /// `(namespace, name)` of a pool.
 pub type PoolKey = (String, String);
@@ -159,6 +161,8 @@ struct Term {
     ca: Mutex<CaView>,
     memory: Mutex<HashMap<PoolKey, PoolMemory>>,
     metrics: ReconcileMetrics,
+    /// Namespaces whose claims are served.
+    served: HashSet<String>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -209,6 +213,15 @@ async fn run_term(ctx: AppContext, metrics: ReconcileMetrics) {
         Some((t, sub))
     })
     .filter_map(std::future::ready);
+    // A claim that waits, binds or goes changes its pool's demand.
+    let claim_triggers = stream::unfold(ctx.claim_events(), |mut sub| async move {
+        let ev = sub.recv().await?;
+        let t = match &ev {
+            ClaimEvent::Apply(c) | ClaimEvent::Delete(c) => Trigger::Pool(claims::pool_key(c)),
+            ClaimEvent::Resync => Trigger::All,
+        };
+        Some((t, sub))
+    });
 
     // One receiver. The view starts at the version it marks seen, so no CA
     // change between the two can be missed.
@@ -227,6 +240,7 @@ async fn run_term(ctx: AppContext, metrics: ReconcileMetrics) {
         }),
         memory: Mutex::new(HashMap::new()),
         metrics,
+        served: ctx.config().served_claim_namespaces(ctx.namespace()),
         ctx: ctx.clone(),
     });
     let ca_triggers = stream::unfold((ca_rx, Arc::clone(&term)), |(mut rx, term)| async move {
@@ -243,7 +257,7 @@ async fn run_term(ctx: AppContext, metrics: ReconcileMetrics) {
     // The CA pass runs once at leadership start, then with every `All`.
     let triggers = stream::once(std::future::ready(Trigger::Pool(ca_key()))).chain(stream::select(
         stream::select(pool_triggers, pod_triggers),
-        ca_triggers,
+        stream::select(ca_triggers, claim_triggers),
     ));
     let all = {
         let term = Arc::clone(&term);
@@ -281,6 +295,9 @@ async fn pass_once(term: &Term, key: &PoolKey) -> Option<Duration> {
         let mut mem = lock(&term.memory).remove(key).unwrap_or_default();
         let ca = lock(&term.ca).clone();
         let pods = term.ctx.pods().state();
+        let waiting = claims::queues(&term.ctx.claims().state(), &term.served)
+            .get(key)
+            .map_or(0, |q| i32::try_from(q.len()).unwrap_or(i32::MAX));
         // Boxed: the pass future (pod spawns and volume writes) is too large for the stack.
         let out = Box::pin(pass::run(
             &term.ops,
@@ -290,6 +307,7 @@ async fn pass_once(term: &Term, key: &PoolKey) -> Option<Duration> {
             &pods,
             &ca,
             &mut mem,
+            waiting,
             Timestamp::now(),
         ))
         .await;

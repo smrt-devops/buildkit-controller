@@ -341,10 +341,27 @@ impl Cluster {
         }
     }
 
-    /// Waits for the project's CRD to be Established.
+    /// Waits for the pool CRD to be Established.
     pub(crate) fn wait_crd_established(&self) -> Result<()> {
         self.wait_condition(
             "crd/buildkitpools.buildkit.smrt-devops.net",
+            None,
+            "Established",
+            Duration::from_mins(1),
+        )
+    }
+
+    /// Applies the chart's pool and claim CRDs (server-side) and waits until
+    /// both are Established. The controller needs both: every allocation is a claim.
+    pub(crate) fn apply_crds(&self) -> Result<()> {
+        for f in [crate::CRD_PATH, crate::CLAIM_CRD_PATH] {
+            let path = crate::root().join(f).to_string_lossy().into_owned();
+            self.kubectl(&["apply", "--server-side", "-f", &path])
+                .with_context(|| format!("applying {f}"))?;
+        }
+        self.wait_crd_established()?;
+        self.wait_condition(
+            "crd/buildkitclaims.buildkit.smrt-devops.net",
             None,
             "Established",
             Duration::from_mins(1),

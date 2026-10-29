@@ -792,6 +792,37 @@ impl Config {
         }
     }
 
+    /// The namespaces whose claims are watched, `[]` = all. The controller's own
+    /// namespace `own` (claims of CI callers) always; with `claims.enabled`, every
+    /// namespace when pools are watched cluster-wide (claims outside
+    /// `claims.namespaces` are refused), else `claims.namespaces` too.
+    #[must_use]
+    pub fn claim_namespaces(&self, own: &str) -> Vec<String> {
+        if !self.claims.enabled {
+            return vec![own.to_owned()];
+        }
+        if self.watched_namespaces().is_empty() {
+            return Vec::new();
+        }
+        let mut v: Vec<String> = std::iter::once(own.to_owned())
+            .chain(self.claims.namespaces.iter().cloned())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// The namespaces whose in-cluster claims are served: the controller's own
+    /// and, with `claims.enabled`, `claims.namespaces`.
+    #[must_use]
+    pub fn served_claim_namespaces(&self, own: &str) -> std::collections::HashSet<String> {
+        let mut s: std::collections::HashSet<String> = std::iter::once(own.to_owned()).collect();
+        if self.claims.enabled {
+            s.extend(self.claims.namespaces.iter().cloned());
+        }
+        s
+    }
+
     fn validate_watch(&self, p: &mut Vec<String>) {
         if !self.watch_namespace.is_empty() && !self.watch_namespaces.is_empty() {
             p.push(

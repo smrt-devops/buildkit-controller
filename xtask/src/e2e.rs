@@ -659,9 +659,10 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
     let oidc = issuer.token(AUD, "e2e")?;
     let foreign = if host == "arm64" { "amd64" } else { "arm64" };
 
-    // l. A long poll through the Gateway, beside scenarios a to h. X holds the only
-    // worker of the foreign pool for 330 s, and Y queues behind it. The API sends
-    // nothing while Y waits, past Envoy's default 5-minute stream idle timeout.
+    // l. A long wait through the Gateway, beside scenarios a to h. X holds the only
+    // worker of the foreign pool for 330 s, and Y queues behind it, past Envoy's
+    // default 5-minute stream idle timeout. No request stays open over 25 s: Y's
+    // claim waits on the server while the client polls.
     let long = LongPoll::start(&c, &format!("{POOL_NS}/{foreign}"), &issuer)?;
 
     // a. A build with a RUN step succeeds through the edge (OIDC token).
@@ -722,6 +723,15 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
     )?;
+    // B waits as a claim in the controller's namespace, at the head of the queue.
+    let pending = until("B pending as a claim", Duration::from_mins(1), || {
+        let s = c.env.kubectl(&[
+            "get", "bkc", "-n", NS, "-o",
+            "jsonpath={range .items[?(@.status.phase==\"Pending\")]}{.metadata.name} {.spec.poolRef.name} {.status.queuePosition}{\"\\n\"}{end}",
+        ])?;
+        let head = format!(" {host} 1");
+        Ok(s.lines().find(|l| l.ends_with(&head)).map(str::to_owned))
+    })?;
     ensure!(a.wait()?.success(), "allocation A failed");
     ensure!(b.wait()?.success(), "allocation B failed");
     let (a_end, b_start) = (
@@ -737,7 +747,7 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
         "B did not wait (launched {b_launched}, started {b_start})"
     );
     println!(
-        "PASS d: second allocation queued {}s and ran after the first was released",
+        "PASS d: second allocation queued {}s as claim {pending} (place 1) and ran after the first was released",
         b_start - b_launched
     );
 
@@ -934,8 +944,8 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Scenario l: an allocation request that stays queued, and silent, for over
-/// five minutes behind the Gateway.
+/// Scenario l: an allocation that stays queued for over five minutes behind the
+/// Gateway, which the client follows with polls of at most 25 s each.
 struct LongPoll {
     holder: Spawned,
     waiter: Spawned,
@@ -999,7 +1009,7 @@ impl LongPoll {
             "Y waited {waited}s, not past the 5-minute idle bound the scenario tests"
         );
         println!(
-            "PASS l: an allocation request queued silently for {waited}s through the Gateway and got the worker"
+            "PASS l: an allocation queued {waited}s through the Gateway, polled with requests of at most 25s, and got the worker"
         );
         Ok(())
     }

@@ -139,6 +139,9 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
+    - jsonPath: .status.queuePosition
+      name: Position
+      type: integer
     - jsonPath: .status.secretName
       name: Secret
       type: string
@@ -174,6 +177,22 @@ spec:
                 nullable: true
                 pattern: ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$
                 type: string
+              cacheScope:
+                description: |-
+                  The caller's cache scope id, written by the API with `owner`. Honoured only in
+                  the controller's namespace.
+                maxLength: 128
+                minLength: 1
+                nullable: true
+                type: string
+              owner:
+                description: |-
+                  The allocation owner the API authenticated. Honoured only in the controller's
+                  namespace; elsewhere the owner is `claim:<namespace>/<name>#<uid>`.
+                maxLength: 1024
+                minLength: 1
+                nullable: true
+                type: string
               poolRef:
                 description: The pool to allocate from.
                 properties:
@@ -193,6 +212,23 @@ spec:
                 - name
                 - namespace
                 type: object
+              publicKey:
+                description: |-
+                  PEM SPKI ECDSA P-256 public key. The leader signs the allocation certificate
+                  for it and writes the certificate into status. Without it the leader generates
+                  the key and writes the Secret `<name>-buildkit`.
+                maxLength: 1024
+                nullable: true
+                type: string
+              queueTimeout:
+                description: |-
+                  How long the claim may stay `Pending` before it fails with `QueueTimeout`.
+                  Defaults to the pool's `allocation.queueTimeout`; its `maxQueueTimeout` caps it.
+                maxLength: 32
+                minLength: 1
+                nullable: true
+                pattern: ^([0-9]+h)?([0-9]+m)?([0-9]+s)?$
+                type: string
               ttl:
                 description: |-
                   Lifetime of the allocation. Defaults to the pool's `allocation.defaultTTL`;
@@ -217,6 +253,48 @@ spec:
             properties:
               allocationId:
                 description: Allocation id (set once bound).
+                nullable: true
+                type: string
+              cache:
+                description: Cache flags and outcome of the allocation, as in the `201` response.
+                nullable: true
+                properties:
+                  key:
+                    description: The effective cache key.
+                    type: string
+                  local:
+                    description: Local volume outcome.
+                    nullable: true
+                    properties:
+                      result:
+                        description: |-
+                          `hit`, `miss`, `spill`, `cold` or `uncached`, or
+                          `reused` when the request left out the local layer.
+                        type: string
+                    required:
+                    - result
+                    type: object
+                  registry:
+                    description: buildx flags of the registry cache.
+                    nullable: true
+                    properties:
+                      from:
+                        description: "`--cache-from` values, in order."
+                        items:
+                          type: string
+                        type: array
+                      to:
+                        description: "`--cache-to` value."
+                        type: string
+                    required:
+                    - from
+                    - to
+                    type: object
+                required:
+                - key
+                type: object
+              certificate:
+                description: The allocation client certificate (PEM; public).
                 nullable: true
                 type: string
               conditions:
@@ -294,10 +372,19 @@ spec:
                 - Failed
                 nullable: true
                 type: string
+              pod:
+                description: The worker pod the claim is bound to.
+                nullable: true
+                type: string
+              queuePosition:
+                description: 1-based place in the pool's queue while `Pending`. Refreshed every few seconds.
+                format: int32
+                nullable: true
+                type: integer
               secretName:
-                description: >-
-                  Secret in the claim's namespace holding `tls.crt`, `tls.key`, `ca.crt` and
-                  `endpoint`.
+                description: |-
+                  Secret in the claim's namespace holding `tls.crt`, `tls.key`, `ca.crt` and `endpoint`.
+                  Unset for a claim with `spec.publicKey`.
                 nullable: true
                 type: string
               serverName:
@@ -530,6 +617,12 @@ rules:
     resources: [configmaps]
     resourceNames: [buildkit-controller-ca-bundle]
     verbs: [patch]
+  - apiGroups: [buildkit.smrt-devops.net]
+    resources: [buildkitclaims]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [buildkit.smrt-devops.net]
+    resources: [buildkitclaims/status]
+    verbs: [get, patch, update]
 
 ---
 # Source: buildkit-controller/templates/rbac.yaml

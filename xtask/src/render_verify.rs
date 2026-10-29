@@ -8,7 +8,7 @@ use std::process::Output;
 use anyhow::{Context, Result, bail};
 use buildkit_controller::render::fixtures::{CONTROLLER_NAMESPACE, POOL_NAMESPACE, render_all};
 
-use super::{CRD_PATH, root};
+use super::root;
 use crate::kube::Cluster;
 
 /// Repository-relative fixture directory.
@@ -46,17 +46,13 @@ fn write_fixtures(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// Install the CRD, namespaces and prerequisites.
-fn prepare(cluster: &Cluster, root: &Path) -> Result<()> {
+/// Install the CRDs, namespaces and prerequisites.
+fn prepare(cluster: &Cluster) -> Result<()> {
     let version = cluster.kubectl(&["version", "-o", "json"])?;
     for l in version.lines().filter(|l| l.contains("gitVersion")) {
         println!("{}", l.trim());
     }
-    let crd = root.join(CRD_PATH).to_string_lossy().into_owned();
-    cluster
-        .kubectl(&["apply", "--server-side", "-f", &crd])
-        .context("CRD apply")?;
-    cluster.wait_crd_established()?;
+    cluster.apply_crds().context("CRD apply")?;
     for ns in [POOL_NAMESPACE, CONTROLLER_NAMESPACE] {
         cluster
             .kubectl(&["create", "namespace", ns])
@@ -99,7 +95,7 @@ pub fn render_verify() -> Result<()> {
         work.join("kubeconfig"),
     );
     cluster.create(None, "120s")?;
-    prepare(&cluster, &root)?;
+    prepare(&cluster)?;
 
     // Apply ServiceAccounts first so the pods find theirs.
     let mut ordered: Vec<&PathBuf> = fixtures.iter().collect();

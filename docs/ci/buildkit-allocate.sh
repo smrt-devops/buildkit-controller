@@ -11,6 +11,11 @@
 #   CACHE_KEY=app-main ... sh buildkit-allocate.sh \
 #     sh -c 'docker buildx build --builder "$BUILDER" $CACHE_ARGS .'
 #
+# The controller queues allocations. POST /v1/allocations answers 201 when a worker is bound
+# and 202 with an id while it waits in the pool's queue; the script then long-polls
+# GET /v1/allocations/{id}?wait=25s until it is bound. All of it is bounded by
+# QUEUE_TIMEOUT (the pool default when unset) plus 60 s.
+#
 # Env: API, POOL (<namespace>/<pool>), TOKEN; optional TTL (seconds),
 # QUEUE_TIMEOUT (seconds), API_CA (PEM file trusted for the API listener),
 # CACHE_KEY (cache key of both layers) and CACHE (auto, registry, local or none).
@@ -114,9 +119,11 @@ openssl pkey -in "$D/key.pem" -pubout -out "$D/pub.pem"
 # retried, both of which happen before the server claims anything: HTTP 503 with Retry-After, and
 # curl failing to resolve or connect (exit 6 or 7). A reset after sending, a timeout and every other
 # status end the run. Retries stop once the next wait would pass queue timeout + 60 s.
-# The client timeout covers queue timeout + startTimeout ceiling (1800) + 10 s.
+# The server answers a POST within about 20 s (201, or 202 with an id), so the client timeout is 40 s.
+# A 202 is polled by id (poll_alloc). Queue timeout running out on a poll is terminal for that id and
+# is retried like a pool_exhausted 503 from the POST: a fresh POST, if the budget allows.
 # A retry queues only for what is left of the budget (QUEUE_TIMEOUT less the time already spent), so
-# a busy pool, which answers 503 after the full queue timeout, does not double the total wait.
+# a busy pool does not double the total wait.
 # QUEUE_TIMEOUT stays unset only when the server reports no pool default; the server default then applies.
 write_body() { # write_body QUEUE_TIMEOUT_OR_EMPTY
 jq -n --arg ns "$NS" --arg pool "$NAME" --rawfile pk "$D/pub.pem" \
@@ -128,6 +135,57 @@ jq -n --arg ns "$NS" --arg pool "$NAME" --rawfile pk "$D/pub.pem" \
    + (if $ck != "" then {cacheKey:$ck} else {} end)
    + (if $cache != "auto" then {cache:$cache} else {} end)' > "$D/req.json"
 }
+# check_id : validate the id in $D/alloc.json and set ID to it.
+check_id() {
+  ID=$(jq -r '.id // empty' "$D/alloc.json" 2>/dev/null || :)
+  case $ID in
+    ''|*[!a-z0-9]*) ID=; echo "controller returned an invalid allocation id" >&2; exit 1 ;;
+  esac
+  [ "${#ID}" -le 63 ] || { ID=; echo "controller returned an invalid allocation id" >&2; exit 1; }
+}
+
+# poll_alloc : long-poll the queued allocation $ID until it is bound or fails for good, leaving the
+# status in $code, the headers in $D/hdr and the body in $D/alloc.json. 200 means bound. A terminal
+# answer (4xx, or 503 pool_exhausted or pod_lost) clears ID: there is nothing left to release. Anything
+# else (202, 5xx, upstream_error, a curl failure) polls the same id again after Retry-After, else 2 s.
+# Stops with code 000 once the overall budget is spent, keeping ID so the allocation is released.
+poll_alloc() {
+  while :; do
+    _left=$(( RETRY_BUDGET - ( $(date +%s) - start ) ))
+    if [ "$_left" -le 0 ]; then
+      echo "allocate $POOL: $ID was not bound within the queue budget" >&2
+      code=000
+      return 0
+    fi
+    _mt=$(( _left + 5 ))
+    [ "$_mt" -le 40 ] || _mt=40
+    _rc=0
+    curl_api --max-time "$_mt" -H @"$D/auth" -D "$D/hdr" -o "$D/alloc.json" -w '%{http_code}' \
+      "$API/v1/allocations/$ID?wait=25s" > "$D/status" &
+    CMD=$!
+    wait "$CMD" || _rc=$?
+    CMD=
+    code=$(cat "$D/status" 2>/dev/null || :)
+    [ -n "$code" ] || code=000
+    _wait=
+    case $code in
+      200) return 0 ;;
+      202) continue ;;
+      000) ;;
+      503)
+        case $(jq -r '.error.code // empty' "$D/alloc.json" 2>/dev/null || :) in
+          pool_exhausted|pod_lost) ID=; return 0 ;;
+        esac
+        _wait=$(retry_wait "$D/hdr") ;;
+      4??) ID=; return 0 ;;
+      *) _wait=$(retry_wait "$D/hdr") ;;
+    esac
+    [ -n "$_wait" ] || _wait=2
+    echo "poll $ID: HTTP $code (curl $_rc), polling again in ${_wait}s" >&2
+    sleep "$_wait"
+  done
+}
+
 start=$(date +%s)
 attempt=1
 backoff=1
@@ -139,16 +197,20 @@ while :; do
     [ "$qt" -le "$QUEUE_TIMEOUT" ] || qt=$QUEUE_TIMEOUT
   fi
   write_body "$qt"
-  MAX_TIME=$(( ${qt:-3600} + 1800 + 10 ))
   rc=0
   # In the background, so a TERM runs the release trap at once instead of after the request.
-  curl_api --max-time "$MAX_TIME" -H @"$D/auth" -D "$D/hdr" -o "$D/alloc.json" -w '%{http_code}' \
+  curl_api --max-time 40 -H @"$D/auth" -D "$D/hdr" -o "$D/alloc.json" -w '%{http_code}' \
     -H 'Content-Type: application/json' --data-binary @"$D/req.json" "$API/v1/allocations" > "$D/status" &
   CMD=$!
   wait "$CMD" || rc=$?
   CMD=
   code=$(cat "$D/status" 2>/dev/null || :)
   wait=
+  if [ "$code" = 202 ]; then
+    check_id
+    echo "allocate $POOL: queued as $ID" >&2
+    poll_alloc
+  fi
   if [ "$code" = 503 ]; then
     # Only the codes the controller sends with Retry-After before it claims a worker; an intermediary
     # that adds Retry-After to its own 503 may have forwarded the request.
@@ -168,17 +230,15 @@ while :; do
   echo "allocate $POOL: $why, retrying in ${wait}s (attempt $attempt)" >&2
   sleep "$wait"
 done
-if [ "$code" != 201 ]; then
-  detail=$(jq -r '.error // empty | "\(.code): \(.message)"' "$D/alloc.json" 2>/dev/null || :)
-  echo "allocation failed: HTTP ${code:-000} $detail" >&2
-  exit 1
-fi
-
-ID=$(jq -r .id "$D/alloc.json")
-case $ID in
-  ''|*[!a-z0-9]*) ID=; echo "controller returned an invalid allocation id" >&2; exit 1 ;;
+case $code in
+  200|201) ;;
+  *)
+    detail=$(jq -r '.error // empty | "\(.code): \(.message)"' "$D/alloc.json" 2>/dev/null || :)
+    echo "allocation failed: HTTP ${code:-000} $detail" >&2
+    exit 1 ;;
 esac
-[ "${#ID}" -le 63 ] || { ID=; echo "controller returned an invalid allocation id" >&2; exit 1; }
+
+check_id
 BUILDER="bk-$ID"
 jq -r .clientCert "$D/alloc.json" > "$D/cert.pem"
 jq -r '.caCert // empty' "$D/alloc.json" > "$D/ca.pem"

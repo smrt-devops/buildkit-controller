@@ -1,4 +1,4 @@
-//! Pure pod logic of the allocation service, covering candidate selection, free slots,
+//! Pure pod logic of allocation, covering candidate selection, free slots,
 //! the claim and retire patches, allocation ids and timestamps.
 
 use std::collections::BTreeSet;
@@ -22,6 +22,8 @@ pub const CERT_MARGIN: time::Duration = time::Duration::minutes(5);
 pub const FREE: &str = "free";
 /// `P alloc` of a retired pod.
 pub const DRAINING: &str = "draining";
+/// `P claim`: `<namespace>/<name>` of the claim an allocated pod serves.
+pub const ANN_CLAIM: &str = "buildkit.smrt-devops.net/claim";
 
 /// An annotation value.
 #[must_use]
@@ -112,30 +114,34 @@ pub(super) fn ptr(section: &str, key: &str) -> String {
     )
 }
 
-/// The claim patch.
+/// What a bind writes onto the pod.
+#[derive(Debug, Clone, Copy)]
+pub struct Bind<'a> {
+    /// Allocation id.
+    pub alloc_id: &'a str,
+    /// Owner string.
+    pub owner: &'a str,
+    /// `<namespace>/<name>` of the claim.
+    pub claim: &'a str,
+    /// `allocated-at`.
+    pub now: &'a str,
+    /// `expires-at`, the allocation's expiry.
+    pub expires: &'a str,
+}
+
+/// The claim patch. The `test`s on uid and `alloc == free` make it lose to any
+/// other writer, so a deposed leader cannot book a pod twice.
 #[must_use]
-pub fn claim_patch(uid: &str, alloc_id: &str, owner: &str, now: &str, expires: &str) -> Value {
+pub fn claim_patch(uid: &str, b: &Bind<'_>) -> Value {
     json!([
         {"op": "test", "path": "/metadata/uid", "value": uid},
         {"op": "test", "path": ptr("annotations", ANN_ALLOC), "value": FREE},
-        {"op": "replace", "path": ptr("annotations", ANN_ALLOC), "value": alloc_id},
+        {"op": "replace", "path": ptr("annotations", ANN_ALLOC), "value": b.alloc_id},
         {"op": "replace", "path": ptr("labels", LABEL_STATE), "value": "allocated"},
-        {"op": "add", "path": ptr("annotations", ANN_OWNER), "value": owner},
-        {"op": "add", "path": ptr("annotations", ANN_ALLOCATED_AT), "value": now},
-        {"op": "add", "path": ptr("annotations", ANN_EXPIRES_AT), "value": expires},
-    ])
-}
-
-/// The commit patch: moves `expires-at` from the claim's short value `from`
-/// to the allocation's real expiry `to`. The test on `from` makes it lose to
-/// a leader that retired the pod at `from`, and makes that retire lose to it.
-#[must_use]
-pub fn extend_patch(uid: &str, alloc_id: &str, from: &str, to: &str) -> Value {
-    json!([
-        {"op": "test", "path": "/metadata/uid", "value": uid},
-        {"op": "test", "path": ptr("annotations", ANN_ALLOC), "value": alloc_id},
-        {"op": "test", "path": ptr("annotations", ANN_EXPIRES_AT), "value": from},
-        {"op": "replace", "path": ptr("annotations", ANN_EXPIRES_AT), "value": to},
+        {"op": "add", "path": ptr("annotations", ANN_OWNER), "value": b.owner},
+        {"op": "add", "path": ptr("annotations", ANN_CLAIM), "value": b.claim},
+        {"op": "add", "path": ptr("annotations", ANN_ALLOCATED_AT), "value": b.now},
+        {"op": "add", "path": ptr("annotations", ANN_EXPIRES_AT), "value": b.expires},
     ])
 }
 
@@ -209,8 +215,20 @@ fn random_bytes<const N: usize>() -> Option<[u8; N]> {
 /// 16 CSPRNG bytes, lowercase RFC 4648 base32, no padding (26 chars).
 #[must_use]
 pub fn new_alloc_id() -> Option<AllocId> {
+    alloc_id_of(random_bytes::<16>()?)
+}
+
+/// The allocation id of an in-cluster claim: the first 16 bytes of SHA-256
+/// over its uid, as [`new_alloc_id`] encodes them. Fixed for the claim, so a
+/// leader that finds a pod carrying it knows the bind already landed.
+#[must_use]
+pub fn derived_alloc_id(uid: &str) -> Option<AllocId> {
+    let d = ring::digest::digest(&ring::digest::SHA256, uid.as_bytes());
+    alloc_id_of(d.as_ref().get(..16)?.try_into().ok()?)
+}
+
+fn alloc_id_of(bytes: [u8; 16]) -> Option<AllocId> {
     const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-    let bytes = random_bytes::<16>()?;
     let (mut acc, mut bits, mut out) = (0u32, 0u32, String::with_capacity(26));
     for b in bytes {
         acc = (acc << 8) | u32::from(b);

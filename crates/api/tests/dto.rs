@@ -233,4 +233,5 @@ fn error_codes_match_spec_table() {
     assert_eq!(ErrorCode::StartTimeout.retry_after_seconds(), Some(5));
     assert_eq!(ErrorCode::NotReady.retry_after_seconds(), None);
     assert_eq!(ErrorCode::ShuttingDown.retry_after_seconds(), Some(1));
+    assert_eq!(ErrorCode::UpstreamError.retry_after_seconds(), Some(2));
 }

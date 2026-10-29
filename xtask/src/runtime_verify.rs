@@ -307,10 +307,8 @@ pub fn runtime_verify() -> Result<()> {
         );
     }
 
-    // 2. Apply the CRD. The stores sync (watch backoff <= 30 s) and /readyz turns 200.
-    let crd = root.join("helm/buildkit-controller/crds/buildkitpools.yaml");
-    cluster.kubectl(&["apply", "--server-side", "-f", &crd.to_string_lossy()])?;
-    cluster.wait_crd_established()?;
+    // 2. Apply the CRDs. The stores sync (watch backoff <= 30 s) and /readyz turns 200.
+    cluster.apply_crds()?;
     let t = wait_for("/readyz 200 on both", Duration::from_secs(90), || {
         replicas
             .iter()
