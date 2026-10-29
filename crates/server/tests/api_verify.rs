@@ -59,6 +59,9 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 const NS: &str = "bk-api";
+/// The controller's namespace (the CA Secret, the API's claims); the controller
+/// keeps no pool in its own namespace.
+const SYS: &str = "bk-api-system";
 const POOL: &str = "p";
 const HIDDEN: &str = "hidden";
 const SERVER_NAME: &str = "bk.example.com";
@@ -256,13 +259,15 @@ async fn setup(issuer: &Issuer, stop: &CancellationToken) -> (H, SocketAddr, Arc
     let client = harness::client().await;
     let image = std::env::var("API_VERIFY_PAUSE_IMAGE").unwrap();
     let work = std::path::PathBuf::from(std::env::var("API_VERIFY_WORK").unwrap());
-    Api::<Namespace>::all(client.clone())
-        .create(
-            &PostParams::default(),
-            &serde_json::from_value(json!({"metadata": {"name": NS}})).unwrap(),
-        )
-        .await
-        .unwrap();
+    for ns in [NS, SYS] {
+        Api::<Namespace>::all(client.clone())
+            .create(
+                &PostParams::default(),
+                &serde_json::from_value(json!({"metadata": {"name": ns}})).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
 
     let api = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -279,7 +284,7 @@ async fn setup(issuer: &Issuer, stop: &CancellationToken) -> (H, SocketAddr, Arc
     std::fs::write(&path, &yaml).unwrap();
     let mut cli = Cli::parse_from(["buildkit-controller", "--config", path.to_str().unwrap()]);
     cli.pod_name = "r1".into();
-    cli.pod_namespace = NS.into();
+    cli.pod_namespace = SYS.into();
     let config = Config::from_yaml(&yaml).unwrap();
 
     let ca = CaBundle::generate(OffsetDateTime::now_utc()).unwrap();
@@ -292,7 +297,7 @@ async fn setup(issuer: &Issuer, stop: &CancellationToken) -> (H, SocketAddr, Arc
             .map(|(k, v)| (k, ByteString(v)))
             .collect(),
     );
-    Api::<Secret>::namespaced(client.clone(), NS)
+    Api::<Secret>::namespaced(client.clone(), SYS)
         .create(&PostParams::default(), &secret)
         .await
         .unwrap();
