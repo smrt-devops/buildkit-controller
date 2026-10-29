@@ -200,7 +200,9 @@ while :; do
   write_body "$qt"
   rc=0
   # In the background, so a TERM runs the release trap at once instead of after the request.
-  curl_api --max-time 40 -H @"$D/auth" -D "$D/hdr" -o "$D/alloc.json" -w '%{http_code}' \
+  _pt=$(( RETRY_BUDGET - ( $(date +%s) - start ) ))
+  [ "$_pt" -ge 1 ] || _pt=1
+  curl_api --max-time "$_pt" -H @"$D/auth" -D "$D/hdr" -o "$D/alloc.json" -w '%{http_code}' \
     -H 'Content-Type: application/json' --data-binary @"$D/req.json" "$API/v1/allocations" > "$D/status" &
   CMD=$!
   wait "$CMD" || rc=$?
@@ -216,7 +218,7 @@ while :; do
     # Only the codes the controller sends with Retry-After before it claims a worker; an intermediary
     # that adds Retry-After to its own 503 may have forwarded the request.
     case $(jq -r '.error.code // empty' "$D/alloc.json" 2>/dev/null || :) in
-      pool_exhausted|start_timeout|upstream_error) wait=$(retry_wait "$D/hdr") ;;
+      pool_exhausted|start_timeout|shutting_down|upstream_error) wait=$(retry_wait "$D/hdr") ;;
     esac
     why="HTTP 503"
   elif [ "$rc" = 6 ] || [ "$rc" = 7 ]; then

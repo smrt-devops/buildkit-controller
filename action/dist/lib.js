@@ -32,8 +32,8 @@ function parseDuration(s) {
 }
 
 /**
- * Socket timeout for POST /v1/allocations and for each long poll. The server answers a POST within
- * about 20 s and caps a poll's `wait` at 25 s; 40 s leaves room for the network.
+ * Socket timeout for each long poll. The server caps a poll's `wait` at 25 s; 40 s leaves room for the
+ * network. A POST gets the whole remaining budget instead (see `postTimeoutMs`).
  */
 const REQUEST_TIMEOUT_MS = 40000;
 const POLL_WAIT = '25s';
@@ -229,6 +229,15 @@ function effectiveQueueTimeout(queueTimeoutSeconds, pool) {
   return Number.isInteger(d) && d >= 0 ? d : undefined;
 }
 
+/**
+ * Socket timeout of a POST: the whole budget left. A v3 controller answers within about 20 s, but a
+ * v0.1.0 controller holds the POST open through the queue wait and the pod start, so a short timeout
+ * would fail an allocation whose id the client never saw.
+ */
+function postTimeoutMs(remainingMs) {
+  return Math.max(1000, remainingMs);
+}
+
 /** Bound on the whole retry loop: the request's queue timeout (1 h, the largest allowed, if unknown) + 60 s. It covers the POST, every poll and any fresh POST after a queue timeout. */
 function retryBudgetMs(queueTimeoutSeconds) {
   const q = queueTimeoutSeconds === undefined ? 3600 : queueTimeoutSeconds;
@@ -413,7 +422,7 @@ async function fetchOidcToken(audience, setSecret) {
 }
 
 module.exports = {
-  parseList, parsePool, REQUEST_TIMEOUT_MS, pollAllocation, allocate, errorCode, parseDuration, generateKey, allocationBody,
+  parseList, parsePool, REQUEST_TIMEOUT_MS, postTimeoutMs, pollAllocation, allocate, errorCode, parseDuration, generateKey, allocationBody,
   validatePools, buildxCommands, parseCacheInputs, cacheFlags, checkAllocationId, createBuilder, writeMaterial, request, apiError,
   effectiveQueueTimeout, retryBudgetMs, SHORT_BUDGET_MS, isClaimFree503, releaseAllocation, queueTimeoutFor, retryAfterMs, isPreSendError, requestWithRetry, fetchOidcToken,
 };
