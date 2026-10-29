@@ -46,7 +46,13 @@ fn default_writers_trust_push_events_and_in_cluster_callers() {
     for e in cache::TRUSTED_EVENTS {
         assert_eq!(cache::tier(&p, &oidc(e)), CacheTier::Trusted, "{e}");
     }
-    for e in ["pull_request", "pull_request_target", "issue_comment", ""] {
+    for e in [
+        "pull_request",
+        "pull_request_target",
+        "issue_comment",
+        "merge_group",
+        "",
+    ] {
         assert_eq!(cache::tier(&p, &oidc(e)), CacheTier::Untrusted, "{e}");
     }
     assert_eq!(cache::tier(&p, &sa("x")), CacheTier::Trusted);

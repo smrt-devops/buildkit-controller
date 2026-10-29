@@ -14,8 +14,9 @@ use crate::auth::Identity;
 use crate::render::{self, ANN_SCOPE, ANN_TIER};
 
 /// GitHub Actions events whose builds may write the cache by default, when
-/// the token's `ref_protected` claim is also true.
-pub const TRUSTED_EVENTS: [&str; 4] = ["push", "schedule", "workflow_dispatch", "merge_group"];
+/// the token's `ref_protected` claim is also true. Not `merge_group`: its
+/// queue ref is never protected.
+pub const TRUSTED_EVENTS: [&str; 3] = ["push", "schedule", "workflow_dispatch"];
 /// GitHub Actions events whose builds never write the cache, whatever
 /// `cache.writers` says: they can run code from forks or from unreviewed
 /// refs, and `workflow_run` and the comment and review events do so from the
@@ -33,9 +34,13 @@ pub const READ_ONLY_EVENTS: [&str; 8] = [
 ];
 /// GitLab CI `pipeline_source` values whose builds never write the cache,
 /// whatever `cache.writers` says: merge request pipelines, which can run a
-/// fork's code in the parent project.
-pub const READ_ONLY_PIPELINE_SOURCES: [&str; 2] =
-    ["merge_request_event", "external_pull_request_event"];
+/// fork's code in the parent project, and child pipelines, whose token does
+/// not say what started the parent.
+pub const READ_ONLY_PIPELINE_SOURCES: [&str; 3] = [
+    "merge_request_event",
+    "external_pull_request_event",
+    "parent_pipeline",
+];
 
 /// The cache of one allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
