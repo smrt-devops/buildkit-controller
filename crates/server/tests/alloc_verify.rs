@@ -366,6 +366,12 @@ fn metric(m: &Metrics, needle: &str) -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "needs a kind cluster: cargo xtask alloc-verify"]
 async fn alloc_verify() {
+    // The controller log, so a failure shows what the replicas did.
+    let _ = buildkit_controller::telemetry::logs::init(
+        "info",
+        buildkit_controller::config::LogFormat::Text,
+        "alloc-verify",
+    );
     let stop = CancellationToken::new();
     let h = setup(&stop).await;
     let svc = h.leader.svc.clone();
