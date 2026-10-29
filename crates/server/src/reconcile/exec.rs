@@ -178,6 +178,9 @@ pub async fn execute<O: KubeOps>(ops: &O, guard: &CaGuard, env: &Env<'_>, plan: 
     let mut ca_ok = false;
     // When an SA or NetworkPolicy apply fails, no creates run.
     let mut apply_failed: Option<String> = None;
+    // After a failed create (quota, admission), the pass creates nothing more:
+    // the next attempt waits for the create backoff.
+    let mut create_failed = false;
     let (mut sa_ok, mut np_ok) = (None, None);
     for action in &plan.actions {
         match action {
@@ -255,8 +258,13 @@ pub async fn execute<O: KubeOps>(ops: &O, guard: &CaGuard, env: &Env<'_>, plan: 
                     tracing::debug!(pod = %name, reason = %why, "create skipped");
                     continue;
                 }
+                if create_failed {
+                    r.trace.push(format!("skip_create:{name}"));
+                    continue;
+                }
                 r.trace.push(format!("create:{name}"));
                 let result = create_pod(ops, env, *slot, &mut r).await;
+                create_failed = matches!(result, CreateResult::Failed { .. });
                 r.creates.push(CreateOutcome {
                     slot: *slot,
                     result,
@@ -411,10 +419,16 @@ async fn create_pod<O: KubeOps>(ops: &O, env: &Env<'_>, slot: u32, r: &mut Repor
         Ok(p) => {
             r.pod_ops.push(("create", "ok"));
             r.created.push(p);
-            // The pod cannot start without its Secret and is retired at
-            // startTimeout; the failure counts toward the create backoff.
+            // Without its own Secret the pod must not start: a Secret of the same
+            // name planted by someone else would let it. Delete it at once.
             if let Err(e) = res.secret {
                 r.errors.push(format!("create slot {slot}: {e}"));
+                if let spawn::PodCreated::Yes { name, uid } = &res.pod {
+                    let ns = env.pool.namespace().unwrap_or_default();
+                    tracing::warn!(namespace = %ns, pod = %name, error = %e, "worker Secret not created; deleting the pod");
+                    let del = ops.delete_pod(&ns, name, uid, None, Some(0)).await;
+                    pod_op(r, "delete", name, del);
+                }
                 return failed(e);
             }
             CreateResult::Created
@@ -526,7 +540,8 @@ async fn replace_ca<O: KubeOps>(
         metadata: ObjectMeta {
             name: Some(CaBundle::backup_name(env.ca_secret_name, odt(env.now))),
             namespace: Some(env.render.controller_namespace.clone()),
-            // The CA Secret keeps backups for forensics. The controller never deletes them.
+            // Backups are for forensics and hold no CA keys: only the CA
+            // certificates and the marker. The controller never deletes them.
             labels: Some(BTreeMap::from([
                 (LABEL_MANAGED_BY.into(), CONTROLLER.into()),
                 ("app.kubernetes.io/component".into(), "ca-replaced".into()),
@@ -534,8 +549,14 @@ async fn replace_ca<O: KubeOps>(
             ..ObjectMeta::default()
         },
         type_: cur.type_.clone(),
-        data: cur.data.clone(),
-        string_data: cur.string_data.clone(),
+        data: cur
+            .data
+            .as_ref()
+            .map(|d| CaBundle::backup_data(d, |v: &ByteString| v.0.as_slice())),
+        string_data: cur
+            .string_data
+            .as_ref()
+            .map(|d| CaBundle::backup_data(d, String::as_bytes)),
         ..Secret::default()
     };
     match ops.create_secret(&backup).await {

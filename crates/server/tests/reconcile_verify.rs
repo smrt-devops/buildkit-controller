@@ -591,8 +591,39 @@ async fn reconcile_verify() {
     })
     .await;
     assert_eq!(h.worker_secrets("p").await.unwrap().len(), 2);
+    // A real build under the worker's security context (NET_RAW dropped), with
+    // no registry: a base layer copied from the worker's own busybox, then a
+    // RUN that deletes a base file (a whiteout) and chowns one.
+    let script = r#"set -e; d=$(mktemp -d); mkdir -p "$d/c/bin" "$d/c/lib"
+cp /bin/busybox "$d/c/bin/"; cp /lib/ld-musl-* "$d/c/lib/"; echo x > "$d/c/gone"
+cat > "$d/Dockerfile" <<'EOF'
+FROM scratch
+COPY c/ /
+RUN ["/bin/busybox", "sh", "-c", "/bin/busybox rm /gone && /bin/busybox echo ok > /ok && /bin/busybox chown 1:1 /ok && test \"$(/bin/busybox stat -c %u /ok)\" = 1"]
+EOF
+buildctl --addr unix:///run/user/1000/buildkit/buildkitd.sock build --frontend dockerfile.v0 --local context="$d" --local dockerfile="$d""#;
+    let built = harness::kubectl()
+        .args([
+            "-n",
+            NS,
+            "exec",
+            "p-0",
+            "-c",
+            "buildkitd",
+            "--",
+            "sh",
+            "-c",
+            script,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "a build in p-0 failed: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
     summary.push(format!(
-        "S1 PASS: 2/2 Ready free in {}s; status applied (observedGeneration {:?}, warm 2, Ready {:?})",
+        "S1 PASS: 2/2 Ready free in {}s; status applied (observedGeneration {:?}, warm 2, Ready {:?}); a RUN build succeeded in p-0",
         took.as_secs(),
         st.observed_generation,
         cond(&p, "Ready")

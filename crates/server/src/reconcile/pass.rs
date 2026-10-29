@@ -222,6 +222,7 @@ pub async fn run<O: KubeOps>(
         time_zone: TimeZone::get(&pool.spec.scaling.time_zone).ok(),
         template: template_check(pool),
         network: &settings.render.worker_network,
+        controller_namespace: &settings.render.controller_namespace,
         platforms: platforms(pool),
         ca: &loaded,
         ca_bundle_current: guard.bundle_current(ca.epoch, now),
@@ -270,7 +271,15 @@ pub(super) fn remember(
     if report.sandbox_applied {
         mem.sandbox_applied = Some((pool.metadata.generation.unwrap_or_default(), now));
     }
-    mem.create_backoff = match plan.backoff {
+    // A refused create (quota, admission) gates the next creates at once, so
+    // event-driven passes do not repeat it.
+    let create_failed = Plan::requeue_after_outcomes(&report.creates) == Requeue::ErrorBackoff;
+    let signal = if create_failed {
+        BackoffSignal::Bump
+    } else {
+        plan.backoff
+    };
+    mem.create_backoff = match signal {
         BackoffSignal::Bump => {
             let step = mem
                 .create_backoff
@@ -293,8 +302,7 @@ pub(super) fn remember(
         .min()
         .map(|t| t.duration_since(now).try_into().unwrap_or(Duration::ZERO));
 
-    let failed = !report.errors.is_empty()
-        || Plan::requeue_after_outcomes(&report.creates) == Requeue::ErrorBackoff;
+    let failed = !report.errors.is_empty() || create_failed;
     if failed {
         let next = mem
             .error_backoff
@@ -433,6 +441,37 @@ mod tests {
         assert!(mem.down_since.is_empty());
         mem.observe_up(&[], t(40));
         assert!(mem.seen_up.is_empty());
+    }
+
+    /// A refused create starts the create backoff in the pass that saw it, and
+    /// a second one doubles it. Before, only a failed or timed-out pod did, so
+    /// every claim event re-planned every refused create.
+    #[test]
+    fn a_failed_create_starts_the_create_backoff() {
+        let now = Timestamp::from_second(1_790_000_000).unwrap();
+        let pool = fixtures::pool("p", serde_json::json!({})).unwrap();
+        let plan = Plan {
+            actions: Vec::new(),
+            requeue_at: None,
+            backoff: BackoffSignal::Keep,
+            slot_holds: std::collections::BTreeMap::new(),
+        };
+        let report = || Report {
+            creates: vec![CreateOutcome {
+                slot: 0,
+                result: CreateResult::Failed {
+                    message: "exceeded quota".into(),
+                },
+            }],
+            ..Report::default()
+        };
+        let mut mem = PoolMemory::default();
+        let requeue = remember(&mut mem, &pool, &plan, &report(), BTreeSet::new(), now);
+        let ten = SignedDuration::from_secs(10);
+        assert_eq!(mem.create_backoff, Some((now + ten, ten)));
+        assert_eq!(requeue, Some(std::time::Duration::from_secs(1)));
+        remember(&mut mem, &pool, &plan, &report(), BTreeSet::new(), now);
+        assert_eq!(mem.create_backoff, Some((now + ten * 2, ten * 2)));
     }
 
     /// A create backoff that has run out is kept until a pod turns Ready, but

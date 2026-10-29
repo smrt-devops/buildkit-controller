@@ -137,6 +137,7 @@ impl Fx {
             time_zone: self.tz.clone(),
             template: self.template.clone(),
             network: &self.network,
+            controller_namespace: "bk-system",
             platforms: Vec::new(),
             ca: self.ca,
             ca_bundle_current: true,
@@ -1304,10 +1305,78 @@ fn sandbox_is_applied_again_after_the_reapply_period() {
             .count()
     };
     let mut f = fx();
-    f.sandbox = Some((1, ago(60)));
+    f.sandbox = Some((1, ago(30)));
     let p = f.plan();
     assert_eq!(applies(&p), 0);
-    assert_eq!(p.requeue_at, Some(ago(60) + REAPPLY_AFTER));
+    assert_eq!(p.requeue_at, Some(ago(30) + REAPPLY_AFTER));
     f.sandbox = Some((1, *NOW - REAPPLY_AFTER));
     assert_eq!(applies(&f.plan()), 2);
+}
+
+/// A pool in the controller's namespace is refused: no sandbox, no creates,
+/// `Ready=False/InvalidSpec`.
+#[test]
+fn pool_in_the_controller_namespace_is_invalid_spec() {
+    let mut f = fx().scale(2, 10);
+    f.sandbox = None;
+    f.pool.metadata.namespace = Some("bk-system".into());
+    let p = f.plan();
+    assert!(creates(&p).is_empty());
+    assert!(
+        !p.actions
+            .iter()
+            .any(|a| matches!(a, Action::ApplySa | Action::ApplyNetworkPolicy))
+    );
+    let c = cond(&p, "Ready");
+    assert_eq!(
+        (c.reason.as_str(), c.message.as_str()),
+        ("InvalidSpec", "pool is in the controller's namespace")
+    );
+}
+
+/// RECON-9: in the last `worker_cert_min_left` of a CA's life every new pod
+/// would be retired as `CertExpiring` at once, so none is created; the pass
+/// comes back just after the CA ends, when it is replaced.
+#[test]
+fn no_creates_when_the_ca_ends_before_a_new_worker_could_serve() {
+    static ENDING: LazyLock<LoadOutcome> = LazyLock::new(|| {
+        let t = odt(*NOW) - time::Duration::days(7305) + time::Duration::hours(24);
+        LoadOutcome::Valid(Box::new(CaBundle::generate(t).unwrap()))
+    });
+    let mut f = fx().scale(2, 10);
+    f.ca = &ENDING;
+    f.pods.clear();
+    let p = f.plan();
+    assert!(creates(&p).is_empty());
+    assert_eq!(p.requeue_at, Some(later(24 * 3600 + 1)));
+    // With a day more the pool scales as usual.
+    f.ca = &OLD;
+    assert_eq!(creates(&f.plan()), vec![0, 1]);
+}
+
+/// RECON-7: a pass that creates pods applies the sandbox first, even when it
+/// was applied moments ago, so a `NetworkPolicy` deleted out of band never
+/// covers a new pod. A pass with no creates applies nothing.
+#[test]
+fn creates_follow_a_fresh_sandbox_apply() {
+    let mut f = fx().scale(2, 10);
+    let p = f.plan();
+    let kinds: Vec<&str> = p
+        .actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::ApplySa => Some("sa"),
+            Action::ApplyNetworkPolicy => Some("np"),
+            Action::CreatePod { .. } => Some("create"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kinds, ["sa", "np", "create", "create"]);
+    f.pods = vec![pod(0), pod(1)];
+    assert!(
+        !f.plan()
+            .actions
+            .iter()
+            .any(|a| matches!(a, Action::ApplySa | Action::ApplyNetworkPolicy))
+    );
 }

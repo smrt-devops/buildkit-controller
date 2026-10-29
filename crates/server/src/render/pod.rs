@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 
 use buildkit_controller_api::v1alpha1::{BuildKitPool, BuildkitdContainer, CONTAINER_NAME};
 use k8s_openapi::api::core::v1::{
-    AppArmorProfile, Container, ContainerPort, EmptyDirVolumeSource, ExecAction, KeyToPath, Pod,
-    PodSecurityContext, PodSpec, Probe, SeccompProfile, SecretVolumeSource, SecurityContext,
-    Volume, VolumeMount,
+    AppArmorProfile, Capabilities, Container, ContainerPort, EmptyDirVolumeSource, ExecAction,
+    KeyToPath, Pod, PodSecurityContext, PodSpec, Probe, SeccompProfile, SecretVolumeSource,
+    SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
@@ -92,8 +92,17 @@ fn container(user: &BuildkitdContainer) -> Container {
             protocol: Some(s("TCP")),
             ..ContainerPort::default()
         }]),
+        // Raw sockets are the one runtime-default capability that neither
+        // rootlesskit nor build steps need, and Pod Security "baseline" leaves
+        // it out. The rest stay: build steps run as root in buildkitd's user
+        // namespace, where the bounding set caps what they can do (chown,
+        // setuid, whiteout device nodes), and newuidmap needs SETUID and SETGID.
         security_context: Some(SecurityContext {
             privileged: Some(false),
+            capabilities: Some(Capabilities {
+                drop: Some(vec![s("NET_RAW")]),
+                add: None,
+            }),
             ..SecurityContext::default()
         }),
         // Probed every second until the first success, so a cold start is

@@ -1,0 +1,5 @@
+---
+source: crates/server/src/render/tests.rs
+expression: err.to_string()
+---
+template conflict: spec.template.metadata.annotations[io.katacontainers.config.hypervisor.kernel_params] (annotation key changes the pod's network or runtime outside the worker sandbox)
