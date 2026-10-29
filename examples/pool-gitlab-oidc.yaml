@@ -3,6 +3,8 @@
 #   auth.oidc[0].url=https://gitlab.example.com
 #   auth.oidc[0].audiences={buildkit-controller}
 # The CI job requests a token with that audience, and the claims below match its payload.
+# Match ids, not paths: a group or project path can be renamed and taken by someone else.
+# Avoid "*" in claims here, since it can match more groups or projects than you mean.
 apiVersion: buildkit.smrt-devops.net/v1alpha1
 kind: BuildKitPool
 metadata:
@@ -14,5 +16,14 @@ spec:
       - oidc:
           issuer: https://gitlab.example.com
           claims:
-            namespace_path: platform
+            namespace_id: "1234"   # the group's numeric id
             ref_protected: "true"
+  # A GitLab token has no event_name, so no GitLab job writes the cache until a
+  # writers rule matches it. Merge request, external pull request and child
+  # pipelines only read, whatever these rules say.
+  workers:
+    cache:
+      writers:
+        - oidc:
+            issuer: https://gitlab.example.com
+            claims: {namespace_id: "1234", ref_protected: "true", pipeline_source: push}
