@@ -172,6 +172,19 @@ pub fn scenarios() -> Result<Vec<Scenario>, FixtureError> {
     permitted.config.worker_network.cluster_cidrs = vec!["10.96.0.0/12".into()];
     permitted.config.worker_network.permitted_cidrs =
         vec!["169.254.20.10/32".into(), "10.96.0.0/24".into()];
+    // Private and IPv6 allowCIDRs entries render once the cluster's ranges of
+    // their family are listed.
+    let mut allow_list = scenario(
+        "egress-allow-list",
+        json!({"network": {"egress": {"internet": "Deny", "allowCIDRs": ["10.20.0.0/16", "192.0.2.10/32", "2001:db8::/32"]}}}),
+    )?;
+    allow_list.config.worker_network.cluster_cidrs =
+        vec!["10.96.0.0/12".into(), "fd00:10:96::/108".into()];
+    let mut allow_plus = scenario(
+        "egress-allow-plus-list",
+        json!({"network": {"egress": {"internet": "Allow", "allowCIDRs": ["10.20.0.0/16"]}}}),
+    )?;
+    allow_plus.config.worker_network.cluster_cidrs = vec!["10.96.0.0/12".into()];
     vec![
         scenario("default", json!({})),
         scenario("full-template", full_template()),
@@ -179,14 +192,8 @@ pub fn scenarios() -> Result<Vec<Scenario>, FixtureError> {
             "egress-deny",
             json!({"network": {"egress": {"internet": "Deny"}}}),
         ),
-        scenario(
-            "egress-allow-list",
-            json!({"network": {"egress": {"internet": "Deny", "allowCIDRs": ["10.20.0.0/16", "192.0.2.10/32", "2001:db8::/32"]}}}),
-        ),
-        scenario(
-            "egress-allow-plus-list",
-            json!({"network": {"egress": {"internet": "Allow", "allowCIDRs": ["10.20.0.0/16"]}}}),
-        ),
+        Ok(allow_list),
+        Ok(allow_plus),
         scenario("platform-arm64", json!({"platforms": ["linux/arm64/v8"]})),
         scenario(
             "platform-multi",

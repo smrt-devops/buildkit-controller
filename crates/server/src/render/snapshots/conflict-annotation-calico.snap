@@ -1,0 +1,5 @@
+---
+source: crates/server/src/render/tests.rs
+expression: err.to_string()
+---
+template conflict: spec.template.metadata.annotations[cni.projectcalico.org/ipAddrs] (annotation key changes the pod's network or runtime outside the worker sandbox)

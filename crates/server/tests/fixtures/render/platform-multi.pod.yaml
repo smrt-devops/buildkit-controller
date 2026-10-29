@@ -11,7 +11,7 @@ metadata:
     app.kubernetes.io/name: buildkitd
     buildkit.smrt-devops.net/pool: platform-multi
     buildkit.smrt-devops.net/state: free
-    buildkit.smrt-devops.net/template-hash: e1f7c1a7cf
+    buildkit.smrt-devops.net/template-hash: facc1554f4
   name: platform-multi-0
   namespace: render-verify
   ownerReferences:
@@ -58,6 +58,9 @@ spec:
         ephemeral-storage: 1Gi
         memory: 1Gi
     securityContext:
+      capabilities:
+        drop:
+        - NET_RAW
       privileged: false
     startupProbe:
       exec:

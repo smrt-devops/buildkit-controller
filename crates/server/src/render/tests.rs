@@ -90,6 +90,26 @@ fn conflict_cases() -> Vec<(&'static str, Value, &'static str)> {
             "spec.template.metadata.annotations[buildkit.smrt-devops.net/alloc]",
         ),
         (
+            "annotation-multus",
+            json!({"template": {"metadata": {"annotations": {"k8s.v1.cni.cncf.io/networks": "default/macvlan"}}}}),
+            "spec.template.metadata.annotations[k8s.v1.cni.cncf.io/networks]",
+        ),
+        (
+            "annotation-calico",
+            json!({"template": {"metadata": {"annotations": {"cni.projectcalico.org/ipAddrs": "[\"10.0.0.9\"]"}}}}),
+            "spec.template.metadata.annotations[cni.projectcalico.org/ipAddrs]",
+        ),
+        (
+            "annotation-cilium",
+            json!({"template": {"metadata": {"annotations": {"network.cilium.io/ipv4-pool": "p"}}}}),
+            "spec.template.metadata.annotations[network.cilium.io/ipv4-pool]",
+        ),
+        (
+            "annotation-kata",
+            json!({"template": {"metadata": {"annotations": {"io.katacontainers.config.hypervisor.kernel_params": "x"}}}}),
+            "spec.template.metadata.annotations[io.katacontainers.config.hypervisor.kernel_params]",
+        ),
+        (
             "volume-certs",
             c(json!({"volumes": [{"name": "certs", "emptyDir": {}}]})),
             "spec.template.spec.volumes[0].name",
@@ -801,11 +821,40 @@ fn allow_cidr_outside_protected_ranges_is_rendered() {
     ] {
         assert_eq!(refused_allow_cidr(entry, &net), None, "{entry}");
     }
-    // Without cluster ranges, 10.0.0.0/8 (a private registry network) is open.
-    assert_eq!(
-        refused_allow_cidr("10.0.0.0/8", &WorkerNetwork::default()),
-        None
-    );
+}
+
+/// RECON-4: without a cluster range of the entry's family the controller
+/// cannot tell cluster addresses apart, so an IPv4 entry in a denied (private)
+/// range and every IPv6 entry are refused unless permitted. Public IPv4 stays open.
+#[test]
+fn allow_cidr_of_a_family_without_cluster_ranges_is_refused() {
+    let mut net = WorkerNetwork::default();
+    for entry in [
+        "10.0.0.0/8",
+        "10.20.0.0/16",
+        "::ffff:10.1.0.0/112",
+        "2600::/12",
+        "2001:db8::/32",
+    ] {
+        let why = refused_allow_cidr(entry, &net).unwrap_or_else(|| panic!("{entry} allowed"));
+        assert!(
+            why.contains("workerNetwork.clusterCIDRs holds no range of its family"),
+            "{entry}: {why}"
+        );
+    }
+    assert_eq!(refused_allow_cidr("192.0.2.10/32", &net), None);
+    // An IPv4 cluster range opens other IPv4 private ranges, not IPv6.
+    net.cluster_cidrs = vec!["10.96.0.0/12".into()];
+    assert_eq!(refused_allow_cidr("10.20.0.0/16", &net), None);
+    assert!(refused_allow_cidr("2001:db8::/32", &net).is_some());
+    net.cluster_cidrs.push("fd00:10:96::/108".into());
+    assert_eq!(refused_allow_cidr("2001:db8::/32", &net), None);
+    // The operator can permit an entry outright.
+    let net = WorkerNetwork {
+        permitted_cidrs: vec!["10.20.0.0/16".into()],
+        ..WorkerNetwork::default()
+    };
+    assert_eq!(refused_allow_cidr("10.20.0.0/16", &net), None);
 }
 
 #[test]
