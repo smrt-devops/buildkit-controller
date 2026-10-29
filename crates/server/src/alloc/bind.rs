@@ -97,7 +97,7 @@ struct Won {
 struct Pass {
     /// The earliest queue deadline among the claims left waiting.
     until: Option<OffsetDateTime>,
-    /// A pod patch was lost or its outcome is unknown.
+    /// A pod patch was lost or its outcome is unknown, or the pod store lags one.
     retry: bool,
     /// Pods this pass took or saw lost; never offered twice.
     taken: HashSet<String>,
@@ -410,18 +410,25 @@ impl Binder {
             cert_not_after: expires_at + CERT_MARGIN,
         };
         let recent: HashSet<String> = self.memory().taken.keys().cloned().collect();
-        let mut cands: Vec<Arc<Pod>> = self
-            .pods
-            .state()
-            .into_iter()
-            .filter(|p| of_pool(p, ns, name, pool_uid) && is_candidate(p, &want))
-            .filter(|p| {
-                p.metadata
-                    .uid
-                    .as_ref()
-                    .is_some_and(|u| !pass.taken.contains(u) && !recent.contains(u))
-            })
-            .collect();
+        let mut cands = Vec::new();
+        for p in self.pods.state() {
+            let Some(uid) = p.metadata.uid.as_ref() else {
+                continue;
+            };
+            if pass.taken.contains(uid)
+                || !of_pool(&p, ns, name, pool_uid)
+                || !is_candidate(&p, &want)
+            {
+                continue;
+            }
+            if recent.contains(uid) {
+                // The store has not caught up with a patch of ours, and no
+                // pod event will wake the pool when it does.
+                pass.retry = true;
+            } else {
+                cands.push(p);
+            }
+        }
         shuffle(&mut cands);
         let now_s = fmt_ts(now);
         let expires = fmt_ts(expires_at);
@@ -438,12 +445,17 @@ impl Binder {
                 continue;
             };
             pass.taken.insert(uid.clone());
-            self.memory().taken.insert(uid.clone(), Instant::now());
             let mut patch = claim_patch(uid, &bind);
             if let Some(p) = &ask.plan {
                 p.claim_ops(&mut patch);
             }
-            match self.backend.patch_pod(ns, pname, patch).await {
+            let outcome = self.backend.patch_pod(ns, pname, patch).await;
+            // An unknown outcome is not remembered: the next pass adopts the
+            // pod if the patch landed, and offers it again if it did not.
+            if !matches!(outcome, PatchOutcome::Unknown) {
+                self.memory().taken.insert(uid.clone(), Instant::now());
+            }
+            match outcome {
                 PatchOutcome::Applied(p) => {
                     // The cache can lag an eviction: the edge would refuse this pod at once.
                     if p.metadata.deletion_timestamp.is_some()

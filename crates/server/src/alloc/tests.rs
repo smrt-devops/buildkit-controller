@@ -645,7 +645,7 @@ async fn a_lost_patch_never_double_books() {
         ann(&e.fake.pod(&name), ANN_ALLOC),
         Some("otheralloc22222222222222222")
     );
-    // An unknown outcome also stays pending, and the pod is not tried again at once.
+    // An unknown outcome also stays pending.
     e.warm(1);
     e.fake
         .w
@@ -655,6 +655,64 @@ async fn a_lost_patch_never_double_books() {
         .push_back(PatchOutcome::Unknown);
     e.binder.pass(&key()).await;
     assert_eq!(phase(&e.fake.status(OWN, &id)), ClaimPhase::Pending);
+}
+
+/// A pod patch with an unknown outcome that did not land leaves the pod free:
+/// the next pass offers it again instead of hiding it for [`super::bind`]'s
+/// memory window.
+#[tokio::test]
+async fn a_pod_patch_that_did_not_land_is_offered_again() {
+    let e = env();
+    let name = e.warm(0);
+    let id = e.ci_claim(0, "sa:x/a");
+    e.fake
+        .w
+        .lock()
+        .unwrap()
+        .patch_out
+        .push_back(PatchOutcome::Unknown);
+    assert_eq!(e.binder.pass(&key()).await, Some(Duration::from_secs(1)));
+    assert_eq!(phase(&e.fake.status(OWN, &id)), ClaimPhase::Pending);
+    e.binder.pass(&key()).await;
+    let s = e.fake.status(OWN, &id);
+    assert_eq!(phase(&s), ClaimPhase::Bound);
+    assert_eq!(s.pod.as_deref(), Some(name.as_str()));
+}
+
+/// A bind whose status write failed, while the pod store still shows the pod
+/// free: no pod event will follow (an allocated pod is not offered), so the
+/// pass keeps looking until the store catches up and the bind is adopted.
+#[tokio::test]
+async fn a_bind_behind_a_lagging_pod_store_is_retried() {
+    let e = env();
+    let name = e.warm(0);
+    let free = e.fake.pod(&name);
+    let id = e.ci_claim(0, "sa:x/a");
+    e.fake
+        .w
+        .lock()
+        .unwrap()
+        .status_out
+        .push_back(Write::Unknown);
+    assert_eq!(e.binder.pass(&key()).await, Some(Duration::from_secs(1)));
+    // The store has not seen the bind yet.
+    let bound = e.fake.pod(&name);
+    e.fake
+        .pods
+        .lock()
+        .unwrap()
+        .apply_watcher_event(&watcher::Event::Apply(free));
+    assert_eq!(
+        e.binder.pass(&key()).await,
+        Some(Duration::from_secs(1)),
+        "no event will come: look again soon"
+    );
+    assert_eq!(phase(&e.fake.status(OWN, &id)), ClaimPhase::Pending);
+    e.fake.put_pod(bound);
+    e.binder.pass(&key()).await;
+    let s = e.fake.status(OWN, &id);
+    assert_eq!(phase(&s), ClaimPhase::Bound);
+    assert_eq!(s.pod.as_deref(), Some(name.as_str()));
 }
 
 /// A bind that landed on the pod while its status write did not is finished
