@@ -24,7 +24,7 @@ use tracing::{error, info, warn};
 use super::backend::{Backend, PatchOutcome, Write};
 use super::cache::{self, Plan};
 use super::certs::CertSource;
-use super::claims::{self, Binding, Caller, PoolKey, reason};
+use super::claims::{self, Binding, Caller, PoolKey, owner_hold_limit, reason};
 use super::metrics::AllocMetrics;
 use super::pods::{
     Bind, CERT_MARGIN, MAX_TRIES, Want, ann, claim_patch, fmt_ts, is_candidate, of_pool, parse_ts,
@@ -302,7 +302,7 @@ impl Binder {
                 )
                 .await;
         }
-        if pass.held.get(&ask.caller.owner).copied().unwrap_or(0) >= max_per_owner(pool) {
+        if pass.held.get(&ask.caller.owner).copied().unwrap_or(0) >= owner_hold_limit(pool) {
             return self
                 .wait(
                     c,
@@ -807,13 +807,6 @@ fn ask(
         public_key,
         plan,
     })
-}
-
-/// Workers one owner (an OIDC run, a service account or pod, a claim) may
-/// hold or wait for in `pool` at once: half of `scaling.max`, at least 1, so
-/// no single caller can take the whole pool.
-pub(super) fn max_per_owner(pool: &BuildKitPool) -> usize {
-    (usize::try_from(pool.spec.scaling.max).unwrap_or(0) / 2).max(1)
 }
 
 fn pool_id(pool: &BuildKitPool) -> Option<(&str, &str, &str)> {

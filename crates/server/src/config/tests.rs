@@ -789,3 +789,22 @@ fn the_protected_ranges_are_always_denied() {
     assert!(!d.iter().any(|x| x == "100.100.100.200/32"), "{d:?}");
     assert!(d.iter().any(|x| x == "168.63.129.16/32"), "{d:?}");
 }
+
+/// `ALWAYS_DENIED` is `PROTECTED_CIDRS` without loopback, plus the NAT64
+/// well-known prefix, each a canonical CIDR.
+#[test]
+fn always_denied_is_the_protected_ranges_without_loopback() {
+    use crate::render::{ALWAYS_DENIED, PROTECTED_CIDRS};
+    let mut want: Vec<&str> = PROTECTED_CIDRS
+        .into_iter()
+        .filter(|r| !matches!(*r, "127.0.0.0/8" | "::1/128"))
+        .chain(["64:ff9b::/96"])
+        .collect();
+    let mut got = ALWAYS_DENIED.to_vec();
+    want.sort_unstable();
+    got.sort_unstable();
+    assert_eq!(got, want);
+    for r in ALWAYS_DENIED {
+        assert!(r.parse::<crate::net::Cidr>().is_ok(), "{r}");
+    }
+}

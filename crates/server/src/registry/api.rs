@@ -37,11 +37,9 @@ use crate::pki::WorkerIdentity;
 
 /// Largest manifest accepted (the reference registry's limit).
 pub const MAX_MANIFEST: usize = 4 << 20;
-/// Manifest bodies buffered at once, each up to [`MAX_MANIFEST`].
+/// Manifest bodies buffered at once, each up to [`MAX_MANIFEST`]. A PUT that
+/// finds none free is answered 429 at once.
 pub const MANIFEST_PUTS: usize = 16;
-/// How long a manifest PUT waits for one of the [`MANIFEST_PUTS`] before it
-/// is answered 429.
-pub const MANIFEST_WAIT: Duration = Duration::from_secs(5);
 /// The whole manifest body must arrive within this, so a slow sender holds
 /// one of the [`MANIFEST_PUTS`] for no longer.
 pub const MANIFEST_BODY: Duration = Duration::from_secs(30);
@@ -668,28 +666,19 @@ async fn put_manifest(
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_owned);
-    let busy = || {
+    let _permit = reg.manifest_puts.try_acquire().map_err(|_| {
         ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "TOOMANYREQUESTS",
             "too many manifest pushes in progress",
         )
         .with(RETRY_AFTER, "1".to_owned())
-    };
-    let _permit = tokio::time::timeout(MANIFEST_WAIT, reg.manifest_puts.acquire())
-        .await
-        .map_err(|_| busy())?
-        .map_err(|_| busy())?;
+    })?;
     let mut body = req.into_body().into_data_stream();
     let mut buf = Vec::new();
     let read = async {
-        loop {
-            let chunk = match tokio::time::timeout(BODY_IDLE, body.next()).await {
-                Err(_) => return Err(StoreError::Stalled.into()),
-                Ok(None) => break,
-                Ok(Some(Err(e))) => return Err(upload_invalid(e.to_string())),
-                Ok(Some(Ok(c))) => c,
-            };
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|e| upload_invalid(e.to_string()))?;
             if buf.len() + chunk.len() > MAX_MANIFEST {
                 return Err(too_large(MAX_MANIFEST as u64));
             }

@@ -646,21 +646,10 @@ fn capped(d: &CrdDuration, field: &str, max: Duration, problems: &mut Vec<String
     Duration::ZERO
 }
 
-/// Ranges the internet rule of every pool always leaves out, whatever
-/// `deniedCIDRs` says (see [`Config::render_config`]): [`PROTECTED_CIDRS`](crate::render::PROTECTED_CIDRS) without
-/// loopback, which never leaves the pod, plus the NAT64 well-known prefix,
-/// which reaches every IPv4 address through a NAT64 gateway.
-fn always_denied() -> impl Iterator<Item = &'static str> {
-    crate::render::PROTECTED_CIDRS
-        .into_iter()
-        .filter(|r| !matches!(*r, "127.0.0.0/8" | "::1/128"))
-        .chain(["64:ff9b::/96"])
-}
-
-/// `deniedCIDRs` plus each [`always_denied`] range that `deniedCIDRs`,
-/// `extraDeniedCIDRs` and `clusterCIDRs` do not already cover. Helm replaces a
-/// list it is given, so an override that adds one range must not reopen the
-/// metadata endpoints.
+/// `deniedCIDRs` plus each [`ALWAYS_DENIED`](crate::render::ALWAYS_DENIED)
+/// range that `deniedCIDRs`, `extraDeniedCIDRs` and `clusterCIDRs` do not
+/// already cover. Helm replaces a list it is given, so an override that adds
+/// one range must not reopen the metadata endpoints.
 fn denied_with_protected(n: &WorkerNetwork) -> Vec<String> {
     let denied: Vec<crate::net::Cidr> = n
         .denied_cidrs
@@ -669,20 +658,11 @@ fn denied_with_protected(n: &WorkerNetwork) -> Vec<String> {
         .chain(&n.cluster_cidrs)
         .filter_map(|c| c.parse().ok())
         .collect();
-    let missing = always_denied()
-        .filter(|r| !denied.iter().any(|d| covers(d, r)))
+    let missing = crate::render::ALWAYS_DENIED
+        .into_iter()
+        .filter(|r| !r.parse().is_ok_and(|r| denied.iter().any(|d| d.covers(&r))))
         .map(String::from);
     n.denied_cidrs.iter().cloned().chain(missing).collect()
-}
-
-/// `d` holds every address of the range `r` (`addr/prefix`).
-fn covers(d: &crate::net::Cidr, r: &str) -> bool {
-    r.split_once('/').is_some_and(|(addr, prefix)| {
-        matches!(
-            (addr.parse::<std::net::IpAddr>(), prefix.parse::<u8>()),
-            (Ok(a), Ok(p)) if d.prefix() <= p && d.contains(a)
-        )
-    })
 }
 
 /// A validated duration as `time::Duration` (zero if unparsable, which
@@ -1048,7 +1028,9 @@ impl Config {
         // Port 53 to these ranges is open for every pool, `internet: Deny` included.
         for c in &n.dns.cidrs {
             if let Ok(d) = c.parse::<crate::net::Cidr>()
-                && let Some(r) = always_denied().find(|r| covers(&d, r))
+                && let Some(r) = crate::render::ALWAYS_DENIED
+                    .into_iter()
+                    .find(|r| r.parse().is_ok_and(|r| d.covers(&r)))
             {
                 p.push(format!(
                     "workerNetwork.dns.cidrs: `{c}` holds the whole of {r}; list the DNS servers' own addresses"

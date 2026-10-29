@@ -35,59 +35,6 @@ pub fn namespace_cap(max_connections: usize) -> usize {
     (max_connections / 4).max(1)
 }
 
-/// Open proxied connections per pool namespace, capped at `max` each. The
-/// namespace comes from the verified allocation certificate.
-pub struct Namespaces {
-    max: usize,
-    open: Mutex<HashMap<String, usize>>,
-}
-
-/// One connection's share of its namespace's cap; released on drop.
-pub struct NamespaceSlot {
-    namespaces: Arc<Namespaces>,
-    ns: String,
-}
-
-impl Drop for NamespaceSlot {
-    fn drop(&mut self) {
-        let mut open = self.namespaces.lock();
-        if let Some(n) = open.get_mut(&self.ns) {
-            *n -= 1;
-            if *n == 0 {
-                open.remove(&self.ns);
-            }
-        }
-    }
-}
-
-impl Namespaces {
-    /// At most `max` connections per namespace; 0 disables the cap.
-    #[must_use]
-    pub fn new(max: usize) -> Self {
-        Self {
-            max,
-            open: Mutex::default(),
-        }
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
-        self.open.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// A slot for namespace `ns`, or `None` when it already holds `max`.
-    pub fn try_take(self: &Arc<Self>, ns: &str) -> Option<NamespaceSlot> {
-        let mut open = self.lock();
-        if self.max != 0 && open.get(ns).copied().unwrap_or(0) >= self.max {
-            return None;
-        }
-        *open.entry(ns.to_owned()).or_insert(0) += 1;
-        Some(NamespaceSlot {
-            namespaces: Arc::clone(self),
-            ns: ns.to_owned(),
-        })
-    }
-}
-
 /// Open proxied connections, by pod uid.
 pub struct Registry {
     next: AtomicU64,

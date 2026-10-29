@@ -334,6 +334,24 @@ pub const PROTECTED_CIDRS: [&str; 12] = [
     "64:ff9b:1::/48",
 ];
 
+/// Ranges the internet rule of every pool leaves out, whatever `deniedCIDRs`
+/// says: [`PROTECTED_CIDRS`] without loopback, which never leaves the pod, plus
+/// the NAT64 well-known prefix, which reaches every IPv4 address through a
+/// NAT64 gateway.
+pub const ALWAYS_DENIED: [&str; 11] = [
+    "169.254.0.0/16",
+    "fe80::/10",
+    "168.63.129.16/32",
+    "100.100.100.200/32",
+    "fd00:ec2::254/128",
+    "fd20:ce::254/128",
+    "fd00:a9fe:a9fe::1/128",
+    "fd00:c1::a9fe:a9fe/128",
+    "fd00:42::42/128",
+    "64:ff9b:1::/48",
+    "64:ff9b::/96",
+];
+
 /// One address range, IPv4 or IPv6, with host bits cleared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Net {

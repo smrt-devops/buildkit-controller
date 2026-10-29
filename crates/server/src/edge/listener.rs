@@ -2,6 +2,7 @@
 //! `ClientHello` and handshake timeouts, readiness and drain.
 
 use std::collections::{BTreeMap, HashMap};
+use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -75,15 +76,20 @@ impl From<IpAddr> for PeerKey {
     }
 }
 
-/// Open connections per [`PeerKey`], capped at `max` each (0: no cap).
+/// Open connections per key, capped at `max` each (0: no cap).
 #[derive(Clone, Debug)]
-pub struct PerPeer {
+pub struct PerKey<K: Hash + Eq> {
     max: usize,
-    open: Arc<Mutex<HashMap<PeerKey, usize>>>,
+    open: Arc<Mutex<HashMap<K, usize>>>,
 }
 
-impl PerPeer {
-    /// A cap of `max` per peer; 0 disables the cap and counts nothing.
+/// Open connections per [`PeerKey`].
+pub type PerPeer = PerKey<PeerKey>;
+/// One connection's share of its peer's cap.
+pub type PeerSlot = Slot<PeerKey>;
+
+impl<K: Hash + Eq + Clone> PerKey<K> {
+    /// A cap of `max` per key; 0 disables the cap and counts nothing.
     #[must_use]
     pub fn new(max: usize) -> Self {
         Self {
@@ -92,26 +98,26 @@ impl PerPeer {
         }
     }
 
-    /// A slot for `ip`, or `None` when its peer already holds `max`.
+    /// A slot for `key`, or `None` when it already holds `max`.
     #[must_use]
-    pub fn try_take(&self, ip: IpAddr) -> Option<PeerSlot> {
-        let key = PeerKey::from(ip);
+    pub fn try_take(&self, key: impl Into<K>) -> Option<Slot<K>> {
+        let key = key.into();
         if self.max == 0 {
-            return Some(PeerSlot { key, open: None });
+            return Some(Slot { key, open: None });
         }
         let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
-        let n = open.entry(key).or_insert(0);
+        let n = open.entry(key.clone()).or_insert(0);
         if *n >= self.max {
             return None;
         }
         *n += 1;
-        Some(PeerSlot {
+        Some(Slot {
             key,
             open: Some(Arc::clone(&self.open)),
         })
     }
 
-    /// Peers holding at least one slot (tests).
+    /// Keys holding at least one slot (tests).
     #[must_use]
     pub fn peers(&self) -> usize {
         self.open
@@ -121,15 +127,15 @@ impl PerPeer {
     }
 }
 
-/// One connection's share of its peer's cap; released on drop.
+/// One connection's share of its key's cap; released on drop.
 #[derive(Debug)]
-pub struct PeerSlot {
-    key: PeerKey,
+pub struct Slot<K: Hash + Eq> {
+    key: K,
     /// `None` when the cap is disabled.
-    open: Option<Arc<Mutex<HashMap<PeerKey, usize>>>>,
+    open: Option<Arc<Mutex<HashMap<K, usize>>>>,
 }
 
-impl Drop for PeerSlot {
+impl<K: Hash + Eq> Drop for Slot<K> {
     fn drop(&mut self) {
         let Some(open) = &self.open else { return };
         let mut open = open.lock().unwrap_or_else(PoisonError::into_inner);

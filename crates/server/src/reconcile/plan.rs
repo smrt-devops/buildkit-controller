@@ -147,9 +147,6 @@ pub struct Observed<'a> {
     /// `workerNetwork`: the planner refuses (`InvalidSpec`) a pool whose
     /// `allowCIDRs` would reopen a range it keeps closed.
     pub network: &'a WorkerNetwork,
-    /// Where the controller runs. A pool there is refused (`InvalidSpec`): its
-    /// workers would share a namespace with the CA Secret and the controller.
-    pub controller_namespace: &'a str,
     /// Derived `status.platforms`.
     pub platforms: Vec<String>,
     /// Result of loading the CA Secret.
@@ -499,12 +496,7 @@ impl<'a> Planner<'_, 'a> {
         let o = self.o;
         let spec = &o.pool.spec;
         // Step 1.
-        let in_controller_ns = o.pool.namespace().as_deref() == Some(o.controller_namespace);
         let spec_block = match (&o.time_zone, &o.template) {
-            _ if in_controller_ns => Some((
-                "InvalidSpec",
-                "pool is in the controller's namespace".to_owned(),
-            )),
             (None, _) => Some((
                 "InvalidSpec",
                 format!("unknown time zone `{}`", spec.scaling.time_zone),
@@ -516,7 +508,7 @@ impl<'a> Planner<'_, 'a> {
         // Refused entries still apply the sandbox: render leaves them out, which
         // narrows a policy an older spec or config opened wider. Pods that run
         // under it lose the range at once.
-        let apply_sandbox = !in_controller_ns && (spec_block.is_none() || egress.is_some());
+        let apply_sandbox = spec_block.is_none() || egress.is_some();
         let spec_block = spec_block.or_else(|| egress.map(|m| ("InvalidSpec", m)));
         // Step 2.
         let ca = self.plan_ca();

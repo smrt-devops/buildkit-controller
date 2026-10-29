@@ -22,9 +22,10 @@ use tracing::{debug, info, warn};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use super::handler::{Accepted, ConnectionHandler, Refusal};
+use super::listener::PerKey;
 use super::metrics::{Direction, EdgeMetrics, Revocation};
 use super::pods::PodView;
-use super::revoke::{MAX_CONNECTIONS_PER_ALLOCATION, Namespaces, Registry, namespace_cap};
+use super::revoke::{MAX_CONNECTIONS_PER_ALLOCATION, Registry};
 use super::tls::EdgeTls;
 use super::upstream::{dial, worker_name};
 use crate::pki::AllocationId;
@@ -42,6 +43,9 @@ pub struct ProxyOptions {
     pub upstream_connect_timeout: Duration,
     /// The worker's buildkitd port (1234; tests override it).
     pub upstream_port: u16,
+    /// Proxied connections one pool namespace (from the allocation
+    /// certificate) may hold on this replica; 0 disables the cap.
+    pub max_per_namespace: usize,
 }
 
 /// The [`ConnectionHandler`] the binary runs.
@@ -56,33 +60,18 @@ struct Inner {
     metrics: EdgeMetrics,
     options: ProxyOptions,
     live: Arc<Registry>,
-    namespaces: Arc<Namespaces>,
+    namespaces: PerKey<String>,
 }
 
 impl ProxyHandler {
     /// `tls` is the generation the listener uses; its `upstream` config is
-    /// the worker-leg client config. Each pool namespace may hold [`namespace_cap`] of the
-    /// default `edge.maxConnections`.
+    /// the worker-leg client config.
     #[must_use]
     pub fn new(
         view: PodView,
         tls: watch::Receiver<Option<Arc<EdgeTls>>>,
         metrics: EdgeMetrics,
         options: ProxyOptions,
-    ) -> Self {
-        let max = usize::try_from(crate::config::EDGE_MAX_CONNECTIONS).unwrap_or(usize::MAX);
-        Self::with_namespace_cap(view, tls, metrics, options, namespace_cap(max))
-    }
-
-    /// [`Self::new`] with at most `max_per_namespace` proxied connections per
-    /// pool namespace (from the allocation certificate) on this replica; 0 disables the cap.
-    #[must_use]
-    pub fn with_namespace_cap(
-        view: PodView,
-        tls: watch::Receiver<Option<Arc<EdgeTls>>>,
-        metrics: EdgeMetrics,
-        options: ProxyOptions,
-        max_per_namespace: usize,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -91,7 +80,7 @@ impl ProxyHandler {
                 metrics,
                 options,
                 live: Arc::new(Registry::new(MAX_CONNECTIONS_PER_ALLOCATION)),
-                namespaces: Arc::new(Namespaces::new(max_per_namespace)),
+                namespaces: PerKey::new(options.max_per_namespace),
             }),
         }
     }

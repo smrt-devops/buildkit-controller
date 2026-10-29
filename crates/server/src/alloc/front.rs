@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use super::backend::{Backend, Write};
-use super::bind::{max_per_owner, retire_pod};
+use super::bind::retire_pod;
 use super::cache;
 use super::certs::CertSource;
 use super::claims;
@@ -581,9 +581,7 @@ impl Front {
     }
 
     /// Refuse a new claim, with the retryable 503 `pool_exhausted`, when its
-    /// caller already holds or waits for twice [`max_per_owner`] claims of the
-    /// pool: as many workers as the leader will bind to it, and as many again
-    /// waiting behind them.
+    /// caller already holds or waits for [`claims::owner_active_limit`] claims of the pool.
     /// The claim `id` itself, made by an earlier try with the same key, never counts.
     fn room_for(
         &self,
@@ -594,7 +592,7 @@ impl Front {
     ) -> Result<(), AllocError> {
         let key = (req.namespace.clone(), req.pool.clone());
         let all = self.claims.state();
-        let cap = 2 * max_per_owner(pool);
+        let cap = claims::owner_active_limit(pool);
         if claims::active_of(&all, &self.namespace, &who.owner(), &key, id) >= cap {
             info!(namespace = %req.namespace, pool = %req.pool, reason = "owner_limit", "allocation refused");
             return Err(AllocError::PoolExhausted(format!(
