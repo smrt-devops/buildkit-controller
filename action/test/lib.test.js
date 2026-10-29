@@ -100,8 +100,10 @@ test('request round-trips JSON', async () => {
   } finally { srv.close(); }
 });
 
-test('requests time out at 40 s: the server answers a POST in about 20 s and caps a poll at 25 s', () => {
+test('a poll times out at 40 s, a POST gets the whole remaining budget', () => {
   assert.equal(L.REQUEST_TIMEOUT_MS, 40000);
+  assert.equal(L.postTimeoutMs(L.retryBudgetMs(300)), 360000);
+  assert.equal(L.postTimeoutMs(0), 1000);
 });
 
 test('checkAllocationId rejects path traversal and odd shapes', () => {
