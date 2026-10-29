@@ -64,6 +64,12 @@ pub const ANN_WORKER_CERT_NOT_AFTER: &str = "buildkit.smrt-devops.net/worker-cer
 pub const ANN_INTERNAL_CA: &str = "buildkit.smrt-devops.net/internal-ca";
 /// `P worker-nonce`: the nonce in the worker serving cert's SAN.
 pub const ANN_WORKER_NONCE: &str = "buildkit.smrt-devops.net/worker-nonce";
+/// `P claim`: `<namespace>/<name>` of the claim an allocated pod serves.
+pub const ANN_CLAIM: &str = "buildkit.smrt-devops.net/claim";
+/// `P alloc` of an unclaimed pod.
+pub const FREE: &str = "free";
+/// `P alloc` of a retired pod.
+pub const DRAINING: &str = "draining";
 
 /// `P scope`: the cache scope id of the allocation a pod serves.
 pub const ANN_SCOPE: &str = "buildkit.smrt-devops.net/scope";

@@ -27,7 +27,7 @@ use super::pass::{self, CaView, PoolMemory, Settings};
 use super::plan::{PlanConfig, REAPPLY_AFTER};
 use super::pods::WorkerPod;
 use super::registry_tls;
-use crate::claim::logic as claims;
+use crate::alloc::claims;
 use crate::config::ElectionTiming;
 use crate::pki::LoadOutcome;
 use crate::render::LABEL_POOL;
@@ -342,7 +342,7 @@ async fn pass_once(term: &Term, key: &PoolKey) -> Option<Duration> {
         let waiting = claims::queues(&term.ctx.claims().state(), &term.served)
             .get(key)
             .map_or(0, |q| i32::try_from(q.len()).unwrap_or(i32::MAX));
-        // Boxed: the pass future (pod spawns and volume writes) is too large for the stack.
+        // Boxed: the pass future (pod spawns and Secret writes) is too large for the stack.
         let out = Box::pin(pass::run(
             &term.ops,
             &term.guard,

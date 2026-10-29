@@ -9,11 +9,10 @@ use time::format_description::well_known::Rfc3339;
 
 use super::auth::{Authorizer, Grant};
 use super::gc::Budgets;
-use crate::alloc::pods::{DRAINING, FREE};
 use crate::pki::WorkerIdentity;
 use crate::render::{
-    ANN_ALLOC, ANN_EXPIRES_AT, ANN_SCOPE, ANN_TIER, ANN_WORKER_NONCE, CONTROLLER, LABEL_MANAGED_BY,
-    LABEL_POOL, is_scope_id, quantity_bytes,
+    ANN_ALLOC, ANN_EXPIRES_AT, ANN_SCOPE, ANN_TIER, ANN_WORKER_NONCE, CONTROLLER, DRAINING, FREE,
+    LABEL_MANAGED_BY, LABEL_POOL, is_scope_id, quantity_bytes,
 };
 use crate::runtime::stores::StoreFreshness;
 

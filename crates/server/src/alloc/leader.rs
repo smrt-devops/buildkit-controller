@@ -1,11 +1,13 @@
-//! The claim controller, on the leader. It runs the allocator's pool passes
-//! ([`Binder::pass`]) on claim and pod events, and every 2 s (and at once
-//! after a claim is deleted) it tidies up: claims from namespaces it does not
-//! serve fail, bound claims expire or lose their worker, finished claims of
-//! CI callers are deleted after [`logic::FINISHED_TTL`], and pods whose claim
-//! is gone or ended are retired.
-
-pub mod logic;
+//! The [`Allocator`]: allocation's leader loop. While this replica leads it
+//! runs the pool passes ([`Binder::pass`]) on claim and pod events, and every
+//! 2 s (and at once after a claim is deleted) it tidies up: claims from
+//! namespaces it does not serve fail, bound claims expire or lose their worker,
+//! finished claims of CI callers are deleted after [`claims::FINISHED_TTL`],
+//! and pods whose claim is gone or ended are retired.
+//!
+//! `main` runs it in the leader stage, which stops before the Lease is
+//! released, so no claim or pod write of this replica overlaps the next
+//! leader's.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -21,18 +23,18 @@ use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::alloc::Binder;
-use crate::alloc::backend::Write;
-use crate::alloc::pods::{FREE, ann, is_ready};
+use super::backend::Write;
+use super::claims::{self, reason};
+use super::pods::{ann, is_ready};
+use super::{BindConfig, Binder, Shared};
 use crate::reconcile::driver::{Trigger, schedule};
-use crate::render::{ANN_ALLOC, LABEL_POOL};
+use crate::render::{ANN_ALLOC, FREE, LABEL_POOL};
 use crate::runtime::AppContext;
-use crate::runtime::hooks::LeaderWork;
+use crate::runtime::hooks::{BoxResult, Component, LeaderWork};
 use crate::runtime::leader::{BoxFut, supervise};
 use crate::runtime::stores::{ClaimEvent, PodEvent};
-use logic::reason;
 
-/// How often the controller tidies claims.
+/// How often the allocator tidies claims.
 const TICK: Duration = Duration::from_secs(2);
 
 type Labels = Vec<(&'static str, String)>;
@@ -52,46 +54,79 @@ impl ClaimMetrics {
     }
 }
 
-/// Run the claim controller while this replica leads, until `shutdown`.
-///
-/// # Errors
-///
-/// When a term's work stops while the replica still leads.
-pub async fn run(
-    ctx: AppContext,
-    binder: Arc<Binder>,
-    shutdown: CancellationToken,
-) -> anyhow::Result<()> {
-    let metrics = ClaimMetrics::default();
-    ctx.metrics().with_registry(|r| {
-        r.register(
-            "claims",
-            "BuildKitClaims in the store, by phase",
-            metrics.claims.clone(),
-        );
-        r.register(
-            "claim_reconciles",
-            "Claim reconcile outcomes",
-            metrics.reconciles.clone(),
-        );
-    });
-    let work: Arc<dyn LeaderWork> = Arc::new(Term {
-        ctx: ctx.clone(),
-        binder,
-        metrics,
-    });
-    let c = ctx.clone();
-    supervise(
-        ctx.leader(),
-        shutdown,
-        move || {
-            let c = c.clone();
-            Box::pin(async move { c.wait_synced().await })
-        },
-        work,
-    )
-    .await?;
-    Ok(())
+/// The leader's half of allocation; made by
+/// [`AllocService::allocator`](super::AllocService::allocator).
+pub struct Allocator {
+    shared: Shared,
+}
+
+impl Allocator {
+    pub(super) fn new(shared: Shared) -> Self {
+        Self { shared }
+    }
+}
+
+impl Component for Allocator {
+    fn name(&self) -> &'static str {
+        "allocator"
+    }
+
+    /// Bind and tidy claims while this replica leads, until `shutdown`.
+    /// Fails when a term's work stops while the replica still leads.
+    fn run(&self, ctx: AppContext, shutdown: CancellationToken) -> BoxResult {
+        let shared = self.shared.clone();
+        Box::pin(async move {
+            let (backend, certs) = shared.sources(&ctx)?;
+            let c = ctx.config();
+            let namespace = ctx.namespace().to_owned();
+            let binder = Arc::new(Binder::new(
+                backend,
+                (ctx.pools(), ctx.pods(), ctx.claims()),
+                certs,
+                BindConfig {
+                    endpoint: c.edge.endpoint.clone(),
+                    server_name: c.edge.server_name.clone(),
+                    allocation_domain: Some(c.edge.allocation_domain.clone())
+                        .filter(|d| !d.is_empty()),
+                    served: c.served_claim_namespaces(&namespace),
+                    namespace,
+                    cache_host: (!c.cache.host.is_empty()).then(|| c.cache.host.clone()),
+                },
+                shared.metrics(&ctx),
+            ));
+            let metrics = ClaimMetrics::default();
+            ctx.metrics().with_registry(|r| {
+                r.register(
+                    "claims",
+                    "BuildKitClaims in the store, by phase",
+                    metrics.claims.clone(),
+                );
+                r.register(
+                    "claim_reconciles",
+                    "Claim reconcile outcomes",
+                    metrics.reconciles.clone(),
+                );
+            });
+            let work: Arc<dyn LeaderWork> = Arc::new(Term {
+                ctx: ctx.clone(),
+                binder,
+                metrics,
+            });
+            let synced = ctx.clone();
+            supervise(
+                ctx.leader(),
+                shutdown,
+                move || {
+                    let s = synced.clone();
+                    Box::pin(async move { s.wait_synced().await })
+                },
+                work,
+            )
+            .await?;
+            info!(component = "allocator", "allocator stopped");
+            Ok(())
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -109,12 +144,12 @@ impl LeaderWork for Term {
 
 /// One leadership term: pool passes and tidying, until dropped.
 async fn run_term(t: Term, term: u64) {
-    info!(term, component = "claims", "claim controller running");
+    info!(term, component = "allocator", "allocator running");
     let claim_triggers = stream::unfold(t.ctx.claim_events(), |mut sub| async move {
         let ev = sub.recv().await?;
         let trigger = match &ev {
-            ClaimEvent::Apply(c) if logic::phase(c) == ClaimPhase::Pending => {
-                Some(Trigger::Pool(logic::pool_key(c)))
+            ClaimEvent::Apply(c) if claims::phase(c) == ClaimPhase::Pending => {
+                Some(Trigger::Pool(claims::pool_key(c)))
             }
             ClaimEvent::Resync => Some(Trigger::All),
             _ => None,
@@ -193,7 +228,7 @@ async fn tidy(t: &Term) {
     }
     let mut per_phase: HashMap<&'static str, i64> = HashMap::new();
     for c in &claims {
-        *per_phase.entry(logic::phase(c).as_str()).or_default() += 1;
+        *per_phase.entry(claims::phase(c).as_str()).or_default() += 1;
     }
     for p in [
         ClaimPhase::Pending,
@@ -225,15 +260,15 @@ pub(crate) async fn tidy_with(
         if c.metadata.deletion_timestamp.is_some() {
             continue;
         }
-        let outcome = match logic::phase(c) {
-            ClaimPhase::Pending if !logic::served(c, served) => refuse(binder, c).await,
-            ClaimPhase::Bound if logic::expired(c, now) => {
+        let outcome = match claims::phase(c) {
+            ClaimPhase::Pending if !claims::served(c, served) => refuse(binder, c).await,
+            ClaimPhase::Bound if claims::expired(c, now) => {
                 end(binder, c, ClaimPhase::Expired).await
             }
-            ClaimPhase::Bound if logic::lost(c, pods.iter().map(AsRef::as_ref), now) => {
+            ClaimPhase::Bound if claims::lost(c, pods.iter().map(AsRef::as_ref), now) => {
                 end(binder, c, ClaimPhase::Lost).await
             }
-            p if p.is_terminal() && logic::collectable(c, own, now) => collect(binder, c).await,
+            p if p.is_terminal() && claims::collectable(c, own, now) => collect(binder, c).await,
             _ => None,
         };
         done.extend(outcome);
@@ -246,14 +281,14 @@ pub(crate) async fn tidy_with(
 /// grants Secret access only in served namespaces, so binding would end in a
 /// 403 after allocating.
 async fn refuse(b: &Binder, c: &BuildKitClaim) -> Option<&'static str> {
-    if logic::reason(c) == Some(reason::NAMESPACE_NOT_SERVED) {
+    if claims::reason(c) == Some(reason::NAMESPACE_NOT_SERVED) {
         return None;
     }
     let msg = format!(
         "namespace {} is not in the controller's claims.namespaces",
         c.metadata.namespace.as_deref().unwrap_or_default()
     );
-    let s = logic::unbound_status(
+    let s = claims::unbound_status(
         c,
         ClaimPhase::Failed,
         reason::NAMESPACE_NOT_SERVED,
@@ -271,7 +306,7 @@ async fn end(b: &Binder, c: &BuildKitClaim, phase: ClaimPhase) -> Option<&'stati
     let (ns, name, uid) = names(c)?;
     if let Some(secret) = c.status.as_ref().and_then(|s| s.secret_name.as_deref()) {
         match b.backend().get_secret(ns, secret).await {
-            Ok(Some(s)) if logic::controlled_by(&s, uid) => {
+            Ok(Some(s)) if claims::controlled_by(&s, uid) => {
                 // The uid precondition spares a Secret recreated since the read.
                 let suid = s.metadata.uid.unwrap_or_default();
                 if !matches!(
@@ -285,7 +320,7 @@ async fn end(b: &Binder, c: &BuildKitClaim, phase: ClaimPhase) -> Option<&'stati
             Err(_) => return None,
         }
     }
-    if !write_status(b, c, &logic::ended_status(c, phase)).await {
+    if !write_status(b, c, &claims::ended_status(c, phase)).await {
         return None;
     }
     info!(
@@ -327,7 +362,7 @@ async fn sweep(
     own: &str,
 ) -> Vec<&'static str> {
     let mut done = Vec::new();
-    for p in logic::strays(pods.iter().map(AsRef::as_ref), claims, served, own) {
+    for p in claims::strays(pods.iter().map(AsRef::as_ref), claims, served, own) {
         let (Some(ns), Some(pool), Some(id)) = (
             p.metadata.namespace.as_deref(),
             p.metadata.labels.as_ref().and_then(|l| l.get(LABEL_POOL)),

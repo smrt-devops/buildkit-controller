@@ -5,7 +5,7 @@
 //! later stage keeps serving what an earlier one still needs. `main` uses three:
 //! the API (alloc, http), then the edge, whose open connections drain until each
 //! ends on its own, then the certificate loader they depend on. Leader-gated
-//! components (the claim controller) are stopped earlier, by [`step_down`],
+//! components (the allocator) are stopped earlier, by [`step_down`],
 //! before the Lease is released.
 
 use std::future::Future;

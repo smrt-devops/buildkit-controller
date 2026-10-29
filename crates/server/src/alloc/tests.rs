@@ -18,14 +18,14 @@ use tokio::sync::{broadcast, watch};
 
 use super::backend::{Backend, PatchOutcome, Write};
 use super::certs::MaterialSource;
+use super::claims::{self, reason};
 use super::metrics::AllocMetrics;
 use super::pods::*;
 use super::{AllocError, BindConfig, Binder, Front, Outcome};
 use crate::auth::Identity;
 use crate::certs::{CaCertRule, CertMaterial};
-use crate::claim::logic::{self, reason};
 use crate::pki::CaBundle;
-use crate::render::{ANN_ALLOC, ANN_OWNER, PodInputs, fixtures, worker_pod};
+use crate::render::{ANN_ALLOC, ANN_CLAIM, ANN_OWNER, PodInputs, fixtures, worker_pod};
 use crate::runtime::stores::{ClaimEvent, ClaimSubscription};
 
 const POOL_NS: &str = fixtures::POOL_NAMESPACE;
@@ -668,7 +668,7 @@ async fn a_written_owner_counts_only_in_the_controllers_namespace() {
     // Its allocation id comes from its uid, so it is the same on every pass.
     assert_eq!(
         s.allocation_id,
-        logic::alloc_id(&e.fake.claim(CI, "build").unwrap(), OWN).map(|a| a.to_string())
+        claims::alloc_id(&e.fake.claim(CI, "build").unwrap(), OWN).map(|a| a.to_string())
     );
     // Without a publicKey it got a Secret with the key, controlled by the claim.
     assert_eq!(s.secret_name.as_deref(), Some("build-buildkit"));
@@ -892,7 +892,7 @@ async fn pending_allocation_is_polled_and_released_by_its_owner() {
     // The leader fails it: the poll answers with the error.
     let c = e.fake.claim(OWN, &p.id).unwrap();
     let mut failed = c.clone();
-    failed.status = Some(logic::unbound_status(
+    failed.status = Some(claims::unbound_status(
         &c,
         ClaimPhase::Failed,
         reason::QUEUE_TIMEOUT,
@@ -981,7 +981,7 @@ async fn tidy_ends_claims_and_retires_strays() {
     e.fake.put_claim(expired);
     let old = e.ci_claim(0, "sa:x/old");
     let mut done = e.fake.claim(OWN, &old).unwrap();
-    let mut st = logic::unbound_status(&done, ClaimPhase::Failed, reason::QUEUE_TIMEOUT, "", None);
+    let mut st = claims::unbound_status(&done, ClaimPhase::Failed, reason::QUEUE_TIMEOUT, "", None);
     st.conditions[0].last_transition_time = Time(
         k8s_openapi::jiff::Timestamp::now() - k8s_openapi::jiff::SignedDuration::from_mins(11),
     );
@@ -990,7 +990,7 @@ async fn tidy_ends_claims_and_retires_strays() {
     e.claim("other", "x", 0, json!({}));
     let claims = e.fake.claims.lock().unwrap().as_reader().state();
     let pods = e.fake.pods.lock().unwrap().as_reader().state();
-    crate::claim::tidy_with(&e.binder, &claims, &pods, OffsetDateTime::now_utc()).await;
+    super::leader::tidy_with(&e.binder, &claims, &pods, OffsetDateTime::now_utc()).await;
     let calls = e.fake.calls();
     assert!(
         calls.contains(&format!("patch {pod_gone} draining")),

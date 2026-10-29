@@ -15,18 +15,14 @@ use k8s_openapi::api::core::v1::{Pod, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, ObjectMeta, OwnerReference, Time};
 use time::OffsetDateTime;
 
-use crate::alloc::pods::{ANN_CLAIM, DRAINING, FREE, ann, derived_alloc_id, parse_ts};
+use super::pods::{ann, derived_alloc_id, parse_ts};
 use crate::auth::Identity;
 use crate::pki::AllocId;
-use crate::render::{ANN_ALLOC, ANN_OWNER};
+use crate::render::{ANN_ALLOC, ANN_CLAIM, ANN_EXPIRES_AT, ANN_OWNER, DRAINING, FREE};
 
 /// `(namespace, name)` of a pool.
 pub type PoolKey = (String, String);
 
-/// Secret annotation holding the allocation id.
-pub const SECRET_ANN_ALLOC: &str = ANN_ALLOC;
-/// Secret annotation holding the allocation expiry.
-pub const SECRET_ANN_EXPIRES: &str = "buildkit.smrt-devops.net/expires-at";
 /// The only condition type a claim carries.
 pub const COND_BOUND: &str = "Bound";
 /// How long after creation a claim waits for its pool to appear in the pool
@@ -553,8 +549,8 @@ pub fn secret(c: &BuildKitClaim, b: &Binding, key_pem: &str, ca: Option<&str>) -
             name: Some(secret_name(&name)),
             namespace: c.metadata.namespace.clone(),
             annotations: Some(BTreeMap::from([
-                (SECRET_ANN_ALLOC.to_owned(), b.alloc_id.clone()),
-                (SECRET_ANN_EXPIRES.to_owned(), b.expires_at.clone()),
+                (ANN_ALLOC.to_owned(), b.alloc_id.clone()),
+                (ANN_EXPIRES_AT.to_owned(), b.expires_at.clone()),
             ])),
             owner_references: Some(vec![OwnerReference {
                 api_version: "buildkit.smrt-devops.net/v1alpha1".into(),
@@ -573,5 +569,5 @@ pub fn secret(c: &BuildKitClaim, b: &Binding, key_pem: &str, ca: Option<&str>) -
 }
 
 #[cfg(test)]
-#[path = "logic_tests.rs"]
+#[path = "claims_tests.rs"]
 mod tests;

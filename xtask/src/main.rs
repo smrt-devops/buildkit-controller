@@ -106,7 +106,7 @@ enum Task {
     },
     /// Install the chart on a throwaway kind cluster with one pool and check the replicas, the leader, the pool and readiness.
     HelmVerify,
-    /// Install the chart with two replicas on a throwaway kind cluster and check that stopping a replica never cuts a live build: a long build survives a rollout, the Lease moves within seconds, and a queued request gets 503 `shutting_down`.
+    /// Install the chart with two replicas on a throwaway kind cluster and check that stopping a replica never cuts a live build: a long build survives a rollout, the Lease moves within seconds after the allocator has stopped, and a pending (202) claim survives a rollout of both replicas and binds once the worker is free.
     DrainVerify {
         /// Run the build past the old 300 s drain budget (390 s), as the nightly job does.
         #[arg(long)]

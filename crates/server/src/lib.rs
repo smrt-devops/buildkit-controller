@@ -1,7 +1,6 @@
 pub mod alloc;
 pub mod auth;
 pub mod certs;
-pub mod claim;
 pub mod config;
 pub mod edge;
 pub mod election;

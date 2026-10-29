@@ -7,9 +7,11 @@
 //!   does the pool lookup **and the access check**, so a caller cannot skip
 //!   it, then creates, reads or deletes the caller's claim in the controller's
 //!   namespace.
-//! - [`bind`]: the leader's allocator. One pass per pool binds pending claims,
-//!   oldest first, to free warm pods and signs their certificates. The claim
-//!   controller ([`crate::claim`]) schedules the passes.
+//! - [`leader`]: the [`Allocator`] component, which runs only on the leader.
+//!   It schedules [`bind`] passes, which bind pending claims, oldest first, to
+//!   free warm pods, and tidies claims that ended or lost their pod.
+//! - [`claims`]: pure decisions about claims. [`pods`]: pure pod logic.
+//!   [`pool`]: pool access rules, readiness and durations.
 //!
 //! HTTP counts in `buildkit_allocations_total` only the rejections it makes
 //! itself (`unauthenticated`, `payload_too_large`, `unsupported_media_type`,
@@ -20,15 +22,18 @@ pub mod backend;
 pub mod bind;
 mod cache;
 pub mod certs;
+pub mod claims;
 pub mod error;
 pub mod front;
+pub mod leader;
 pub mod metrics;
 pub mod pods;
+pub mod pool;
 
 #[cfg(test)]
 mod tests;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::Duration;
 
 use buildkit_controller_api::dto::{CreateAllocationRequest, ErrorCode};
@@ -41,6 +46,7 @@ pub use bind::{BindConfig, Binder};
 pub use certs::{CertSource, MaterialSource};
 pub use error::AllocError;
 pub use front::{Front, Outcome};
+pub use leader::Allocator;
 
 use crate::auth::Identity;
 use crate::certs::CertMaterial;
@@ -48,12 +54,47 @@ use crate::runtime::AppContext;
 use crate::runtime::hooks::{BoxResult, Component};
 use metrics::AllocMetrics;
 
+/// What the front door and the [`Allocator`] share.
+#[derive(Clone)]
+struct Shared {
+    material: watch::Receiver<CertMaterial>,
+    metrics: Arc<OnceLock<AllocMetrics>>,
+    registered: Arc<Once>,
+}
+
+impl Shared {
+    /// The alloc metric families, registered once per process.
+    fn metrics(&self, ctx: &AppContext) -> AllocMetrics {
+        let m = self
+            .metrics
+            .get_or_init(|| AllocMetrics::with_releases(ctx.metrics().releases()))
+            .clone();
+        self.registered
+            .call_once(|| ctx.metrics().with_registry(|r| m.register(r)));
+        m
+    }
+
+    /// The API server and certificate sources both components use.
+    fn sources(&self, ctx: &AppContext) -> anyhow::Result<(Arc<dyn Backend>, Arc<dyn CertSource>)> {
+        let timeout = ctx
+            .config()
+            .kube
+            .request_timeout
+            .seconds()
+            .map(Duration::from_secs)
+            .map_err(|e| anyhow::anyhow!("kube.requestTimeout: {e}"))?;
+        Ok((
+            Arc::new(KubeBackend::new(ctx.client(), timeout)),
+            Arc::new(MaterialSource::new(self.material.clone())),
+        ))
+    }
+}
+
 /// Handle to allocation; clone it into the HTTP layer.
 #[derive(Clone)]
 pub struct AllocService {
-    material: watch::Receiver<CertMaterial>,
+    shared: Shared,
     front: Arc<OnceLock<Arc<Front>>>,
-    metrics: Arc<OnceLock<AllocMetrics>>,
 }
 
 impl AllocService {
@@ -62,9 +103,12 @@ impl AllocService {
     #[must_use]
     pub fn new(material: watch::Receiver<CertMaterial>) -> Self {
         Self {
-            material,
+            shared: Shared {
+                material,
+                metrics: Arc::default(),
+                registered: Arc::new(Once::new()),
+            },
             front: Arc::default(),
-            metrics: Arc::default(),
         }
     }
 
@@ -73,8 +117,15 @@ impl AllocService {
     #[must_use]
     pub fn with_metrics(material: watch::Receiver<CertMaterial>, metrics: AllocMetrics) -> Self {
         let s = Self::new(material);
-        let _ = s.metrics.set(metrics);
+        let _ = s.shared.metrics.set(metrics);
         s
+    }
+
+    /// The leader's half of allocation, sharing this handle's cert material
+    /// and metrics. `main` runs it in the leader stage.
+    #[must_use]
+    pub fn allocator(&self) -> Allocator {
+        Allocator::new(self.shared.clone())
     }
 
     /// Count a POST the HTTP layer refused before [`Self::allocate`]
@@ -83,7 +134,7 @@ impl AllocService {
     /// in `buildkit_allocations_total`, with empty `namespace` and `pool`,
     /// because no parsed, authorized pool exists yet. A no-op before [`Component::run`].
     pub fn count_rejection(&self, code: ErrorCode) {
-        if let Some(m) = self.metrics.get() {
+        if let Some(m) = self.shared.metrics.get() {
             m.allocation("", "", code.as_str());
         }
     }
@@ -140,60 +191,32 @@ impl Component for AllocService {
         "alloc"
     }
 
-    /// The front door on every replica, and the claim controller (the
-    /// allocator among it) while this replica leads.
+    /// The front door, on every replica. Binding is the [`Allocator`]'s.
     fn run(&self, ctx: AppContext, shutdown: CancellationToken) -> BoxResult {
         let cell = Arc::clone(&self.front);
-        let material = self.material.clone();
-        let metrics_cell = Arc::clone(&self.metrics);
+        let shared = self.shared.clone();
         Box::pin(async move {
-            let metrics = metrics_cell
-                .get_or_init(|| AllocMetrics::with_releases(ctx.metrics().releases()))
-                .clone();
-            ctx.metrics().with_registry(|r| metrics.register(r));
-            let c = ctx.config();
-            let timeout = c
-                .kube
-                .request_timeout
-                .seconds()
-                .map(Duration::from_secs)
-                .map_err(|e| anyhow::anyhow!("kube.requestTimeout: {e}"))?;
-            let backend: Arc<dyn Backend> = Arc::new(KubeBackend::new(ctx.client(), timeout));
-            let certs: Arc<dyn CertSource> = Arc::new(MaterialSource::new(material));
+            let metrics = shared.metrics(&ctx);
+            let (backend, certs) = shared.sources(&ctx)?;
             let own = ctx.namespace().to_owned();
-            let served = c.served_claim_namespaces(&own);
+            let served = ctx.config().served_claim_namespaces(&own);
             let sub_ctx = ctx.clone();
             let front = Front::new(
-                Arc::clone(&backend),
+                backend,
                 ctx.pools(),
                 ctx.claims(),
                 Box::new(move || sub_ctx.claim_events()),
-                Arc::clone(&certs),
-                own.clone(),
-                served.clone(),
-                metrics.clone(),
+                certs,
+                own,
+                served,
+                metrics,
             )
             .with_stopping(shutdown.clone())
             .with_pods(ctx.pods());
-            let binder = Arc::new(Binder::new(
-                backend,
-                (ctx.pools(), ctx.pods(), ctx.claims()),
-                certs,
-                BindConfig {
-                    endpoint: c.edge.endpoint.clone(),
-                    server_name: c.edge.server_name.clone(),
-                    allocation_domain: Some(c.edge.allocation_domain.clone())
-                        .filter(|d| !d.is_empty()),
-                    namespace: own,
-                    served,
-                    cache_host: (!c.cache.host.is_empty()).then(|| c.cache.host.clone()),
-                },
-                metrics,
-            ));
             ctx.wait_synced().await;
             let _ = cell.set(Arc::new(front));
             info!(component = "alloc", "allocation service running");
-            crate::claim::run(ctx, binder, shutdown).await?;
+            shutdown.cancelled().await;
             Ok(())
         })
     }

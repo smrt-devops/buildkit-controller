@@ -267,9 +267,11 @@ async fn replica(
         let (ctx, stop) = (ctx.clone(), stop.clone());
         tokio::spawn(async move { certs.run(ctx, stop).await });
     }
-    {
-        let (svc, ctx, stop) = (svc.clone(), ctx.clone(), stop.clone());
-        tokio::spawn(async move { svc.run(ctx, stop).await });
+    // The front door on every replica; the allocator acts only while leading.
+    let components: [Arc<dyn Component>; 2] = [Arc::new(svc.clone()), Arc::new(svc.allocator())];
+    for c in components {
+        let (ctx, stop) = (ctx.clone(), stop.clone());
+        tokio::spawn(async move { c.run(ctx, stop).await });
     }
     if reconcile {
         let work: Arc<dyn LeaderWork> = Arc::new(Reconciler::new(&ctx));

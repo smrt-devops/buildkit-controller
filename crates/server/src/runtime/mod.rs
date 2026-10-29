@@ -22,7 +22,7 @@
 //!
 //! Long-running modules implement [`hooks::Component`] (alloc, http, edge and
 //! the certificate loader run on every replica until their stage's shutdown
-//! token fires; the claim controller acts only while leading) or
+//! token fires; the allocator acts only while leading) or
 //! [`hooks::LeaderWork`] (reconcile; it starts per leadership term, after
 //! `wait_synced`, and is dropped when leadership ends). `main` fills
 //! [`hooks::Hooks`] with them.
@@ -85,9 +85,8 @@ use stores::{ClaimSubscription, PodSubscription, SecretState, StoreFreshness, St
 /// nothing for 90 s. Calls bounded by `kube.requestTimeout` (5 s by default;
 /// the allocation, reconcile, token review and Lease calls) keep that bound,
 /// which config validation holds below this one so that it is the one that
-/// applies. Calls without their own bound, such as the claim controller's,
-/// gain this one. It is also beyond how long the API server takes to start
-/// answering a list, even a paged one served from etcd. The
+/// applies. Calls without their own bound gain this one. It is also beyond
+/// how long the API server takes to start answering a list, even a paged one served from etcd. The
 /// controller makes no exec, attach or log requests, the long-lived calls that
 /// a read timeout would break.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(90);

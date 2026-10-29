@@ -326,7 +326,7 @@ async fn setup(issuer: &Issuer, stop: &CancellationToken) -> (H, SocketAddr, Arc
     }
 
     let metrics = Arc::new(Metrics::new());
-    // The leader: its alloc component also binds the claims.
+    // The leader: its allocator binds the claims.
     let (leader_tx, leader_rx) = watch::channel(LeaderState::Leader { term: 1 });
     std::mem::forget(leader_tx);
     let ctx = AppContext::build(
@@ -340,8 +340,12 @@ async fn setup(issuer: &Issuer, stop: &CancellationToken) -> (H, SocketAddr, Arc
     let certs = Certs::new();
     let svc = AllocService::new(certs.subscribe());
     let http = HttpComponent::new(svc.clone(), certs.subscribe());
-    let components: [Arc<dyn Component>; 3] =
-        [Arc::new(certs), Arc::new(svc.clone()), Arc::new(http)];
+    let components: [Arc<dyn Component>; 4] = [
+        Arc::new(certs),
+        Arc::new(svc.clone()),
+        Arc::new(svc.allocator()),
+        Arc::new(http),
+    ];
     for c in components {
         let (ctx, stop) = (ctx.clone(), stop.clone());
         tokio::spawn(async move { c.run(ctx, stop).await });

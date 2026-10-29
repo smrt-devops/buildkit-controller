@@ -8,8 +8,8 @@ use buildkit_controller_api::v1alpha1::{BuildKitPool, CacheScope};
 use kube::ResourceExt;
 use serde_json::{Value, json};
 
-use super::bind::rules;
 use super::pods::ptr;
+use super::pool::rules;
 use crate::auth::Identity;
 use crate::render::{self, ANN_SCOPE, ANN_TIER};
 
