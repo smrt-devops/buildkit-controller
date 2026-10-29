@@ -16,9 +16,9 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use buildkit_controller_api::v1alpha1::Internet;
 
 use super::{
-    BUILDKIT_PORT, CONTROLLER, LABEL_MANAGED_BY, LABEL_NAME, LABEL_POOL, PodInputs, RenderConfig,
-    RenderError, WorkerNetwork, WorkerTlsPem, owner_ref, pool_identity, worker_object_name,
-    worker_pod_name, worker_secret_name,
+    BUILDKIT_PORT, CONTROLLER, LABEL_MANAGED_BY, LABEL_NAME, LABEL_POOL, PodInputs, REGISTRY_NAME,
+    RenderConfig, RenderError, WorkerNetwork, WorkerTlsPem, owner_ref, pool_identity,
+    worker_object_name, worker_pod_name, worker_secret_name,
 };
 
 fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -45,13 +45,16 @@ fn pool_meta(pool: &BuildKitPool) -> Result<ObjectMeta, RenderError> {
 }
 
 /// The per-pod Secret `<pod>-<nonce>` of the pod [`super::worker_pod`] renders
-/// from the same `inputs`: `tls.crt`, `tls.key`, `ca.crt`, `buildkitd.toml`.
+/// from the same `inputs`: `tls.crt`, `tls.key`, `ca.crt`, `client.crt`, `client.key`
+/// (the registry client leaf) and `buildkitd.toml`.
+/// `cache_host` adds the cache registry entry to `buildkitd.toml`.
 /// It carries the pool's ownerReference as rendered; [`crate::reconcile::spawn`]
 /// replaces it with the pod's before the Secret is created.
 pub fn worker_secret(
     pool: &BuildKitPool,
     inputs: &PodInputs,
     tls: &WorkerTlsPem,
+    cache_host: Option<&str>,
 ) -> Result<Secret, RenderError> {
     let bytes = |s: &str| ByteString(s.as_bytes().to_vec());
     let mut metadata = pool_meta(pool)?;
@@ -64,9 +67,14 @@ pub fn worker_secret(
             ("tls.crt".to_owned(), bytes(&tls.cert)),
             ("tls.key".to_owned(), bytes(&tls.key)),
             ("ca.crt".to_owned(), bytes(&tls.ca)),
+            ("client.crt".to_owned(), bytes(&tls.client_cert)),
+            ("client.key".to_owned(), bytes(&tls.client_key)),
             (
                 "buildkitd.toml".to_owned(),
-                bytes(&super::buildkitd_config(pool)),
+                bytes(&super::buildkitd_config(
+                    &pool.spec.workers.buildkitd_config,
+                    cache_host,
+                )),
             ),
         ])),
         ..Secret::default()
@@ -133,6 +141,28 @@ fn dns_rule(net: &WorkerNetwork) -> Option<NetworkPolicyEgressRule> {
     (!peers.is_empty()).then(|| to(peers, Some(vec![port("UDP", 53), port("TCP", 53)])))
 }
 
+/// The cache registry pods in the controller namespace, on the port of `cache.host`.
+fn cache_rule(cfg: &RenderConfig) -> Option<NetworkPolicyEgressRule> {
+    let port_no = cfg
+        .cache_host
+        .as_deref()?
+        .rsplit_once(':')?
+        .1
+        .parse::<i32>()
+        .ok()?;
+    Some(to(
+        vec![NetworkPolicyPeer {
+            namespace_selector: Some(selector(labels(&[(
+                "kubernetes.io/metadata.name",
+                &cfg.controller_namespace,
+            )]))),
+            pod_selector: Some(selector(labels(&[(LABEL_NAME, REGISTRY_NAME)]))),
+            ip_block: None,
+        }],
+        Some(vec![port("TCP", port_no)]),
+    ))
+}
+
 /// `NetworkPolicy` `<pool>-buildkit-worker`.
 ///
 /// Leaves out every `allowCIDRs` entry [`super::refused_allow_cidr`] refuses, so the
@@ -162,6 +192,7 @@ pub fn network_policy(
             egress.push(to(vec![block("::/0", except(v6))], None));
         }
     }
+    egress.extend(cache_rule(cfg));
     egress.extend(
         spec.allow_cidrs
             .iter()

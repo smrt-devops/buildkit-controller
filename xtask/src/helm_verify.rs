@@ -6,7 +6,8 @@
 //! pool in each watched namespace is Ready with its warm pod and binds a claim,
 //! that a pool in a third namespace is ignored, that the controller cannot
 //! create pods or Secrets in that namespace or in kube-system, and that its logs
-//! show no RBAC denial. The controller namespace enforces `PodSecurity`
+//! show no RBAC denial; then that the cache registry becomes Ready with the
+//! certificate the leader writes, and its logs show no RBAC denial either. The controller namespace enforces `PodSecurity`
 //! "restricted".
 //!
 //! The cluster name is `bk-helm-verify`, plus `-$BK_KIND_SUFFIX` when that is set.
@@ -306,6 +307,30 @@ fn verify(env: &Cluster) -> Result<()> {
         "controller logs show an RBAC denial"
     );
     println!("PASS no RBAC denial (Forbidden / is forbidden / \"code\":403) in controller logs");
+
+    // The cache registry starts once the leader has written its certificate, and
+    // reads pods and pools in the watched namespaces without a denial.
+    env.kubectl(&[
+        "rollout",
+        "status",
+        "statefulset/buildkit-controller-registry",
+        "-n",
+        NS,
+        "--timeout=180s",
+    ])?;
+    let logs = env.kubectl(&[
+        "logs",
+        "-n",
+        NS,
+        "-l",
+        "app.kubernetes.io/name=buildkit-registry",
+        "--tail=-1",
+    ])?;
+    ensure!(
+        !shows_rbac_denial(&logs),
+        "cache registry logs show an RBAC denial"
+    );
+    println!("PASS cache registry Ready, no RBAC denial in its logs");
     println!("helm-verify: all checks passed");
     Ok(())
 }

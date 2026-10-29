@@ -1,5 +1,0 @@
-apiVersion: buildkit.smrt-devops.net/v1alpha1
-kind: BuildKitPool
-metadata: {name: cache-registry, namespace: default}
-spec:
-  workers: {cache: {registry: {repository: "localhost:5000/cache", ref: "{repository}:{pool}-{cacheKey}", defaultKey: main, importFrom: [trunk, "ghcr.io/org/base:main"]}, local: {affinity: "off", keysPerVolume: 4, gcKeepStorage: 10Gi}}}

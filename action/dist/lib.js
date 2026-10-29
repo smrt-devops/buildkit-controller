@@ -63,7 +63,7 @@ function allocationBody({ namespace, pool }, publicKey, ttl, queueTimeout, cache
   return b;
 }
 
-const CACHE_CHOICES = ['auto', 'registry', 'local', 'none'];
+const CACHE_CHOICES = ['auto', 'none'];
 const CACHE_KEY = /^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 
 /**
@@ -72,7 +72,7 @@ const CACHE_KEY = /^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/;
  */
 function parseCacheInputs({ cache, cacheKey, cacheMode, cacheFrom }) {
   const c = String(cache || '').trim() || 'auto';
-  if (!CACHE_CHOICES.includes(c)) throw new Error(`invalid cache "${c}": use auto, registry, local or none`);
+  if (!CACHE_CHOICES.includes(c)) throw new Error(`invalid cache "${c}": use auto or none`);
   const k = String(cacheKey || '').trim();
   if (k && (k.length > 63 || !CACHE_KEY.test(k))) {
     throw new Error(`invalid cache-key "${k}": 1 to 63 of [A-Za-z0-9._-], starting and ending alphanumeric`);

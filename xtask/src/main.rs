@@ -115,7 +115,7 @@ enum Task {
     Docs,
     /// Install the chart behind Envoy Gateway with PROXY protocol on, on a throwaway kind cluster, and check that the logs and the per-address caps see client addresses, that a build through the edge works, and that an untrusted pod cannot forge its address.
     ProxyVerify,
-    /// Run the end-to-end suite on a kind cluster, exposed through Envoy Gateway. Covers chart install, the Gateway API routes, OIDC and `TokenReview`, builds, the registry cache, queueing, a long poll, multi-platform builds and the Envoy extras.
+    /// Run the end-to-end suite on a kind cluster, exposed through Envoy Gateway. Covers chart install, the Gateway API routes, OIDC and `TokenReview`, builds, an external registry cache, the built-in cache registry for trusted and untrusted callers, the v0.1.0 volume sweep, queueing, a long poll, multi-platform builds and the Envoy extras.
     E2e,
     /// Install the chart on kind behind Envoy Gateway, trust GitHub OIDC for REPO (owner/name) and leave the cluster running. Used by the CI Action job.
     E2eUp {

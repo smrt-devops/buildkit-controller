@@ -48,15 +48,11 @@ spec:
                 description: "`cache` of `POST /v1/allocations`."
                 enum:
                 - auto
-                - registry
-                - local
                 - none
                 nullable: true
                 type: string
               cacheKey:
-                description: >-
-                  Cache key of both cache layers, as `cacheKey` of `POST /v1/allocations`. Unset
-                  uses the pool's default key.
+                description: Cache tag, as `cacheKey` of `POST /v1/allocations`. Unset uses the pool name.
                 maxLength: 63
                 minLength: 1
                 nullable: true
@@ -68,6 +64,13 @@ spec:
                   the controller's namespace.
                 maxLength: 128
                 minLength: 1
+                nullable: true
+                type: string
+              cacheTier:
+                description: Whether an allocation may write the cache or only read it.
+                enum:
+                - trusted
+                - untrusted
                 nullable: true
                 type: string
               owner:
@@ -141,26 +144,14 @@ spec:
                 nullable: true
                 type: string
               cache:
-                description: Cache flags and outcome of the allocation, as in the `201` response.
+                description: Cache flags of the allocation, as in the `201` response.
                 nullable: true
                 properties:
                   key:
                     description: The effective cache key.
                     type: string
-                  local:
-                    description: Local volume outcome.
-                    nullable: true
-                    properties:
-                      result:
-                        description: |-
-                          `hit`, `miss`, `spill`, `cold` or `uncached`, or
-                          `reused` when the request left out the local layer.
-                        type: string
-                    required:
-                    - result
-                    type: object
                   registry:
-                    description: buildx flags of the registry cache.
+                    description: buildx flags for the built-in cache registry.
                     nullable: true
                     properties:
                       from:
@@ -169,11 +160,11 @@ spec:
                           type: string
                         type: array
                       to:
-                        description: "`--cache-to` value."
+                        description: "`--cache-to` value. Absent when the caller may only read the cache."
+                        nullable: true
                         type: string
                     required:
                     - from
-                    - to
                     type: object
                 required:
                 - key

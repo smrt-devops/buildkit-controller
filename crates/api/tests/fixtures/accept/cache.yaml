@@ -1,0 +1,11 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: cache, namespace: default}
+spec:
+  workers:
+    cache:
+      scope: pool
+      maxSize: 20Gi
+      writers:
+      - oidc: {issuer: https://token.actions.githubusercontent.com, claims: {event_name: push, ref: refs/heads/main}}
+      - serviceAccount: {name: builder}

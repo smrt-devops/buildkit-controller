@@ -63,14 +63,14 @@ pub struct BuildKitClaimSpec {
     /// Defaults to the pool's `allocation.queueTimeout`; its `maxQueueTimeout` caps it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_timeout: Option<Duration>,
-    /// Cache key of both cache layers, as `cacheKey` of `POST /v1/allocations`. Unset uses the pool's default key.
+    /// Cache tag, as `cacheKey` of `POST /v1/allocations`. Unset uses the pool name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(
         length(min = 1, max = 63),
         regex(pattern = r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$")
     )]
     pub cache_key: Option<String>,
-    /// Which cache layers to use, as `cache` of `POST /v1/allocations`. Unset means `auto`.
+    /// Whether to use the cache, as `cache` of `POST /v1/allocations`. Unset means `auto`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<crate::dto::CacheChoice>,
     /// PEM SPKI ECDSA P-256 public key. The leader signs the allocation certificate
@@ -89,6 +89,31 @@ pub struct BuildKitClaimSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 128))]
     pub cache_scope: Option<String>,
+    /// The caller's cache tier, written by the API with `owner`. Honoured only in the
+    /// controller's namespace; there a claim without it may only read the cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_tier: Option<CacheTier>,
+}
+
+/// Whether an allocation may write the cache or only read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheTier {
+    /// Pull and push.
+    Trusted,
+    /// Pull only.
+    Untrusted,
+}
+
+impl CacheTier {
+    /// The value as written on the worker pod.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Trusted => "trusted",
+            Self::Untrusted => "untrusted",
+        }
+    }
 }
 
 /// Reference to a `BuildKitPool`.
@@ -178,7 +203,7 @@ pub struct BuildKitClaimStatus {
     /// 1-based place in the pool's queue while `Pending`. Refreshed every few seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_position: Option<i32>,
-    /// Cache flags and outcome of the allocation, as in the `201` response.
+    /// Cache flags of the allocation, as in the `201` response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<crate::dto::CacheResponse>,
     /// Generation of the spec this status describes.

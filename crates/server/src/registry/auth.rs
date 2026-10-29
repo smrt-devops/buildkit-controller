@@ -1,6 +1,6 @@
 //! Who is calling and what they may do.
 //!
-//! The TLS layer has already chained the client cert to the internal CA.
+//! The TLS layer has already chained the client cert to the client CA.
 //! [`peer_identity`] then reads the worker it names, and an [`Authorizer`]
 //! maps that worker to a [`Grant`]. The grant is asked for again on every
 //! request, so an allocation that ends takes its access with it.

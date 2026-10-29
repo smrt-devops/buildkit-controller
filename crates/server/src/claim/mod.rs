@@ -21,13 +21,13 @@ use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::alloc::Binder;
 use crate::alloc::backend::Write;
 use crate::alloc::pods::{FREE, ann, is_ready};
-use crate::alloc::{AllocService, Binder};
 use crate::reconcile::driver::{Trigger, schedule};
 use crate::render::{ANN_ALLOC, LABEL_POOL};
 use crate::runtime::AppContext;
-use crate::runtime::hooks::{BoxResult, Component, LeaderWork};
+use crate::runtime::hooks::LeaderWork;
 use crate::runtime::leader::{BoxFut, supervise};
 use crate::runtime::stores::{ClaimEvent, PodEvent};
 use logic::reason;
@@ -49,32 +49,6 @@ impl ClaimMetrics {
         self.reconciles
             .get_or_create(&vec![("result", result.to_owned())])
             .inc();
-    }
-}
-
-/// Kept for the binary's wiring, which adds it when `claims.enabled` is set.
-/// The claim controller now always runs, inside the `alloc` component, because
-/// every allocation is a claim; this component only waits for shutdown.
-pub struct ClaimController;
-
-impl ClaimController {
-    /// The arguments are unused; see the type docs.
-    #[must_use]
-    pub fn new(_alloc: AllocService, _namespaces: impl IntoIterator<Item = String>) -> Self {
-        Self
-    }
-}
-
-impl Component for ClaimController {
-    fn name(&self) -> &'static str {
-        "claims"
-    }
-
-    fn run(&self, _ctx: AppContext, shutdown: CancellationToken) -> BoxResult {
-        Box::pin(async move {
-            shutdown.cancelled().await;
-            Ok(())
-        })
     }
 }
 

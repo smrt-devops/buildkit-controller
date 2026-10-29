@@ -1,4 +1,36 @@
 ---
+# Source: buildkit-controller/templates/cache.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: buildkit-controller-registry
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-registry
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: buildkit-registry
+      app.kubernetes.io/instance: bk
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/managed-by: buildkit-controller
+              app.kubernetes.io/name: buildkitd
+      ports:
+        - {protocol: TCP, port: 5000}
+    - ports:
+        - {protocol: TCP, port: 8080}
+
+---
 # Source: buildkit-controller/templates/extras.yaml
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -17,6 +49,21 @@ spec:
     matchLabels:
       app.kubernetes.io/name: buildkit-controller
       app.kubernetes.io/instance: bk
+
+---
+# Source: buildkit-controller/templates/cache.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: buildkit-controller-registry
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-registry
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
 
 ---
 # Source: buildkit-controller/templates/serviceaccount.yaml
@@ -60,6 +107,9 @@ data:
         maxReviewsPerIp: 4
         recentSubjectTtl: 10m
         reservedReviews: 8
+    cache:
+      host: buildkit-controller-registry.buildkit-system.svc:5000
+      tlsSecretName: buildkit-controller-registry-tls
     claims:
       enabled: false
       namespaces: []
@@ -160,15 +210,11 @@ spec:
                 description: "`cache` of `POST /v1/allocations`."
                 enum:
                 - auto
-                - registry
-                - local
                 - none
                 nullable: true
                 type: string
               cacheKey:
-                description: >-
-                  Cache key of both cache layers, as `cacheKey` of `POST /v1/allocations`. Unset
-                  uses the pool's default key.
+                description: Cache tag, as `cacheKey` of `POST /v1/allocations`. Unset uses the pool name.
                 maxLength: 63
                 minLength: 1
                 nullable: true
@@ -180,6 +226,13 @@ spec:
                   the controller's namespace.
                 maxLength: 128
                 minLength: 1
+                nullable: true
+                type: string
+              cacheTier:
+                description: Whether an allocation may write the cache or only read it.
+                enum:
+                - trusted
+                - untrusted
                 nullable: true
                 type: string
               owner:
@@ -253,26 +306,14 @@ spec:
                 nullable: true
                 type: string
               cache:
-                description: Cache flags and outcome of the allocation, as in the `201` response.
+                description: Cache flags of the allocation, as in the `201` response.
                 nullable: true
                 properties:
                   key:
                     description: The effective cache key.
                     type: string
-                  local:
-                    description: Local volume outcome.
-                    nullable: true
-                    properties:
-                      result:
-                        description: |-
-                          `hit`, `miss`, `spill`, `cold` or `uncached`, or
-                          `reused` when the request left out the local layer.
-                        type: string
-                    required:
-                    - result
-                    type: object
                   registry:
-                    description: buildx flags of the registry cache.
+                    description: buildx flags for the built-in cache registry.
                     nullable: true
                     properties:
                       from:
@@ -281,11 +322,11 @@ spec:
                           type: string
                         type: array
                       to:
-                        description: "`--cache-to` value."
+                        description: "`--cache-to` value. Absent when the caller may only read the cache."
+                        nullable: true
                         type: string
                     required:
                     - from
-                    - to
                     type: object
                 required:
                 - key
@@ -402,6 +443,37 @@ spec:
       status: {}
 
 ---
+# Source: buildkit-controller/templates/cache.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: buildkit-controller-registry-buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-registry
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+rules:
+  - apiGroups:
+    - buildkit.smrt-devops.net
+    resources:
+    - buildkitpools
+    verbs:
+    - get
+    - list
+    - watch
+  - apiGroups:
+    - ""
+    resources:
+    - pods
+    verbs:
+    - get
+    - list
+    - watch
+
+---
 # Source: buildkit-controller/templates/rbac.yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -474,10 +546,7 @@ rules:
     resources:
     - persistentvolumeclaims
     verbs:
-    - get
     - list
-    - create
-    - patch
     - delete
   - apiGroups:
     - networking.k8s.io
@@ -486,6 +555,25 @@ rules:
     verbs:
     - create
     - patch
+
+---
+# Source: buildkit-controller/templates/cache.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: buildkit-controller-registry-buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-registry
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: buildkit-controller-registry-buildkit-system}
+subjects:
+  - kind: ServiceAccount
+    name: buildkit-controller-registry
+    namespace: buildkit-system
 
 ---
 # Source: buildkit-controller/templates/rbac.yaml
@@ -551,6 +639,10 @@ rules:
     resources: [secrets]
     resourceNames: [buildkit-controller-ca]
     verbs: [get, list, watch, update]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [buildkit-controller-registry-tls]
+    verbs: [get, update]
   - apiGroups: [events.k8s.io]
     resources: [events]
     verbs: [create]
@@ -586,6 +678,29 @@ subjects:
   - kind: ServiceAccount
     name: buildkit-controller
     namespace: buildkit-system
+
+---
+# Source: buildkit-controller/templates/cache.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildkit-controller-registry
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-registry
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: buildkit-registry
+    app.kubernetes.io/instance: bk
+  ports:
+    - {name: registry, port: 5000, targetPort: registry}
+    - {name: metrics, port: 8080, targetPort: ops}
 
 ---
 # Source: buildkit-controller/templates/service.yaml
@@ -667,7 +782,7 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: buildkit-controller-0.1.0
       annotations:
-        checksum/config: 9eb541839f76d5200337269c0ee50b2ed5aea7d39a07858eb94e01f376d1f209
+        checksum/config: 3cff04bf47b4e265a8126f6edc87f34b60b5721b35f5209701b53f70b1a15dcc
     spec:
       serviceAccountName: buildkit-controller
       terminationGracePeriodSeconds: 86715
@@ -727,3 +842,92 @@ spec:
                   matchLabels:
                     app.kubernetes.io/name: buildkit-controller
                     app.kubernetes.io/instance: bk
+
+---
+# Source: buildkit-controller/templates/cache.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: buildkit-controller-registry
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-registry
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+spec:
+  replicas: 1
+  serviceName: buildkit-controller-registry
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: buildkit-registry
+      app.kubernetes.io/instance: bk
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: buildkit-registry
+        app.kubernetes.io/instance: bk
+        app.kubernetes.io/component: cache
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/version: "0.1.0"
+        helm.sh/chart: buildkit-controller-0.1.0
+    spec:
+      serviceAccountName: buildkit-controller-registry
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: registry
+          image: "ghcr.io/smrt-devops/buildkit-controller:0.1.0"
+          imagePullPolicy: IfNotPresent
+          args: [cache]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: [ALL]}
+          env:
+            - {name: LOG_LEVEL, value: "info"}
+            - {name: LOG_FORMAT, value: "json"}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: BUILDKIT_CACHE_OPS_LISTEN, value: "0.0.0.0:8080"}
+            - {name: BUILDKIT_CACHE_MAX_SIZE, value: "40Gi"}
+            - {name: BUILDKIT_CACHE_POOL_MAX_SIZE, value: "10Gi"}
+            - {name: BUILDKIT_CACHE_MAX_BLOB_SIZE, value: "5Gi"}
+            - {name: BUILDKIT_CACHE_MAX_UPLOAD_SIZE, value: "10Gi"}
+            - {name: BUILDKIT_CACHE_GC_INTERVAL, value: "10m"}
+          ports:
+            - {name: registry, containerPort: 5000}
+            - {name: ops, containerPort: 8080}
+          livenessProbe:
+            httpGet: {path: /healthz, port: ops}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: ops}
+            periodSeconds: 5
+          resources:
+            limits:
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/buildkit-cache}
+            - {name: tls, mountPath: /etc/buildkit-cache/tls, readOnly: true}
+      volumes:
+        - name: tls
+          secret: {secretName: buildkit-controller-registry-tls, defaultMode: 0440}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: "60Gi"}

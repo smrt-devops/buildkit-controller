@@ -6,7 +6,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use buildkit_controller_api::claim::{BuildKitClaim, BuildKitClaimStatus, ClaimPhase, secret_name};
+use buildkit_controller_api::claim::{
+    BuildKitClaim, BuildKitClaimStatus, CacheTier, ClaimPhase, secret_name,
+};
 use buildkit_controller_api::dto::{CacheResponse, ErrorCode};
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::{Pod, Secret};
@@ -73,6 +75,8 @@ pub struct Caller {
     pub identity: Option<Identity>,
     /// The cache scope id the API wrote, for a claim the API wrote.
     pub cache_scope: Option<String>,
+    /// The cache tier the API wrote, for a claim the API wrote.
+    pub cache_tier: Option<CacheTier>,
 }
 
 /// The claim's identity, from API-server-set metadata only.
@@ -97,6 +101,7 @@ pub fn caller(c: &BuildKitClaim, own: &str) -> Option<Caller> {
             owner: owner.clone(),
             identity: None,
             cache_scope: c.spec.cache_scope.clone(),
+            cache_tier: c.spec.cache_tier,
         });
     }
     let id = identity(c)?;
@@ -104,6 +109,7 @@ pub fn caller(c: &BuildKitClaim, own: &str) -> Option<Caller> {
         owner: id.owner(),
         identity: Some(id),
         cache_scope: None,
+        cache_tier: None,
     })
 }
 

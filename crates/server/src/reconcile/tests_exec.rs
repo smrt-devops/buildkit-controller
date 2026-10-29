@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use buildkit_controller_api::v1alpha1::{BuildKitPool, BuildKitPoolStatus, condition, reason};
 use futures::future::BoxFuture;
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret};
+use k8s_openapi::api::core::v1::{Pod, Secret};
 use k8s_openapi::api::events::v1::Event;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use k8s_openapi::jiff::Timestamp;
@@ -35,7 +35,6 @@ struct Fake {
     fail: HashMap<String, OpError>,
     statuses: Mutex<Vec<BuildKitPoolStatus>>,
     deletes: Mutex<Vec<Delete>>,
-    pvcs: Mutex<std::collections::BTreeMap<String, PersistentVolumeClaim>>,
     /// When set, every apply waits for a permit first.
     gate: Option<Arc<tokio::sync::Notify>>,
 }
@@ -142,27 +141,6 @@ impl KubeOps for Fake {
     }
     async fn create_event(&self, e: &Event) -> OpResult {
         self.call(format!("event:{}", e.reason.clone().unwrap_or_default()))
-    }
-    async fn get_pvc(&self, _ns: &str, name: &str) -> OpResult<Option<PersistentVolumeClaim>> {
-        self.call(format!("get_pvc:{name}"))?;
-        Ok(self.pvcs.lock().unwrap().get(name).cloned())
-    }
-    async fn create_pvc(&self, pvc: &PersistentVolumeClaim) -> OpResult {
-        let name = pvc.metadata.name.clone().unwrap_or_default();
-        self.call(format!("create_pvc:{name}"))?;
-        let mut p = pvc.clone();
-        p.metadata.uid = Some(format!("uid-{name}"));
-        self.pvcs.lock().unwrap().insert(name, p);
-        Ok(())
-    }
-    async fn delete_pvc(&self, _ns: &str, name: &str, uid: &str) -> OpResult {
-        self.call(format!("delete_pvc:{name}:{uid}"))?;
-        self.pvcs.lock().unwrap().remove(name);
-        Ok(())
-    }
-    async fn list_pvcs(&self, _ns: &str, _selector: &str) -> OpResult<Vec<PersistentVolumeClaim>> {
-        self.call("list_pvcs".into())?;
-        Ok(self.pvcs.lock().unwrap().values().cloned().collect())
     }
 }
 
@@ -936,18 +914,6 @@ impl KubeOps for Hang {
     async fn create_event(&self, _: &Event) -> OpResult {
         self.hang("event").await
     }
-    async fn get_pvc(&self, _: &str, _: &str) -> OpResult<Option<PersistentVolumeClaim>> {
-        self.hang("get_pvc").await
-    }
-    async fn create_pvc(&self, _: &PersistentVolumeClaim) -> OpResult {
-        self.hang("create_pvc").await
-    }
-    async fn delete_pvc(&self, _: &str, _: &str, _: &str) -> OpResult {
-        self.hang("delete_pvc").await
-    }
-    async fn list_pvcs(&self, _: &str, _: &str) -> OpResult<Vec<PersistentVolumeClaim>> {
-        self.hang("list_pvcs").await
-    }
 }
 
 /// Regression (control review P2): the reconciler's API calls had no time
@@ -1130,285 +1096,11 @@ impl WorkerSecrets for Hang {
     }
 }
 
-/// A pool with `cache.local` (limit 2 of max 4), ready to create pods.
-fn cached_pool() -> BuildKitPool {
-    let mut p = fixtures::pool(
-        "p",
-        json!({"scaling": {"max": 4}, "workers": {"cache": {"local": {"maxVolumes": 2}}}}),
-    )
-    .unwrap();
-    p.metadata.generation = Some(3);
-    p.status = Some(BuildKitPoolStatus::default());
-    p
-}
-
-/// Seeds the rendered volume of `slot` (as if created earlier), then lets `edit` change it.
-fn seed_pvc(
-    fake: &Fake,
-    p: &BuildKitPool,
-    slot: u32,
-    edit: impl FnOnce(&mut PersistentVolumeClaim),
-) {
-    let mut pvc = crate::render::cache_volume(p, slot)
-        .unwrap()
-        .unwrap_or_else(|| {
-            crate::render::cache_volume(&cached_pool(), 0)
-                .unwrap()
-                .unwrap()
-        });
-    let name = format!("p-cache-{slot}");
-    pvc.metadata.name = Some(name.clone());
-    pvc.metadata.uid = Some(format!("uid-{name}"));
-    edit(&mut pvc);
-    fake.pvcs.lock().unwrap().insert(name, pvc);
-}
-
 fn create(slot: u32) -> Action {
     Action::CreatePod {
         slot,
         name: format!("p-{slot}"),
     }
-}
-
-fn state_claim(p: &Pod) -> Option<String> {
-    let vs = p.spec.as_ref()?.volumes.as_ref()?;
-    let v = vs.iter().find(|v| v.name == "state")?;
-    v.persistent_volume_claim
-        .as_ref()
-        .map(|c| c.claim_name.clone())
-}
-
-#[tokio::test]
-async fn cached_slot_creates_its_volume_before_the_pod() {
-    let (p, ca) = (cached_pool(), valid_ca());
-    let fake = Fake::default();
-    let r = execute(
-        &fake,
-        &CaGuard::default(),
-        &env(&p, &ca, None, 0),
-        &plan(vec![create(1), create(2)]),
-    )
-    .await;
-    // The volume exists before the Secret and the pod; slot 2 has none.
-    assert_eq!(
-        fake.calls_n(),
-        [
-            "get_pvc:p-cache-1",
-            "create_pvc:p-cache-1",
-            "create:p-1",
-            "secret_create:p-1-N:Pod/uid-p-1",
-            "create:p-2",
-            "secret_create:p-2-N:Pod/uid-p-2",
-        ]
-    );
-    assert_eq!(state_claim(&r.created[0]).as_deref(), Some("p-cache-1"));
-    assert_eq!(state_claim(&r.created[1]), None);
-    assert_eq!(r.volume_ops, [("create", "ok")]);
-}
-
-#[tokio::test]
-async fn volume_create_conflict_goes_on_and_other_errors_fail_the_create() {
-    let (p, ca) = (cached_pool(), valid_ca());
-    let fake = Fake::failing(&[
-        ("create_pvc:p-cache-0", OpError::Conflict("exists".into())),
-        (
-            "create_pvc:p-cache-1",
-            OpError::Other("exceeded quota".into()),
-        ),
-    ]);
-    let r = execute(
-        &fake,
-        &CaGuard::default(),
-        &env(&p, &ca, None, 0),
-        &plan(vec![create(0), create(1)]),
-    )
-    .await;
-    assert_eq!(r.creates[0].result, CreateResult::Created);
-    assert!(matches!(r.creates[1].result, CreateResult::Failed { .. }));
-    assert!(!fake.calls().contains(&"create:p-1".to_owned()));
-    assert_eq!(r.volume_ops, [("create", "ok"), ("create", "error")]);
-}
-
-#[tokio::test]
-async fn current_volume_passes_its_cache_key_to_the_pod() {
-    use crate::render::{KEY_CACHE_GENERATION, KEY_CACHE_KEYS, KEY_CACHE_SCOPE, pod_cache_keys};
-    let ann = |p: &Pod, k: &str| {
-        p.metadata
-            .annotations
-            .as_ref()
-            .and_then(|a| a.get(k).cloned())
-    };
-    let (p, ca) = (cached_pool(), valid_ca());
-    // (PVC cache-scope, expected P cache-scope, P cache-generation, keys copied)
-    let cases = [
-        // Bound: the warm pod serves the owner and keeps the generation and keys.
-        (Some("s1@g1"), "s1", Some("g1"), true),
-        // Never bound (or a volume from before scopes): serves any scope, emptied.
-        (None, "", None, false),
-        // Unbound by a recycle.
-        (Some(""), "", None, false),
-        // Malformed: treated as unbound.
-        (Some("s1"), "", None, false),
-    ];
-    for (binding, scope, generation, keys) in cases {
-        let fake = Fake::default();
-        seed_pvc(&fake, &p, 0, |v| {
-            let a = v.metadata.annotations.get_or_insert_default();
-            a.insert(KEY_CACHE_KEYS.into(), "repo-main,repo-dev".into());
-            if let Some(b) = binding {
-                a.insert(KEY_CACHE_SCOPE.into(), b.into());
-            }
-        });
-        let r = execute(
-            &fake,
-            &CaGuard::default(),
-            &env(&p, &ca, None, 0),
-            &plan(vec![create(0)]),
-        )
-        .await;
-        assert_eq!(
-            fake.calls_n(),
-            [
-                "get_pvc:p-cache-0",
-                "create:p-0",
-                "secret_create:p-0-N:Pod/uid-p-0",
-            ]
-        );
-        let pod = &r.created[0];
-        assert_eq!(
-            ann(pod, KEY_CACHE_SCOPE).as_deref(),
-            Some(scope),
-            "{binding:?}"
-        );
-        assert_eq!(
-            ann(pod, KEY_CACHE_GENERATION).as_deref(),
-            generation,
-            "{binding:?}"
-        );
-        assert_eq!(
-            pod_cache_keys(pod),
-            keys.then_some("repo-main,repo-dev"),
-            "{binding:?}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn terminating_replaced_or_foreign_volumes_block_the_create() {
-    let (p, ca) = (cached_pool(), valid_ca());
-    let fake = Fake::default();
-    seed_pvc(&fake, &p, 0, |v| {
-        v.metadata.deletion_timestamp = Some(Time(now()));
-    });
-    seed_pvc(&fake, &p, 1, |v| {
-        v.metadata
-            .labels
-            .get_or_insert_default()
-            .insert(crate::render::LABEL_VOLUME_HASH.into(), "old".into());
-    });
-    let r = execute(
-        &fake,
-        &CaGuard::default(),
-        &env(&p, &ca, None, 0),
-        &plan(vec![create(0), create(1)]),
-    )
-    .await;
-    assert_eq!(r.creates[0].result, CreateResult::VolumePending);
-    assert_eq!(r.creates[1].result, CreateResult::VolumePending);
-    assert_eq!(
-        fake.calls(),
-        [
-            "get_pvc:p-cache-0",
-            "get_pvc:p-cache-1",
-            "delete_pvc:p-cache-1:uid-p-cache-1"
-        ]
-    );
-    assert_eq!(
-        super::plan::Plan::requeue_after_outcomes(&r.creates),
-        super::plan::Requeue::ErrorBackoff
-    );
-
-    let fake = Fake::default();
-    seed_pvc(&fake, &p, 0, |v| v.metadata.owner_references = None);
-    let r = execute(
-        &fake,
-        &CaGuard::default(),
-        &env(&p, &ca, None, 0),
-        &plan(vec![create(0)]),
-    )
-    .await;
-    assert!(matches!(r.creates[0].result, CreateResult::Failed { .. }));
-    assert_eq!(
-        fake.calls(),
-        ["get_pvc:p-cache-0"],
-        "a foreign volume is never deleted"
-    );
-}
-
-#[tokio::test]
-async fn only_a_crash_or_start_timeout_in_a_cached_slot_loses_its_volume() {
-    let (p, ca) = (cached_pool(), valid_ca());
-    // Expired is the normal end of an unreleased build; PodFinished covers a
-    // build that ended its own daemon and an evicted pod. Those keep the cache.
-    let cases = [
-        (RetireReason::StartTimeout, true),
-        (RetireReason::DaemonCrashed, true),
-        (RetireReason::Expired, false),
-        (RetireReason::PodFinished, false),
-        (RetireReason::Idle, false),
-    ];
-    for (reason, reaped) in cases {
-        let fake = Fake::default();
-        seed_pvc(&fake, &p, 0, |_| {});
-        let action = Action::RetireFree {
-            pod: "p-0".into(),
-            uid: "u0".into(),
-            reason,
-        };
-        let r = execute(
-            &fake,
-            &CaGuard::default(),
-            &env(&p, &ca, None, 0),
-            &plan(vec![action]),
-        )
-        .await;
-        let pvc_calls: Vec<String> = fake
-            .calls()
-            .into_iter()
-            .filter(|c| c.contains("pvc"))
-            .collect();
-        let want: &[&str] = if reaped {
-            &["get_pvc:p-cache-0", "delete_pvc:p-cache-0:uid-p-cache-0"]
-        } else {
-            &[]
-        };
-        assert_eq!(pvc_calls, want, "{reason:?}");
-        assert_eq!(r.volume_ops.len(), usize::from(reaped), "{reason:?}");
-    }
-}
-#[tokio::test]
-async fn volumes_above_the_limit_are_reaped_unless_a_pod_holds_the_slot() {
-    let p = cached_pool();
-    let fake = Fake::default();
-    for s in 0..4 {
-        seed_pvc(&fake, &p, s, |_| {});
-    }
-    let mut r = super::exec::Report::default();
-    let held = BTreeSet::from([3]);
-    assert!(!super::cache::reap_above_limit(&fake, &p, &held, &mut r).await);
-    assert_eq!(
-        fake.calls(),
-        ["list_pvcs", "delete_pvc:p-cache-2:uid-p-cache-2"]
-    );
-    assert!(super::cache::reap_above_limit(&fake, &p, &BTreeSet::new(), &mut r).await);
-    let left: Vec<String> = fake.pvcs.lock().unwrap().keys().cloned().collect();
-    assert_eq!(left, ["p-cache-0", "p-cache-1"]);
-
-    // Turning cache.local off reaps every volume of the pool.
-    let mut off = p.clone();
-    off.spec.workers.cache.local = None;
-    assert!(super::cache::reap_above_limit(&fake, &off, &BTreeSet::new(), &mut r).await);
-    assert!(fake.pvcs.lock().unwrap().is_empty());
 }
 
 /// Regression (RECON-2): `SandboxPending` was written only inside a planned

@@ -619,3 +619,31 @@ fn edge_max_connections_defaults_to_the_chart_value_everywhere() {
         "the edge listener's own default follows the config one"
     );
 }
+
+#[test]
+fn cache_is_off_without_a_host_and_checked_with_one() {
+    let c = Config::from_yaml(MIN).unwrap();
+    assert!(c.render_config("bk").cache_host.is_none());
+    let c = Config::from_yaml(&format!(
+        "{MIN}cache: {{host: bk-registry.bk.svc:5000, tlsSecretName: bk-registry-tls}}\n"
+    ))
+    .unwrap();
+    assert_eq!(c.cache.server_name(), "bk-registry.bk.svc");
+    assert_eq!(
+        c.render_config("bk").cache_host.as_deref(),
+        Some("bk-registry.bk.svc:5000")
+    );
+    for host in [
+        "bk-registry.bk.svc",
+        "bk-registry.bk.svc:0",
+        "-bad-:5000",
+        "x:http",
+    ] {
+        let v = errs(&format!(
+            "{MIN}cache: {{host: \"{host}\", tlsSecretName: t}}\n"
+        ));
+        assert!(v.iter().any(|m| m.contains("cache.host")), "{host}: {v:?}");
+    }
+    let v = errs(&format!("{MIN}cache: {{host: \"a.b:5000\"}}\n"));
+    assert!(v.iter().any(|m| m.contains("cache.tlsSecretName")), "{v:?}");
+}

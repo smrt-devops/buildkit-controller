@@ -373,7 +373,7 @@ impl Front {
 
     /// Everything that can fail on the caller's input happens here, before
     /// the claim exists: the pool and its access rules, readiness, TTL, queue
-    /// timeout, key and cache choice.
+    /// timeout and key.
     fn claim_for(
         &self,
         who: &Identity,
@@ -413,7 +413,6 @@ impl Front {
         ClientPublicKey::from_pem(&pem).map_err(|_| {
             AllocError::InvalidRequest("publicKey must be a PEM SPKI ECDSA P-256 key".into())
         })?;
-        cache::plan(&pool, req.cache_key.as_ref(), req.cache)?;
         let id = new_alloc_id().ok_or(AllocError::Internal)?;
         let mut c = BuildKitClaim::new(
             id.as_str(),
@@ -428,7 +427,8 @@ impl Front {
                 cache: req.cache,
                 public_key: Some(pem),
                 owner: Some(who.owner()),
-                cache_scope: cache::scope(&pool, who),
+                cache_scope: Some(cache::scope(&pool, who)),
+                cache_tier: Some(cache::tier(&pool, who)),
             },
         );
         c.metadata.namespace = Some(self.namespace.clone());

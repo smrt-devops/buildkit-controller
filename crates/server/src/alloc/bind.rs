@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use buildkit_controller_api::claim::{BuildKitClaim, ClaimPhase, secret_name};
+use buildkit_controller_api::claim::{BuildKitClaim, CacheTier, ClaimPhase, secret_name};
 use buildkit_controller_api::dto::CacheKey;
 use buildkit_controller_api::v1alpha1::{self as crd, BuildKitPool};
 use k8s_openapi::api::core::v1::Pod;
@@ -26,8 +26,8 @@ use super::cache::{self, Plan};
 use super::certs::CertSource;
 use super::metrics::AllocMetrics;
 use super::pods::{
-    Bind, CERT_MARGIN, FREE, MAX_TRIES, Want, ann, claim_patch, fmt_ts, free_slots, is_candidate,
-    of_pool, parse_ts, retire_patch, whole_seconds,
+    Bind, CERT_MARGIN, MAX_TRIES, Want, ann, claim_patch, fmt_ts, is_candidate, of_pool, parse_ts,
+    retire_patch, shuffle, whole_seconds,
 };
 use crate::auth::{AccessRule, AccessRules};
 use crate::claim::logic::{self, Binding, Caller, PoolKey, reason};
@@ -58,6 +58,8 @@ pub struct BindConfig {
     pub namespace: String,
     /// Namespaces whose claims are served.
     pub served: HashSet<String>,
+    /// `cache.host`, `None` when the controller runs no cache registry.
+    pub cache_host: Option<String>,
 }
 
 impl BindConfig {
@@ -78,10 +80,13 @@ impl BindConfig {
 /// denies the whole pool (fails closed).
 #[must_use]
 pub fn access_rules(pool: &BuildKitPool) -> Option<AccessRules> {
-    let rules = pool
-        .spec
-        .access
-        .rules
+    rules(&pool.spec.access.rules)
+}
+
+/// Pool access rules into the auth rule type; `None` when one is malformed.
+#[must_use]
+pub fn rules(list: &[crd::AccessRule]) -> Option<AccessRules> {
+    let rules = list
         .iter()
         .map(|r| match (&r.oidc, &r.service_account, &r.claims) {
             (None, None, Some(c)) => Some(AccessRule::Claims {
@@ -131,26 +136,12 @@ struct Ask {
     /// A PEM key that parses.
     public_key: Option<String>,
     plan: Option<Plan>,
-    scope: Option<String>,
     deadline: Option<OffsetDateTime>,
 }
 
-impl Ask {
-    /// Key and `keysPerVolume` when the local layer applies with soft affinity.
-    fn affinity(&self) -> Option<(String, usize)> {
-        let p = self.plan.as_ref()?;
-        Some((p.key.clone(), p.soft?))
-    }
-
-    fn local(&self) -> bool {
-        self.plan.as_ref().is_some_and(|p| p.local)
-    }
-}
-
-/// A pod bound to a claim, with its `P cache-keys` from before the bind.
+/// A pod bound to a claim.
 struct Won {
     pod: Pod,
-    before: Option<String>,
 }
 
 /// What a pass carries from claim to claim.
@@ -164,8 +155,6 @@ struct Pass {
     retry: bool,
     /// Pods this pass took or saw lost; never offered twice.
     taken: HashSet<String>,
-    /// A claim found no pod it could use, while warm pods of another cache scope sat free.
-    recycle: Option<Arc<Pod>>,
 }
 
 impl Pass {
@@ -280,9 +269,6 @@ impl Binder {
         for c in &queue {
             self.serve(c, pool.as_deref(), now, &mut pass).await;
         }
-        if let (Some(pool), Some(pod)) = (pool.as_deref(), pass.recycle.take()) {
-            self.recycle(pool, &pod).await;
-        }
         let at = pass
             .until
             .map(|t| (t - now).try_into().unwrap_or(Duration::ZERO) + Duration::from_secs(1));
@@ -320,7 +306,8 @@ impl Binder {
             }
             return self.no_pool(c, now, pass).await;
         };
-        let ask = match ask(c, pool, own, caller, alloc_id, claim_ref) {
+        let host = self.cfg.cache_host.as_deref();
+        let ask = match ask(c, pool, own, host, caller, alloc_id, claim_ref) {
             Ok(a) => a,
             Err(message) => {
                 return self
@@ -341,8 +328,7 @@ impl Binder {
                 .await;
         };
         if let Some((pod, expires_at)) = self.bound_pod(pool, &ask) {
-            let before = rnd::pod_cache_keys(&pod).map(str::to_owned);
-            let won = Won { pod, before };
+            let won = Won { pod };
             return self
                 .finish(c, pool, &ask, &won, expires_at, &ca, pass)
                 .await;
@@ -406,31 +392,20 @@ impl Binder {
             internal_ca: fp.get(..16).unwrap_or_default(),
             cert_not_after: expires_at + CERT_MARGIN,
         };
-        let pods: Vec<Arc<Pod>> = self
+        let recent: HashSet<String> = self.memory().taken.keys().cloned().collect();
+        let mut cands: Vec<Arc<Pod>> = self
             .pods
             .state()
             .into_iter()
-            .filter(|p| of_pool(p, ns, name, pool_uid))
-            .collect();
-        let recent: HashSet<String> = self.memory().taken.keys().cloned().collect();
-        let (mut cands, foreign): (Vec<Arc<Pod>>, Vec<Arc<Pod>>) = pods
-            .iter()
-            .filter(|p| is_candidate(p, &want))
+            .filter(|p| of_pool(p, ns, name, pool_uid) && is_candidate(p, &want))
             .filter(|p| {
                 p.metadata
                     .uid
                     .as_ref()
                     .is_some_and(|u| !pass.taken.contains(u) && !recent.contains(u))
             })
-            .cloned()
-            .partition(|p| cache::serves(pool, p, ask.scope.as_deref()));
-        let affinity = ask.affinity();
-        cache::order_warm(
-            pool,
-            &mut cands,
-            affinity.as_ref().map(|a| a.0.as_str()),
-            ask.local(),
-        );
+            .collect();
+        shuffle(&mut cands);
         let now_s = fmt_ts(now);
         let expires = fmt_ts(expires_at);
         let bind = Bind {
@@ -446,16 +421,10 @@ impl Binder {
             };
             pass.taken.insert(uid.clone());
             self.memory().taken.insert(uid.clone(), Instant::now());
-            let before = rnd::pod_cache_keys(pod).map(str::to_owned);
             let mut patch = claim_patch(uid, &bind);
-            cache::claim_ops(
-                pool,
-                pod,
-                before.as_deref(),
-                affinity.as_ref(),
-                ask.scope.as_deref(),
-                &mut patch,
-            );
+            if let Some(p) = &ask.plan {
+                p.claim_ops(&mut patch);
+            }
             match self.backend.patch_pod(ns, pname, patch).await {
                 PatchOutcome::Applied(p) => {
                     // The cache can lag an eviction: the edge would refuse this pod at once.
@@ -467,7 +436,7 @@ impl Binder {
                             .await;
                         continue;
                     }
-                    return Some(Won { pod: *p, before });
+                    return Some(Won { pod: *p });
                 }
                 PatchOutcome::Lost => {
                     self.metrics.conflict(ns, name);
@@ -480,16 +449,6 @@ impl Binder {
                     return None;
                 }
             }
-        }
-        if cands.is_empty() && pass.recycle.is_none() {
-            let free = free_slots(
-                pods.iter().filter_map(|p| p.metadata.name.as_deref()),
-                name,
-                u32::try_from(pool.spec.scaling.max).unwrap_or(0),
-            )
-            .len();
-            let foreign: Vec<&Arc<Pod>> = foreign.iter().collect();
-            pass.recycle = cache::recycle_pick(pool, &pods, free, &foreign).cloned();
         }
         None
     }
@@ -539,7 +498,6 @@ impl Binder {
                 return;
             }
         };
-        let local = self.local_cache(pool, ask, won);
         let binding = Binding {
             alloc_id: ask.alloc_id.to_string(),
             pod: pod_name.to_owned(),
@@ -547,7 +505,7 @@ impl Binder {
             server_name: self.cfg.server_name.clone(),
             expires_at: fmt_ts(expires_at),
             certificate: cert.cert_pem().to_owned(),
-            cache: ask.plan.as_ref().and_then(|p| p.response(local)),
+            cache: ask.plan.as_ref().map(Plan::response),
         };
         let secret = match cert.private_key_pem() {
             None => false,
@@ -594,59 +552,11 @@ impl Binder {
         self.metrics.allocation(pool_ns, pool_name, "ok");
         self.metrics.duration(pool_ns, pool_name, path, waited);
         self.metrics.queue_wait(pool_ns, pool_name, "ok", waited);
-        let served = ask.plan.as_ref().is_some_and(|p| p.registry.is_some());
-        self.metrics
-            .cache(pool_ns, pool_name, served, local.filter(|_| ask.local()));
+        if let Some(p) = &ask.plan {
+            self.metrics.cache(pool_ns, pool_name, p.tier.as_str());
+        }
         info!(namespace = ns, claim = name, pool = %pool_name, pod = pod_name,
             alloc_id = %ask.alloc_id, owner = %ask.caller.owner, path, waited_s = waited, "claim bound");
-    }
-
-    /// Record the key and scope on a won cached slot and return the cache
-    /// result when the local layer applies, or `reused` when it does not and
-    /// the slot is cached.
-    fn local_cache(&self, pool: &BuildKitPool, ask: &Ask, won: &Won) -> Option<&'static str> {
-        let (pod, before) = (&won.pod, &won.before);
-        if let Some((k, cap)) = &ask.affinity()
-            && cache::cached(pool, pod)
-        {
-            let keys = rnd::push_key(before.as_deref(), k, *cap);
-            cache::annotate_detached(
-                Arc::clone(&self.backend),
-                self.metrics.clone(),
-                pool,
-                pod,
-                keys,
-            );
-        }
-        if let Some(scope) = &ask.scope {
-            cache::bind_detached(
-                Arc::clone(&self.backend),
-                self.metrics.clone(),
-                pool,
-                pod,
-                scope,
-            );
-        }
-        let p = ask.plan.as_ref()?;
-        if !p.local {
-            // The slot's state dir still applies without the layer.
-            return cache::cached(pool, pod).then_some("reused");
-        }
-        let (ns, name, uid) = pool_id(pool)?;
-        let pods: Vec<Arc<Pod>> = self
-            .pods
-            .state()
-            .into_iter()
-            .filter(|q| of_pool(q, ns, name, uid))
-            .collect();
-        Some(cache::result(
-            pool,
-            pod,
-            before.as_deref(),
-            ask.scope.as_deref(),
-            &p.key,
-            &pods,
-        ))
     }
 
     /// The claim's Secret, fresh: a stale one the claim controls is replaced.
@@ -818,21 +728,6 @@ impl Binder {
     pub async fn retire(&self, ns: &str, pool: &str, pod: &Pod, expected: &str, why: &str) -> bool {
         retire_pod(&*self.backend, &self.metrics, ns, pool, pod, expected, why).await
     }
-
-    /// Retire one warm pod of a cached slot that serves another cache scope,
-    /// so a claim that found no pod gets its slot. Its volume is unbound first,
-    /// so the slot's next pod serves any scope.
-    async fn recycle(&self, pool: &BuildKitPool, pod: &Pod) {
-        let Some((ns, name, _)) = pool_id(pool) else {
-            return;
-        };
-        if !cache::unbind(&*self.backend, &self.metrics, pool, pod).await {
-            return;
-        }
-        if self.retire(ns, name, pod, FREE, "cache_scope").await {
-            info!(namespace = %ns, pool = %name, pod = ?pod.metadata.name, reason = "cache_scope", "retired a warm pod of another cache scope");
-        }
-    }
 }
 
 /// Check what claim `c` asks of `pool`; the message says what is wrong.
@@ -840,6 +735,7 @@ fn ask(
     c: &BuildKitClaim,
     pool: &BuildKitPool,
     own: &str,
+    cache_host: Option<&str>,
     caller: Caller,
     alloc_id: AllocId,
     claim_ref: String,
@@ -880,13 +776,18 @@ fn ask(
         .map(CacheKey::try_from)
         .transpose()
         .map_err(|e| e.to_string())?;
-    let plan = cache::plan(pool, key.as_ref(), c.spec.cache).map_err(|e| e.to_string())?;
-    let scope = match (&caller.identity, &caller.cache_scope) {
-        (Some(id), _) => cache::scope(pool, id),
-        (None, s) => s
-            .clone()
-            .filter(|_| pool.spec.workers.cache.local.is_some()),
+    // A claim the API wrote carries the scope and tier the API derived from
+    // its caller; without a well-formed scope it gets no cache.
+    let who = match (&caller.identity, &caller.cache_scope) {
+        (Some(id), _) => Some((cache::scope(pool, id), cache::tier(pool, id))),
+        (None, Some(s)) if rnd::is_scope_id(s) => {
+            Some((s.clone(), caller.cache_tier.unwrap_or(CacheTier::Untrusted)))
+        }
+        (None, _) => None,
     };
+    let plan = who.and_then(|(scope, tier)| {
+        cache::plan(cache_host, pool, key.as_ref(), c.spec.cache, scope, tier)
+    });
     Ok(Ask {
         deadline: logic::queue_deadline(c, qt),
         caller,
@@ -895,7 +796,6 @@ fn ask(
         ttl: time::Duration::seconds(i64::try_from(ttl).map_err(|e| e.to_string())?),
         public_key,
         plan,
-        scope,
     })
 }
 
