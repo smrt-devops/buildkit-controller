@@ -218,7 +218,8 @@ impl Binder {
         // Fair share: an owner at the hold limit lets a claim of another
         // owner under it, waiting further back, go first. Its claim is served
         // after the rest of the queue, so a worker nobody else took is never
-        // left idle.
+        // left idle. Once an owner yields, its later claims follow it, so
+        // one owner's claims keep their order.
         let limit = pool.as_deref().map_or(usize::MAX, owner_hold_limit);
         let own = self.cfg.namespace.as_str();
         let owners: Vec<Option<String>> = queue
@@ -230,6 +231,7 @@ impl Binder {
             *behind.entry(o.as_str()).or_default() += 1;
         }
         let mut later = Vec::new();
+        let mut yielded: HashSet<&str> = HashSet::new();
         for (c, owner) in queue.iter().zip(&owners) {
             let Some(o) = owner.as_deref() else {
                 self.serve(c, pool.as_deref(), now, &mut pass).await;
@@ -239,11 +241,13 @@ impl Binder {
                 *n -= 1;
             }
             let held = |x: &str| pass.held.get(x).copied().unwrap_or(0);
-            let yields = held(o) >= limit
-                && behind
-                    .iter()
-                    .any(|(x, n)| *n > 0 && *x != o && held(x) < limit);
+            let yields = yielded.contains(o)
+                || (held(o) >= limit
+                    && behind
+                        .iter()
+                        .any(|(x, n)| *n > 0 && *x != o && held(x) < limit));
             if yields {
+                yielded.insert(o);
                 later.push(c);
             } else {
                 self.serve(c, pool.as_deref(), now, &mut pass).await;

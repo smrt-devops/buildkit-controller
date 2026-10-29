@@ -1595,6 +1595,29 @@ async fn an_owner_at_the_hold_limit_yields_to_another_waiting_owner() {
     assert_eq!(phase(&e.fake.status(OWN, &third)), ClaimPhase::Bound);
 }
 
+/// An owner that yields keeps its own claims in order: with A at the limit,
+/// the queue A1, B1, A2 and two free workers, B1 and then A1 bind, not A2.
+#[tokio::test]
+async fn an_owner_that_yields_keeps_its_claims_in_order() {
+    let e = env();
+    e.warm(0);
+    e.warm(1);
+    for ago in [60, 59] {
+        e.ci_claim(ago, "sa:x/a");
+    }
+    e.binder.pass(&key()).await;
+    let a1 = e.ci_claim(50, "sa:x/a");
+    let b1 = e.ci_claim(40, "sa:x/b");
+    let a2 = e.ci_claim(30, "sa:x/a");
+    e.warm(2);
+    e.warm(3);
+    e.binder.pass(&key()).await;
+    assert_eq!(
+        [&a1, &b1, &a2].map(|id| phase(&e.fake.status(OWN, id))),
+        [ClaimPhase::Bound, ClaimPhase::Bound, ClaimPhase::Pending]
+    );
+}
+
 /// An in-cluster claim asking for a longer queue wait than the pool allows
 /// fails `InvalidRequest`, as the HTTP API refuses it, instead of being cut.
 #[tokio::test]
