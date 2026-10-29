@@ -54,7 +54,7 @@ async function run() {
     const attemptOpts = ({ remainingMs }) => {
       const q = L.queueTimeoutFor(pqt, remainingMs);
       return {
-        method: 'POST', ca, timeoutMs: L.REQUEST_TIMEOUT_MS, headers: { 'Content-Type': 'application/json' },
+        method: 'POST', ca, timeoutMs: L.postTimeoutMs(remainingMs), headers: { 'Content-Type': 'application/json' },
         body: L.allocationBody(p, keys[i].publicKey, ttl, q, cache),
       };
     };

@@ -200,7 +200,9 @@ while :; do
   write_body "$qt"
   rc=0
   # In the background, so a TERM runs the release trap at once instead of after the request.
-  curl_api --max-time 40 -H @"$D/auth" -D "$D/hdr" -o "$D/alloc.json" -w '%{http_code}' \
+  _pt=$(( RETRY_BUDGET - ( $(date +%s) - start ) ))
+  [ "$_pt" -ge 1 ] || _pt=1
+  curl_api --max-time "$_pt" -H @"$D/auth" -D "$D/hdr" -o "$D/alloc.json" -w '%{http_code}' \
     -H 'Content-Type: application/json' --data-binary @"$D/req.json" "$API/v1/allocations" > "$D/status" &
   CMD=$!
   wait "$CMD" || rc=$?

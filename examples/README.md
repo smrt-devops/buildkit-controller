@@ -9,8 +9,7 @@ Every pool example uses the `ci` namespace, which you create first and label for
 | [pool-multiplatform-amd64.yaml](pool-multiplatform-amd64.yaml), [pool-multiplatform-arm64.yaml](pool-multiplatform-arm64.yaml) | Two single-platform pools that the Action combines into one builder. |
 | [pool-github-oidc.yaml](pool-github-oidc.yaml) | Access rules for GitHub OIDC claims and a ServiceAccount. |
 | [pool-gitlab-oidc.yaml](pool-gitlab-oidc.yaml) | Access rules for a GitLab or other generic OIDC issuer. |
-| [pool-cache.yaml](pool-cache.yaml) | Both cache layers: a registry cache ref and two local volumes. |
-| [pool-registry-cache.md](pool-registry-cache.md) | Passing the registry cache flags to `docker buildx build`. |
+| [pool-cache.yaml](pool-cache.yaml) | Cache settings of a pool: who may write the built-in cache (here only pushes to main), and its size. |
 | [helm-values.yaml](helm-values.yaml) | Chart values with an OIDC issuer, routes on a Gateway (or a LoadBalancer Service) and a pool. |
 | [claim-pod.yaml](claim-pod.yaml) | A `BuildKitClaim` and a pod that runs `buildctl` with the Secret it gets, both in the namespace `apps`. Needs `claims.enabled: true`, `apps` in `claims.namespaces`, and a pool rule `claims: {namespaces: [apps]}`. |
 
