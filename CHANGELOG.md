@@ -15,7 +15,7 @@ v3 replaces the per-replica allocation queues with one claim queue and replaces 
 - The allocation API: `cache` accepts `auto` and `none` only (`registry` and `local` are gone), and the `201` response no longer has `cache.local`. `cache.registry` now carries `to` (absent when the caller may only read the cache) and `from`. `cacheKey` is the cache tag and defaults to the pool name; the pool `registry.defaultKey` is gone.
 - The Action input `cache` and the script variable `CACHE` accept `auto` or `none`.
 - `POST /v1/allocations` may answer `202` with an id when no worker binds within about 20 seconds. A client from before v3 does not follow it. Update the Action (and `buildkit-allocate.sh`) with the controller.
-- The error codes `shutting_down` and `start_timeout` are no longer sent. They stay in the API enum so older clients parse them.
+- The error codes `shutting_down` and `start_timeout` are gone from the API. The Action and `buildkit-allocate.sh` still retry them, so they keep working against a v0.1.0 controller during the upgrade.
 - Metrics removed: `buildkit_queue_depth`, `buildkit_cache_affinity_total` and the volume metrics. Alert on `buildkit_pool_waiting` instead of `buildkit_queue_depth`. `buildkit_releases_total` no longer has the `cache_scope` reason.
 - `BuildKitClaim` spec gains `queueTimeout`, `publicKey`, `owner`, `cacheScope` and `cacheTier`, and its status gains `certificate` and `queuePosition`. The controller honours `owner`, `cacheScope` and `cacheTier` only in its own namespace. `status.cache` no longer has a local result. Apply the regenerated CRDs.
 

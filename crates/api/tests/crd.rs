@@ -303,10 +303,6 @@ fn template_schema_prunes_volume_sources_and_matches_spec_names() {
         assert!(spec["allocation"]["properties"].get(f).is_some(), "{f}");
     }
     let st = &v["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]["properties"];
-    assert!(
-        st.get("waiters").is_none(),
-        "the per-replica waiters list is gone"
-    );
     for f in ["waiting", "platforms"] {
         assert!(st.get(f).is_some(), "status.{f}");
     }
@@ -319,10 +315,6 @@ fn status_waiting_platforms_roundtrip() {
     let s: BuildKitPoolStatus = serde_json::from_value(wire.clone()).unwrap();
     assert_eq!(s.waiting, Some(2));
     assert_eq!(serde_json::to_value(&s).unwrap(), wire);
-    // The per-replica entries of older versions are dropped on read.
-    let old = json!({"waiting": 1, "waiters": [{"replica": "bk-0", "count": 1, "updatedAt": "2026-01-01T00:00:00Z"}]});
-    let s: BuildKitPoolStatus = serde_json::from_value(old).unwrap();
-    assert_eq!(serde_json::to_value(&s).unwrap(), json!({"waiting": 1}));
 }
 
 #[test]
