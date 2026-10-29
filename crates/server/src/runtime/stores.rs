@@ -343,36 +343,6 @@ pub struct StoreSpec<'a> {
     pub readiness: Arc<Readiness>,
 }
 
-/// A watch of `K` in `namespaces`, `[]` = all namespaces, that restarts itself
-/// after an error (see [`restarting`]), so every error is followed by a full
-/// relist and an `InitDone`. More than one namespace runs one watch per
-/// namespace, merged by [`merge_namespaces`]; `store` is the reader of the
-/// store the events are applied to.
-///
-/// The merged watch completes a list only while every namespace is current, so
-/// one namespace that cannot be listed holds it forever. Use it where acting
-/// on a partial list is unsafe (the claim sweep releases workers of claims
-/// missing from its store); elsewhere use [`tolerant_watch`].
-#[must_use]
-pub fn scoped_watch<K>(
-    client: Client,
-    namespaces: &[String],
-    cfg: &watcher::Config,
-    store: Store<K>,
-) -> BoxStream<'static, watcher::Result<watcher::Event<K>>>
-where
-    K: Resource<Scope = NamespaceResourceScope>
-        + Clone
-        + DeserializeOwned
-        + Debug
-        + Send
-        + Sync
-        + 'static,
-    K::DynamicType: Default + Clone + Eq + Hash,
-{
-    merged_watch(namespaces, store, None, api_watch(client, cfg))
-}
-
 /// A factory of kube watches: of one namespace, or of all when `None`.
 fn api_watch<K>(
     client: Client,
@@ -883,8 +853,11 @@ fn strip<K: ResourceExt>(o: &mut K) {
 }
 
 /// The claim store and its event broadcast. Every allocation is a claim. The
-/// watch is strict, because the leader releases workers of claims missing from
-/// the store, so a partial list must never count as synced.
+/// watch is tolerant: a namespace that cannot be listed (its `RoleBinding` was
+/// deleted, say) is given up and listed as `claim_store/<namespace>` on
+/// `/readyz`, instead of holding readiness and leadership on every replica.
+/// The leader leaves the claims and workers of such a namespace alone (see
+/// [`AppContext::unlisted_claim_namespaces`](super::AppContext::unlisted_claim_namespaces)).
 fn claim_watch(
     client: &Client,
     claim_namespaces: &[String],
@@ -894,11 +867,12 @@ fn claim_watch(
 ) -> (Store<BuildKitClaim>, broadcast::Sender<ClaimEvent>) {
     let (claim_store, claim_writer) = reflector::store::<BuildKitClaim>();
     let (claim_tx, _) = broadcast::channel(POD_EVENT_CAPACITY);
-    let events = scoped_watch(
+    let events = tolerant_watch(
         client.clone(),
         claim_namespaces,
         &watcher::Config::default(),
         claim_store.clone(),
+        NamespaceReport::full("claim", Arc::clone(metrics), Arc::clone(readiness)),
     )
     .modify(strip);
     let m = Arc::clone(metrics);
