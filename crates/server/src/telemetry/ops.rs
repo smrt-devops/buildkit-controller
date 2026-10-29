@@ -77,8 +77,14 @@ pub fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
 /// Open ops connections; more are closed on accept. Probes and a few scrapers
 /// need a handful, and the cap keeps idle sockets from exhausting descriptors.
 const MAX_CONNECTIONS: usize = 64;
-/// Longest wait for a request head, also the keep-alive idle bound.
-const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest wait for a request head, also the keep-alive idle bound. Tests use a
+/// short real-time bound: a paused clock jumps ahead while the server is still
+/// accepting, so the test deadline fired before the server timer existed.
+const HEADER_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(10)
+};
 /// How long open connections may finish after `stop` before they are dropped.
 pub const STOP_GRACE: Duration = Duration::from_secs(2);
 
@@ -245,7 +251,7 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_request_head_that_never_ends_is_cut() {
         use tokio::io::AsyncWriteExt;
         let (addr, _stop, _task) = start();
