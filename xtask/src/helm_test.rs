@@ -154,7 +154,19 @@ pub(crate) fn helm_test(update: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::judge;
+    use super::{CHART, judge};
+
+    /// The chart's default image tag is its appVersion, and a checkout of a
+    /// release tag installs from this file. It must name the release being cut.
+    #[test]
+    fn chart_version_is_the_workspace_version() {
+        let path = crate::root().join(CHART).join("Chart.yaml");
+        let chart: serde_json::Value =
+            serde_saphyr::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let workspace = env!("CARGO_PKG_VERSION");
+        assert_eq!(chart["version"], workspace, "Chart.yaml version");
+        assert_eq!(chart["appVersion"], workspace, "Chart.yaml appVersion");
+    }
 
     #[test]
     fn invalid_fixture_needs_an_expect_line() {

@@ -31,7 +31,7 @@ http-body = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 futures = "0.3.34"
-buildkit-controller-api = { path = "../api", version = "0.1.0" }
+buildkit-controller-api = { path = "../api", version = "0.2.0" }
 clap = { workspace = true }
 jsonwebtoken = { workspace = true }
 jiff = { workspace = true }
