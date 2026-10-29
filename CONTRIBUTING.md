@@ -20,7 +20,7 @@ The workspace has `crates/api` (CRD and API types, and the HTTP client), `crates
 
 ## Checks
 
-Run these before opening a pull request. CI runs the same four.
+Run these before opening a pull request. CI also runs `cargo xtask crdgen --check`, `cargo xtask helm-test`, the release image build on amd64 and arm64, and `cargo xtask kind-all --jobs 3`.
 
 ```sh
 cargo fmt --all --check
@@ -62,8 +62,8 @@ The image build keeps its cache in a Docker volume named from a hash of the chec
 4. Use [Conventional Commits](https://www.conventionalcommits.org/) for messages, for example `fix(server/edge): close connections when a pod disappears`.
 5. Open the pull request, fill in the template and link the issue.
 
-A pull request needs one maintainer approval and passing CI. If you change the CRD types, run `cargo xtask crdgen` and commit the result.
+A pull request needs one maintainer approval and the required checks listed in [.github/workflows/README.md](.github/workflows/README.md#branch-protection-for-main). If you change the CRD types, run `cargo xtask crdgen` and commit the result.
 
 ## Releases
 
-Maintainers tag `vX.Y.Z`. The release workflow builds the image for amd64 and arm64, signs it, packages the chart, and publishes GitHub's generated release notes. See [.github/workflows/README.md](.github/workflows/README.md).
+Maintainers bump the version, then tag `vX.Y.Z`. The release workflow refuses a tag whose version differs from `Cargo.toml` and `Chart.yaml`, then builds the image for amd64 and arm64, signs it, and publishes the chart and the release notes. The steps are in [.github/workflows/README.md](.github/workflows/README.md#cutting-a-release).
