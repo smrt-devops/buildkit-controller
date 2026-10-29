@@ -61,6 +61,7 @@ fn sa(ns: &str, name: &str) -> Identity {
         namespace: ns.into(),
         name: name.into(),
         uid: "u".into(),
+        pod_uid: None,
     }
 }
 
@@ -652,11 +653,11 @@ async fn alloc_verify() {
     let intruder = sa(NS, "intruder");
     assert_eq!(
         h.follower.svc.get(&intruder, &r.id, Duration::ZERO).await,
-        Err(AllocError::Forbidden)
+        Err(AllocError::NotFound)
     );
     assert_eq!(
         svc.release(&intruder, &r.id).await,
-        Err(AllocError::Forbidden)
+        Err(AllocError::NotFound)
     );
     let claim = h.claims.get(&r.id).await.unwrap();
     let pod_name = claim.status.as_ref().unwrap().pod.clone().unwrap();
@@ -667,7 +668,7 @@ async fn alloc_verify() {
         "non-owner release must not touch the pod"
     );
     println!(
-        "SCENARIO owner-only: follower answered, forbidden for others, pod {pod_name} still allocated"
+        "SCENARIO owner-only: follower answered, not found for others, pod {pod_name} still allocated"
     );
     let pod_uid = pod.metadata.uid.clone().unwrap();
     let der = pem::parse(&r.client_cert).unwrap();
@@ -769,9 +770,9 @@ async fn cold(stop: &CancellationToken) {
     let claim_store = r.ctx.claims();
     wait("claim pending", Duration::from_secs(20), || {
         claim_store.state().iter().any(|c| {
-            c.status.as_ref().is_some_and(|s| {
-                s.phase == Some(ClaimPhase::Pending) && s.queue_position == Some(1)
-            })
+            c.status
+                .as_ref()
+                .is_some_and(|s| s.phase == Some(ClaimPhase::Pending))
         })
     })
     .await;
@@ -863,7 +864,7 @@ async fn upgrade(h: &H) {
     let svc = &h.leader.svc;
     assert_eq!(
         svc.release(&sa(NS, "intruder"), &api_id).await,
-        Err(AllocError::Forbidden)
+        Err(AllocError::NotFound)
     );
     // The store may lag the patch by a moment.
     let end = tokio::time::Instant::now() + Duration::from_secs(10);

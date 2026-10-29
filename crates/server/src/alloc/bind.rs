@@ -105,6 +105,8 @@ struct Pass {
     retry: bool,
     /// Pods this pass took or saw lost; never offered twice.
     taken: HashSet<String>,
+    /// Workers each owner holds in the pool, counting this pass's binds.
+    held: HashMap<String, usize>,
 }
 
 impl Pass {
@@ -183,7 +185,7 @@ impl Binder {
     /// The pools with waiting claims.
     #[must_use]
     pub fn pools_waiting(&self) -> Vec<PoolKey> {
-        claims::queues(&self.claims.state(), &self.cfg.served)
+        claims::pending(&self.claims.state(), &self.cfg.served)
             .into_keys()
             .collect()
     }
@@ -192,7 +194,8 @@ impl Binder {
     /// another pass without an event: at the next queue deadline, or soon
     /// after a contended patch.
     pub async fn pass(&self, key: &PoolKey) -> Option<Duration> {
-        let mut queue = claims::queues(&self.claims.state(), &self.cfg.served)
+        let all = self.claims.state();
+        let mut queue = claims::pending(&all, &self.cfg.served)
             .remove(key)
             .unwrap_or_default();
         if queue.is_empty() {
@@ -215,7 +218,10 @@ impl Binder {
             .pools
             .get(&ObjectRef::new(&key.1).within(&key.0))
             .filter(|p| p.metadata.uid.is_some());
-        let mut pass = Pass::default();
+        let mut pass = Pass {
+            held: self.held(&all, key),
+            ..Pass::default()
+        };
         for c in &queue {
             self.serve(c, pool.as_deref(), now, &mut pass).await;
         }
@@ -296,6 +302,18 @@ impl Binder {
                 )
                 .await;
         }
+        if pass.held.get(&ask.caller.owner).copied().unwrap_or(0) >= max_per_owner(pool) {
+            return self
+                .wait(
+                    c,
+                    &ask,
+                    reason::QUEUED,
+                    "the caller holds as many workers as the pool allows",
+                    now,
+                    pass,
+                )
+                .await;
+        }
         let expires_at = whole_seconds(now) + ask.ttl;
         match self.claim_pod(pool, &ask, &ca, now, expires_at, pass).await {
             Some(won) => {
@@ -307,6 +325,34 @@ impl Binder {
                     .await;
             }
         }
+    }
+
+    /// Workers each owner holds in pool `key`: its `Bound` claims, and the
+    /// claims this leader bound in the last [`RECENT`] that the store still
+    /// shows `Pending`.
+    fn held(&self, claims: &[Arc<BuildKitClaim>], key: &PoolKey) -> HashMap<String, usize> {
+        let own = self.cfg.namespace.as_str();
+        let m = self.memory();
+        let mut out: HashMap<String, usize> = HashMap::new();
+        for c in claims {
+            let holds = match claims::phase(c) {
+                ClaimPhase::Bound => true,
+                ClaimPhase::Pending => c
+                    .metadata
+                    .uid
+                    .as_ref()
+                    .is_some_and(|u| m.bound.contains_key(u)),
+                _ => false,
+            };
+            if holds
+                && claims::pool_key(c) == *key
+                && c.metadata.deletion_timestamp.is_none()
+                && let Some(x) = claims::caller(c, own)
+            {
+                *out.entry(x.owner).or_default() += 1;
+            }
+        }
+        out
     }
 
     /// A pod of `pool` that already carries this claim's allocation: a bind
@@ -495,6 +541,7 @@ impl Binder {
                 return;
             }
         }
+        *pass.held.entry(ask.caller.owner.clone()).or_default() += 1;
         if let Some(uid) = &c.metadata.uid {
             self.memory().bound.insert(uid.clone(), Instant::now());
         }
@@ -584,15 +631,19 @@ impl Binder {
             }
             pass.until(d);
         }
-        // Its place among the claims of this pass still waiting.
+        // Its place among the claims of this pass still waiting. A claim of
+        // the controller's namespace keeps no stored place: the API works it
+        // out from the store, and rewriting it for every API waiter whenever
+        // the queue moves would cost a write per waiter.
         pass.waiting += 1;
-        let position = pass.waiting;
+        let own = c.metadata.namespace.as_deref() == Some(self.cfg.namespace.as_str());
+        let position = (!own).then_some(pass.waiting);
         // The reason is written at once; a changed place at most every
         // POSITION_EVERY, so a queue that moves does not cost a write per waiter per bind.
         let uid = c.metadata.uid.clone().unwrap_or_default();
         let same_reason = c.status.is_some() && claims::reason(c) == Some(why);
         let at = c.status.as_ref().and_then(|s| s.queue_position);
-        if same_reason && at == i32::try_from(position).ok() {
+        if same_reason && at == position.and_then(|p| i32::try_from(p).ok()) {
             return;
         }
         if same_reason {
@@ -605,7 +656,7 @@ impl Binder {
         }
         self.memory().positions.insert(uid, Instant::now());
         let (ns, name) = claim_names(c);
-        let status = claims::unbound_status(c, ClaimPhase::Pending, why, message, Some(position));
+        let status = claims::unbound_status(c, ClaimPhase::Pending, why, message, position);
         if !matches!(
             self.backend
                 .patch_claim_status(ns, name, rv(c), &status)
@@ -708,8 +759,13 @@ fn ask(
     let qt = match &c.spec.queue_timeout {
         Some(t) => seconds(t)?,
         None => seconds(&a.queue_timeout)?,
+    };
+    if qt > seconds(&a.max_queue_timeout)? {
+        return Err(format!(
+            "queueTimeout must be at most {}",
+            a.max_queue_timeout.as_str()
+        ));
     }
-    .min(seconds(&a.max_queue_timeout)?);
     // The controller holds no Secret rights in its own namespace.
     let public_key = match &c.spec.public_key {
         Some(pem) => {
@@ -751,6 +807,13 @@ fn ask(
         public_key,
         plan,
     })
+}
+
+/// Workers one owner (an OIDC run, a service account or pod, a claim) may
+/// hold or wait for in `pool` at once: half of `scaling.max`, at least 1, so
+/// no single caller can take the whole pool.
+pub(super) fn max_per_owner(pool: &BuildKitPool) -> usize {
+    (usize::try_from(pool.spec.scaling.max).unwrap_or(0) / 2).max(1)
 }
 
 fn pool_id(pool: &BuildKitPool) -> Option<(&str, &str, &str)> {

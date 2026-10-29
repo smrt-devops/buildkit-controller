@@ -535,10 +535,10 @@ async fn api_verify() {
                 .status()
         }
     };
-    assert_eq!(del(sa.clone(), a_id.clone()).await, StatusCode::FORBIDDEN);
+    assert_eq!(del(sa.clone(), a_id.clone()).await, StatusCode::NOT_FOUND);
     assert_eq!(
         del(issuer.token(AUD, "other"), a_id.clone()).await,
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND
     );
     assert_eq!(h.claimed(&a_id), std::slice::from_ref(&pa), "still claimed");
     assert_eq!(
@@ -546,7 +546,7 @@ async fn api_verify() {
         StatusCode::NO_CONTENT
     );
     h.gone(&pa).await;
-    println!("d. DELETE non-owner 403, owner 204, pod drained: PASS");
+    println!("d. DELETE non-owner 404, owner 204, pod drained: PASS");
 
     // f. With no worker for 20 s the POST answers 202 with the id and the
     // place; the reconciler's replacement arrives; a long poll follows the
@@ -578,7 +578,7 @@ async fn api_verify() {
     let (st, v) = get(sa.clone(), "").await;
     assert_eq!(
         (st, v["error"]["code"].as_str()),
-        (StatusCode::FORBIDDEN, Some("forbidden")),
+        (StatusCode::NOT_FOUND, Some("not_found")),
         "{v}"
     );
     let (st, v) = get(alice.clone(), "").await;
@@ -594,7 +594,7 @@ async fn api_verify() {
     assert_eq!(f["id"], f_id.as_str());
     assert_eq!(h.wait_claimed(&f_id).await, w3);
     println!(
-        "f. POST 202 pending at place 1, GET 403 for others, long poll 200 once a worker is free: PASS"
+        "f. POST 202 pending at place 1, GET 404 for others, long poll 200 once a worker is free: PASS"
     );
     assert_eq!(
         del(alice.clone(), a_id.clone()).await,

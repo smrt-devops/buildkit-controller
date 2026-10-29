@@ -18,13 +18,15 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus};
+use k8s_openapi::api::authentication::v1::{
+    TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
+};
 use serde_json::{Map, Value};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::time::Instant;
@@ -43,6 +45,10 @@ const POSITIVE_ENTRIES: usize = 4096;
 const NEGATIVE_ENTRIES: usize = 1024;
 /// `TokenReview` calls in flight per client address unless configured otherwise.
 pub const DEFAULT_MAX_REVIEWS_PER_IP: usize = 4;
+/// `TokenReview` calls a second through the shared slots; the reserve gets its
+/// proportional part. Legitimate callers reuse a token for its cache lifetime,
+/// so this is far above their need and far below what a flood could send.
+const REVIEWS_PER_SEC: u32 = 50;
 /// Slots of the global pool reserved for recently seen subjects unless configured otherwise.
 pub const DEFAULT_RESERVED_REVIEWS: usize = 8;
 /// How long a subject that passed a review counts as recently seen, unless configured otherwise.
@@ -277,19 +283,10 @@ impl ReviewCache {
     }
 }
 
-/// The address the per-peer review cap counts: IPv4 as is, an IPv4-mapped IPv6
-/// address as its IPv4 address, any other IPv6 address as its /56. A routed
-/// allocation is usually a /56 or larger, so one allocation is one peer. The
-/// shared `PeerKey` of the connection caps stays at /64; masking here to /56
-/// first makes it group the masked address, so this changes reviews only.
+/// The address the per-peer review cap counts: the client's /56 group, as for
+/// the API's connection cap ([`crate::net::client_group`]).
 pub(crate) fn review_peer(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
-            let s = v6.segments();
-            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3] & 0xff00, 0, 0, 0, 0))
-        }
-        _ => ip,
-    }
+    crate::net::client_group(ip)
 }
 
 /// Reviews in flight: a shared pool, plus a reserve for subjects seen recently.
@@ -300,15 +297,57 @@ pub(crate) fn review_peer(ip: IpAddr) -> IpAddr {
 /// share. Any other token uses the shared pool only. The `sub` is read without
 /// verification, so forging a known one wins nothing beyond that share. The
 /// review result alone decides authentication, and this only schedules.
+///
+/// Slots bound concurrency, not rate: a refused review takes about a
+/// millisecond, so a few slots kept busy with forged tokens would still send
+/// thousands of reviews a second. Each pool therefore also has a token
+/// bucket. The shared pool gets [`REVIEWS_PER_SEC`] reviews a second and the
+/// reserve its proportional part, so a flood of forged tokens costs the API
+/// server at most that much.
 pub(crate) struct ReviewSlots {
     max: usize,
     reserved: usize,
     ttl: Duration,
     shared: Semaphore,
     reserve: Semaphore,
+    shared_rate: Bucket,
+    reserve_rate: Bucket,
     /// Reserved slots held per subject.
     held: Mutex<HashMap<String, usize>>,
     recent: Mutex<HashMap<String, Instant>>,
+}
+
+/// A token bucket: `per_sec` tokens a second, at most `burst` saved up.
+struct Bucket {
+    per_sec: f64,
+    burst: f64,
+    /// Tokens, and when they were counted.
+    state: Mutex<(f64, Option<Instant>)>,
+}
+
+impl Bucket {
+    fn new(per_sec: f64) -> Self {
+        let burst = per_sec.max(1.0);
+        Self {
+            per_sec,
+            burst,
+            state: Mutex::new((burst, None)),
+        }
+    }
+
+    /// Takes one token if there is one.
+    fn take(&self, now: Instant) -> bool {
+        let mut s = lock(&self.state);
+        let (tokens, at) = *s;
+        let earned = at.map_or(0.0, |t| now.duration_since(t).as_secs_f64() * self.per_sec);
+        let tokens = (tokens + earned).min(self.burst);
+        if tokens < 1.0 {
+            *s = (tokens, Some(now));
+            return false;
+        }
+        *s = (tokens - 1.0, Some(now));
+        true
+    }
 }
 
 /// A held review slot; a reserved one gives its subject's share back on drop.
@@ -332,15 +371,20 @@ impl Drop for ReviewSlot<'_> {
 }
 
 impl ReviewSlots {
+    #[allow(clippy::cast_precision_loss, reason = "slot counts are small")]
     pub(crate) fn new(max: usize, reserved: usize, ttl: Duration) -> Self {
+        let rate = f64::from(REVIEWS_PER_SEC);
         let max = max.max(1);
         let reserved = reserved.min(max - 1);
+        let reserve_rate = rate * reserved as f64 / (max - reserved) as f64;
         Self {
             max,
             reserved,
             ttl,
             shared: Semaphore::new(max - reserved),
             reserve: Semaphore::new(reserved),
+            shared_rate: Bucket::new(rate),
+            reserve_rate: Bucket::new(reserve_rate),
             held: Mutex::default(),
             recent: Mutex::default(),
         }
@@ -366,14 +410,23 @@ impl ReviewSlots {
         (self.reserved / 4).max(1)
     }
 
-    /// A slot for a review of `subject`, or `None` when none is open to it.
+    /// A slot for a review of `subject`, or `None` when none is open to it:
+    /// a shared one, else a reserved one ([`Self::acquire_reserved`]).
     pub(crate) fn acquire(&self, subject: &str, now: Instant) -> Option<ReviewSlot<'_>> {
-        if let Ok(permit) = self.shared.try_acquire() {
+        if let Ok(permit) = self.shared.try_acquire()
+            && self.shared_rate.take(now)
+        {
             return Some(ReviewSlot {
                 _permit: permit,
                 reserved_for: None,
             });
         }
+        self.acquire_reserved(subject, now)
+    }
+
+    /// A reserved slot for a review of `subject`, which must have been seen
+    /// recently and hold less than its share.
+    pub(crate) fn acquire_reserved(&self, subject: &str, now: Instant) -> Option<ReviewSlot<'_>> {
         if !self.seen_recently(subject, now) {
             return None;
         }
@@ -383,6 +436,9 @@ impl ReviewSlots {
             return None;
         }
         let permit = self.reserve.try_acquire().ok()?;
+        if !self.reserve_rate.take(now) {
+            return None;
+        }
         held.insert(subject.to_owned(), n + 1);
         Some(ReviewSlot {
             _permit: permit,
@@ -447,7 +503,21 @@ pub(crate) fn identity_from_status(
         namespace: namespace.to_owned(),
         name: name.to_owned(),
         uid: user.and_then(|u| u.uid.clone()).unwrap_or_default(),
+        pod_uid: user.and_then(pod_uid),
     })
+}
+
+/// The `extra` key in which the API server names the pod a bound token was issued for.
+const EXTRA_POD_UID: &str = "authentication.kubernetes.io/pod-uid";
+
+/// The pod uid of a bound token's review: one value of hex digits and dashes.
+fn pod_uid(user: &UserInfo) -> Option<String> {
+    match user.extra.as_ref()?.get(EXTRA_POD_UID)?.as_slice() {
+        [uid] if !uid.is_empty() && uid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') => {
+            Some(uid.clone())
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

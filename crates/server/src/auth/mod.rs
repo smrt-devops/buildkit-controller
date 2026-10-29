@@ -43,6 +43,9 @@ pub enum Identity {
         namespace: String,
         name: String,
         uid: String,
+        /// The pod a bound token was issued for, from the `TokenReview`.
+        /// Pods that share a service account are different owners.
+        pod_uid: Option<String>,
     },
     /// A `BuildKitClaim`, served by the leader. All
     /// three fields come from the API server, never from the claim spec.
@@ -55,7 +58,8 @@ pub enum Identity {
 
 impl Identity {
     /// Owner string: `oidc:<iss>#<sub>` (with the run claims appended when the
-    /// token has them, see [`RUN_CLAIMS`]), `sa:<ns>/<name>` or
+    /// token has them, see [`RUN_CLAIMS`]), `sa:<ns>/<name>` (with `#pod=<uid>`
+    /// for a token bound to a pod) or
     /// `claim:<ns>/<name>#<uid>`. Only the same caller may release an allocation.
     #[must_use]
     pub fn owner(&self) -> String {
@@ -66,8 +70,14 @@ impl Identity {
                 claims,
             } => oidc_owner(issuer, subject, claims),
             Self::ServiceAccount {
-                namespace, name, ..
-            } => format!("sa:{namespace}/{name}"),
+                namespace,
+                name,
+                pod_uid,
+                ..
+            } => match pod_uid {
+                Some(pod) => format!("sa:{namespace}/{name}#pod={pod}"),
+                None => format!("sa:{namespace}/{name}"),
+            },
             Self::Claim {
                 namespace,
                 name,
@@ -386,19 +396,23 @@ impl<R: TokenReviewer> Authenticator<R> {
         if let Some(hit) = self.reviews.get(&key, now) {
             return hit;
         }
-        let _peer_slot = match peer {
-            Some(ip) => match self.review_peers.try_take(token_review::review_peer(ip)) {
-                Some(s) => Some(s),
+        let peer_slot = peer.map(|ip| self.review_peers.try_take(token_review::review_peer(ip)));
+        // An address over its cap may still use the reserve for a subject seen
+        // recently: behind a gateway every client shares one address, and the
+        // reserve exists for exactly those callers. Its per-subject share bounds them.
+        let (_peer_slot, _slot) = match peer_slot {
+            Some(None) => match self.review_slots.acquire_reserved(&subject, now) {
+                Some(s) => (None, s),
                 None => {
                     return Err(AuthError::Upstream(
                         "tokenreview busy for this address".into(),
                     ));
                 }
             },
-            None => None,
-        };
-        let Some(_slot) = self.review_slots.acquire(&subject, now) else {
-            return Err(AuthError::Upstream("tokenreview saturated".into()));
+            p => match self.review_slots.acquire(&subject, now) {
+                Some(s) => (p.flatten(), s),
+                None => return Err(AuthError::Upstream("tokenreview saturated".into())),
+            },
         };
         let status = self
             .reviewer

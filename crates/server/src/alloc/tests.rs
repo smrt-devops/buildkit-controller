@@ -439,6 +439,7 @@ fn sa(name: &str) -> Identity {
         namespace: POOL_NS.into(),
         name: name.into(),
         uid: "u".into(),
+        pod_uid: None,
     }
 }
 
@@ -501,10 +502,11 @@ fn why(s: &BuildKitClaimStatus) -> String {
         .unwrap_or_default()
 }
 
-/// Pending claims bind oldest first; equal creation times go by name. The
-/// claim left over waits `Queued` at place 1, and binds once a pod frees.
+/// Pending claims bind oldest first. The claim left over waits `Queued`, with
+/// no stored place (the API works out an API claim's place from the store),
+/// and binds once a pod frees.
 #[tokio::test]
-async fn claims_bind_oldest_first_ties_by_name() {
+async fn claims_bind_oldest_first() {
     let e = env();
     e.warm(0);
     e.warm(1);
@@ -529,10 +531,7 @@ async fn claims_bind_oldest_first_ties_by_name() {
         (phase(&a), phase(&b), phase(&n)),
         (ClaimPhase::Bound, ClaimPhase::Bound, ClaimPhase::Pending)
     );
-    assert_eq!(
-        (why(&n).as_str(), n.queue_position),
-        (reason::QUEUED, Some(1))
-    );
+    assert_eq!((why(&n).as_str(), n.queue_position), (reason::QUEUED, None));
     // The first in line got the first pod tried; both pods carry their claims.
     for (s, owner) in [(&a, "sa:x/a"), (&b, "sa:x/b")] {
         let pod = e.fake.pod(s.pod.as_deref().unwrap());
@@ -924,7 +923,8 @@ async fn pending_allocation_is_polled_and_released_by_its_owner() {
             .get(&sa("mallory"), &p.id, Duration::ZERO)
             .await
             .unwrap_err(),
-        AllocError::Forbidden
+        AllocError::NotFound,
+        "another caller learns nothing about a live id"
     );
     assert_eq!(
         e.front
@@ -962,7 +962,7 @@ async fn pending_allocation_is_polled_and_released_by_its_owner() {
     // Release: owner only; transient failures are 503 upstream_error.
     assert_eq!(
         e.front.release(&sa("mallory"), &p.id).await.unwrap_err(),
-        AllocError::Forbidden
+        AllocError::NotFound
     );
     e.fake
         .w
@@ -1375,8 +1375,8 @@ async fn tidy_ends_claims_and_retires_strays() {
 }
 
 /// An allocation made before every allocation was a claim has no claim: its
-/// owner's DELETE retires its pod; anyone else gets 403, an unknown id 404.
-#[tokio::test]
+/// owner's DELETE retires its pod; anyone else, like an unknown id, gets 404.
+#[tokio::test(start_paused = true)]
 async fn release_retires_a_pod_allocated_before_claims() {
     let e = env();
     let name = e.warm(0);
@@ -1388,7 +1388,7 @@ async fn release_retires_a_pod_allocated_before_claims() {
     e.fake.put_pod(pod);
     assert_eq!(
         e.front.release(&sa("mallory"), &id).await,
-        Err(AllocError::Forbidden)
+        Err(AllocError::NotFound)
     );
     assert_eq!(
         e.fake.pod(&name).metadata.annotations.unwrap()[ANN_ALLOC],
@@ -1484,3 +1484,128 @@ async fn a_bound_claim_without_a_ca_answers_pending() {
 
 #[path = "tests_cache.rs"]
 mod cache_tests;
+
+fn fresh_key() -> String {
+    rcgen::KeyPair::generate().unwrap().public_key_pem()
+}
+
+/// Any caller can name random ids. A lookup reads the store only, never the
+/// API server, and waits briefly for a claim another replica just created.
+#[tokio::test(start_paused = true)]
+async fn a_lookup_by_id_never_reads_the_api_server() {
+    let e = env();
+    let random = new_alloc_id().unwrap().to_string();
+    assert_eq!(
+        e.front.get(&sa("alice"), &random, Duration::ZERO).await,
+        Err(AllocError::NotFound)
+    );
+    assert_eq!(
+        e.front.release(&sa("alice"), &random).await,
+        Err(AllocError::NotFound)
+    );
+    assert!(
+        !e.fake.calls().iter().any(|c| c.starts_with("get_claim")),
+        "{:?}",
+        e.fake.calls()
+    );
+    // A claim that reaches the store during the wait is found.
+    let id = new_alloc_id().unwrap().to_string();
+    let fake = Arc::clone(&e.fake);
+    let late = id.clone();
+    let mut c = BuildKitClaim::new(
+        &late,
+        serde_json::from_value(json!({"poolRef": {"namespace": POOL_NS, "name": POOL},
+            "owner": sa("alice").owner(), "publicKey": *KEY}))
+        .unwrap(),
+    );
+    c.metadata.namespace = Some(OWN.into());
+    c.metadata.uid = Some("33333333-0000-4000-8000-000000000001".into());
+    c.metadata.creation_timestamp = Some(Time(k8s_openapi::jiff::Timestamp::now()));
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        fake.put_claim(c);
+    });
+    assert!(matches!(
+        e.front.get(&sa("alice"), &id, Duration::ZERO).await,
+        Ok(Outcome::Pending(_))
+    ));
+}
+
+/// One owner may hold or wait for at most half of `scaling.max` (4 here) in
+/// a pool. Over that a POST gets the retryable `pool_exhausted`; a repeat of
+/// a key it already holds and other owners are unaffected.
+#[tokio::test(start_paused = true)]
+async fn one_owner_takes_at_most_half_the_pool() {
+    let e = env();
+    let first = post_req(&fresh_key());
+    for req in [&first, &post_req(&fresh_key())] {
+        assert!(matches!(
+            e.front.allocate(&sa("alice"), req).await,
+            Ok(Outcome::Pending(_))
+        ));
+    }
+    let r = e
+        .front
+        .allocate(&sa("alice"), &post_req(&fresh_key()))
+        .await;
+    assert!(matches!(r, Err(AllocError::PoolExhausted(_))), "{r:?}");
+    assert!(matches!(
+        e.front.allocate(&sa("alice"), &first).await,
+        Ok(Outcome::Pending(_))
+    ));
+    assert!(matches!(
+        e.front.allocate(&sa("bob"), &post_req(&fresh_key())).await,
+        Ok(Outcome::Pending(_))
+    ));
+    assert_eq!(claim_names(&e).len(), 3);
+}
+
+/// The leader binds no more than the cap to one owner either, so claims that
+/// slipped past the front (two replicas racing) wait instead of binding.
+#[tokio::test]
+async fn the_leader_binds_at_most_half_the_pool_to_one_owner() {
+    let e = env();
+    for slot in 0..4 {
+        e.warm(slot);
+    }
+    let ids: Vec<String> = (0..3).map(|i| e.ci_claim(30 - i, "sa:x/a")).collect();
+    let other = e.ci_claim(1, "sa:x/b");
+    e.binder.pass(&key()).await;
+    let phases: Vec<ClaimPhase> = ids
+        .iter()
+        .map(|id| phase(&e.fake.status(OWN, id)))
+        .collect();
+    assert_eq!(
+        phases,
+        [ClaimPhase::Bound, ClaimPhase::Bound, ClaimPhase::Pending]
+    );
+    assert_eq!(phase(&e.fake.status(OWN, &other)), ClaimPhase::Bound);
+    // A second pass, before the store shows the binds, still counts them.
+    e.binder.pass(&key()).await;
+    assert_eq!(phase(&e.fake.status(OWN, &ids[2])), ClaimPhase::Pending);
+}
+
+/// An in-cluster claim asking for a longer queue wait than the pool allows
+/// fails `InvalidRequest`, as the HTTP API refuses it, instead of being cut.
+#[tokio::test]
+async fn an_in_cluster_queue_timeout_over_the_max_is_refused() {
+    let e = env();
+    e.claim(CI, "long", 0, json!({"queueTimeout": "1h"}));
+    e.binder.pass(&key()).await;
+    let s = e.fake.status(CI, "long");
+    assert_eq!(
+        (phase(&s), why(&s).as_str()),
+        (ClaimPhase::Failed, reason::INVALID_REQUEST)
+    );
+}
+
+/// A key padded past the claim CRD's `maxLength` would parse and then fail
+/// the create; it is a 400, never a 500.
+#[tokio::test]
+async fn an_oversized_public_key_is_a_bad_request() {
+    let e = env();
+    let padded = format!("{}\n{}", "x".repeat(2000), *KEY);
+    let r = e.front.allocate(&sa("alice"), &post_req(&padded)).await;
+    assert!(matches!(r, Err(AllocError::InvalidRequest(_))), "{r:?}");
+    assert!(claim_names(&e).is_empty());
+}
