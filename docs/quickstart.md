@@ -22,7 +22,7 @@ That release predates some features and fixes in this repository. A setting or b
 
 ### On a real cluster
 
-The chart exposes the controller through a Gateway API Gateway: an HTTPRoute for the API and a TLS passthrough TLSRoute for the edge. You need the Gateway API v1.5.0 or later standard-channel CRDs, an implementation that supports TLSRoute, and a Gateway with two listeners: HTTPS for the API, with a certificate for your DNS name, and TLS in Passthrough mode for the edge. [helm/README.md](../helm/README.md#exposure) has an Envoy Gateway example and the list of implementations. This page assumes a Gateway `bk` in namespace `gateway-system` with the API on 443 and the edge on 8444.
+The chart exposes the controller through a Gateway API Gateway: an HTTPRoute for the API and a TLS passthrough TLSRoute for the edge. You need the Gateway API v1.5.0 or later standard-channel CRDs, an implementation that supports TLSRoute, and a Gateway with two listeners: HTTPS for the API, with a certificate for your DNS name, and TLS in Passthrough mode for the edge. [the chart README](../helm/buildkit-controller/README.md#exposure) has an Envoy Gateway example and the list of implementations. This page assumes a Gateway `bk` in namespace `gateway-system` with the API on 443 and the edge on 8444.
 
 Pick a DNS name, install, then point the name at the Gateway's address.
 
@@ -41,7 +41,7 @@ kubectl get httproute,tlsroute -n buildkit-system
 
 Behind a gateway every client reaches the controller from the gateway's addresses, so the per-address caps apply to all clients together. Raise `edge.maxHandshakesPerIp`, `api.maxConnectionsPerIp` and `auth.serviceAccount.maxReviewsPerIp`, or set them to 0, before many jobs start at once (see [operations.md](operations.md#exposure)).
 
-Without a Gateway, or where the managed gateway has no TLS passthrough (GKE's managed Gateway, the AWS Load Balancer Controller), use a load balancer instead: replace the two `parentRefs` flags with `--set service.type=LoadBalancer`, point the DNS name at the Service address from `kubectl get svc -n buildkit-system`, and use `https://bk.example.com:8443` as the API URL. Some load balancers need a higher idle timeout. See [helm/README.md](../helm/README.md#load-balancer-idle-timeout).
+Without a Gateway, or where the managed gateway has no TLS passthrough (GKE's managed Gateway, the AWS Load Balancer Controller), use a load balancer instead: replace the two `parentRefs` flags with `--set service.type=LoadBalancer`, point the DNS name at the Service address from `kubectl get svc -n buildkit-system`, and use `https://bk.example.com:8443` as the API URL. Some load balancers need a higher idle timeout. See [the chart README](../helm/buildkit-controller/README.md#load-balancer-idle-timeout).
 
 ### On kind
 

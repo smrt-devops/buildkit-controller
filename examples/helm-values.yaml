@@ -26,7 +26,7 @@ auth:
 
 # Routes on the Gateway bk (namespace gateway-system): the API on its HTTPS listener,
 # where the Gateway's certificate is publicly trusted, and the edge on its TLS
-# passthrough listener. See helm/README.md#exposure for a Gateway to match.
+# passthrough listener. See helm/buildkit-controller/README.md#exposure for a Gateway to match.
 gateway:
   api:
     parentRefs: [{name: bk, namespace: gateway-system, sectionName: api}]

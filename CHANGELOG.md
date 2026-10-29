@@ -8,13 +8,18 @@ v3 replaces the per-replica allocation queues with one claim queue and replaces 
 
 ### Breaking
 
-- `spec.workers.cache.local` and `spec.workers.cache.registry` of `BuildKitPool` are removed, with their CEL rules, defaults and status fields. A pool that still sets them has the fields pruned by the API server, and kubectl's strict field validation refuses the apply. `spec.workers.cache` now holds `sizeLimit`, `scope`, `writers` and `maxSize`.
+- `spec.workers.cache.local` and `spec.workers.cache.registry` of `BuildKitPool` are removed, with their CEL rules, defaults and status fields. A pool that still sets them has the fields pruned by the API server, and kubectl's strict field validation refuses the apply. `spec.workers.cache` now holds `scope`, `writers` and `maxSize`.
 - Workers have no volumes. The PVC per slot, the `cache-init` init container, scope binding on pods, soft affinity, spill and the wipe markers are gone. BuildKit build history is no longer turned off on any pool.
 - The external cache registry layer is removed. A team that wants its own registry passes its own buildx flags.
 - Helm values `cacheDefaults` and the `cache` key of a `pools` item are removed, and the chart rejects them. The chart gains a `cache` block for the registry (`cache.enabled`, `maxSize`, `poolMaxSize`, `maxBlobSize`, `maxUploadSize`, `gcInterval`, `persistence`, `resources`).
 - The allocation API: `cache` accepts `auto` and `none` only (`registry` and `local` are gone), and the `201` response no longer has `cache.local`. `cache.registry` now carries `to` (absent when the caller may only read the cache) and `from`. `cacheKey` is the cache tag and defaults to the pool name; the pool `registry.defaultKey` is gone.
 - The Action input `cache` and the script variable `CACHE` accept `auto` or `none`.
 - `POST /v1/allocations` may answer `202` with an id when no worker binds within about 20 seconds. A client from before v3 does not follow it. Update the Action (and `buildkit-allocate.sh`) with the controller.
+- `spec.workers.cache.sizeLimit` moves to `spec.workers.stateSizeLimit`. It sizes the buildkitd state `emptyDir`, not the cache.
+- Helm value `claims.enabled` is removed, and the chart rejects it. A non-empty `claims.namespaces` turns on in-cluster claims.
+- Helm value `watchNamespace` and the controller config key of the same name are removed. Use `watchNamespaces: [<namespace>]`.
+- The claim CRD moves from a chart template to `crds/`, beside the pool CRD. Helm installs both on first install and upgrades neither, so apply `crds/` yourself before `helm upgrade`. A claim CRD that v0.1.0 installed as a template carries `helm.sh/resource-policy: keep`, so the upgrade does not delete it.
+- The cache registry role is `buildkit-controller registry` (it was `cache` during v3 development), its chart template is `registry.yaml` with the label `app.kubernetes.io/component: registry`, and the controller config keys `cache.host` and `cache.tlsSecretName` are `registry.host` and `registry.tlsSecretName`. The chart writes them; only a hand-written config needs the change.
 - The error codes `shutting_down` and `start_timeout` are gone from the API. The Action and `buildkit-allocate.sh` still retry them, so they keep working against a v0.1.0 controller during the upgrade.
 - Metrics removed: `buildkit_queue_depth`, `buildkit_cache_affinity_total` and the volume metrics. Alert on `buildkit_pool_waiting` instead of `buildkit_queue_depth`. `buildkit_releases_total` no longer has the `cache_scope` reason.
 - `BuildKitClaim` spec gains `queueTimeout`, `publicKey`, `owner`, `cacheScope` and `cacheTier`, and its status gains `certificate` and `queuePosition`. The controller honours `owner`, `cacheScope` and `cacheTier` only in its own namespace. `status.cache` no longer has a local result. Apply the regenerated CRDs.
@@ -38,7 +43,8 @@ v3 replaces the per-replica allocation queues with one claim queue and replaces 
 - Each worker gets a second certificate, a clientAuth-only leaf from the client CA, which the pool's `buildkitd.toml` presents to the cache registry. The serving certificate stays serverAuth only. The registry trusts the client CA for clients, and mTLS is its boundary.
 - Builds from `pull_request`, `pull_request_target`, `workflow_run`, `issue_comment`, `pull_request_review` and `pull_request_review_comment` events never write the cache, whatever `spec.workers.cache.writers` says.
 - A `POST` from the Action and the script waits for the whole remaining budget (queue timeout plus 60 seconds) instead of 40 seconds, so a slow allocation against a v0.1.0 controller completes. Polls keep a 40 second timeout.
-- The claim CRD is always installed. `claims.enabled` only adds the tenant namespaces whose claims the controller serves.
+- The claim CRD is always installed. `claims.namespaces` only adds the tenant namespaces whose claims the controller serves.
+- `gateway.api.timeouts.request` and `.backendRequest` default to 60s instead of 15m, since no API request lasts longer than 25 seconds. The Envoy stream idle timeout follows them.
 - A draining replica no longer hands queued requests off. Pending claims stay pending and another replica answers the client's next poll.
 - Removed from the allocator: per-replica queues and wake-ups, API replicas creating pre-claimed pods, the provisional-expiry commit and its orphan guard, and the commit-on-body step.
 
