@@ -789,3 +789,10 @@ fn the_protected_ranges_are_always_denied() {
     assert!(!d.iter().any(|x| x == "100.100.100.200/32"), "{d:?}");
     assert!(d.iter().any(|x| x == "168.63.129.16/32"), "{d:?}");
 }
+
+#[test]
+fn version_prints_the_crate_version() {
+    let e = Cli::try_parse_from(["x", "--version"]).unwrap_err();
+    assert_eq!(e.kind(), clap::error::ErrorKind::DisplayVersion);
+    assert!(e.to_string().contains(env!("CARGO_PKG_VERSION")));
+}

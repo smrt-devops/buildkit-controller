@@ -10,6 +10,7 @@ use crate::config::LogFormat;
 #[derive(Clone, Debug, clap::Parser)]
 #[command(
     name = "buildkit-controller registry",
+    version,
     about = "Run the built-in cache registry"
 )]
 pub struct RegistryArgs {
@@ -130,5 +131,12 @@ mod tests {
         assert_eq!(a.listen.port(), 5000);
         assert_eq!(a.max_blob_size, 5 << 30);
         assert!(a.grants_file.is_none());
+    }
+
+    #[test]
+    fn version_prints_the_crate_version() {
+        let e = RegistryArgs::try_parse_from(["registry", "--version"]).unwrap_err();
+        assert_eq!(e.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(e.to_string().contains(env!("CARGO_PKG_VERSION")));
     }
 }
