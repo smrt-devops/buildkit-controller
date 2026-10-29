@@ -100,3 +100,105 @@ test('the pool listing is retried on 503 with Retry-After', { skip }, async (t) 
   assert.equal(r.code, 0, r.out);
   assert.equal(f.calls.filter((c) => c.method === 'GET').length, 2);
 });
+
+const queued = (id) => ({ status: 202, body: JSON.stringify({ id, state: 'pending', position: 1 }) });
+const boundBody = (id) => ({
+  status: 200, body: JSON.stringify({ id, namespace: 'ci', pool: 'a', clientCert: 'CERT', endpoint: 'tcp://e.example:8444', serverName: 'e.example' }),
+});
+const errBody = (status, code, headers) => ({ status, headers, body: JSON.stringify({ error: { code, message: 'x' } }) });
+const isPost = (rec) => rec.method === 'POST' && rec.url === '/v1/allocations';
+const isPoll = (rec) => rec.method === 'GET' && rec.url.startsWith('/v1/allocations/');
+
+test('a 202 is polled until bound, then the command runs and the worker is released', { skip }, async (t) => {
+  let polls = 0;
+  const f = await fixture(t, {
+    override: (rec) => {
+      if (isPost(rec)) return queued('q1');
+      if (isPoll(rec)) return ++polls < 3 ? queued('q1') : boundBody('q1');
+      return undefined;
+    },
+  });
+  const r = await sh(f, ['sh', '-c', 'test "$BUILDER" = bk-q1']);
+  assert.equal(r.code, 0, r.out);
+  assert.equal(f.calls.filter(isPost).length, 1);
+  assert.deepEqual(f.calls.filter(isPoll).map((c) => c.url), Array(3).fill('/v1/allocations/q1?wait=25s'));
+  assert.deepEqual(deletes(f.calls), ['/v1/allocations/q1']);
+});
+
+test('a transient poll failure polls the same id again', { skip }, async (t) => {
+  let polls = 0;
+  const f = await fixture(t, {
+    override: (rec) => {
+      if (isPost(rec)) return queued('q1');
+      if (isPoll(rec)) {
+        polls += 1;
+        if (polls === 1) return errBody(503, 'upstream_error', { 'Retry-After': '1' });
+        if (polls === 2) return { status: 500, body: '' };
+        return boundBody('q1');
+      }
+      return undefined;
+    },
+  });
+  const r = await sh(f, ['true']);
+  assert.equal(r.code, 0, r.out);
+  assert.equal(f.calls.filter(isPost).length, 1);
+  assert.equal(polls, 3);
+});
+
+test('pool_exhausted on a poll allocates again within the budget', { skip }, async (t) => {
+  let posts = 0;
+  const f = await fixture(t, {
+    override: (rec) => {
+      if (isPost(rec)) return queued(`q${++posts}`);
+      if (isPoll(rec)) return rec.url.includes('/q1?') ? errBody(503, 'pool_exhausted', { 'Retry-After': '1' }) : boundBody('q2');
+      return undefined;
+    },
+  });
+  const r = await sh(f, ['sh', '-c', 'test "$BUILDER" = bk-q2'], { QUEUE_TIMEOUT: '300' });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(posts, 2);
+  assert.deepEqual(deletes(f.calls), ['/v1/allocations/q2'], 'the exhausted id is not released');
+});
+
+test('pod_lost on a poll fails the run without another POST', { skip }, async (t) => {
+  const f = await fixture(t, {
+    override: (rec) => {
+      if (isPost(rec)) return queued('q1');
+      if (isPoll(rec)) return errBody(503, 'pod_lost');
+      return undefined;
+    },
+  });
+  const r = await sh(f, ['true']);
+  assert.equal(r.code, 1);
+  assert.match(r.out, /allocation failed: HTTP 503 pod_lost/);
+  assert.equal(f.calls.filter(isPost).length, 1);
+  assert.deepEqual(deletes(f.calls), []);
+});
+
+test('a TERM while the allocation is queued releases its id', { skip }, async (t) => {
+  const f = await fixture(t, {
+    override: (rec) => {
+      if (isPost(rec)) return queued('q1');
+      if (isPoll(rec)) return errBody(503, 'upstream_error', { 'Retry-After': '30' });
+      return undefined;
+    },
+  });
+  const p = spawn('sh', [SCRIPT, 'true'], { env: env(f) });
+  const closed = new Promise((r) => p.on('close', (code) => r(code)));
+  for (let i = 0; i < 100 && !f.calls.some(isPoll); i++) await sleep(100);
+  await sleep(300);
+  p.kill('SIGTERM');
+  assert.equal(await closed, 143);
+  assert.deepEqual(deletes(f.calls), ['/v1/allocations/q1']);
+});
+
+test('a release answered 503 upstream_error with Retry-After is retried', { skip }, async (t) => {
+  let n = 0;
+  const f = await fixture(t, {
+    override: (rec) => (rec.method === 'DELETE' && ++n === 1 ? errBody(503, 'upstream_error', { 'Retry-After': '1' }) : undefined),
+  });
+  const r = await sh(f, ['true']);
+  assert.equal(r.code, 0, r.out);
+  assert.equal(deletes(f.calls).length, 2);
+  assert.ok(!r.out.includes('warning: release'), r.out);
+});

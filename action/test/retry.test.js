@@ -183,7 +183,7 @@ test('a retry shrinks the queue timeout to what is left of the budget', async ()
   const opts = ({ remainingMs }) => {
     const q = L.queueTimeoutFor(qt, remainingMs);
     sent.push(q);
-    return { ...post, body: { queueTimeoutSeconds: q }, timeoutMs: L.postTimeoutMs(q) };
+    return { ...post, body: { queueTimeoutSeconds: q }, timeoutMs: L.REQUEST_TIMEOUT_MS };
   };
   const res = await L.requestWithRetry(s.url, opts, h.opts);
   s.close();
@@ -232,7 +232,7 @@ async function busyPool(inputQt, pool, serverDefault) {
   const opts = ({ remainingMs }) => {
     const q = L.queueTimeoutFor(pqt, remainingMs);
     sent.push(q);
-    return { ...post, body: L.allocationBody({ namespace: 'ci', pool: 'amd64' }, 'pk', undefined, q), timeoutMs: L.postTimeoutMs(q) };
+    return { ...post, body: L.allocationBody({ namespace: 'ci', pool: 'amd64' }, 'pk', undefined, q), timeoutMs: L.REQUEST_TIMEOUT_MS };
   };
   const res = await L.requestWithRetry(s.url, opts, h.opts);
   s.close();
