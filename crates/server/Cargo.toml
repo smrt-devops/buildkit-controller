@@ -52,9 +52,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 socket2 = { workspace = true }
-tokio = { workspace = true, features = ["time", "sync", "net", "signal", "rt-multi-thread", "io-util"] }
+tokio = { workspace = true, features = ["time", "sync", "net", "signal", "rt-multi-thread", "io-util", "fs"] }
 tokio-rustls = { workspace = true, features = ["ring"] }
-tokio-util = "0.7.20"
+tokio-util = { version = "0.7.20", features = ["io"] }
 toml_edit = "0.25.17"
 tower = { version = "0.5.3", features = ["util"] }
 tracing = { workspace = true }
