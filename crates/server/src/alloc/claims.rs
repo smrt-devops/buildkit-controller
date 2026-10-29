@@ -281,36 +281,12 @@ pub fn position<S: std::hash::BuildHasher>(
 }
 
 /// Workers one owner (an OIDC run, a service account or pod, a claim) may
-/// hold in `pool` at once: half of `scaling.max`, at least 1, so no single
-/// caller can take the whole pool. The leader enforces it when binding.
+/// hold in `pool` while another owner waits for one: half of `scaling.max`,
+/// at least 1. With nobody else waiting an owner may take the whole pool, so
+/// a single tenant or one CI matrix is not capped at half. The leader
+/// enforces it when binding.
 pub(super) fn owner_hold_limit(pool: &BuildKitPool) -> usize {
     (usize::try_from(pool.spec.scaling.max).unwrap_or(0) / 2).max(1)
-}
-
-/// Claims one owner may hold or wait for in `pool`, as [`active_of`] counts
-/// them: the hold limit, and as many again waiting behind it. The front
-/// refuses a new claim at this limit.
-pub(super) fn owner_active_limit(pool: &BuildKitPool) -> usize {
-    2 * owner_hold_limit(pool)
-}
-
-/// Claims of the controller's namespace `own` that `owner` holds or waits
-/// for in pool `key`, other than the claim named `except`.
-#[must_use]
-pub fn active_of(
-    claims: &[Arc<BuildKitClaim>],
-    own: &str,
-    owner: &str,
-    key: &PoolKey,
-    except: &str,
-) -> usize {
-    claims
-        .iter()
-        .filter(|c| c.metadata.namespace.as_deref() == Some(own))
-        .filter(|c| c.metadata.deletion_timestamp.is_none() && !phase(c).is_terminal())
-        .filter(|c| c.spec.owner.as_deref() == Some(owner))
-        .filter(|c| c.metadata.name.as_deref() != Some(except) && pool_key(c) == *key)
-        .count()
 }
 
 /// When a waiting claim's queue timeout ends, given its timeout in seconds.
@@ -540,12 +516,10 @@ pub fn unbound_status(
     phase: ClaimPhase,
     reason: &str,
     message: &str,
-    position: Option<u32>,
 ) -> BuildKitClaimStatus {
     BuildKitClaimStatus {
         phase: Some(phase),
         observed_generation: c.metadata.generation,
-        queue_position: position.and_then(|p| i32::try_from(p).ok()),
         conditions: vec![condition(false, reason, message, c.metadata.generation)],
         ..BuildKitClaimStatus::default()
     }
@@ -587,7 +561,6 @@ pub fn bound_status(c: &BuildKitClaim, b: &Binding, secret: bool) -> BuildKitCla
         pod: Some(b.pod.clone()),
         certificate: Some(b.certificate.clone()),
         expires_at: Some(b.expires_at.clone()),
-        queue_position: None,
         cache: b.cache.clone(),
         observed_generation: c.metadata.generation,
         conditions: vec![condition(

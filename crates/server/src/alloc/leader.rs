@@ -190,8 +190,8 @@ async fn run_term(t: Term, term: u64) {
 /// new or its spec changed. Once the leader has written its status, further
 /// events are the leader's own status writes and the API's `seen-at` and
 /// `delivered` marks, and a pass for each would cost a pass per waiter per write.
-/// A claim that ends or goes away may free its owner to bind a waiting claim
-/// (the per-owner limit), so it calls for a pass of its pool too.
+/// A claim that ends or goes away changes what its owner holds, and so who
+/// goes first under fair share, so it calls for a pass of its pool too.
 pub(super) fn claim_trigger(ev: &ClaimEvent) -> Option<Trigger> {
     match ev {
         ClaimEvent::Apply(c) if claims::phase(c) == ClaimPhase::Pending => {
@@ -339,13 +339,7 @@ async fn refuse(b: &Binder, c: &BuildKitClaim) -> Option<&'static str> {
         "namespace {} is not in the controller's claims.namespaces",
         c.metadata.namespace.as_deref().unwrap_or_default()
     );
-    let s = claims::unbound_status(
-        c,
-        ClaimPhase::Failed,
-        reason::NAMESPACE_NOT_SERVED,
-        &msg,
-        None,
-    );
+    let s = claims::unbound_status(c, ClaimPhase::Failed, reason::NAMESPACE_NOT_SERVED, &msg);
     write_status(b, c, &s).await.then_some("failed")
 }
 

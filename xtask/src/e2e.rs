@@ -554,13 +554,13 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
     )?;
-    // B waits as a claim in the controller's namespace, at the head of the queue.
+    // B waits as a claim in the controller's namespace.
     let pending = until("B pending as a claim", Duration::from_mins(1), || {
         let s = c.env.kubectl(&[
             "get", "bkc", "-n", NS, "-o",
-            "jsonpath={range .items[?(@.status.phase==\"Pending\")]}{.metadata.name} {.spec.poolRef.name} {.status.queuePosition}{\"\\n\"}{end}",
+            "jsonpath={range .items[?(@.status.phase==\"Pending\")]}{.metadata.name} {.spec.poolRef.name}{\"\\n\"}{end}",
         ])?;
-        let head = format!(" {host} 1");
+        let head = format!(" {host}");
         Ok(s.lines().find(|l| l.ends_with(&head)).map(str::to_owned))
     })?;
     ensure!(a.wait()?.success(), "allocation A failed");
@@ -578,7 +578,7 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
         "B did not wait (launched {b_launched}, started {b_start})"
     );
     println!(
-        "PASS d: second allocation queued {}s as claim {pending} (place 1) and ran after the first was released",
+        "PASS d: second allocation queued {}s as claim {pending} and ran after the first was released",
         b_start - b_launched
     );
 

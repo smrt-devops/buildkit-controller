@@ -22,9 +22,6 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
-    - jsonPath: .status.queuePosition
-      name: Position
-      type: integer
     - jsonPath: .status.secretName
       name: Secret
       type: string
@@ -250,13 +247,6 @@ spec:
                 description: The worker pod the claim is bound to.
                 nullable: true
                 type: string
-              queuePosition:
-                description: |-
-                  1-based place in the pool's queue while `Pending`, refreshed every few
-                  seconds. Written only for claims outside the controller's namespace.
-                format: int32
-                nullable: true
-                type: integer
               secretName:
                 description: |-
                   Secret in the claim's namespace holding `tls.crt`, `tls.key`, `ca.crt` and `endpoint`.

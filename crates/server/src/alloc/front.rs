@@ -554,7 +554,6 @@ impl Front {
             AllocError::InvalidRequest("publicKey must be a PEM SPKI ECDSA P-256 key".into())
         })?;
         let id = key_alloc_id(&key).ok_or(AllocError::Internal)?;
-        self.room_for(who, &pool, req, id.as_str())?;
         let mut c = BuildKitClaim::new(
             id.as_str(),
             BuildKitClaimSpec {
@@ -578,28 +577,6 @@ impl Front {
             fmt_ts(OffsetDateTime::now_utc()),
         )]));
         Ok(c)
-    }
-
-    /// Refuse a new claim, with the retryable 503 `pool_exhausted`, when its
-    /// caller already holds or waits for [`claims::owner_active_limit`] claims of the pool.
-    /// The claim `id` itself, made by an earlier try with the same key, never counts.
-    fn room_for(
-        &self,
-        who: &Identity,
-        pool: &BuildKitPool,
-        req: &CreateAllocationRequest,
-        id: &str,
-    ) -> Result<(), AllocError> {
-        let key = (req.namespace.clone(), req.pool.clone());
-        let all = self.claims.state();
-        let cap = claims::owner_active_limit(pool);
-        if claims::active_of(&all, &self.namespace, &who.owner(), &key, id) >= cap {
-            info!(namespace = %req.namespace, pool = %req.pool, reason = "owner_limit", "allocation refused");
-            return Err(AllocError::PoolExhausted(format!(
-                "the caller already holds or waits for {cap} allocations of this pool, the most it may"
-            )));
-        }
-        Ok(())
     }
 
     fn lookup(
