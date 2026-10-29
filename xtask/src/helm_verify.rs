@@ -7,8 +7,9 @@
 //! that a pool in a third namespace is ignored, that the controller cannot
 //! create pods or Secrets in that namespace or in kube-system, and that its logs
 //! show no RBAC denial; then that the cache registry becomes Ready with the
-//! certificate the leader writes, and its logs show no RBAC denial either. The controller namespace enforces `PodSecurity`
-//! "restricted".
+//! certificate the leader writes, and its logs show no RBAC denial either, and
+//! that `helm upgrade` refuses to render against a pool CRD older than the
+//! chart. The controller namespace enforces `PodSecurity` "restricted".
 //!
 //! The cluster name is `bk-helm-verify`, plus `-$BK_KIND_SUFFIX` when that is set.
 //! Every kind, kubectl and helm call uses the private kubeconfig under
@@ -327,6 +328,41 @@ fn verify(env: &Cluster) -> Result<()> {
         "cache registry logs show an RBAC denial"
     );
     println!("PASS cache registry Ready, no RBAC denial in its logs");
+
+    // An upgrade against a pool CRD older than the chart fails to render.
+    env.kubectl(&[
+        "patch",
+        "crd",
+        "buildkitpools.buildkit.smrt-devops.net",
+        "--type=json",
+        "-p",
+        r#"[{"op":"remove","path":"/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/workers/properties/cache/properties/writers"}]"#,
+    ])?;
+    let out = crate::proc::run(env.helm_cmd().args([
+        "upgrade",
+        "bk",
+        &chart,
+        "-n",
+        NS,
+        "-f",
+        &values,
+        "--dry-run=server",
+    ]))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    ensure!(
+        !out.status.success() && stderr.contains("older than this chart"),
+        "helm upgrade against an old pool CRD: expected the CRD guard to fail it, got {}: {stderr}",
+        out.status
+    );
+    let crds = root.join("helm/buildkit-controller/crds");
+    env.kubectl(&[
+        "apply",
+        "--server-side",
+        "--force-conflicts",
+        "-f",
+        &crds.to_string_lossy(),
+    ])?;
+    println!("PASS helm upgrade refuses an old pool CRD");
     println!("helm-verify: all checks passed");
     Ok(())
 }

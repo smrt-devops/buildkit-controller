@@ -124,3 +124,35 @@ longest edge connection lifetime (24h maxTTL cap + 5m cert margin = 86700 s). */
 86700
 {{- end -}}
 {{- end -}}
+
+{{/*
+Helm applies crds/ on first install only. On an upgrade against a cluster, fail when a
+served CRD predates this chart: the API server would prune the new fields, so pools would
+lose cache.writers and every API claim its publicKey. Probes: a field each CRD gained in
+0.2.0. Offline renders (helm template) see no CRDs and skip the check.
+*/}}
+{{- define "bkc.crdGuard" -}}
+{{- if .Release.IsUpgrade -}}
+{{- $pools := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "buildkitpools.buildkit.smrt-devops.net" -}}
+{{- if $pools -}}
+  {{- $claims := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "buildkitclaims.buildkit.smrt-devops.net" -}}
+  {{- $poolOk := false -}}
+  {{- range $pools.spec.versions -}}
+    {{- if eq .name "v1alpha1" -}}
+      {{- $cache := dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "workers" "properties" "cache" "properties" dict . -}}
+      {{- $poolOk = hasKey $cache "writers" -}}
+    {{- end -}}
+  {{- end -}}
+  {{- $claimOk := false -}}
+  {{- range (dig "spec" "versions" list $claims) -}}
+    {{- if eq .name "v1alpha1" -}}
+      {{- $spec := dig "schema" "openAPIV3Schema" "properties" "spec" "properties" dict . -}}
+      {{- $claimOk = hasKey $spec "publicKey" -}}
+    {{- end -}}
+  {{- end -}}
+  {{- if not (and $poolOk $claimOk) -}}
+    {{- fail "the BuildKitPool or BuildKitClaim CRD in this cluster is older than this chart. Helm does not upgrade crds/, so apply them first: kubectl apply --server-side --force-conflicts -f helm/buildkit-controller/crds/ (see docs/operations.md, Upgrades)" -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

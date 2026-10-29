@@ -132,7 +132,7 @@ Check the state with `kubectl get bkp -A`. The Warm, Allocated and Waiting colum
 ## Upgrades
 
 - Upgrade with `helm upgrade`. The Deployment rolls one replica at a time and the PodDisruptionBudget keeps one replica up. Running builds survive it: see [Stopping a replica](#stopping-a-replica).
-- Helm installs both CRDs (`crds/`) on first install only and never upgrades them. When a release changes `crds/`, apply them yourself before `helm upgrade` with `kubectl apply --server-side --force-conflicts -f helm/buildkit-controller/crds/`. `--force-conflicts` takes over the fields that Helm wrote at install.
+- Helm installs both CRDs (`crds/`) on first install only and never upgrades them. When a release changes `crds/`, apply them yourself before `helm upgrade` with `kubectl apply --server-side --force-conflicts -f helm/buildkit-controller/crds/`. `--force-conflicts` takes over the fields that Helm wrote at install. `helm upgrade` fails while a CRD in the cluster is older than the chart.
 - Install the chart from the release, or from a checkout of the release tag. The chart's `appVersion` picks the image, so a checkout of another commit can run an image that does not match its config.
 - A change to a pool's template changes its pod template hash. The reconciler retires free pods with the old hash and starts new ones. Allocated pods run to the end of their allocation.
 - A config change restarts the controller. No pool state is lost, because state lives in pods and pool status.
