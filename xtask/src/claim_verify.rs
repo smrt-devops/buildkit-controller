@@ -1,5 +1,5 @@
 //! `cargo xtask claim-verify` installs the chart on a throwaway kind cluster
-//! with `claims.enabled` and one pool that admits claims from namespace
+//! with `claims.namespaces` set and one pool that admits claims from namespace
 //! `claim-ok`, then checks the claim lifecycle end to end:
 //!
 //! 1. A claim in `claim-ok` binds and its Secret appears.
@@ -183,7 +183,7 @@ fn verify(env: &Cluster) -> Result<()> {
         Ok((!ips.trim().is_empty()).then_some(()))
     })?;
     println!(
-        "installed chart with claims.enabled; pool Ready, controller in the Service endpoints"
+        "installed chart with claims.namespaces; pool Ready, controller in the Service endpoints"
     );
 
     // 7. A cacheKey that starts with a hyphen is rejected at admission.

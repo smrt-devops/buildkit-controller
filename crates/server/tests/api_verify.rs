@@ -271,7 +271,7 @@ async fn setup(issuer: &Issuer, stop: &CancellationToken) -> (H, SocketAddr, Arc
     let ca_file = work.join("issuer-ca.pem");
     std::fs::write(&ca_file, &issuer.ca_pem).unwrap();
     let yaml = format!(
-        "watchNamespace: {NS}\nlisten:\n  api: \"{api}\"\nedge:\n  endpoint: tcp://{SERVER_NAME}:8444\n  serverName: {SERVER_NAME}\n  allocationDomain: alloc.{SERVER_NAME}\nauth:\n  oidc:\n    - url: {}\n      audiences: [{AUD}]\n      caBundleFile: {}\n",
+        "watchNamespaces: [{NS}]\nlisten:\n  api: \"{api}\"\nedge:\n  endpoint: tcp://{SERVER_NAME}:8444\n  serverName: {SERVER_NAME}\n  allocationDomain: alloc.{SERVER_NAME}\nauth:\n  oidc:\n    - url: {}\n      audiences: [{AUD}]\n      caBundleFile: {}\n",
         issuer.url,
         ca_file.display()
     );

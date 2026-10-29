@@ -36,7 +36,6 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- end -}}
 {{- $fn := include "bkc.fullname" . -}}
 {{- $cfg := dict
-  "watchNamespace" ""
   "listen" (dict "api" "0.0.0.0:8443" "edge" "0.0.0.0:8444" "ops" (printf "0.0.0.0:%d" (int .Values.metrics.port)))
   "pki" (dict "caSecretName" (printf "%s-ca" $fn))
   "leaderElection" (dict "leaseName" (printf "%s-leader" $fn))
@@ -57,7 +56,7 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
   "auth" (dict "oidc" $issuers "serviceAccount" .Values.auth.serviceAccount)
   "workerNetwork" .Values.workerNetwork
   "shutdown" (ternary .Values.shutdown (omit .Values.shutdown "drainTimeout") (not (empty .Values.shutdown.drainTimeout)))
-  "claims" (dict "enabled" .Values.claims.enabled "namespaces" .Values.claims.namespaces) -}}
+  "claims" (dict "namespaces" .Values.claims.namespaces) -}}
 {{- if .Values.cache.enabled -}}
   {{- $_ := set $cfg "cache" (dict "host" (include "bkc.cacheHost" .) "tlsSecretName" (printf "%s-registry-tls" $fn)) -}}
 {{- end -}}
@@ -69,9 +68,8 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
     {{- $_ := set (get $cfg $l) "proxyProtocol" (dict "enabled" true "trustedCIDRs" $p.trustedCIDRs "headerTimeout" $p.headerTimeout) -}}
   {{- end -}}
 {{- end -}}
-{{- /* Scoped: the list. Cluster-wide: the old empty key, so existing configs (and their checksum) stay the same. */ -}}
+{{- /* Scoped: the list. Cluster-wide: no key. */ -}}
 {{- with include "bkc.watchNamespaces" . | fromJsonArray -}}
-  {{- $_ := unset $cfg "watchNamespace" -}}
   {{- $_ := set $cfg "watchNamespaces" . -}}
 {{- end -}}
 {{- toYaml $cfg -}}
@@ -100,12 +98,9 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- $t -}}
 {{- end -}}
 
-{{/* Watched namespaces as a JSON list, [] = cluster-wide. watchNamespace is the deprecated single form. */}}
+{{/* Watched namespaces as a JSON list, [] = cluster-wide. */}}
 {{- define "bkc.watchNamespaces" -}}
-{{- if and .Values.watchNamespace .Values.watchNamespaces -}}
-{{- fail "set watchNamespaces or the deprecated watchNamespace, not both" -}}
-{{- end -}}
-{{- $list := ternary (list .Values.watchNamespace) (default (list) .Values.watchNamespaces) (not (empty .Values.watchNamespace)) -}}
+{{- $list := default (list) .Values.watchNamespaces -}}
 {{- if has .Release.Namespace $list -}}
 {{- fail (printf "watchNamespaces must not include the release namespace %s: it holds the CA Secret, and pool workloads must not run beside it" .Release.Namespace) -}}
 {{- end -}}

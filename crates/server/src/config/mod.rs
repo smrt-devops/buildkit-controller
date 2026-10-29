@@ -112,9 +112,6 @@ impl Settings {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct Config {
-    /// Deprecated single-namespace form of `watchNamespaces`; `""` = unset.
-    /// Setting both is a validation error.
-    pub watch_namespace: String,
     /// Namespaces whose pools, pods and claims the controller watches; `[]` =
     /// all namespaces. Read through [`Config::watched_namespaces`].
     pub watch_namespaces: Vec<String>,
@@ -559,10 +556,9 @@ impl Default for Shutdown {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Claims {
-    /// Run the claim controller on the leader. Off by default.
-    pub enabled: bool,
-    /// Namespaces whose claims are served. The chart grants Secret access in
-    /// these only; a claim elsewhere fails with `NamespaceNotServed`.
+    /// Tenant namespaces whose in-cluster claims are served, besides the
+    /// controller's own. The chart grants Secret access in these only; a claim
+    /// elsewhere fails with `NamespaceNotServed`. Empty = no in-cluster claims.
     pub namespaces: Vec<String>,
 }
 
@@ -723,12 +719,6 @@ impl Config {
     /// Check every config rule, returning all failures.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut p = Vec::new();
-        if self.claims.enabled && self.claims.namespaces.is_empty() {
-            p.push(
-                "claims.namespaces must list at least one namespace when claims.enabled is true"
-                    .into(),
-            );
-        }
         let rt = secs(&self.kube.request_timeout, "kube.requestTimeout", &mut p);
         let ld = secs(
             &self.leader_election.lease_duration,
@@ -811,20 +801,16 @@ impl Config {
     /// The namespaces to watch, `[]` = all. Call only on a validated config.
     #[must_use]
     pub fn watched_namespaces(&self) -> &[String] {
-        if self.watch_namespace.is_empty() {
-            &self.watch_namespaces
-        } else {
-            std::slice::from_ref(&self.watch_namespace)
-        }
+        &self.watch_namespaces
     }
 
     /// The namespaces whose claims are watched, `[]` = all. The controller's own
-    /// namespace `own` (claims of CI callers) always; with `claims.enabled`, every
+    /// namespace `own` (claims of CI callers) always; with `claims.namespaces`, every
     /// namespace when pools are watched cluster-wide (claims outside
     /// `claims.namespaces` are refused), else `claims.namespaces` too.
     #[must_use]
     pub fn claim_namespaces(&self, own: &str) -> Vec<String> {
-        if !self.claims.enabled {
+        if self.claims.namespaces.is_empty() {
             return vec![own.to_owned()];
         }
         if self.watched_namespaces().is_empty() {
@@ -839,24 +825,16 @@ impl Config {
     }
 
     /// The namespaces whose in-cluster claims are served: the controller's own
-    /// and, with `claims.enabled`, `claims.namespaces`.
+    /// and `claims.namespaces`.
     #[must_use]
     pub fn served_claim_namespaces(&self, own: &str) -> std::collections::HashSet<String> {
-        let mut s: std::collections::HashSet<String> = std::iter::once(own.to_owned()).collect();
-        if self.claims.enabled {
-            s.extend(self.claims.namespaces.iter().cloned());
-        }
-        s
+        std::iter::once(own.to_owned())
+            .chain(self.claims.namespaces.iter().cloned())
+            .collect()
     }
 
     fn validate_watch(&self, p: &mut Vec<String>) {
-        if !self.watch_namespace.is_empty() && !self.watch_namespaces.is_empty() {
-            p.push(
-                "watchNamespace and watchNamespaces are both set; use watchNamespaces only (watchNamespace is deprecated)"
-                    .into(),
-            );
-        }
-        namespace_list("watchNamespaces", self.watched_namespaces(), p);
+        namespace_list("watchNamespaces", &self.watch_namespaces, p);
         namespace_list("claims.namespaces", &self.claims.namespaces, p);
     }
 

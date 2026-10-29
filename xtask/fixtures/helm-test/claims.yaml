@@ -6,7 +6,7 @@ podDisruptionBudget: {enabled: true, minAvailable: 2}
 resources: {requests: {cpu: 250m, memory: 256Mi}, limits: {memory: 1Gi}}
 logLevel: debug
 logFormat: text
-watchNamespace: ci
+watchNamespaces: [ci]
 edge:
   endpoint: tcp://bk.example.com:9444
   serverName: bk.example.com
@@ -54,6 +54,5 @@ affinity: {podAntiAffinity: {preferredDuringSchedulingIgnoredDuringExecution: [{
 topologySpreadConstraints: [{maxSkew: 1, topologyKey: topology.kubernetes.io/zone, whenUnsatisfiable: ScheduleAnyway, labelSelector: {matchLabels: {app.kubernetes.io/name: buildkit-controller}}}]
 priorityClassName: system-cluster-critical
 claims:
-  enabled: true
   namespaces: [ci, team-b]
 gateway: {enabled: false}

@@ -223,7 +223,7 @@ async fn ca_secret(client: &kube::Client, ns: &str, config: &Config) -> CaBundle
 
 fn config(ns: &str) -> String {
     format!(
-        "watchNamespace: {ns}\nedge:\n  endpoint: tcp://bk.example.com:8444\n  serverName: bk.example.com\n  allocationDomain: alloc.bk.example.com\n"
+        "watchNamespaces: [{ns}]\nedge:\n  endpoint: tcp://bk.example.com:8444\n  serverName: bk.example.com\n  allocationDomain: alloc.bk.example.com\n"
     )
 }
 

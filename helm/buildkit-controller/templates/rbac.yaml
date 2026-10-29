@@ -127,10 +127,7 @@ metadata:
   labels: {{- include "bkc.labels" . | nindent 4 }}
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: {{ $fn }}}
 subjects: {{- toYaml $subjects | nindent 2 }}
-{{- if .Values.claims.enabled }}
-{{- if empty .Values.claims.namespaces }}
-{{- fail "claims.namespaces must list the namespaces whose claims the controller serves" }}
-{{- end }}
+{{- if .Values.claims.namespaces }}
 {{- $claimRules := list
   (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitclaims") "verbs" (list "get" "list" "watch"))
   (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitclaims/status") "verbs" (list "get" "patch" "update")) }}

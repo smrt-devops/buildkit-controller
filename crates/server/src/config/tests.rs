@@ -1,6 +1,6 @@
 use super::*;
 
-const MIN: &str = "edge:\n  endpoint: tcp://bk.example.com:8444\n  serverName: bk.example.com\n";
+const MIN: &str = "edge:\n  endpoint: tcp://bk.exaple.com:8444\n  serverName: bk.example.com\n";
 
 fn errs(yaml: &str) -> Vec<String> {
     match Config::from_yaml(yaml) {
@@ -408,16 +408,21 @@ fn connection_limits_default_and_zero_rules() {
 }
 
 #[test]
-fn claims_are_off_unless_enabled() {
-    assert!(!Config::from_yaml(MIN).unwrap().claims.enabled);
-    let v = errs(&format!("{MIN}claims:\n  enabled: true\n"));
-    assert!(v.iter().any(|m| m.contains("claims.namespaces")), "{v:?}");
+fn in_cluster_claims_are_served_only_in_listed_namespaces() {
+    let c = Config::from_yaml(MIN).unwrap();
+    assert!(c.claims.namespaces.is_empty());
+    assert_eq!(c.claim_namespaces("bk"), ["bk"]);
+    assert_eq!(c.served_claim_namespaces("bk"), ["bk".to_owned()].into());
     let c = Config::from_yaml(&format!(
-        "{MIN}claims:\n  enabled: true\n  namespaces: [ci]\n"
+        "{MIN}watchNamespaces: [ci]\nclaims:\n  namespaces: [ci]\n"
     ))
     .unwrap();
-    assert!(c.claims.enabled && c.claims.namespaces == ["ci"]);
-    let e = Config::from_yaml(&format!("{MIN}claims:\n  enable: true\n")).unwrap_err();
+    assert_eq!(c.claim_namespaces("bk"), ["bk", "ci"]);
+    assert_eq!(
+        c.served_claim_namespaces("bk"),
+        ["bk".to_owned(), "ci".to_owned()].into()
+    );
+    let e = Config::from_yaml(&format!("{MIN}claims:\n  enabled: true\n")).unwrap_err();
     assert!(matches!(e, ConfigError::Parse(_)), "{e}");
 }
 
@@ -425,23 +430,14 @@ fn claims_are_off_unless_enabled() {
 fn watch_namespaces_default_to_cluster_wide() {
     let c = Config::from_yaml(MIN).unwrap();
     assert!(c.watched_namespaces().is_empty());
-    let c =
-        Config::from_yaml(&format!("{MIN}watchNamespace: \"\"\nwatchNamespaces: []\n")).unwrap();
-    assert!(c.watched_namespaces().is_empty());
 }
 
 #[test]
-fn watch_namespaces_list_and_deprecated_alias() {
+fn watch_namespaces_list() {
     let c = Config::from_yaml(&format!("{MIN}watchNamespaces: [team-a, team-b]\n")).unwrap();
     assert_eq!(c.watched_namespaces(), ["team-a", "team-b"]);
-    let c = Config::from_yaml(&format!("{MIN}watchNamespace: ci\n")).unwrap();
-    assert_eq!(c.watched_namespaces(), ["ci"]);
-}
-
-#[test]
-fn watch_namespace_and_watch_namespaces_are_exclusive() {
-    let v = errs(&format!("{MIN}watchNamespace: ci\nwatchNamespaces: [ci]\n"));
-    assert!(v.iter().any(|m| m.contains("both set")), "{v:?}");
+    let e = Config::from_yaml(&format!("{MIN}watchNamespace: ci\n")).unwrap_err();
+    assert!(matches!(e, ConfigError::Parse(_)), "{e}");
 }
 
 #[test]
@@ -460,8 +456,6 @@ fn watch_namespaces_must_be_unique_namespace_names() {
             "{bad}: {v:?}"
         );
     }
-    let v = errs(&format!("{MIN}watchNamespace: Bad\n"));
-    assert!(v.iter().any(|m| m.contains("`Bad` is not")), "{v:?}");
 }
 
 #[test]
@@ -566,9 +560,7 @@ fn lease_name_must_be_an_object_name() {
 
 #[test]
 fn claim_namespaces_are_names_listed_once() {
-    let v = errs(&format!(
-        "{MIN}claims:\n  enabled: true\n  namespaces: [ci, Bad_ns, ci]\n"
-    ));
+    let v = errs(&format!("{MIN}claims:\n  namespaces: [ci, Bad_ns, ci]\n"));
     assert!(
         v.iter()
             .any(|m| m.contains("claims.namespaces: `Bad_ns` is not a namespace name")),

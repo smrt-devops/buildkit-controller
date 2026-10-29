@@ -140,9 +140,6 @@ impl AppContext {
         shutdown: &CancellationToken,
     ) -> Self {
         readiness.register("config").set();
-        if !settings.config.watch_namespace.is_empty() {
-            tracing::warn!("watchNamespace is deprecated; use watchNamespaces");
-        }
         tracing::info!(namespaces = ?settings.config.watched_namespaces(), "watch scope, [] = all namespaces");
         let stores = Stores::spawn(
             StoreSpec {
