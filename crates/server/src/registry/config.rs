@@ -1,4 +1,4 @@
-//! Flags and environment of the `cache` role.
+//! Flags and environment of the `registry` role.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -6,13 +6,13 @@ use std::time::Duration;
 
 use crate::config::LogFormat;
 
-/// `buildkit-controller cache [flags]`.
+/// `buildkit-controller registry [flags]`.
 #[derive(Clone, Debug, clap::Parser)]
 #[command(
-    name = "buildkit-controller cache",
+    name = "buildkit-controller registry",
     about = "Run the built-in cache registry"
 )]
-pub struct CacheArgs {
+pub struct RegistryArgs {
     /// Registry listener (mTLS).
     #[arg(long, env = "BUILDKIT_CACHE_LISTEN", default_value = "0.0.0.0:5000")]
     pub listen: SocketAddr,
@@ -126,7 +126,7 @@ mod tests {
 
     #[test]
     fn defaults_parse() {
-        let a = CacheArgs::try_parse_from(["cache"]).unwrap();
+        let a = RegistryArgs::try_parse_from(["registry"]).unwrap();
         assert_eq!(a.listen.port(), 5000);
         assert_eq!(a.max_blob_size, 5 << 30);
         assert!(a.grants_file.is_none());

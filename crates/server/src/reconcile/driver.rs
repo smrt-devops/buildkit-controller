@@ -294,7 +294,7 @@ async fn side_work(ctx: AppContext, swept: Arc<AtomicBool>) {
     {
         swept.store(true, Ordering::Relaxed);
     }
-    let c = &ctx.config().cache;
+    let c = &ctx.config().registry;
     if c.host.is_empty() {
         return std::future::pending().await;
     }

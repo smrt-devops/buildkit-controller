@@ -681,7 +681,7 @@ fn workers_may_reach_the_cache_registry_and_nothing_else_new() {
             .unwrap()
     };
     let without = rules(&cfg);
-    cfg.cache_host = Some(HOST.into());
+    cfg.registry_host = Some(HOST.into());
     let with = rules(&cfg);
     assert_eq!(with.len(), without.len() + 1);
     let r = with.iter().find(|r| !without.contains(r)).unwrap();

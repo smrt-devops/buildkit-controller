@@ -136,7 +136,7 @@ pub struct Config {
     /// The `BuildKitClaim` controller.
     pub claims: Claims,
     /// The built-in cache registry.
-    pub cache: Cache,
+    pub registry: Registry,
 }
 
 /// `listen`.
@@ -562,20 +562,20 @@ pub struct Claims {
     pub namespaces: Vec<String>,
 }
 
-/// `cache`: where workers reach the built-in cache registry. Unset, allocations
+/// `registry`: where workers reach the built-in cache registry. Unset, allocations
 /// carry no cache flags and workers get no registry entry.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
-pub struct Cache {
+pub struct Registry {
     /// `<host>:<port>` of the registry Service, for example
-    /// `bk-cache.buildkit-system.svc:5000`. `""` = no cache.
+    /// `bk-registry.buildkit-system.svc:5000`. `""` = no cache.
     pub host: String,
     /// Secret in the controller's namespace where the leader keeps the registry's
     /// serving certificate (`tls.crt`, `tls.key`) and the internal CA (`ca.crt`).
     pub tls_secret_name: String,
 }
 
-impl Cache {
+impl Registry {
     /// The host without its port, the name in the serving certificate.
     #[must_use]
     pub fn server_name(&self) -> &str {
@@ -780,7 +780,7 @@ impl Config {
             ));
         }
         self.validate_watch(&mut p);
-        self.validate_cache(&mut p);
+        self.validate_registry(&mut p);
         self.validate_edge(&mut p);
         self.validate_auth(&mut p);
         self.validate_network(&mut p);
@@ -838,17 +838,20 @@ impl Config {
         namespace_list("claims.namespaces", &self.claims.namespaces, p);
     }
 
-    fn validate_cache(&self, p: &mut Vec<String>) {
-        let c = &self.cache;
+    fn validate_registry(&self, p: &mut Vec<String>) {
+        let c = &self.registry;
         if c.host.is_empty() {
             return;
         }
         let port = c.host.rsplit_once(':').map(|(_, port)| port.parse::<u16>());
         if !matches!(port, Some(Ok(n)) if n > 0) || !is_dns_name(c.server_name()) {
-            p.push(format!("cache.host `{}` must be <dns-name>:<port>", c.host));
+            p.push(format!(
+                "registry.host `{}` must be <dns-name>:<port>",
+                c.host
+            ));
         }
         if c.tls_secret_name.is_empty() {
-            p.push("cache.tlsSecretName is required when cache.host is set".into());
+            p.push("registry.tlsSecretName is required when registry.host is set".into());
         }
     }
 
@@ -1072,7 +1075,7 @@ impl Config {
                     cidrs: n.dns.cidrs.clone(),
                 },
             },
-            cache_host: (!self.cache.host.is_empty()).then(|| self.cache.host.clone()),
+            registry_host: (!self.registry.host.is_empty()).then(|| self.registry.host.clone()),
         }
     }
 }

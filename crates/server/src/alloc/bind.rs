@@ -56,8 +56,8 @@ pub struct BindConfig {
     pub namespace: String,
     /// Namespaces whose claims are served.
     pub served: HashSet<String>,
-    /// `cache.host`, `None` when the controller runs no cache registry.
-    pub cache_host: Option<String>,
+    /// `registry.host`, `None` when the controller runs no cache registry.
+    pub registry_host: Option<String>,
 }
 
 impl BindConfig {
@@ -253,7 +253,7 @@ impl Binder {
             }
             return self.no_pool(c, now, pass).await;
         };
-        let host = self.cfg.cache_host.as_deref();
+        let host = self.cfg.registry_host.as_deref();
         let ask = match ask(c, pool, own, host, caller, alloc_id, claim_ref) {
             Ok(a) => a,
             Err(message) => {
@@ -682,7 +682,7 @@ fn ask(
     c: &BuildKitClaim,
     pool: &BuildKitPool,
     own: &str,
-    cache_host: Option<&str>,
+    registry_host: Option<&str>,
     caller: Caller,
     alloc_id: AllocId,
     claim_ref: String,
@@ -733,7 +733,7 @@ fn ask(
         (None, _) => None,
     };
     let plan = who.and_then(|(scope, tier)| {
-        cache::plan(cache_host, pool, key.as_ref(), c.spec.cache, scope, tier)
+        cache::plan(registry_host, pool, key.as_ref(), c.spec.cache, scope, tier)
     });
     Ok(Ask {
         deadline: claims::queue_deadline(c, qt),

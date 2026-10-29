@@ -396,7 +396,7 @@ async fn create_pod<O: KubeOps>(ops: &O, env: &Env<'_>, slot: u32, r: &mut Repor
         slot,
         odt(env.now),
         env.worker_cert_validity,
-        env.render.cache_host.as_deref(),
+        env.render.registry_host.as_deref(),
     ) {
         Ok(w) => w,
         Err(e) => return failed(e),

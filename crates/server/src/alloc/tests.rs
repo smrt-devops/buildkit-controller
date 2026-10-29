@@ -352,7 +352,7 @@ fn env() -> Env {
             allocation_domain: Some("alloc.bk.example.com".into()),
             namespace: OWN.into(),
             served: served.clone(),
-            cache_host: Some(CACHE_HOST.into()),
+            registry_host: Some(CACHE_HOST.into()),
         },
         metrics.clone(),
     );

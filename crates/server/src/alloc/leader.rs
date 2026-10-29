@@ -90,7 +90,7 @@ impl Component for Allocator {
                         .filter(|d| !d.is_empty()),
                     served: c.served_claim_namespaces(&namespace),
                     namespace,
-                    cache_host: (!c.cache.host.is_empty()).then(|| c.cache.host.clone()),
+                    registry_host: (!c.registry.host.is_empty()).then(|| c.registry.host.clone()),
                 },
                 shared.metrics(&ctx),
             ));

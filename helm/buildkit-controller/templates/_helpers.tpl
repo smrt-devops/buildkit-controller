@@ -58,7 +58,7 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
   "shutdown" (ternary .Values.shutdown (omit .Values.shutdown "drainTimeout") (not (empty .Values.shutdown.drainTimeout)))
   "claims" (dict "namespaces" .Values.claims.namespaces) -}}
 {{- if .Values.cache.enabled -}}
-  {{- $_ := set $cfg "cache" (dict "host" (include "bkc.cacheHost" .) "tlsSecretName" (printf "%s-registry-tls" $fn)) -}}
+  {{- $_ := set $cfg "registry" (dict "host" (include "bkc.registryHost" .) "tlsSecretName" (printf "%s-registry-tls" $fn)) -}}
 {{- end -}}
 {{- /* PROXY protocol only when on, so configs without it (and their checksum) stay the same. */ -}}
 {{- range $l := list "api" "edge" -}}
@@ -76,7 +76,7 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- end -}}
 
 {{/* The cache registry Service, as workers reach it. */}}
-{{- define "bkc.cacheHost" -}}
+{{- define "bkc.registryHost" -}}
 {{- printf "%s-registry.%s.svc:5000" (include "bkc.fullname" .) .Release.Namespace -}}
 {{- end -}}
 

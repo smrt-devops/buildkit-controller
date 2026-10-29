@@ -145,7 +145,7 @@ pub struct RenderConfig {
     pub worker_network: WorkerNetwork,
     /// `cache.host`: where workers reach the built-in cache registry, in the
     /// controller namespace. `None` = no cache.
-    pub cache_host: Option<String>,
+    pub registry_host: Option<String>,
 }
 
 /// The `workerNetwork` settings.

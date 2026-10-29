@@ -1,5 +1,5 @@
 ---
-# Source: buildkit-controller/templates/cache.yaml
+# Source: buildkit-controller/templates/registry.yaml
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -8,7 +8,7 @@ metadata:
   labels:
     app.kubernetes.io/name: buildkit-registry
     app.kubernetes.io/instance: bk
-    app.kubernetes.io/component: cache
+    app.kubernetes.io/component: registry
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: buildkit-controller-0.1.0
@@ -51,7 +51,7 @@ spec:
       app.kubernetes.io/instance: bk
 
 ---
-# Source: buildkit-controller/templates/cache.yaml
+# Source: buildkit-controller/templates/registry.yaml
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -60,7 +60,7 @@ metadata:
   labels:
     app.kubernetes.io/name: buildkit-registry
     app.kubernetes.io/instance: bk
-    app.kubernetes.io/component: cache
+    app.kubernetes.io/component: registry
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: buildkit-controller-0.1.0
@@ -125,9 +125,6 @@ data:
         maxReviewsPerIp: 2
         recentSubjectTtl: 10m
         reservedReviews: 8
-    cache:
-      host: bkc-registry.buildkit-system.svc:5000
-      tlsSecretName: bkc-registry-tls
     claims:
       namespaces:
       - ci
@@ -154,6 +151,9 @@ data:
       ops: 0.0.0.0:9090
     pki:
       caSecretName: bkc-ca
+    registry:
+      host: bkc-registry.buildkit-system.svc:5000
+      tlsSecretName: bkc-registry-tls
     shutdown:
       delay: 10s
       drainTimeout: 10m
@@ -217,38 +217,6 @@ subjects:
   - kind: ServiceAccount
     name: bkc
     namespace: buildkit-system
-
----
-# Source: buildkit-controller/templates/cache.yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: bkc-registry-buildkit-system
-  namespace: ci
-  labels:
-    app.kubernetes.io/name: buildkit-registry
-    app.kubernetes.io/instance: bk
-    app.kubernetes.io/component: cache
-    app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.1.0"
-    helm.sh/chart: buildkit-controller-0.1.0
-rules:
-  - apiGroups:
-    - buildkit.smrt-devops.net
-    resources:
-    - buildkitpools
-    verbs:
-    - get
-    - list
-    - watch
-  - apiGroups:
-    - ""
-    resources:
-    - pods
-    verbs:
-    - get
-    - list
-    - watch
 
 ---
 # Source: buildkit-controller/templates/rbac.yaml
@@ -439,24 +407,36 @@ rules:
     verbs: [get, create, delete]
 
 ---
-# Source: buildkit-controller/templates/cache.yaml
+# Source: buildkit-controller/templates/registry.yaml
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: Role
 metadata:
   name: bkc-registry-buildkit-system
   namespace: ci
   labels:
     app.kubernetes.io/name: buildkit-registry
     app.kubernetes.io/instance: bk
-    app.kubernetes.io/component: cache
+    app.kubernetes.io/component: registry
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: buildkit-controller-0.1.0
-roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: bkc-registry-buildkit-system}
-subjects:
-  - kind: ServiceAccount
-    name: bkc-registry
-    namespace: buildkit-system
+rules:
+  - apiGroups:
+    - buildkit.smrt-devops.net
+    resources:
+    - buildkitpools
+    verbs:
+    - get
+    - list
+    - watch
+  - apiGroups:
+    - ""
+    resources:
+    - pods
+    verbs:
+    - get
+    - list
+    - watch
 
 ---
 # Source: buildkit-controller/templates/rbac.yaml
@@ -535,7 +515,27 @@ subjects:
     namespace: buildkit-system
 
 ---
-# Source: buildkit-controller/templates/cache.yaml
+# Source: buildkit-controller/templates/registry.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bkc-registry-buildkit-system
+  namespace: ci
+  labels:
+    app.kubernetes.io/name: buildkit-registry
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/component: registry
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: bkc-registry-buildkit-system}
+subjects:
+  - kind: ServiceAccount
+    name: bkc-registry
+    namespace: buildkit-system
+
+---
+# Source: buildkit-controller/templates/registry.yaml
 apiVersion: v1
 kind: Service
 metadata:
@@ -544,7 +544,7 @@ metadata:
   labels:
     app.kubernetes.io/name: buildkit-registry
     app.kubernetes.io/instance: bk
-    app.kubernetes.io/component: cache
+    app.kubernetes.io/component: registry
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: buildkit-controller-0.1.0
@@ -639,7 +639,7 @@ spec:
         helm.sh/chart: buildkit-controller-0.1.0
         team: ci
       annotations:
-        checksum/config: 952d2e29f4e9671f2a64b3ea1ce450fba153b9268871a462373fc83654f2679d
+        checksum/config: b27c11905c8f227afda0e9a10c8ea94a73e07b410c984f219854ea482c9e2be1
         example.com/x: "1"
     spec:
       serviceAccountName: bkc
@@ -721,7 +721,7 @@ spec:
           whenUnsatisfiable: ScheduleAnyway
 
 ---
-# Source: buildkit-controller/templates/cache.yaml
+# Source: buildkit-controller/templates/registry.yaml
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -730,7 +730,7 @@ metadata:
   labels:
     app.kubernetes.io/name: buildkit-registry
     app.kubernetes.io/instance: bk
-    app.kubernetes.io/component: cache
+    app.kubernetes.io/component: registry
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: buildkit-controller-0.1.0
@@ -746,7 +746,7 @@ spec:
       labels:
         app.kubernetes.io/name: buildkit-registry
         app.kubernetes.io/instance: bk
-        app.kubernetes.io/component: cache
+        app.kubernetes.io/component: registry
         app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: buildkit-controller-0.1.0
@@ -765,7 +765,7 @@ spec:
         - name: registry
           image: "registry.example.com/bkc:v9.9.9"
           imagePullPolicy: Always
-          args: [cache]
+          args: [registry]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

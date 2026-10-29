@@ -613,16 +613,16 @@ fn edge_max_connections_defaults_to_the_chart_value_everywhere() {
 }
 
 #[test]
-fn cache_is_off_without_a_host_and_checked_with_one() {
+fn registry_is_off_without_a_host_and_checked_with_one() {
     let c = Config::from_yaml(MIN).unwrap();
-    assert!(c.render_config("bk").cache_host.is_none());
+    assert!(c.render_config("bk").registry_host.is_none());
     let c = Config::from_yaml(&format!(
-        "{MIN}cache: {{host: bk-registry.bk.svc:5000, tlsSecretName: bk-registry-tls}}\n"
+        "{MIN}registry: {{host: bk-registry.bk.svc:5000, tlsSecretName: bk-registry-tls}}\n"
     ))
     .unwrap();
-    assert_eq!(c.cache.server_name(), "bk-registry.bk.svc");
+    assert_eq!(c.registry.server_name(), "bk-registry.bk.svc");
     assert_eq!(
-        c.render_config("bk").cache_host.as_deref(),
+        c.render_config("bk").registry_host.as_deref(),
         Some("bk-registry.bk.svc:5000")
     );
     for host in [
@@ -632,10 +632,16 @@ fn cache_is_off_without_a_host_and_checked_with_one() {
         "x:http",
     ] {
         let v = errs(&format!(
-            "{MIN}cache: {{host: \"{host}\", tlsSecretName: t}}\n"
+            "{MIN}registry: {{host: \"{host}\", tlsSecretName: t}}\n"
         ));
-        assert!(v.iter().any(|m| m.contains("cache.host")), "{host}: {v:?}");
+        assert!(
+            v.iter().any(|m| m.contains("registry.host")),
+            "{host}: {v:?}"
+        );
     }
-    let v = errs(&format!("{MIN}cache: {{host: \"a.b:5000\"}}\n"));
-    assert!(v.iter().any(|m| m.contains("cache.tlsSecretName")), "{v:?}");
+    let v = errs(&format!("{MIN}registry: {{host: \"a.b:5000\"}}\n"));
+    assert!(
+        v.iter().any(|m| m.contains("registry.tlsSecretName")),
+        "{v:?}"
+    );
 }

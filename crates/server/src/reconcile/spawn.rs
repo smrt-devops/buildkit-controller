@@ -69,14 +69,14 @@ pub struct Worker {
 /// Picks a nonce, issues the serving cert (internal CA) and the registry client
 /// cert (client CA, its own key) for `<nonce>.<pod>.<pool>.<ns>` valid for
 /// `validity`, and renders the pod and its Secret, whose `buildkitd.toml`
-/// names the cache registry at `cache_host`.
+/// names the cache registry at `registry_host`.
 pub fn prepare(
     pool: &BuildKitPool,
     ca: &CaBundle,
     slot: u32,
     now: OffsetDateTime,
     validity: Duration,
-    cache_host: Option<&str>,
+    registry_host: Option<&str>,
 ) -> Result<Worker, String> {
     let ns =
         Namespace::try_from(pool.namespace().unwrap_or_default()).map_err(|e| e.to_string())?;
@@ -103,7 +103,7 @@ pub fn prepare(
     };
     Ok(Worker {
         pod: render::worker_pod(pool, &inputs).map_err(|e| e.to_string())?,
-        secret: render::worker_secret(pool, &inputs, &pem, cache_host)
+        secret: render::worker_secret(pool, &inputs, &pem, registry_host)
             .map_err(|e| e.to_string())?,
         not_after,
     })

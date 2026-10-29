@@ -1,6 +1,6 @@
 //! `buildkit-controller`: API, edge and reconciler in one binary.
 //!
-//! `buildkit-controller cache` runs the cache registry role instead (see
+//! `buildkit-controller registry` runs the cache registry instead (see
 //! `registry`): no kube client, no election, only its own flags.
 //!
 //! Startup runs config (exit 2 when invalid), telemetry, kube client, shared
@@ -34,7 +34,7 @@ use buildkit_controller::election::kube_api::KubeLeaseApi;
 use buildkit_controller::election::{Elector, TokioClock};
 use buildkit_controller::http::HttpComponent;
 use buildkit_controller::reconcile::Reconciler;
-use buildkit_controller::registry::CacheArgs;
+use buildkit_controller::registry::RegistryArgs;
 use buildkit_controller::runtime::AppContext;
 use buildkit_controller::runtime::hooks::{Component, Hooks, LeaderWork};
 use buildkit_controller::runtime::leader::supervise;
@@ -44,8 +44,8 @@ use buildkit_controller::runtime::stop::Shutdown;
 use buildkit_controller::telemetry::{logs, ops};
 
 fn main() -> ExitCode {
-    if std::env::args_os().nth(1).is_some_and(|a| a == "cache") {
-        return cache_main();
+    if std::env::args_os().nth(1).is_some_and(|a| a == "registry") {
+        return registry_main();
     }
     let cli = Cli::parse();
     let settings = match Settings::load(cli, |k| std::env::var(k).ok()) {
@@ -95,10 +95,10 @@ fn main() -> ExitCode {
     }
 }
 
-/// The `cache` role. The first SIGTERM or SIGINT drains, a second exits at once.
-fn cache_main() -> ExitCode {
-    let args = CacheArgs::parse_from(std::env::args_os().skip(1));
-    let replica = std::env::var("POD_NAME").unwrap_or_else(|_| "cache".to_owned());
+/// The `registry` role. The first SIGTERM or SIGINT drains, a second exits at once.
+fn registry_main() -> ExitCode {
+    let args = RegistryArgs::parse_from(std::env::args_os().skip(1));
+    let replica = std::env::var("POD_NAME").unwrap_or_else(|_| "registry".to_owned());
     if let Err(e) = logs::init(&args.log_level, args.log_format, &replica) {
         eprintln!("{e:#}");
         return ExitCode::from(2);
