@@ -372,7 +372,7 @@ fn worker_secret_keys() {
     let data = s.data.unwrap();
     assert_eq!(
         data.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["buildkitd.toml", "ca.crt", "tls.crt", "tls.key"]
+        ["buildkitd.toml", "ca.crt", "client.crt", "client.key", "tls.crt", "tls.key"]
     );
     assert_eq!(data["buildkitd.toml"].0, b"debug = true\n");
     assert_eq!(s.type_.as_deref(), Some("Opaque"));
@@ -586,10 +586,10 @@ fn cached_config(cfg: &str) -> toml_edit::DocumentMut {
 }
 
 #[test]
-fn the_cache_registry_entry_uses_the_worker_key_pair_and_the_internal_ca() {
+fn the_cache_registry_entry_uses_the_worker_client_leaf_and_the_internal_ca() {
     assert_eq!(
         buildkitd_config("", Some(HOST)),
-        "[registry.\"bk-registry.bk.svc:5000\"]\nca = [\"/certs/ca.crt\"]\nkeypair = [{ key = \"/certs/tls.key\", cert = \"/certs/tls.crt\" }]\n"
+        "[registry.\"bk-registry.bk.svc:5000\"]\nca = [\"/certs/ca.crt\"]\nkeypair = [{ key = \"/certs/client.key\", cert = \"/certs/client.crt\" }]\n"
     );
     // Without a cache host the config passes through unread.
     assert_eq!(buildkitd_config("worker = 1\n", None), "worker = 1\n");

@@ -69,6 +69,7 @@ fn trusted(b: &CaBundle, p: Profile, der: &CertificateDer<'_>, now: OffsetDateTi
             now,
         ),
         Profile::EdgeClient => chains(der, internal, KeyUsage::client_auth(), None, now),
+        Profile::WorkerClient => chains(der, client, KeyUsage::client_auth(), None, now),
         Profile::CacheServing => chains(
             der,
             internal,
@@ -94,7 +95,10 @@ fn edge_names() -> EdgeNames {
 fn min_left_at_renewal(p: Profile) -> Duration {
     match p {
         // With 30 days, renewal leaves at least 10 days.
-        Profile::WorkerServing | Profile::CacheServing | Profile::EdgeServing => Duration::days(10),
+        Profile::WorkerServing
+        | Profile::WorkerClient
+        | Profile::CacheServing
+        | Profile::EdgeServing => Duration::days(10),
         // With 24 hours, renewal leaves at least 8 hours.
         Profile::EdgeClient => Duration::hours(8),
         Profile::Allocation => Duration::ZERO,

@@ -30,8 +30,9 @@ pub struct CacheArgs {
         default_value = "/var/lib/buildkit-cache"
     )]
     pub data_dir: PathBuf,
-    /// Holds `tls.crt` and `tls.key` (the serving cert) and `ca.crt` (the
-    /// internal CA, the only anchor for client certs). Re-read every minute.
+    /// Holds `tls.crt` and `tls.key` (the serving cert, from the internal CA) and
+    /// `ca.crt` (the client CA, the only anchor for the workers' registry client
+    /// certs). Re-read every minute.
     #[arg(
         long,
         env = "BUILDKIT_CACHE_TLS_DIR",

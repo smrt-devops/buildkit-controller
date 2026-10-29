@@ -12,6 +12,9 @@
 //! d. Deleting the pod cuts a live session, and the task measures the latency.
 //! e. A 512 MiB COPY through the edge, compared with one direct to buildkitd,
 //!    in MB/s.
+//! f. No certificate a worker holds (its serving cert, its registry client
+//!    cert, another worker's) is accepted by buildkitd, dialled from a pod the
+//!    worker `NetworkPolicy` admits; the edge client cert is.
 //!
 //! The controller's RBAC is the chart's (`templates/rbac.yaml`, rendered with
 //! `helm template`), so the "no 403s" check covers the RBAC that ships. Every
@@ -342,7 +345,8 @@ fn deploy(env: &Cluster, work: &Path, ca: &CaBundle, now: OffsetDateTime) -> Res
     p.metadata.uid = Some(uid);
 
     let serving = ca.issue_worker_serving(&worker_identity()?, now)?;
-    let tls = WorkerTlsPem::from_pki(&serving, ca.internal_ca())?;
+    let client = ca.issue_worker_client_for(&worker_identity()?, now, time::Duration::days(30))?;
+    let tls = WorkerTlsPem::from_pki(&serving, &client, ca.internal_ca())?;
     let expires = now + Duration::from_hours(2);
     let inputs = PodInputs {
         slot: 0,
@@ -510,6 +514,39 @@ fn scenarios(env: &Cluster, pod_ip: &str, r: &mut Report) -> Result<Vec<f64>> {
         ),
     );
 
+    // f. No certificate a worker holds opens a buildkitd: the client pod in the
+    // controller namespace passes the worker NetworkPolicy, so only TLS decides.
+    // The edge client cert is the control that the path is open.
+    let (ok, out) = client_in(
+        env,
+        SYSTEM_NS,
+        &format!("timeout 30 {} debug workers", direct("direct")),
+    )?;
+    r.check(
+        "f/edge client cert direct to worker accepted",
+        ok,
+        last_line(&out),
+    );
+    for (cert, what) in [
+        ("w2serve", "another worker's serving cert"),
+        ("w2client", "another worker's registry client cert"),
+        ("w1client", "the worker's own registry client cert"),
+    ] {
+        let (ok, out) = client_in(
+            env,
+            SYSTEM_NS,
+            &format!(
+                "timeout 30 {} debug workers; rc=$?; echo rc=$rc; exit $rc",
+                direct(cert)
+            ),
+        )?;
+        r.check(
+            &format!("f/{what} refused by buildkitd"),
+            !ok && out.contains("rc=1") && !out.contains("connection refused"),
+            last_line(&out),
+        );
+    }
+
     // e. Runs before d, which deletes the worker.
     let mut rates = Vec::new();
     for (name, ns, fl, dir) in [
@@ -655,6 +692,7 @@ fn client_certs(
         })
     };
     let hour = Duration::from_hours(1);
+    let month = time::Duration::days(30);
     let certs = [
         (
             "alloc",
@@ -669,6 +707,16 @@ fn client_certs(
             ca.issue_allocation(&id(OTHER_ALLOC)?, LeafKey::Generate, now, expires)?,
         ),
         ("direct", ca.issue_edge_client(now)?),
+        // What a worker holds: its serving cert and its registry client cert.
+        (
+            "w1client",
+            ca.issue_worker_client_for(&worker_identity()?, now, month)?,
+        ),
+        ("w2serve", ca.issue_worker_serving(&other_worker()?, now)?),
+        (
+            "w2client",
+            ca.issue_worker_client_for(&other_worker()?, now, month)?,
+        ),
     ];
     let mut files = std::collections::BTreeMap::new();
     files.insert(
@@ -728,6 +776,16 @@ fn worker_identity() -> Result<WorkerIdentity> {
         pool: POOL.parse()?,
         pod: format!("{POOL}-0"),
         nonce: NONCE.into(),
+    })
+}
+
+/// Another worker of the pool: credentials of the same CA the target worker
+/// must refuse.
+fn other_worker() -> Result<WorkerIdentity> {
+    Ok(WorkerIdentity {
+        pod: format!("{POOL}-1"),
+        nonce: "00000000000000bb".into(),
+        ..worker_identity()?
     })
 }
 

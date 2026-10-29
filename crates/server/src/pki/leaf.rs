@@ -77,9 +77,12 @@ impl From<ring::error::Unspecified> for IssueError {
 pub enum Profile {
     /// Allocation certificate: client CA, clientAuth, never renewed.
     Allocation,
-    /// Worker certificate: internal CA, serverAuth (buildkitd) and clientAuth (to the
-    /// cache registry).
+    /// Worker serving certificate: internal CA, serverAuth.
     WorkerServing,
+    /// Worker registry client certificate: client CA, clientAuth, with the worker's
+    /// DNS name. Only the cache registry accepts it: buildkitd trusts the internal CA
+    /// alone, and the edge wants an allocation URI.
+    WorkerClient,
     /// Cache registry serving certificate: internal CA, serverAuth.
     CacheServing,
     /// Edge and API serving certificate: client CA, serverAuth (self-issued default).
@@ -376,15 +379,32 @@ impl CaBundle {
             profile: Profile::WorkerServing,
             cn: "buildkitd",
             sans: vec![dns(id.dns_name())?],
-            // clientAuth too: buildkitd presents it to the cache registry.
-            eku: vec![
-                ExtendedKeyUsagePurpose::ServerAuth,
-                ExtendedKeyUsagePurpose::ClientAuth,
-            ],
+            eku: vec![ExtendedKeyUsagePurpose::ServerAuth],
             not_before: checked_sub(now, BACKDATE)?,
             not_after: checked_add(now, validity)?,
         };
         issue(self.internal_ca(), spec, LeafKey::Generate)
+    }
+
+    /// Worker registry client certificate with DNS [`WorkerIdentity::dns_name`] and its
+    /// own key, from the client CA, valid for `validity`. Never accepted by a buildkitd,
+    /// which trusts only the internal CA.
+    pub fn issue_worker_client_for(
+        &self,
+        id: &WorkerIdentity,
+        now: OffsetDateTime,
+        validity: Duration,
+    ) -> Result<IssuedCert, IssueError> {
+        let now = whole_seconds(now);
+        let spec = Spec {
+            profile: Profile::WorkerClient,
+            cn: "buildkitd",
+            sans: vec![dns(id.dns_name())?],
+            eku: vec![ExtendedKeyUsagePurpose::ClientAuth],
+            not_before: checked_sub(now, BACKDATE)?,
+            not_after: checked_add(now, validity)?,
+        };
+        issue(self.client_ca(), spec, LeafKey::Generate)
     }
 
     /// Cache registry serving certificate for DNS `name`, valid for `validity`.

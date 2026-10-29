@@ -254,7 +254,7 @@ fn worker_serving_profile_and_renewal() {
         b.internal_ca(),
         "buildkitd",
         &[GeneralName::DNSName(name)],
-        (true, true),
+        (false, true),
         Duration::days(30),
         t,
     );
@@ -264,8 +264,8 @@ fn worker_serving_profile_and_renewal() {
         KeyUsage::server_auth(),
         t
     ));
-    // buildkitd presents it to the cache registry.
-    assert!(chain_ok(
+    // Never a client cert: no buildkitd may accept it from another worker.
+    assert!(!chain_ok(
         c.cert_der(),
         b.internal_ca().cert_der(),
         KeyUsage::client_auth(),
@@ -717,4 +717,55 @@ fn cache_serving_profile() {
         KeyUsage::server_auth(),
         t
     ));
+}
+
+/// The worker's registry client cert chains only to the client CA, which no
+/// buildkitd trusts, and carries no allocation URI, so the edge refuses it too.
+#[test]
+fn worker_client_profile_is_accepted_by_the_registry_only() {
+    let t = now();
+    let b = CaBundle::generate(t).unwrap();
+    let id = WorkerIdentity {
+        namespace: "ci".parse().unwrap(),
+        pool: "default".parse().unwrap(),
+        pod: "default-3".into(),
+        nonce: "0123456789abcdef".into(),
+    };
+    let c = b
+        .issue_worker_client_for(&id, t, Duration::days(30))
+        .unwrap();
+    let name = "0123456789abcdef.default-3.default.ci.worker.buildkit.internal";
+    assert_eq!(c.profile(), Profile::WorkerClient);
+    assert_leaf(
+        &c,
+        b.client_ca(),
+        "buildkitd",
+        &[GeneralName::DNSName(name)],
+        (true, false),
+        Duration::days(30),
+        t,
+    );
+    assert!(chain_ok(
+        c.cert_der(),
+        b.client_ca().cert_der(),
+        KeyUsage::client_auth(),
+        t
+    ));
+    // buildkitd's only anchor is the internal CA.
+    assert!(!chain_ok(
+        c.cert_der(),
+        b.internal_ca().cert_der(),
+        KeyUsage::client_auth(),
+        t
+    ));
+    assert!(!chain_ok(
+        c.cert_der(),
+        b.client_ca().cert_der(),
+        KeyUsage::server_auth(),
+        t
+    ));
+    assert!(verify_allocation_cert(c.cert_der(), b.client_ca().cert_der(), unix(t)).is_err());
+    // Its own key, not the serving cert's.
+    let s = b.issue_worker_serving(&id, t).unwrap();
+    assert_ne!(c.private_key_pem(), s.private_key_pem());
 }

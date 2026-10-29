@@ -253,13 +253,16 @@ mod tests {
         );
     }
 
-    /// The certificate the reconciler gives a worker names the pod the
-    /// registry looks up.
+    /// The registry client certificate the reconciler gives a worker names the
+    /// pod the registry looks up; its serving certificate is no client cert.
     #[test]
     fn a_worker_certificate_identifies_its_pod() {
-        let ca = CaBundle::generate(OffsetDateTime::now_utc()).unwrap();
+        let now = OffsetDateTime::now_utc();
+        let ca = CaBundle::generate(now).unwrap();
+        let serving = ca.issue_worker_serving(&peer(), now).unwrap();
+        assert!(peer_identity(&CertificateDer::from(serving.cert_der().to_vec())).is_err());
         let c = ca
-            .issue_worker_serving(&peer(), OffsetDateTime::now_utc())
+            .issue_worker_client_for(&peer(), now, time::Duration::days(30))
             .unwrap();
         let id = peer_identity(&CertificateDer::from(c.cert_der().to_vec())).unwrap();
         assert_eq!(id, peer());

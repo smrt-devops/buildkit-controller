@@ -11,7 +11,7 @@ metadata:
     app.kubernetes.io/name: buildkitd
     buildkit.smrt-devops.net/pool: platform-arm64
     buildkit.smrt-devops.net/state: free
-    buildkit.smrt-devops.net/template-hash: e470658845
+    buildkit.smrt-devops.net/template-hash: b2667f7e3b
   name: platform-arm64-0
   namespace: render-verify
   ownerReferences:
@@ -109,6 +109,10 @@ spec:
         path: tls.key
       - key: ca.crt
         path: ca.crt
+      - key: client.crt
+        path: client.crt
+      - key: client.key
+        path: client.key
       - key: buildkitd.toml
         path: buildkitd.toml
       secretName: platform-arm64-0-00000000000000aa

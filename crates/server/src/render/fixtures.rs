@@ -212,6 +212,8 @@ pub fn fake_tls() -> WorkerTlsPem {
         cert: FAKE_CERT.into(),
         key: "fixture-key-not-a-real-key\n".into(),
         ca: FAKE_CERT.into(),
+        client_cert: FAKE_CERT.into(),
+        client_key: "fixture-client-key-not-a-real-key\n".into(),
     }
 }
 

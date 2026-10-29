@@ -45,7 +45,8 @@ fn pool_meta(pool: &BuildKitPool) -> Result<ObjectMeta, RenderError> {
 }
 
 /// The per-pod Secret `<pod>-<nonce>` of the pod [`super::worker_pod`] renders
-/// from the same `inputs`: `tls.crt`, `tls.key`, `ca.crt`, `buildkitd.toml`.
+/// from the same `inputs`: `tls.crt`, `tls.key`, `ca.crt`, `client.crt`, `client.key`
+/// (the registry client leaf) and `buildkitd.toml`.
 /// `cache_host` adds the cache registry entry to `buildkitd.toml`.
 /// It carries the pool's ownerReference as rendered; [`crate::reconcile::spawn`]
 /// replaces it with the pod's before the Secret is created.
@@ -66,6 +67,8 @@ pub fn worker_secret(
             ("tls.crt".to_owned(), bytes(&tls.cert)),
             ("tls.key".to_owned(), bytes(&tls.key)),
             ("ca.crt".to_owned(), bytes(&tls.ca)),
+            ("client.crt".to_owned(), bytes(&tls.client_cert)),
+            ("client.key".to_owned(), bytes(&tls.client_key)),
             (
                 "buildkitd.toml".to_owned(),
                 bytes(&super::buildkitd_config(

@@ -226,6 +226,10 @@ pub struct WorkerTlsPem {
     pub key: String,
     /// Internal CA certificate only.
     pub ca: String,
+    /// The worker's registry client certificate (client CA, its own key).
+    pub client_cert: String,
+    /// Its PKCS#8 private key.
+    pub client_key: String,
 }
 
 impl fmt::Debug for WorkerTlsPem {
@@ -235,12 +239,19 @@ impl fmt::Debug for WorkerTlsPem {
 }
 
 impl WorkerTlsPem {
-    /// Collect the PEMs from a freshly issued worker cert and the internal CA.
-    pub fn from_pki(cert: &IssuedCert, internal_ca: &Ca) -> Result<Self, RenderError> {
+    /// Collect the PEMs from a freshly issued worker serving cert, the worker's
+    /// registry client cert and the internal CA.
+    pub fn from_pki(
+        cert: &IssuedCert,
+        client: &IssuedCert,
+        internal_ca: &Ca,
+    ) -> Result<Self, RenderError> {
         Ok(Self {
             cert: cert.cert_pem().to_owned(),
             key: cert.private_key_pem().ok_or(RenderError::NoPrivateKey)?,
             ca: internal_ca.cert_pem().to_owned(),
+            client_cert: client.cert_pem().to_owned(),
+            client_key: client.private_key_pem().ok_or(RenderError::NoPrivateKey)?,
         })
     }
 }

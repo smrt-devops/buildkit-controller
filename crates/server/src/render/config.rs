@@ -7,7 +7,8 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TomlError, Value};
 use super::hash::sha256_hex;
 
 /// The pool's `buildkitdConfig` with a `[registry."<cache_host>"]` entry that
-/// trusts the internal CA and presents the worker certificate. Without a
+/// trusts the internal CA and presents the worker's registry client certificate
+/// (`client.crt`, from the client CA, which no buildkitd trusts). Without a
 /// cache host, or for a config [`with_registry`] refuses, the config is
 /// returned unchanged: `validate_template` reports a refused one, so no pod
 /// is rendered from it.
@@ -34,8 +35,8 @@ pub(super) fn with_registry(cfg: &str, host: &str) -> Result<String, String> {
         Value::Array(Array::from_iter(["/certs/ca.crt"])),
     );
     let mut pair = InlineTable::new();
-    pair.insert("key", "/certs/tls.key".into());
-    pair.insert("cert", "/certs/tls.crt".into());
+    pair.insert("key", "/certs/client.key".into());
+    pair.insert("cert", "/certs/client.crt".into());
     set(entry, "keypair", Value::Array(Array::from_iter([pair])));
     Ok(doc.to_string())
 }

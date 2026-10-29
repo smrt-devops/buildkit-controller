@@ -2,10 +2,11 @@
 //!
 //! The registry pod mounts the Secret `cache.tlsSecretName` (in the
 //! controller namespace) and re-reads it every minute. The leader issues its
-//! certificate from the internal CA for the host of `cache.host`, puts the
-//! internal CA next to it (the only anchor for worker client certificates),
-//! and reissues it when the internal CA changes or two thirds of its life
-//! have passed. The registry never sees a CA key.
+//! certificate from the internal CA (which workers trust) for the host of
+//! `cache.host`, puts the client CA next to it as `ca.crt` (the anchor for the
+//! workers' registry client certificates, which no buildkitd trusts), and
+//! reissues it when either CA changes or two thirds of its life have passed.
+//! The registry never sees a CA key.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -57,10 +58,10 @@ pub fn decide(
     t: &Target,
     now: OffsetDateTime,
 ) -> Result<Decision, IssueError> {
-    let ca_pem = ca.internal_ca().cert_pem();
+    let ca_pem = ca.client_ca().cert_pem();
     if let Some(renew_at) = have
         .filter(|s| field(s, "ca.crt") == Some(ca_pem.as_bytes()) && field(s, "tls.key").is_some())
-        .and_then(|s| current_until(field(s, "tls.crt")?, &t.server_name))
+        .and_then(|s| current_until(field(s, "tls.crt")?, &t.server_name, ca, now))
         .filter(|at| *at > now)
     {
         return Ok(Decision::Keep(renew_at));
@@ -95,10 +96,33 @@ fn field<'a>(s: &'a Secret, key: &str) -> Option<&'a [u8]> {
     s.data.as_ref()?.get(key).map(|v| v.0.as_slice())
 }
 
-/// When a certificate that names exactly `name` is due for renewal (two
-/// thirds of its life), or `None` when it does not parse or names another host.
-fn current_until(pem: &[u8], name: &str) -> Option<OffsetDateTime> {
+/// When a serving certificate of the current internal CA that names exactly
+/// `name` is due for renewal (two thirds of its life), or `None` when it does
+/// not parse, does not chain to that CA, or names another host.
+fn current_until(
+    pem: &[u8],
+    name: &str,
+    ca: &CaBundle,
+    now: OffsetDateTime,
+) -> Option<OffsetDateTime> {
     let (_, pem) = parse_x509_pem(pem).ok()?;
+    let anchor = webpki::anchor_from_trusted_cert(ca.internal_ca().cert_der()).ok()?;
+    let der = rustls_pki_types::CertificateDer::from(pem.contents.as_slice());
+    let at = rustls_pki_types::UnixTime::since_unix_epoch(Duration::from_secs(
+        u64::try_from(now.unix_timestamp()).ok()?,
+    ));
+    webpki::EndEntityCert::try_from(&der)
+        .ok()?
+        .verify_for_usage(
+            &[webpki::ring::ECDSA_P256_SHA256],
+            &[anchor],
+            &[],
+            at,
+            webpki::KeyUsage::server_auth(),
+            None,
+            None,
+        )
+        .ok()?;
     let cert = pem.parse_x509().ok()?;
     let names: Vec<&str> = cert
         .extensions()
@@ -125,12 +149,16 @@ fn current_until(pem: &[u8], name: &str) -> Option<OffsetDateTime> {
 /// leader last loaded it.
 pub async fn keep(client: kube::Client, t: Target, ca: impl Fn() -> Option<CaBundle>) {
     let api: Api<Secret> = Api::namespaced(client, &t.namespace);
-    // The internal CA and the renewal time of the last Secret seen current.
+    // Both CAs and the renewal time of the last Secret seen current.
     let mut held: Option<(String, OffsetDateTime)> = None;
     loop {
         let now = OffsetDateTime::now_utc();
         if let Some(bundle) = ca() {
-            let fp = bundle.internal_ca().fingerprint_hex();
+            let fp = format!(
+                "{}{}",
+                bundle.internal_ca().fingerprint_hex(),
+                bundle.client_ca().fingerprint_hex()
+            );
             let due = held.as_ref().is_none_or(|(f, at)| *f != fp || *at <= now);
             if due {
                 held = sync(&api, &t, &bundle, now).await.map(|at| (fp, at));
@@ -214,7 +242,7 @@ mod tests {
         assert_eq!(s.type_.as_deref(), Some("kubernetes.io/tls"));
         assert_eq!(
             field(&s, "ca.crt"),
-            Some(ca.internal_ca().cert_pem().as_bytes())
+            Some(ca.client_ca().cert_pem().as_bytes())
         );
         assert!(at > now + time::Duration::days(19) && at < now + time::Duration::days(21));
         s.metadata.resource_version = Some("7".into());
@@ -237,12 +265,33 @@ mod tests {
         let (s2, _) = write(decide(Some(&s), &other, &target(), now).unwrap());
         assert_eq!(
             field(&s2, "ca.crt"),
-            Some(other.internal_ca().cert_pem().as_bytes())
+            Some(other.client_ca().cert_pem().as_bytes())
         );
         let moved = Target {
             server_name: "elsewhere.bk.svc".into(),
             ..target()
         };
         write(decide(Some(&s), &ca, &moved, now).unwrap());
+    }
+
+    /// The serving cert must come from the internal CA workers trust: a Secret
+    /// whose `ca.crt` is current but whose serving cert another CA issued is
+    /// reissued.
+    #[test]
+    fn a_serving_cert_of_another_internal_ca_is_reissued() {
+        let now = OffsetDateTime::now_utc();
+        let (old, new) = (
+            CaBundle::generate(now).unwrap(),
+            CaBundle::generate(now).unwrap(),
+        );
+        let (mut s, _) = write(decide(None, &old, &target(), now).unwrap());
+        s.data.as_mut().unwrap().insert(
+            "ca.crt".into(),
+            ByteString(new.client_ca().cert_pem().as_bytes().to_vec()),
+        );
+        let (fresh, _) = write(decide(Some(&s), &new, &target(), now).unwrap());
+        let crt = field(&fresh, "tls.crt").unwrap();
+        assert!(current_until(crt, "bk-registry.bk.svc", &new, now).is_some());
+        assert!(current_until(crt, "bk-registry.bk.svc", &old, now).is_none());
     }
 }

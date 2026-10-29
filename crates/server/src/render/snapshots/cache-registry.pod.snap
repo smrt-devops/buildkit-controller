@@ -15,7 +15,7 @@ metadata:
     app.kubernetes.io/name: buildkitd
     buildkit.smrt-devops.net/pool: cache-registry
     buildkit.smrt-devops.net/state: free
-    buildkit.smrt-devops.net/template-hash: 25f3041ccd
+    buildkit.smrt-devops.net/template-hash: e2d7eed739
   name: cache-registry-0
   namespace: render-verify
   ownerReferences:
@@ -111,6 +111,10 @@ spec:
         path: tls.key
       - key: ca.crt
         path: ca.crt
+      - key: client.crt
+        path: client.crt
+      - key: client.key
+        path: client.key
       - key: buildkitd.toml
         path: buildkitd.toml
       secretName: cache-registry-0-00000000000000aa

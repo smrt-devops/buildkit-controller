@@ -135,9 +135,16 @@ fn volumes(pool: &BuildKitPool) -> Vec<Volume> {
                 secret_name: None,
                 default_mode: Some(0o440),
                 items: Some(
-                    ["tls.crt", "tls.key", "ca.crt", "buildkitd.toml"]
-                        .map(item)
-                        .to_vec(),
+                    [
+                        "tls.crt",
+                        "tls.key",
+                        "ca.crt",
+                        "client.crt",
+                        "client.key",
+                        "buildkitd.toml",
+                    ]
+                    .map(item)
+                    .to_vec(),
                 ),
                 optional: None,
             }),

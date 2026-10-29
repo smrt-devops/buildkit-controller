@@ -62,12 +62,13 @@ pub struct Worker {
     pub pod: Pod,
     /// `<pod>-<nonce>`; [`spawn`] makes the pod its owner.
     pub secret: Secret,
-    /// The serving cert's notAfter.
+    /// The earlier notAfter of its serving and registry client certs.
     pub not_after: OffsetDateTime,
 }
 
-/// Picks a nonce, issues the serving cert for `<nonce>.<pod>.<pool>.<ns>` valid
-/// for `validity`, and renders the pod and its Secret, whose `buildkitd.toml`
+/// Picks a nonce, issues the serving cert (internal CA) and the registry client
+/// cert (client CA, its own key) for `<nonce>.<pod>.<pool>.<ns>` valid for
+/// `validity`, and renders the pod and its Secret, whose `buildkitd.toml`
 /// names the cache registry at `cache_host`.
 pub fn prepare(
     pool: &BuildKitPool,
@@ -85,12 +86,17 @@ pub fn prepare(
     let cert = ca
         .issue_worker_serving_for(&id, now, validity)
         .map_err(|e| e.to_string())?;
-    let pem = WorkerTlsPem::from_pki(&cert, ca.internal_ca()).map_err(|e| e.to_string())?;
+    let client = ca
+        .issue_worker_client_for(&id, now, validity)
+        .map_err(|e| e.to_string())?;
+    let pem =
+        WorkerTlsPem::from_pki(&cert, &client, ca.internal_ca()).map_err(|e| e.to_string())?;
+    // Either CA can end first; the pod is good until the earlier leaf ends.
+    let not_after = cert.not_after().min(client.not_after());
     let inputs = PodInputs {
         slot,
         internal_ca_fingerprint: ca.internal_ca().fingerprint_hex(),
-        worker_cert_not_after: cert
-            .not_after()
+        worker_cert_not_after: not_after
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| e.to_string())?,
         nonce: id.nonce,
@@ -99,7 +105,7 @@ pub fn prepare(
         pod: render::worker_pod(pool, &inputs).map_err(|e| e.to_string())?,
         secret: render::worker_secret(pool, &inputs, &pem, cache_host)
             .map_err(|e| e.to_string())?,
-        not_after: cert.not_after(),
+        not_after,
     })
 }
 
