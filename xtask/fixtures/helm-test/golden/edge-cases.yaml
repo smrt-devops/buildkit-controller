@@ -490,7 +490,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: controller
-          image: "ghcr.io/smrt-devops/buildkit-controller:0.2.0"
+          image: "ghcr.io/smrt-devops/buildkit-controller:0.2.0@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
@@ -582,7 +582,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: registry
-          image: "ghcr.io/smrt-devops/buildkit-controller:0.2.0"
+          image: "ghcr.io/smrt-devops/buildkit-controller:0.2.0@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
           imagePullPolicy: IfNotPresent
           args: [registry]
           securityContext:

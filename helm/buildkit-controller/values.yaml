@@ -3,7 +3,7 @@
 
 image:
   repository: ghcr.io/smrt-devops/buildkit-controller
-  tag: ""            # defaults to .Chart.AppVersion
+  tag: ""            # defaults to .Chart.AppVersion; "0.2.0@sha256:<digest>" pins the digest
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 nameOverride: ""
