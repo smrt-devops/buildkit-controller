@@ -28,7 +28,7 @@ use super::claims::{self, reason};
 use super::pods::{ann, is_ready};
 use super::{BindConfig, Binder, Shared};
 use crate::reconcile::driver::{Trigger, schedule};
-use crate::render::{ANN_ALLOC, ANN_CLAIM, FREE, LABEL_POOL};
+use crate::render::{ANN_ALLOC, ANN_CLAIM, ANN_OWNER, FREE, LABEL_POOL};
 use crate::runtime::AppContext;
 use crate::runtime::hooks::{BoxResult, Component, LeaderWork};
 use crate::runtime::leader::{BoxFut, supervise};
@@ -297,9 +297,15 @@ fn listed_only(
     claims.retain(|c| listed(c.metadata.namespace.as_deref()));
     pods.retain(|p| {
         listed(
+            // Workers bound by an earlier version name the claim only in the owner.
             ann(p, ANN_CLAIM)
                 .and_then(|r| r.split_once('/'))
-                .map(|(ns, _)| ns),
+                .map(|(ns, _)| ns)
+                .or_else(|| {
+                    ann(p, ANN_OWNER)
+                        .and_then(claims::claim_owner)
+                        .map(|(ns, _)| ns)
+                }),
         )
     });
     (claims, pods)
@@ -482,6 +488,20 @@ mod listed_tests {
         })
     }
 
+    /// A worker bound by an earlier version: the claim is named only in the owner.
+    fn owned_worker(claim_ns: &str) -> Arc<Pod> {
+        Arc::new(Pod {
+            metadata: ObjectMeta {
+                name: Some(format!("old-{claim_ns}")),
+                annotations: Some(
+                    [(ANN_OWNER.to_owned(), format!("claim:{claim_ns}/c#u1"))].into(),
+                ),
+                ..ObjectMeta::default()
+            },
+            ..Pod::default()
+        })
+    }
+
     /// A claims namespace given up (its `RoleBinding` was deleted) must not
     /// make its bound workers look like strays to release.
     #[test]
@@ -489,7 +509,13 @@ mod listed_tests {
         let unlisted = HashSet::from(["b".to_owned()]);
         let (claims, pods) = listed_only(
             vec![claim("a"), claim("b")],
-            vec![worker(Some("a")), worker(Some("b")), worker(None)],
+            vec![
+                worker(Some("a")),
+                worker(Some("b")),
+                worker(None),
+                owned_worker("a"),
+                owned_worker("b"),
+            ],
             &unlisted,
         );
         let ns: Vec<_> = claims
@@ -501,6 +527,6 @@ mod listed_tests {
             .iter()
             .map(|p| p.metadata.name.clone().unwrap())
             .collect();
-        assert_eq!(names, ["w-a", "w-none"]);
+        assert_eq!(names, ["w-a", "w-none", "old-a"]);
     }
 }

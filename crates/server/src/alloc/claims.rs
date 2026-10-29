@@ -449,7 +449,7 @@ fn unclaimed_stray<S: std::hash::BuildHasher>(
 }
 
 /// `(namespace, uid)` of a claim owner string `claim:<ns>/<name>#<uid>`.
-fn claim_owner(s: &str) -> Option<(&str, &str)> {
+pub(crate) fn claim_owner(s: &str) -> Option<(&str, &str)> {
     let (ns, rest) = s.strip_prefix("claim:")?.split_once('/')?;
     let (name, uid) = rest.split_once('#')?;
     (!ns.is_empty() && !name.is_empty() && !uid.is_empty()).then_some((ns, uid))
