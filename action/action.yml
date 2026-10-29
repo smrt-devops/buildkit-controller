@@ -12,7 +12,8 @@ inputs:
     description: Allocation TTL, e.g. 3600, 90m or 1h (default is the pool default).
     required: false
   queue-timeout:
-    description: How long to wait in the queue, e.g. 300 or 5m (default is the pool default). Also bounds the whole allocation: the Action keeps polling a queued allocation and retrying a 503 with Retry-After, or a queue timeout that ran out, for at most this long (the pool default when unset) plus 60 seconds.
+    description: >-
+      How long to wait in the queue, e.g. 300 or 5m (default is the pool default). Also bounds the whole allocation: the Action keeps polling a queued allocation and retrying a 503 with Retry-After, or a queue timeout that ran out, for at most this long (the pool default when unset) plus 60 seconds.
     required: false
   audience:
     description: OIDC token audience.
