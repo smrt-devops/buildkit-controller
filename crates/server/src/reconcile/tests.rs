@@ -137,6 +137,7 @@ impl Fx {
             time_zone: self.tz.clone(),
             template: self.template.clone(),
             network: &self.network,
+            controller_namespace: "bk-system",
             platforms: Vec::new(),
             ca: self.ca,
             ca_bundle_current: true,
@@ -1310,4 +1311,25 @@ fn sandbox_is_applied_again_after_the_reapply_period() {
     assert_eq!(p.requeue_at, Some(ago(60) + REAPPLY_AFTER));
     f.sandbox = Some((1, *NOW - REAPPLY_AFTER));
     assert_eq!(applies(&f.plan()), 2);
+}
+
+/// A pool in the controller's namespace is refused: no sandbox, no creates,
+/// `Ready=False/InvalidSpec`.
+#[test]
+fn pool_in_the_controller_namespace_is_invalid_spec() {
+    let mut f = fx().scale(2, 10);
+    f.sandbox = None;
+    f.pool.metadata.namespace = Some("bk-system".into());
+    let p = f.plan();
+    assert!(creates(&p).is_empty());
+    assert!(
+        !p.actions
+            .iter()
+            .any(|a| matches!(a, Action::ApplySa | Action::ApplyNetworkPolicy))
+    );
+    let c = cond(&p, "Ready");
+    assert_eq!(
+        (c.reason.as_str(), c.message.as_str()),
+        ("InvalidSpec", "pool is in the controller's namespace")
+    );
 }
