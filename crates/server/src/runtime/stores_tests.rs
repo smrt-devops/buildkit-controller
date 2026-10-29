@@ -724,3 +724,62 @@ async fn a_strict_merge_is_ready_again_once_every_namespace_relisted() {
     assert!(readiness.failing().is_empty());
     assert_eq!(keys(&store), ["a/p2", "b/q2"]);
 }
+
+/// A namespace given up is marked listed again only once its relist is in the
+/// store: before that the leader would see it as listed but empty, and release
+/// the workers of its claims as strays.
+#[tokio::test(start_paused = true)]
+async fn a_namespace_listed_again_is_unmarked_only_after_its_objects_are_stored() {
+    let (store, writer) = reflector::store::<Pod>();
+    let (a, wa) = fed(10);
+    let (b, wb) = fed(10);
+    let tagged = stream::select_all([
+        restarting(wa).map(|ev| (0, ev)).boxed(),
+        restarting(wb).map(|ev| (1, ev)).boxed(),
+    ]);
+    let readiness = Arc::new(Readiness::default());
+    let merged = merge_tolerant(
+        tagged.boxed(),
+        vec!["a".into(), "b".into()],
+        store.clone(),
+        NamespaceReport::full("pod", Arc::new(Metrics::new()), Arc::clone(&readiness)),
+    );
+    let flag = readiness.register("pod_store");
+    let early = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let given_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (rd, st, ea, gu) = (
+        Arc::clone(&readiness),
+        store.clone(),
+        Arc::clone(&early),
+        Arc::clone(&given_up),
+    );
+    // Checked after each event is applied: what the leader could see then.
+    let check = move || {
+        let marked = !rd.degraded().is_empty();
+        if marked {
+            gu.store(true, std::sync::atomic::Ordering::SeqCst);
+        } else if gu.load(std::sync::atomic::Ordering::SeqCst)
+            && !keys(&st).contains(&"b/q1".to_owned())
+        {
+            ea.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    };
+    let tap = check.clone();
+    tokio::spawn(drive(writer, merged, flag, |_| {}, move |_| tap()));
+    let t0 = tokio::time::Instant::now();
+    send(&a[0], listed(&[pod_in("a", "p1")]));
+    fail_every(&b[..5]);
+    at(t0, GIVE_UP_AFTER + SEC).await;
+    assert_eq!(readiness.degraded(), ["pod_store/b"]);
+    send(&b[5], listed(&[pod_in("b", "q1")]));
+    for _ in 0..50 {
+        settle().await;
+        check();
+    }
+    assert!(readiness.degraded().is_empty(), "b is listed again");
+    assert_eq!(keys(&store), ["a/p1", "b/q1"]);
+    assert!(
+        !early.load(std::sync::atomic::Ordering::SeqCst),
+        "b was unmarked before its objects were stored"
+    );
+}

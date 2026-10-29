@@ -573,6 +573,13 @@ where
     report: Option<NamespaceReport>,
     /// A namespace failed since the last full list was sent.
     erred: bool,
+    /// Items handed to the consumer so far.
+    sent: u64,
+    /// Namespaces listed again, each reported once the consumer has taken
+    /// (and so applied) the first `.0` items: clearing the degraded mark
+    /// earlier would show the leader a namespace whose objects are not in the
+    /// store yet.
+    listed_after: VecDeque<(u64, String)>,
 }
 
 fn same<K: Resource>(a: &K, b: &K) -> bool {
@@ -603,6 +610,8 @@ where
             out: VecDeque::new(),
             report,
             erred: false,
+            sent: 0,
+            listed_after: VecDeque::new(),
         }
     }
 
@@ -612,7 +621,9 @@ where
     ) -> impl Stream<Item = watcher::Result<watcher::Event<K>>> + Send + 'static {
         stream::unfold((tagged, self), |(mut tagged, mut m)| async move {
             loop {
+                m.report_listed();
                 if let Some(ev) = m.out.pop_front() {
+                    m.sent += 1;
                     return Some((ev, (tagged, m)));
                 }
                 let give_up = m.next_give_up();
@@ -702,14 +713,33 @@ where
         let Some(n) = self.ns.get_mut(i) else {
             return;
         };
+        let regained = std::mem::take(&mut n.given_up).then(|| n.name.clone());
+        self.merge_list(i, objs);
+        if let Some(name) = regained {
+            let at = self.sent + self.out.len() as u64;
+            self.listed_after.push_back((at, name));
+        }
+    }
+
+    /// Report the namespaces whose relist the consumer has taken.
+    fn report_listed(&mut self) {
+        while let Some((at, _)) = self.listed_after.front()
+            && *at <= self.sent
+            && let Some((_, name)) = self.listed_after.pop_front()
+        {
+            if let Some(r) = &self.report {
+                r.listed(&name);
+            }
+        }
+    }
+
+    fn merge_list(&mut self, i: usize, objs: Vec<K>) {
+        let Some(n) = self.ns.get_mut(i) else {
+            return;
+        };
         n.listed = true;
         n.current = true;
         n.failing_since = None;
-        if std::mem::take(&mut n.given_up)
-            && let Some(r) = &self.report
-        {
-            r.listed(&n.name);
-        }
         let ns = n.name.clone();
         if let Some(held) = &mut self.initial {
             held.retain(|x| x.meta().namespace.as_ref() != Some(&ns));
