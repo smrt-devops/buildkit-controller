@@ -142,7 +142,7 @@ fn full_template() -> Value {
         },
         "workers": {
             "buildkitdConfig": "[worker.oci]\n  max-parallelism = 4\n",
-            "cache": {"sizeLimit": "50Gi"}
+            "stateSizeLimit": "50Gi"
         }
     })
 }
