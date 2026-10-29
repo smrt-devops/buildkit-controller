@@ -191,34 +191,6 @@ fn a_claim_the_pool_refuses_is_not_demand() {
     assert_eq!(position(&refused, &served(), OWN, &mine), Some(1));
 }
 
-/// Active claims count per owner and pool: pending and bound, not ended,
-/// not the claim being retried, and only in the controller's namespace.
-#[test]
-fn active_claims_count_per_owner_and_pool() {
-    let owned = |ns: &str, name: &str, owner: &str, phase: Option<ClaimPhase>| {
-        let mut c = claim(ns, name, name, "2026-10-21T12:00:00Z");
-        c.spec.owner = Some(owner.into());
-        Arc::new(match phase {
-            Some(p) => with_phase(c, p),
-            None => c,
-        })
-    };
-    let all = vec![
-        owned(OWN, "a", "x", None),
-        owned(OWN, "b", "x", Some(ClaimPhase::Bound)),
-        owned(OWN, "c", "x", Some(ClaimPhase::Failed)),
-        owned(OWN, "d", "y", None),
-        owned("ci", "e", "x", None),
-    ];
-    let pool = ("pools".to_owned(), "default".to_owned());
-    assert_eq!(active_of(&all, OWN, "x", &pool, ""), 2);
-    assert_eq!(active_of(&all, OWN, "x", &pool, "a"), 1);
-    assert_eq!(
-        active_of(&all, OWN, "x", &("pools".into(), "other".into()), ""),
-        0
-    );
-}
-
 #[test]
 fn deadlines_grace_and_expiry() {
     let c = claim("ci", "a", "u1", "2026-10-21T12:00:00Z");
@@ -281,7 +253,6 @@ fn finished_ci_claims_are_collected_after_ten_minutes() {
         ClaimPhase::Failed,
         reason::QUEUE_TIMEOUT,
         "",
-        None,
     ));
     let ended = c.status.as_ref().unwrap().conditions[0]
         .last_transition_time
@@ -364,7 +335,7 @@ fn finished_claims_answer_with_their_api_error() {
     let c = claim(OWN, "a", "u1", "2026-10-21T12:00:00Z");
     let failed = |r: &str| {
         let mut x = c.clone();
-        x.status = Some(unbound_status(&c, ClaimPhase::Failed, r, "msg", None));
+        x.status = Some(unbound_status(&c, ClaimPhase::Failed, r, "msg"));
         api_error(&x).unwrap().0
     };
     assert_eq!(failed(reason::QUEUE_TIMEOUT), ErrorCode::PoolExhausted);
@@ -398,10 +369,10 @@ fn statuses_and_the_secret() {
         (Some("default-0"), Some("CERT"))
     );
     assert_eq!(bound_status(&c, &binding("a1"), false).secret_name, None);
-    let p = unbound_status(&c, ClaimPhase::Pending, reason::QUEUED, "waiting", Some(4));
+    let p = unbound_status(&c, ClaimPhase::Pending, reason::QUEUED, "waiting");
     assert_eq!(
-        (p.queue_position, p.conditions[0].status.as_str()),
-        (Some(4), "False")
+        (p.phase, p.conditions[0].status.as_str()),
+        (Some(ClaimPhase::Pending), "False")
     );
     let s = secret(&c, &binding("a1"), "KEY", Some("CA")).unwrap();
     assert_eq!(s.metadata.name.as_deref(), Some("build-buildkit"));

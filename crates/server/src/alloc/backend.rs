@@ -298,10 +298,9 @@ impl Backend for KubeBackend {
 }
 
 /// Status fields a write may leave unset. A merge patch keeps a field it
-/// does not name, so each unset one is sent as `null`: a claim that leaves
-/// `Pending` loses its place, and an ended claim no longer names its deleted
-/// Secret.
-const CLEARABLE: [&str; 10] = [
+/// does not name, so each unset one is sent as `null`: an ended claim no
+/// longer names its deleted Secret.
+const CLEARABLE: [&str; 9] = [
     "allocationId",
     "endpoint",
     "serverName",
@@ -309,7 +308,6 @@ const CLEARABLE: [&str; 10] = [
     "pod",
     "certificate",
     "expiresAt",
-    "queuePosition",
     "cache",
     "observedGeneration",
 ];
@@ -334,28 +332,6 @@ mod tests {
 
     use super::status_patch;
 
-    #[test]
-    fn leaving_pending_clears_the_queue_position() {
-        let bound = BuildKitClaimStatus {
-            phase: Some(ClaimPhase::Bound),
-            ..BuildKitClaimStatus::default()
-        };
-        let p = status_patch("7", &bound);
-        assert_eq!(p["metadata"]["resourceVersion"], "7");
-        assert_eq!(p["status"]["queuePosition"], json!(null));
-        assert!(
-            p["status"]
-                .as_object()
-                .is_some_and(|m| m.contains_key("queuePosition"))
-        );
-        let pending = BuildKitClaimStatus {
-            phase: Some(ClaimPhase::Pending),
-            queue_position: Some(3),
-            ..BuildKitClaimStatus::default()
-        };
-        assert_eq!(status_patch("7", &pending)["status"]["queuePosition"], 3);
-    }
-
     /// An ended claim's status drops `secretName`: the write must say so, or
     /// the merge keeps the name of the Secret `end()` just deleted. Every
     /// optional status field is covered, so a new one cannot be forgotten.
@@ -370,7 +346,7 @@ mod tests {
         let full: BuildKitClaimStatus = serde_json::from_value(json!({
             "phase": "Bound", "allocationId": "a", "endpoint": "e", "serverName": "s",
             "secretName": "x", "pod": "p", "certificate": "c", "expiresAt": "t",
-            "queuePosition": 1, "cache": {"key": "k"},
+            "cache": {"key": "k"},
             "observedGeneration": 1, "conditions": []
         }))
         .unwrap();

@@ -126,8 +126,8 @@ The reconciler keeps `max(effective min, pending claims)` pods warm, capped at `
 - `scaling.idleTimeout` (10 minutes by default) is how long a free pod above the floor lives before the reconciler removes it.
 - When the pool is at `max`, requests wait in the pool's queue for `allocation.queueTimeout` (2 minutes by default), in the order they arrived. Callers can ask for a longer wait, capped by `allocation.maxQueueTimeout` (10 minutes by default, up to 1 hour). A claim that is still pending then fails with `QueueTimeout`, and the client gets `pool_exhausted`. Set it to `0s` to fail at once. The wait is not one open request: the client polls (see [Using it from CI](ci/README.md#how-an-allocation-completes)).
 - An allocation lasts `defaultTTL` (1 hour) and never more than `maxTTL` (24 hours). The time counts from the moment the request wins a worker, after any queue wait, so a cold pod start comes out of the TTL. Releasing early frees the pod immediately.
-- One owner (an OIDC run, a ServiceAccount or pod, a claim) holds at most half of `scaling.max` workers of a pool at once, at least 1. Its further claims wait behind its own workers, and other callers' claims bind first. A `POST` from an owner that already holds or waits for twice that many claims gets `503 pool_exhausted` at once.
-Check the state with `kubectl get bkp -A`. The Warm, Allocated and Waiting columns show pods and queued requests. `kubectl get bkc -A` lists the queue itself: each claim with its pool, phase and queue position (the Position column), and the recently finished ones.
+- Fair share: while a claim of another owner waits for a pool, an owner (an OIDC run, a ServiceAccount or pod, a claim) that holds half of `scaling.max` workers, at least 1, binds no more. A worker that frees goes to the other owner first, even when this owner's claim is older. With nobody else waiting, one owner may use the whole pool, so a single tenant or one wide CI matrix is not capped. Fair share never takes back a bound worker: a claim frees its worker only at release or expiry.
+Check the state with `kubectl get bkp -A`. The Warm, Allocated and Waiting columns show pods and queued requests. `kubectl get bkc -A` lists the queue itself: each claim with its pool and phase, and the recently finished ones. Add `--sort-by=.metadata.creationTimestamp` to see the queue order.
 
 ## Upgrades
 
@@ -344,8 +344,8 @@ Errors the API returns to clients, and the usual cause:
 - 503 `upstream_error` with `Retry-After: 30` on authentication. The keys of an OIDC issuer could not be fetched. The message reads "token issuer keys unavailable". It also answers for a token signed with a key id the controller has not fetched yet, while a recent fetch holds the next one back. Check that the controller can reach the issuer's `jwksUrl` and look at `buildkit_jwks_fetch_total{result="error"}`. The Action and the curl recipe retry it.
 - 503 `upstream_error` with `Retry-After: 2` on `POST` or `DELETE /v1/allocations/{id}`. The API server throttled the request (429 or 408), answered with a 5xx, or did not answer, so the controller does not know the outcome. Repeating either is safe (a `POST` with the same key finds the claim the first one made), so the Action and the curl recipe retry it. If the retries run out, they log a warning and the worker drains at the allocation's expiry.
 - 404 `pool_not_found`. The pool does not exist, or no access rule matches the caller. The API never answers 403 for this, so pools cannot be probed.
-- 503 `pool_exhausted`. The pool is at `scaling.max` and the claim was still pending when its queue timeout ran out (`QueueTimeout` on the claim), or the caller already holds or waits for twice its share of the pool (see [Scaling](#scaling)). It carries `Retry-After: 5`. Raise `max`, or `queueTimeout`.
-- 202 `{"state": "pending"}` is not an error: the claim is queued. The client polls `GET /v1/allocations/{id}?wait=25s` with the returned id. `kubectl get bkc -n <release namespace>` shows the claim and its position.
+- 503 `pool_exhausted`. The pool is at `scaling.max` and the claim was still pending when its queue timeout ran out (`QueueTimeout` on the claim). It carries `Retry-After: 5`. Raise `max`, or `queueTimeout`.
+- 202 `{"state": "pending"}` is not an error: the claim is queued. The client polls `GET /v1/allocations/{id}?wait=25s` with the returned id. Each answer carries the claim's `position` in the queue. `kubectl get bkc -n <release namespace>` shows the claim.
 - 503 `pod_lost`. The worker pod of a bound allocation is gone. It is final for that id. Run the job again.
 - 404 `not_found` on `GET` or `DELETE /v1/allocations/{id}`. The id is unknown, its claim finished and was cleaned up (10 minutes after it ended), or it belongs to another caller. The API does not tell these apart, so a leaked id says nothing about a live allocation. A claim that another replica created a moment ago is waited for up to 2 seconds.
 - 503 `upstream_error` on `GET`, from a replica that has started to stop. The client's next poll reaches another replica.
@@ -391,7 +391,7 @@ spec:
 
 The controller honours the `owner`, `cacheScope` and `cacheTier` fields of a claim only in its own namespace, so a tenant who can create claims cannot pass as a CI identity, borrow another scope's cache or write a cache the pool does not let it write. Without a `publicKey`, the controller generates the key and writes the Secret `<claim>-buildkit`.
 
-`kubectl get bkc -A` shows each claim's phase and, while it waits, its queue position. The `Bound` condition's reason
+`kubectl get bkc -A` shows each claim's phase. The `Bound` condition's reason
 says why a claim waits or failed:
 
 | Reason | Meaning | Action |

@@ -672,10 +672,16 @@ fn pending_claim_survives_rollout(c: &Client<'_>) -> Result<()> {
     let (max_waiting, max_pods) = watch_for_surplus(env)?;
     env.kubectl(&["rollout", "status", DEPLOY, "-n", NS, "--timeout=300s"])?;
     let rolled = t0.elapsed();
-    let now = claim("{.metadata.uid} {.status.phase} {.status.queuePosition}")?;
+    let now = claim("{.metadata.uid} {.status.phase}")?;
     ensure!(
-        now == format!("{uid} Pending 1"),
+        now == format!("{uid} Pending"),
         "the pending claim did not survive the rollout: {now}"
+    );
+    let (code, body) = c.get(&id)?;
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    ensure!(
+        code == "202" && v["state"] == "pending" && v["position"] == 1,
+        "poll of {id} after the rollout: HTTP {code} {body}"
     );
     ensure!(
         max_waiting == 1,
