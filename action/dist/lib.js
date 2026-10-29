@@ -236,14 +236,22 @@ function effectiveQueueTimeout(queueTimeoutSeconds, pool) {
   return Number.isInteger(d) && d >= 0 ? d : undefined;
 }
 
+/** True when the pool entry comes from the current server, which reports `queueTimeoutSeconds`. */
+function isCurrentServer(pool) {
+  return Number.isInteger(pool && pool.queueTimeoutSeconds);
+}
+
 /**
- * Socket timeout of a POST: the whole budget left. A v3 controller answers within about 20 s, but a
- * v0.1.0 controller holds the POST open through the queue wait and the pod start, so a short timeout
- * would fail an allocation whose id the client never saw. v0.1.0 upgrade shim: remove in the release
- * after v3, with a 40 s timeout like the polls.
+ * Socket timeout of a POST. The current server (`current`: its pool entry carries
+ * `queueTimeoutSeconds`) answers within about 20 s, so a POST gets 40 s like a poll: a black-holed
+ * response is retried with the same key long before the claim looks abandoned. A v0.1.0 controller
+ * holds the POST open through the queue wait and the pod start, so it gets the whole budget left; a
+ * short timeout would fail an allocation whose id the client never saw. v0.1.0 upgrade shim: drop the
+ * long branch in the release after v3.
  */
-function postTimeoutMs(remainingMs) {
-  return Math.max(1000, remainingMs);
+function postTimeoutMs(remainingMs, current = false) {
+  const t = Math.max(1000, remainingMs);
+  return current ? Math.min(REQUEST_TIMEOUT_MS, t) : t;
 }
 
 /** Bound on the whole retry loop: the request's queue timeout (1 h, the largest allowed, if unknown) + 60 s. It covers the POST, every poll and any fresh POST after a queue timeout. */
@@ -272,6 +280,8 @@ const TERMINAL_POLL_CODES = new Set(['pool_exhausted', 'pod_lost', 'not_found', 
 // the next attempt needs a new key. pool_exhausted is the queue timeout running out, pod_lost a worker gone.
 const ENDED_CODES = new Set(['pool_exhausted', 'pod_lost']);
 
+// A 202 poll that came back faster than this was not held for `wait`; pause before asking again.
+const FAST_POLL_MS = 1000;
 const MIN_WAIT_MS = 1000;
 const MAX_WAIT_MS = 30000;
 
@@ -352,12 +362,18 @@ async function pollAllocation(api, id, { ca, getToken, budgetMs, log = () => {},
     const left = budgetMs - (now() - start);
     if (left <= 0) throw new Error(`allocation ${id} was not bound within the queue budget`);
     let wait = 0;
+    const polled = now();
     try {
       const headers = getToken ? { Authorization: `Bearer ${await getToken()}` } : {};
       const res = await request(`${api}/v1/allocations/${id}?wait=${POLL_WAIT}`,
         { ca, headers, timeoutMs: Math.min(REQUEST_TIMEOUT_MS, left + 5000) });
       if (res.status === 200) return res;
-      if (res.status === 202) continue;
+      if (res.status === 202) {
+        if (now() - polled >= FAST_POLL_MS) continue;
+        wait = FAST_POLL_MS + Math.floor(Math.random() * FAST_POLL_MS);
+        await sleep(wait);
+        continue;
+      }
       if (res.status < 500 || (res.status === 503 && TERMINAL_POLL_CODES.has(errorCode(res)))) return res;
       wait = retryAfterMs(res.headers, now()) ?? 2000;
       log(`poll ${id}: HTTP ${res.status}, polling again in ${Math.round(wait / 1000)}s`);
@@ -377,9 +393,11 @@ async function pollAllocation(api, id, { ca, getToken, budgetMs, log = () => {},
  * with a new key from `newKey()` follows while the overall budget (`budgetMs`, from the call) allows.
  * `attemptOpts({remainingMs, publicKey})` builds each POST's request options. `onId(id)` fires as
  * soon as an id is known and `onGone(id)` when that id ended for good, so the caller can release
- * exactly the ids that may still hold a worker. Resolves the AllocationResponse.
+ * exactly the ids that may still hold a worker. A fresh POST is not sent when its queue timeout would
+ * be 0 (`queueSeconds`, the effective queue timeout, is above 0 but no time is left): the last
+ * answer fails the call. Resolves the AllocationResponse.
  */
-async function allocate(api, { what, ca, getToken, attemptOpts, budgetMs, newKey = generateKey, onId = () => {}, onGone = () => {}, log = () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now }) {
+async function allocate(api, { what, ca, getToken, attemptOpts, budgetMs, queueSeconds, newKey = generateKey, onId = () => {}, onGone = () => {}, log = () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now }) {
   const start = now();
   for (;;) {
     const { publicKey } = newKey();
@@ -394,10 +412,12 @@ async function allocate(api, { what, ca, getToken, attemptOpts, budgetMs, newKey
       log(`${what}: queued as ${id}`);
       res = await pollAllocation(api, id, { ca, getToken, budgetMs: budgetMs - (now() - start), log, sleep, now });
       if (res.status === 200) return JSON.parse(res.body);
-      onGone(id);
+      // A 401 may be the token, not the allocation, so the id stays for the release.
+      if (res.status !== 401) onGone(id);
     }
     const wait = retryAfterMs(res.headers, now()) ?? 5000;
     if (errorCode(res) !== 'pool_exhausted' || now() - start + wait > budgetMs) throw apiError(what, res);
+    if (queueSeconds > 0 && queueTimeoutFor(queueSeconds, budgetMs - (now() - start) - wait) === 0) throw apiError(what, res);
     log(`${what}: queue timeout ran out${id ? ` for ${id}` : ''}, allocating again with a new key in ${Math.round(wait / 1000)}s`);
     await sleep(wait);
   }
@@ -408,6 +428,29 @@ async function releaseAllocation({ api, ca, getToken, id, log, ...inject }) {
   const res = await requestWithRetry(`${api}/v1/allocations/${id}`, { method: 'DELETE', ca, timeoutMs: 30000 },
     { what: `release ${id}`, getToken, budgetMs: SHORT_BUDGET_MS, log, ...inject });
   if (res.status !== 204 && res.status !== 404) throw apiError(`release ${id}`, res);
+}
+
+/** Payload `exp` of a JWT in ms since the epoch, or undefined when the token cannot be decoded. */
+function jwtExpiryMs(token) {
+  try {
+    const exp = JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString('utf8')).exp;
+    return Number.isFinite(exp) ? exp * 1000 : undefined;
+  } catch { return undefined; }
+}
+
+/**
+ * Wrap `fetchToken` so that a token is reused until `marginMs` before its `exp`. A token without a
+ * readable `exp` is never reused: every call fetches.
+ */
+function cachedToken(fetchToken, { now = Date.now, marginMs = 60000 } = {}) {
+  let cached;
+  return async () => {
+    if (cached && now() < cached.until) return cached.token;
+    const token = await fetchToken();
+    const exp = jwtExpiryMs(token);
+    cached = exp === undefined ? undefined : { token, until: exp - marginMs };
+    return token;
+  };
 }
 
 /** GitHub OIDC token for `audience`. Masks the bearer and the token via `setSecret`. */
@@ -426,7 +469,7 @@ async function fetchOidcToken(audience, setSecret) {
 }
 
 module.exports = {
-  parseList, parsePool, REQUEST_TIMEOUT_MS, postTimeoutMs, pollAllocation, allocate, errorCode, parseDuration, generateKey, allocationBody,
+  parseList, parsePool, REQUEST_TIMEOUT_MS, postTimeoutMs, isCurrentServer, cachedToken, jwtExpiryMs, FAST_POLL_MS, pollAllocation, allocate, errorCode, parseDuration, generateKey, allocationBody,
   validatePools, buildxCommands, parseCacheInputs, cacheFlags, checkAllocationId, createBuilder, writeMaterial, request, apiError,
   effectiveQueueTimeout, retryBudgetMs, SHORT_BUDGET_MS, releaseAllocation, queueTimeoutFor, retryAfterMs, requestWithRetry, fetchOidcToken,
 };

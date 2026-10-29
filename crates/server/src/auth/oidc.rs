@@ -258,6 +258,7 @@ impl IssuerVerifier {
             }
             in_flight
         };
+        let fetched = in_flight.is_some();
         if let Some(mut done) = in_flight {
             // Errs once the fetch task drops its sender, after recording its outcome.
             let _ = done.changed().await;
@@ -266,6 +267,10 @@ impl IssuerVerifier {
         let now = Instant::now();
         match cache.find(kid, alg, now) {
             Some(jwk) => Ok(jwk),
+            // No fetch looked for this kid: the backoff held it back, and anyone
+            // can set the backoff off with a made-up kid. The key may be new
+            // after a rotation, so the caller is told to retry rather than refused.
+            None if !fetched && !cache.has_kid(kid) => Err(AuthError::KeysUnavailable),
             None if cache.usable(now) => Err(AuthError::Invalid(if cache.has_kid(kid) {
                 "alg does not match jwk"
             } else {

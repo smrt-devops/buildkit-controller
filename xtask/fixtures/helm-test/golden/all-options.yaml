@@ -123,8 +123,6 @@ data:
         enabled: true
         maxConcurrentReviews: 8
         maxReviewsPerIp: 2
-        recentSubjectTtl: 10m
-        reservedReviews: 8
     claims:
       namespaces: []
     edge:
@@ -536,7 +534,7 @@ spec:
         helm.sh/chart: buildkit-controller-0.2.0
         team: ci
       annotations:
-        checksum/config: e598ab79df55dc69cecdfdd659b7b6597908eebb2773e69d0449e096438792e2
+        checksum/config: 91aaf9f76152f4c5cf50aa07ded69dd099a4eb82cdf85574d2139198abcd0158
         example.com/x: "1"
     spec:
       serviceAccountName: bkc

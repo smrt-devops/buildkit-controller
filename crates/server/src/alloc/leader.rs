@@ -147,14 +147,7 @@ async fn run_term(t: Term, term: u64) {
     info!(term, component = "allocator", "allocator running");
     let claim_triggers = stream::unfold(t.ctx.claim_events(), |mut sub| async move {
         let ev = sub.recv().await?;
-        let trigger = match &ev {
-            ClaimEvent::Apply(c) if claims::phase(c) == ClaimPhase::Pending => {
-                Some(Trigger::Pool(claims::pool_key(c)))
-            }
-            ClaimEvent::Resync => Some(Trigger::All),
-            _ => None,
-        };
-        Some((trigger, sub))
+        Some((claim_trigger(&ev), sub))
     });
     let pod_triggers = stream::unfold(t.ctx.pod_events(), |mut sub| async move {
         let ev = sub.recv().await?;
@@ -191,6 +184,30 @@ async fn run_term(t: Term, term: u64) {
         }
     });
     tokio::join!(passes, tidy_loop(&t));
+}
+
+/// The pass a claim event calls for. A pending claim needs one when it is
+/// new or its spec changed. Once the leader has written its status, further
+/// events are the leader's own status writes and the API's `seen-at` and
+/// `delivered` marks, and a pass for each would cost a pass per waiter per write.
+/// A claim that ends or goes away may free its owner to bind a waiting claim
+/// (the per-owner limit), so it calls for a pass of its pool too.
+pub(super) fn claim_trigger(ev: &ClaimEvent) -> Option<Trigger> {
+    match ev {
+        ClaimEvent::Apply(c) if claims::phase(c) == ClaimPhase::Pending => {
+            let seen = c
+                .status
+                .as_ref()
+                .is_some_and(|s| s.observed_generation == c.metadata.generation);
+            (!seen).then(|| Trigger::Pool(claims::pool_key(c)))
+        }
+        ClaimEvent::Apply(c) if claims::phase(c).is_terminal() => {
+            Some(Trigger::Pool(claims::pool_key(c)))
+        }
+        ClaimEvent::Delete(c) => Some(Trigger::Pool(claims::pool_key(c))),
+        ClaimEvent::Resync => Some(Trigger::All),
+        ClaimEvent::Apply(_) => None,
+    }
 }
 
 /// A pod a waiting claim could take.
@@ -458,6 +475,54 @@ fn names(c: &BuildKitClaim) -> Option<(&str, &str, &str)> {
         c.metadata.name.as_deref()?,
         c.metadata.uid.as_deref()?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::sync::Arc;
+
+    use buildkit_controller_api::claim::{BuildKitClaim, BuildKitClaimStatus, ClaimPhase};
+    use serde_json::json;
+
+    use super::{ClaimEvent, Trigger, claim_trigger};
+
+    fn claim(status: Option<(ClaimPhase, Option<i64>)>, generation: i64) -> ClaimEvent {
+        let mut c = BuildKitClaim::new(
+            "c",
+            serde_json::from_value(json!({"poolRef": {"namespace": "p", "name": "x"}})).unwrap(),
+        );
+        c.metadata.generation = Some(generation);
+        c.status = status.map(|(phase, observed)| BuildKitClaimStatus {
+            phase: Some(phase),
+            observed_generation: observed,
+            ..BuildKitClaimStatus::default()
+        });
+        ClaimEvent::Apply(Arc::new(c))
+    }
+
+    /// A new or changed pending claim calls for a pass. The leader's own status
+    /// writes and the API's annotations on a claim it has seen do not, or each
+    /// waiter would cost a pass per write.
+    #[test]
+    fn only_new_or_changed_pending_claims_trigger_a_pass() {
+        let pass = |ev: &ClaimEvent| matches!(claim_trigger(ev), Some(Trigger::Pool(_)));
+        assert!(pass(&claim(None, 1)));
+        assert!(pass(&claim(Some((ClaimPhase::Pending, Some(1))), 2)));
+        assert!(!pass(&claim(Some((ClaimPhase::Pending, Some(1))), 1)));
+        assert!(!pass(&claim(Some((ClaimPhase::Bound, Some(1))), 1)));
+        // An ended or deleted claim may free its owner to bind another.
+        assert!(pass(&claim(Some((ClaimPhase::Expired, Some(1))), 1)));
+        let ClaimEvent::Apply(c) = claim(Some((ClaimPhase::Bound, Some(1))), 1) else {
+            unreachable!()
+        };
+        assert!(pass(&ClaimEvent::Delete(c)));
+        assert!(matches!(
+            claim_trigger(&ClaimEvent::Resync),
+            Some(Trigger::All)
+        ));
+    }
 }
 
 #[cfg(test)]

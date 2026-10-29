@@ -93,10 +93,6 @@ impl Component for HttpComponent {
                 usize::try_from(sa.max_concurrent_reviews).unwrap_or(usize::MAX),
             )
             .with_max_reviews_per_ip(usize::try_from(sa.max_reviews_per_ip).unwrap_or(usize::MAX))
-            .with_reserved_reviews(
-                usize::try_from(sa.reserved_reviews).unwrap_or(usize::MAX),
-                std::time::Duration::from_secs(sa.recent_subject_ttl.seconds().unwrap_or(600)),
-            )
             .with_jwks_observer(move |issuer, r| observer.jwks(issuer, r));
             let state = Arc::new(ApiState {
                 alloc,

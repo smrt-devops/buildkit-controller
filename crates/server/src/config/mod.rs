@@ -453,11 +453,6 @@ pub struct ServiceAccountAuth {
     pub max_concurrent_reviews: u32,
     /// `TokenReview` calls in flight for one client address; more get 503. 0: no cap.
     pub max_reviews_per_ip: u32,
-    /// `TokenReview` slots (of `max_concurrent_reviews`) held back for service accounts that
-    /// passed a review within `recent_subject_ttl`. Cut to fit below `max_concurrent_reviews`.
-    pub reserved_reviews: u32,
-    /// How long a service account that passed a review counts as recently seen.
-    pub recent_subject_ttl: CrdDuration,
 }
 
 impl Default for ServiceAccountAuth {
@@ -467,8 +462,6 @@ impl Default for ServiceAccountAuth {
             audiences: vec!["buildkit-controller".into()],
             max_concurrent_reviews: 32,
             max_reviews_per_ip: 4,
-            reserved_reviews: 8,
-            recent_subject_ttl: CrdDuration::new("10m"),
         }
     }
 }
@@ -1016,11 +1009,6 @@ impl Config {
         {
             p.push("auth.serviceAccount.maxConcurrentReviews must be at least 1".into());
         }
-        secs(
-            &self.auth.service_account.recent_subject_ttl,
-            "auth.serviceAccount.recentSubjectTtl",
-            p,
-        );
     }
 
     fn validate_network(&self, p: &mut Vec<String>) {

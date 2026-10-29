@@ -109,10 +109,13 @@ fn allocation_ids_are_fixed_for_the_claim() {
 }
 
 #[test]
-fn queues_are_fifo_by_creation_then_name_and_hold_only_waiting_served_claims() {
+fn queues_are_fifo_by_creation_then_uid_and_hold_only_waiting_served_claims() {
     let claims: Vec<Arc<BuildKitClaim>> = [
         claim("ci", "c", "u3", "2026-10-21T12:00:02Z"),
-        claim("ci", "b", "u2", "2026-10-21T12:00:01Z"),
+        with_phase(
+            claim("ci", "b", "u2", "2026-10-21T12:00:01Z"),
+            ClaimPhase::Pending,
+        ),
         claim(OWN, "a", "u1", "2026-10-21T12:00:01Z"),
         with_phase(
             claim("ci", "bound", "u4", "2026-10-21T11:00:00Z"),
@@ -127,15 +130,93 @@ fn queues_are_fifo_by_creation_then_name_and_hold_only_waiting_served_claims() {
     deleting.metadata.deletion_timestamp = Some(Time("2026-10-21T12:00:03Z".parse().unwrap()));
     let mut all = claims.clone();
     all.push(Arc::new(deleting));
-    let q = queues(&all, &served());
-    let names: Vec<&str> = q[&("pools".into(), "default".into())]
-        .iter()
-        .map(|c| c.metadata.name.as_deref().unwrap())
+    let pool = ("pools".to_owned(), "default".to_owned());
+    let names = |q: &HashMap<PoolKey, Vec<Arc<BuildKitClaim>>>| -> Vec<String> {
+        q.get(&pool)
+            .into_iter()
+            .flatten()
+            .map(|c| c.metadata.name.clone().unwrap())
+            .collect()
+    };
+    assert_eq!(names(&pending(&all, &served())), ["a", "b", "c"]);
+    // Only claims the leader admitted (it wrote a status) are demand.
+    assert_eq!(names(&queues(&all, &served())), ["b"]);
+    // An API claim counts ahead without a status; tenant claim c does not.
+    assert_eq!(position(&all, &served(), OWN, &claims[0]), Some(3));
+    assert_eq!(position(&all, &served(), OWN, &claims[2]), Some(1));
+    assert_eq!(position(&all, &served(), OWN, &claims[3]), None, "bound");
+    let late = claim(OWN, "z", "u9", "2026-10-21T12:00:05Z");
+    assert_eq!(
+        position(&all, &served(), OWN, &late),
+        Some(3),
+        "c is not ahead"
+    );
+}
+
+/// Equal creation times go by uid, which the API server picks, never by the
+/// name a client can grind its key for.
+#[test]
+fn ties_go_by_uid_not_name() {
+    let early_name = claim(
+        OWN,
+        "22222aaaaaaaaaaaaaaaaaaaaa",
+        "u2",
+        "2026-10-21T12:00:00Z",
+    );
+    let late_name = claim(
+        OWN,
+        "zzzzzaaaaaaaaaaaaaaaaaaaaa",
+        "u1",
+        "2026-10-21T12:00:00Z",
+    );
+    assert_eq!(queue_order(&late_name, &early_name), Ordering::Less);
+}
+
+/// A tenant claim that names a pool which does not admit it gets no status
+/// from the leader, so it never counts as demand nor pushes anyone back.
+#[test]
+fn a_claim_the_pool_refuses_is_not_demand() {
+    let refused: Vec<Arc<BuildKitClaim>> = (0..5)
+        .map(|i| {
+            Arc::new(claim(
+                "ci",
+                &format!("r{i}"),
+                &format!("r{i}"),
+                "2026-10-21T11:00:00Z",
+            ))
+        })
         .collect();
-    assert_eq!(names, ["a", "b", "c"]);
-    assert_eq!(position(&all, &served(), &claims[0]), Some(3));
-    assert_eq!(position(&all, &served(), &claims[2]), Some(1));
-    assert_eq!(position(&all, &served(), &claims[3]), None, "bound");
+    assert!(queues(&refused, &served()).is_empty());
+    let mine = claim(OWN, "m", "m", "2026-10-21T12:00:00Z");
+    assert_eq!(position(&refused, &served(), OWN, &mine), Some(1));
+}
+
+/// Active claims count per owner and pool: pending and bound, not ended,
+/// not the claim being retried, and only in the controller's namespace.
+#[test]
+fn active_claims_count_per_owner_and_pool() {
+    let owned = |ns: &str, name: &str, owner: &str, phase: Option<ClaimPhase>| {
+        let mut c = claim(ns, name, name, "2026-10-21T12:00:00Z");
+        c.spec.owner = Some(owner.into());
+        Arc::new(match phase {
+            Some(p) => with_phase(c, p),
+            None => c,
+        })
+    };
+    let all = vec![
+        owned(OWN, "a", "x", None),
+        owned(OWN, "b", "x", Some(ClaimPhase::Bound)),
+        owned(OWN, "c", "x", Some(ClaimPhase::Failed)),
+        owned(OWN, "d", "y", None),
+        owned("ci", "e", "x", None),
+    ];
+    let pool = ("pools".to_owned(), "default".to_owned());
+    assert_eq!(active_of(&all, OWN, "x", &pool, ""), 2);
+    assert_eq!(active_of(&all, OWN, "x", &pool, "a"), 1);
+    assert_eq!(
+        active_of(&all, OWN, "x", &("pools".into(), "other".into()), ""),
+        0
+    );
 }
 
 #[test]

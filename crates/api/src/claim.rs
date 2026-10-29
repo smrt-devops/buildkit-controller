@@ -200,7 +200,8 @@ pub struct BuildKitClaimStatus {
     /// RFC 3339 UTC expiry of the allocation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
-    /// 1-based place in the pool's queue while `Pending`. Refreshed every few seconds.
+    /// 1-based place in the pool's queue while `Pending`, refreshed every few
+    /// seconds. Written only for claims outside the controller's namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_position: Option<i32>,
     /// Cache flags of the allocation, as in the `201` response.
