@@ -1234,7 +1234,7 @@ async fn reconcile_verify() {
     println!("{}", summary.last().unwrap());
 
     // 10. A client that gives up while its claim waits (a cancelled CI job)
-    // leaves no claim behind once the leader finds it unasked-for for a minute;
+    // leaves no claim behind once the leader finds it unasked-for for 3 minutes;
     // the pod made for it retires (idle or released)
     // with its worker Secret.
     let mark = h.mark();
@@ -1246,7 +1246,8 @@ async fn reconcile_verify() {
     inflight.abort();
     let took = until(
         "the claim gone, r-0 retired and its worker Secret collected",
-        150,
+        // ABANDON_AFTER (180 s), then the retire and the Secret GC.
+        300,
         || async {
             live_claims_of_r().await.is_empty()
                 && h.list("r").await.is_empty()

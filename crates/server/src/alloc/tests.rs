@@ -235,6 +235,24 @@ impl Backend for Fake {
         ready(Write::Done)
     }
 
+    fn delete_claim_at(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+        resource_version: &str,
+    ) -> BoxFuture<'static, Write> {
+        let current = self.claim(ns, name);
+        if current
+            .as_ref()
+            .is_some_and(|c| c.metadata.resource_version.as_deref() != Some(resource_version))
+        {
+            self.call(format!("delete_claim {name} refused"));
+            return ready(Write::Gone);
+        }
+        self.delete_claim(ns, name, uid)
+    }
+
     fn annotate_claim(
         &self,
         ns: &str,
@@ -1137,9 +1155,10 @@ async fn tidy_at(e: &Env, now: OffsetDateTime) {
 }
 
 /// A client that gave up while its claim waited never asks for it again: a
-/// minute after it was last seen, the leader deletes the pending claim.
+/// [`claims::ABANDON_AFTER`] after it was last seen, the leader deletes the
+/// pending claim.
 #[tokio::test(start_paused = true)]
-async fn an_abandoned_pending_claim_is_deleted_after_a_minute() {
+async fn an_abandoned_pending_claim_is_deleted_after_three_minutes() {
     let e = env();
     let Outcome::Pending(p) = e
         .front
@@ -1150,9 +1169,9 @@ async fn an_abandoned_pending_claim_is_deleted_after_a_minute() {
         panic!("bound without a pod")
     };
     let now = OffsetDateTime::now_utc();
-    tidy_at(&e, now + time::Duration::seconds(30)).await;
-    assert!(e.fake.claim(OWN, &p.id).is_some(), "seen 30 s ago: kept");
-    tidy_at(&e, now + time::Duration::seconds(61)).await;
+    tidy_at(&e, now + time::Duration::seconds(170)).await;
+    assert!(e.fake.claim(OWN, &p.id).is_some(), "seen 170 s ago: kept");
+    tidy_at(&e, now + time::Duration::seconds(181)).await;
     assert!(e.fake.claim(OWN, &p.id).is_none(), "{:?}", e.fake.calls());
 }
 
@@ -1192,7 +1211,7 @@ async fn an_abandoned_bound_claim_frees_its_worker_and_a_delivered_one_stays() {
         .unwrap();
     assert!(matches!(got, Outcome::Bound(_)), "{got:?}");
     assert!(claims::delivered(&e.fake.claim(OWN, &kept.id).unwrap()));
-    let later = OffsetDateTime::now_utc() + time::Duration::seconds(61);
+    let later = OffsetDateTime::now_utc() + time::Duration::seconds(181);
     tidy_at(&e, later).await;
     assert!(
         e.fake.claim(OWN, &gone.id).is_none(),
@@ -1212,7 +1231,7 @@ async fn an_abandoned_bound_claim_frees_its_worker_and_a_delivered_one_stays() {
     );
 }
 
-/// A client that comes back within the minute, by POST with the same key or
+/// A client that comes back within three minutes, by POST with the same key or
 /// by GET, is seen again: its claim is not deleted and keeps its place.
 #[tokio::test(start_paused = true)]
 async fn a_claim_whose_client_comes_back_keeps_its_place() {
@@ -1222,7 +1241,7 @@ async fn a_claim_whose_client_comes_back_keeps_its_place() {
         panic!("bound without a pod")
     };
     let later = e.ci_claim(-5, "sa:x/later");
-    seen_ago(&e, &p.id, 50);
+    seen_ago(&e, &p.id, 150);
     let Outcome::Pending(again) = e.front.allocate(&sa("alice"), &req).await.unwrap() else {
         panic!("bound without a pod")
     };
@@ -1230,19 +1249,76 @@ async fn a_claim_whose_client_comes_back_keeps_its_place() {
         (again.id.as_str(), again.position),
         (p.id.as_str(), Some(1))
     );
-    tidy_at(&e, OffsetDateTime::now_utc() + time::Duration::seconds(30)).await;
+    tidy_at(&e, OffsetDateTime::now_utc() + time::Duration::seconds(100)).await;
     assert!(e.fake.claim(OWN, &p.id).is_some(), "the retry was seen");
-    seen_ago(&e, &p.id, 50);
+    seen_ago(&e, &p.id, 150);
     e.front
         .get(&sa("alice"), &p.id, Duration::ZERO)
         .await
         .unwrap();
-    tidy_at(&e, OffsetDateTime::now_utc() + time::Duration::seconds(30)).await;
+    tidy_at(&e, OffsetDateTime::now_utc() + time::Duration::seconds(100)).await;
     assert!(e.fake.claim(OWN, &p.id).is_some(), "the poll was seen");
     e.warm(0);
     e.binder.pass(&key()).await;
     assert_eq!(phase(&e.fake.status(OWN, &p.id)), ClaimPhase::Bound);
     assert_eq!(phase(&e.fake.status(OWN, &later)), ClaimPhase::Pending);
+}
+
+/// A claim last seen 60 to 170 s ago is a client between requests (a poll
+/// lost on the way, a `Retry-After`, clock skew): kept. Past
+/// [`claims::ABANDON_AFTER`] it goes.
+#[tokio::test(start_paused = true)]
+async fn a_claim_seen_within_three_minutes_is_kept() {
+    let e = env();
+    let Outcome::Pending(p) = e
+        .front
+        .allocate(&sa("alice"), &post_req(&KEY))
+        .await
+        .unwrap()
+    else {
+        panic!("bound without a pod")
+    };
+    for ago in [60, 120, 170] {
+        seen_ago(&e, &p.id, ago);
+        tidy_at(&e, OffsetDateTime::now_utc()).await;
+        assert!(e.fake.claim(OWN, &p.id).is_some(), "seen {ago} s ago: kept");
+    }
+    seen_ago(&e, &p.id, 181);
+    tidy_at(&e, OffsetDateTime::now_utc()).await;
+    assert!(
+        e.fake.claim(OWN, &p.id).is_none(),
+        "seen 181 s ago: deleted"
+    );
+}
+
+/// The leader decides from its store, which may predate the client coming
+/// back. The delete names the resourceVersion it decided on, so the client's
+/// new `seen-at` makes the API server refuse it, and the claim stays.
+#[tokio::test(start_paused = true)]
+async fn an_abandon_decided_on_a_stale_store_is_refused() {
+    let e = env();
+    let Outcome::Pending(p) = e
+        .front
+        .allocate(&sa("alice"), &post_req(&KEY))
+        .await
+        .unwrap()
+    else {
+        panic!("bound without a pod")
+    };
+    seen_ago(&e, &p.id, 200);
+    let stale = e.fake.claims.lock().unwrap().as_reader().state();
+    e.front
+        .get(&sa("alice"), &p.id, Duration::ZERO)
+        .await
+        .unwrap();
+    let pods = e.fake.pods.lock().unwrap().as_reader().state();
+    super::leader::tidy_with(&e.binder, &stale, &pods, OffsetDateTime::now_utc()).await;
+    assert!(e.fake.claim(OWN, &p.id).is_some(), "{:?}", e.fake.calls());
+    assert!(
+        e.fake
+            .calls()
+            .contains(&format!("delete_claim {} refused", p.id))
+    );
 }
 /// The tidy pass: refuses unserved namespaces, ends expired and lost claims,
 /// deletes finished CI claims after ten minutes, and retires pods whose claim

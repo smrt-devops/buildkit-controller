@@ -36,7 +36,11 @@ pub const LOST_GRACE: Duration = Duration::from_secs(30);
 pub const FINISHED_TTL: Duration = Duration::from_mins(10);
 /// How long a CI claim whose bound answer was never delivered may go without
 /// its caller asking for it before the leader deletes it: the client is gone.
-pub const ABANDON_AFTER: Duration = Duration::from_mins(1);
+/// It covers the longest gap the shipped clients leave between requests that
+/// reach a replica (a 25 s poll, a 40 s client timeout on a poll lost on the
+/// way, a 30 s `Retry-After`), plus [`SEEN_EVERY`], plus clock skew between
+/// the replica that writes `seen-at` and the leader that reads it.
+pub const ABANDON_AFTER: Duration = Duration::from_mins(3);
 /// The API refreshes a claim's `seen-at` at most this often.
 pub const SEEN_EVERY: Duration = Duration::from_secs(15);
 /// Claim annotation: when the API last answered the claim's caller.

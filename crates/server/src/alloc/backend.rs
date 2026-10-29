@@ -62,6 +62,15 @@ pub trait Backend: Send + Sync + 'static {
     ) -> BoxFuture<'static, Result<Option<BuildKitClaim>, Write>>;
     /// `DELETE` a claim with a uid precondition.
     fn delete_claim(&self, ns: &str, name: &str, uid: &str) -> BoxFuture<'static, Write>;
+    /// `DELETE` a claim if it still has `uid` and `resource_version`: a claim
+    /// changed since it was read is a 409, which is [`Write::Gone`].
+    fn delete_claim_at(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+        resource_version: &str,
+    ) -> BoxFuture<'static, Write>;
     /// Merge `annotations` into a claim's metadata, if the claim still has
     /// `uid` (a 409 otherwise, which is [`Write::Gone`]).
     fn annotate_claim(
@@ -219,6 +228,21 @@ impl Backend for KubeBackend {
     fn delete_claim(&self, ns: &str, name: &str, uid: &str) -> BoxFuture<'static, Write> {
         let (api, name, t) = (self.api::<BuildKitClaim>(ns), name.to_owned(), self.timeout);
         let dp = delete_params(uid, None);
+        Box::pin(async move { written(done(t, api.delete(&name, &dp)).await) })
+    }
+
+    fn delete_claim_at(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+        resource_version: &str,
+    ) -> BoxFuture<'static, Write> {
+        let (api, name, t) = (self.api::<BuildKitClaim>(ns), name.to_owned(), self.timeout);
+        let mut dp = delete_params(uid, None);
+        if let Some(p) = dp.preconditions.as_mut() {
+            p.resource_version = Some(resource_version.to_owned());
+        }
         Box::pin(async move { written(done(t, api.delete(&name, &dp)).await) })
     }
 

@@ -342,11 +342,15 @@ async fn end(b: &Binder, c: &BuildKitClaim, phase: ClaimPhase) -> Option<&'stati
 /// then retires its pod, if it had one.
 async fn abandon(b: &Binder, c: &BuildKitClaim) -> Option<&'static str> {
     let (ns, name, uid) = names(c)?;
-    match b.backend().delete_claim(ns, name, uid).await {
-        Write::Done | Write::Gone => {
+    let rv = c.metadata.resource_version.as_deref()?;
+    // Only the claim as read: a client that came back since wrote seen-at or
+    // delivered, which moved the resourceVersion, and the delete is refused.
+    match b.backend().delete_claim_at(ns, name, uid, rv).await {
+        Write::Done => {
             info!(namespace = ns, claim = name, phase = ?claims::phase(c), "deleted an abandoned claim");
             Some("abandoned")
         }
+        Write::Gone => None,
         w => {
             warn!(namespace = ns, claim = name, outcome = ?w, "deleting an abandoned claim");
             None
