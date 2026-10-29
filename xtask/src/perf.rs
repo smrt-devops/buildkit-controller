@@ -536,16 +536,17 @@ const CONNECT_OVERHEAD_MS: f64 = 5.0;
 const EDGE_SHARE: f64 = 0.5;
 
 /// Verdict on the p99 connect overhead from sorted direct and edge first-byte
-/// samples. When the direct path's own p99 sits more than the target above its
-/// p50, the rig cannot resolve a difference that small.
+/// samples. The direct path's own spread, p99 minus p50, is the rig's noise:
+/// an overhead over the target but inside that spread is inconclusive, one
+/// past both is a MISS.
 fn connect_verdict(direct: &[f64], edge: &[f64]) -> String {
     let over = pct(edge, 99.0) - pct(direct, 99.0);
     let p50 = pct(edge, 50.0) - pct(direct, 50.0);
     let tail = pct(direct, 99.0) - pct(direct, 50.0);
     if over < 0.0 {
         format!("inconclusive (p99 diff negative; p50 {p50:+.1} ms)")
-    } else if tail >= CONNECT_OVERHEAD_MS {
-        format!("inconclusive (direct p99 is {tail:.1} ms over its p50; p50 {p50:+.1} ms)")
+    } else if over >= CONNECT_OVERHEAD_MS && over < tail {
+        format!("inconclusive (within direct p99-p50 spread {tail:.1} ms; p50 {p50:+.1} ms)")
     } else {
         verdict(over < CONNECT_OVERHEAD_MS)
     }
@@ -846,10 +847,14 @@ mod tests {
     }
 
     #[test]
-    fn connect_overhead_needs_a_tight_direct_tail() {
+    fn connect_overhead_is_judged_against_the_direct_spread() {
         // Kind at c=8: direct p50 4.7, p99 74; edge p99 82. The 8 ms gap is noise.
         let v = connect_verdict(&ms(4.7, 74.0), &ms(5.6, 82.0));
-        assert!(v.starts_with("inconclusive (direct p99"), "{v}");
+        assert!(v.starts_with("inconclusive (within direct"), "{v}");
+        // A real regression outruns the spread: +20 ms over a 13.5 ms spread.
+        assert_eq!(connect_verdict(&ms(4.3, 17.8), &ms(4.3, 38.0)), "MISS");
+        // Under the target is a pass even on a loose tail.
+        assert_eq!(connect_verdict(&ms(4.3, 17.8), &ms(4.3, 20.0)), "PASS");
         let v = connect_verdict(&ms(4.7, 91.0), &ms(5.6, 74.6));
         assert!(v.starts_with("inconclusive (p99 diff negative"), "{v}");
         // A tight direct tail resolves the target both ways.
