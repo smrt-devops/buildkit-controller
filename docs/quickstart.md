@@ -5,7 +5,7 @@ This page installs the controller, creates a pool and runs one build with the Gi
 ## Requirements
 
 - The cluster's CNI must enforce NetworkPolicy. The worker sandbox is a NetworkPolicy, and a CNI that ignores it, such as kindnet or the default EKS VPC CNI, lets a build reach every pod and the cloud metadata endpoint. The pool still reports Ready, so check your CNI before you run untrusted builds.
-- Each pool namespace must admit privileged pods under Pod Security Admission, because rootless BuildKit needs unconfined seccomp and AppArmor. Step 2 sets the `pod-security.kubernetes.io/enforce=privileged` label. Without it the pool reports `Degraded` with reason `PodCreateFailed` and the PodSecurity error.
+- Each pool namespace must admit privileged pods under Pod Security Admission, because rootless BuildKit needs unconfined seccomp and AppArmor. Step 1 sets the `pod-security.kubernetes.io/enforce=privileged` label. Without it the pool reports `Degraded` with reason `PodCreateFailed` and the PodSecurity error.
 - Give each pool its own namespace, with no other workloads and no other NetworkPolicies. NetworkPolicies add up, so any other policy that selects the worker pods widens the sandbox.
 - On an IPv6 or dual-stack cluster, list the IPv6 pod, service and node ranges in `workerNetwork.clusterCIDRs`, plus any IPv4 pod or node ranges outside RFC 1918 and 100.64.0.0/10. Until it holds an IPv6 range, workers get no IPv6 egress, and on an IPv6-only cluster every image pull fails while the pool reports Ready.
 
@@ -24,9 +24,11 @@ That release predates some features and fixes in this repository. A setting or b
 
 The chart exposes the controller through a Gateway API Gateway: an HTTPRoute for the API and a TLS passthrough TLSRoute for the edge. You need the Gateway API v1.5.0 or later standard-channel CRDs, an implementation that supports TLSRoute, and a Gateway with two listeners: HTTPS for the API, with a certificate for your DNS name, and TLS in Passthrough mode for the edge. [the chart README](../helm/buildkit-controller/README.md#exposure) has an Envoy Gateway example and the list of implementations. This page assumes a Gateway `bk` in namespace `gateway-system` with the API on 443 and the edge on 8444.
 
-Pick a DNS name, install, then point the name at the Gateway's address.
+Pick a DNS name, create the pool namespace, install, then point the name at the Gateway's address. The namespace must exist before `helm install`, because the chart creates a Role and RoleBinding in each namespace in `watchNamespaces`.
 
 ```sh
+kubectl create namespace ci
+kubectl label namespace ci pod-security.kubernetes.io/enforce=privileged
 helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
   --set edge.endpoint=tcp://bk.example.com:8444 --set edge.serverName=bk.example.com \
   --set-json 'gateway.api.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"api"}]' \
@@ -37,7 +39,7 @@ helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
 kubectl get httproute,tlsroute -n buildkit-system
 ```
 
-`watchNamespaces` lists the namespaces that hold pools (`ci`, created in step 2). The chart grants the controller pod and Secret access in those namespaces only, and the controller ignores pools anywhere else. Leave it out and the controller serves every namespace through a ClusterRole that can create pods and Secrets anywhere, kube-system included. The chart refuses to render without `edge.endpoint`, `edge.serverName` and `gateway.parentRefs`. The API URL is `https://bk.example.com`, and `edge.endpoint` must be the Gateway's edge listener. Without `auth.oidc`, only ServiceAccount tokens authenticate.
+`watchNamespaces` lists the namespaces that hold pools (`ci`, created before the install). The chart grants the controller pod and Secret access in those namespaces only, and the controller ignores pools anywhere else. Leave it out and the controller serves every namespace through a ClusterRole that can create pods and Secrets anywhere, kube-system included. The chart refuses to render without `edge.endpoint`, `edge.serverName` and `gateway.parentRefs`. The API URL is `https://bk.example.com`, and `edge.endpoint` must be the Gateway's edge listener. Without `auth.oidc`, only ServiceAccount tokens authenticate.
 
 Behind a gateway every client reaches the controller from the gateway's addresses, so the per-address caps apply to all clients together. Raise `edge.maxHandshakesPerIp`, `api.maxConnectionsPerIp` and `auth.serviceAccount.maxReviewsPerIp`, or set them to 0, before many jobs start at once (see [operations.md](operations.md#exposure)).
 
@@ -50,6 +52,8 @@ kind has no load balancer, so this installs without exposure and uses a port-for
 ```sh
 kind create cluster --name bk
 cargo xtask image --tag buildkit-controller:dev --load-kind bk
+kubectl create namespace ci
+kubectl label namespace ci pod-security.kubernetes.io/enforce=privileged
 helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
   --set fullnameOverride=buildkit-controller \
   --set image.repository=buildkit-controller --set image.tag=dev \
@@ -64,8 +68,6 @@ The chart also starts the build cache: a one-pod StatefulSet `buildkit-controlle
 ## 2. Create a pool
 
 ```sh
-kubectl create namespace ci
-kubectl label namespace ci pod-security.kubernetes.io/enforce=privileged
 kubectl -n ci create serviceaccount builder
 kubectl apply -f - <<'YAML'
 apiVersion: buildkit.smrt-devops.net/v1alpha1

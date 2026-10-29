@@ -28,7 +28,10 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 You need a cluster that meets the requirements above, `helm`, and a GitHub repository that can run Actions. The chart exposes the controller through a Gateway API Gateway you run: an HTTPS listener for the API and a TLS passthrough listener for the edge, with the Gateway API v1.5.0 or later CRDs ([the chart README](helm/buildkit-controller/README.md#exposure) has an example and the implementations that support it). Without one, add `--set service.type=LoadBalancer`. [docs/quickstart.md](docs/quickstart.md) has the kind version.
 
 ```sh
-# 1. Install the controller and its CRD, attached to the Gateway bk in gateway-system.
+# 1. Create the pool namespace, then install the controller and its CRD, attached to the Gateway bk in gateway-system.
+#    Every namespace in watchNamespaces must exist before helm install.
+kubectl create namespace ci
+kubectl label namespace ci pod-security.kubernetes.io/enforce=privileged
 helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
   --set edge.endpoint=tcp://bk.example.com:8444 --set edge.serverName=bk.example.com \
   --set-json 'gateway.api.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"api"}]' \
@@ -37,12 +40,10 @@ helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
   --set 'auth.oidc[0].url=https://token.actions.githubusercontent.com' \
   --set 'auth.oidc[0].audiences={buildkit-controller}'
 
-# 2. Create a namespace and a pool that accepts your GitHub organization.
+# 2. Create a pool that accepts your GitHub organization.
 #    Edit the access rules in the example first: set repository_owner_id to your
 #    organization's id (gh api orgs/<org> --jq .id) and replace the sample repository. The
 #    first rule allows the main branch only; to allow pull requests, replace its `ref` and `event_name` claims with `event_name: pull_request`.
-kubectl create namespace ci
-kubectl label namespace ci pod-security.kubernetes.io/enforce=privileged
 kubectl apply -f examples/pool-github-oidc.yaml
 
 # 3. Check that the pool is ready.
