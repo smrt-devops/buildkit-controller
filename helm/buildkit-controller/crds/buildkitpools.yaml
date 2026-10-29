@@ -2107,7 +2107,11 @@ spec:
                           Callers whose builds may write the cache, in the syntax of `access.rules`; the
                           rest only read it. Unset trusts OIDC tokens whose `event_name` claim is `push`,
                           `schedule`, `workflow_dispatch` or `merge_group`, and every `ServiceAccount` and
-                          `BuildKitClaim` caller. `[]` trusts nobody.
+                          `BuildKitClaim` caller. `[]` trusts nobody. A token whose `event_name` is
+                          `pull_request`, `pull_request_target`, `workflow_run`, `issue_comment`,
+                          `pull_request_review` or `pull_request_review_comment` only reads, whatever these
+                          rules say, since those jobs can run fork code. Pin `event_name` in OIDC rules here
+                          (for example `push`) rather than matching on the repository alone.
                         items:
                           description: One access rule. Set exactly one of `oidc`, `serviceAccount` or `claims`.
                           properties:

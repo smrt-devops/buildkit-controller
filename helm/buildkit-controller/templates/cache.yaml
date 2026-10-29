@@ -64,7 +64,7 @@ spec:
     - {name: registry, port: 5000, targetPort: registry}
     - {name: metrics, port: {{ .Values.metrics.port }}, targetPort: ops}
 ---
-{{- /* Worker pods only reach the registry port; the ops port serves probes and metrics. */}}
+{{- /* Defence in depth only: these pod labels can be forged by anyone who can create pods. The boundary is mTLS: the registry accepts only workers' client-CA certificates and grants each its live allocation. The ops port serves probes and metrics. */}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
