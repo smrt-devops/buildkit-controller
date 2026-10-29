@@ -9,11 +9,9 @@
 //!    verification. Anything else is answered 401 locally.
 //! 2. [`ReviewCache`]: a definitive answer is reused for a few seconds, keyed by
 //!    the token's SHA-256 (never the token itself).
-//! 3. [`ReviewSlots`] bound reviews in flight, and a per-address cap (IPv6 peers
-//!    grouped at /56, see [`review_peer`]) keeps one client from holding all of
-//!    them. Part of the pool is reserved for service accounts that passed a
-//!    review recently, so a flood of forged tokens from unknown subjects cannot
-//!    starve them. Over any bound the caller gets 503 `upstream_error` with
+//! 3. [`ReviewSlots`] bound reviews in flight and per second, and a per-address
+//!    cap (IPv6 peers grouped at /56, see [`review_peer`]) keeps one client from
+//!    holding every slot. Over any bound the caller gets 503 `upstream_error` with
 //!    `Retry-After` instead of a queued API call.
 
 use std::collections::HashMap;
@@ -45,16 +43,9 @@ const POSITIVE_ENTRIES: usize = 4096;
 const NEGATIVE_ENTRIES: usize = 1024;
 /// `TokenReview` calls in flight per client address unless configured otherwise.
 pub const DEFAULT_MAX_REVIEWS_PER_IP: usize = 4;
-/// `TokenReview` calls a second through the shared slots. Legitimate callers
-/// reuse a token for its cache lifetime,
-/// so this is far above their need and far below what a flood could send.
+/// `TokenReview` calls a second. Legitimate callers reuse a token for its
+/// cache lifetime, so this is far above their need and far below what a flood could send.
 const REVIEWS_PER_SEC: u32 = 50;
-/// Slots of the global pool reserved for recently seen subjects unless configured otherwise.
-pub const DEFAULT_RESERVED_REVIEWS: usize = 8;
-/// How long a subject that passed a review counts as recently seen, unless configured otherwise.
-pub const DEFAULT_RECENT_SUBJECT_TTL: Duration = Duration::from_mins(10);
-/// Recently seen subjects kept per replica; the least recently seen is dropped first.
-const RECENT_SUBJECTS: usize = 256;
 /// Minimum gap between two sweeps of expired entries.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// Username prefix of every service-account token (`system:serviceaccount:<ns>:<name>`).
@@ -136,7 +127,7 @@ fn classify(code: u16) -> ReviewError {
     }
 }
 
-/// The `exp` and subject (`<ns>/<name>`) of `token` if it has the shape of a service-account JWT for this
+/// The `exp` of `token` if it has the shape of a service-account JWT for this
 /// server, read without verification: three segments, an asymmetric `alg`
 /// (never `none` or HS*), a `sub` of `system:serviceaccount:<ns>:<name>`, an
 /// `exp` not past (with [`LEEWAY_SECS`]), and an `aud` that names one of
@@ -144,11 +135,7 @@ fn classify(code: u16) -> ReviewError {
 /// and a review of any other token cannot succeed: the `aud` check would fail
 /// in [`identity_from_status`], or the username check would. The `iss` is not
 /// checked, because the API server may accept several issuers.
-pub(crate) fn sa_token_claims(
-    token: &str,
-    audiences: &[String],
-    now_secs: u64,
-) -> Option<(u64, String)> {
+pub(crate) fn sa_token_claims(token: &str, audiences: &[String], now_secs: u64) -> Option<u64> {
     let mut parts = token.split('.');
     let (header, payload, signature) = (parts.next()?, parts.next()?, parts.next()?);
     if parts.next().is_some() || signature.is_empty() {
@@ -161,7 +148,9 @@ pub(crate) fn sa_token_claims(
     }
     let claims = decode_object(payload)?;
     let sub = claims.get("sub").and_then(Value::as_str)?;
-    let (namespace, name) = sub.strip_prefix(SA_PREFIX)?.split_once(':')?;
+    if !sub.strip_prefix(SA_PREFIX)?.contains(':') {
+        return None;
+    }
     let exp = claims.get("exp").and_then(Value::as_u64)?;
     if exp.saturating_add(LEEWAY_SECS) <= now_secs {
         return None;
@@ -171,7 +160,7 @@ pub(crate) fn sa_token_claims(
         Value::Array(list) => list.iter().any(names_ours),
         one => names_ours(one),
     };
-    ours.then(|| (exp, format!("{namespace}/{name}")))
+    ours.then_some(exp)
 }
 
 fn decode_object(segment: &str) -> Option<Map<String, Value>> {
@@ -289,31 +278,17 @@ pub(crate) fn review_peer(ip: IpAddr) -> IpAddr {
     crate::net::client_group(ip)
 }
 
-/// Reviews in flight: a shared pool, plus a reserve for subjects seen recently.
-///
-/// A service account that passed a review in the last `ttl` is "recently seen"
-/// (a bounded LRU of `<ns>/<name>`). A token whose unverified `sub` names one
-/// may take a reserved slot once the shared pool is full, up to a per-subject
-/// share. Any other token uses the shared pool only. The `sub` is read without
-/// verification, so forging a known one wins nothing beyond that share. The
-/// review result alone decides authentication, and this only schedules.
+/// Reviews in flight and per second, for every uncached token alike.
 ///
 /// Slots bound concurrency, not rate: a refused review takes about a
 /// millisecond, so a few slots kept busy with forged tokens would still send
-/// thousands of reviews a second. The shared pool therefore also has a token
-/// bucket of [`REVIEWS_PER_SEC`]. The reserve has none: a bucket there would
-/// be keyed off the unverified `sub`, so forgers could drain it; the
-/// per-subject share bounds it instead.
+/// thousands of reviews a second. The token bucket caps them at
+/// [`REVIEWS_PER_SEC`]. A forged token can name any `sub`, so no subject gets
+/// slots or rate of its own: under a flood a legitimate caller with an
+/// uncached token gets the retryable 503, and cached tokens are unaffected.
 pub(crate) struct ReviewSlots {
-    max: usize,
-    reserved: usize,
-    ttl: Duration,
-    shared: Semaphore,
-    reserve: Semaphore,
-    shared_rate: Bucket,
-    /// Reserved slots held per subject.
-    held: Mutex<HashMap<String, usize>>,
-    recent: Mutex<HashMap<String, Instant>>,
+    slots: Semaphore,
+    rate: Bucket,
 }
 
 /// A token bucket: `per_sec` tokens a second, at most `burst` saved up.
@@ -349,119 +324,19 @@ impl Bucket {
     }
 }
 
-/// A held review slot; a reserved one gives its subject's share back on drop.
-pub(crate) struct ReviewSlot<'a> {
-    _permit: SemaphorePermit<'a>,
-    reserved_for: Option<(&'a ReviewSlots, String)>,
-}
-
-impl Drop for ReviewSlot<'_> {
-    fn drop(&mut self) {
-        if let Some((slots, subject)) = self.reserved_for.take() {
-            let mut held = lock(&slots.held);
-            if let Some(n) = held.get_mut(&subject) {
-                *n -= 1;
-                if *n == 0 {
-                    held.remove(&subject);
-                }
-            }
-        }
-    }
-}
-
 impl ReviewSlots {
-    pub(crate) fn new(max: usize, reserved: usize, ttl: Duration) -> Self {
-        let max = max.max(1);
-        let reserved = reserved.min(max - 1);
+    /// `max` reviews in flight (at least 1).
+    pub(crate) fn new(max: usize) -> Self {
         Self {
-            max,
-            reserved,
-            ttl,
-            shared: Semaphore::new(max - reserved),
-            reserve: Semaphore::new(reserved),
-            shared_rate: Bucket::new(f64::from(REVIEWS_PER_SEC)),
-            held: Mutex::default(),
-            recent: Mutex::default(),
+            slots: Semaphore::new(max.max(1)),
+            rate: Bucket::new(f64::from(REVIEWS_PER_SEC)),
         }
     }
 
-    /// The same limits with `max` slots in all (at least 1).
-    pub(crate) fn with_max(self, max: usize) -> Self {
-        Self::new(max, self.reserved, self.ttl)
-    }
-
-    /// The same limits with `reserved` of the slots held back, fewer than the total.
-    pub(crate) fn with_reserved(self, reserved: usize) -> Self {
-        Self::new(self.max, reserved, self.ttl)
-    }
-
-    /// The same limits with subjects recently seen for `ttl`.
-    pub(crate) fn with_ttl(self, ttl: Duration) -> Self {
-        Self::new(self.max, self.reserved, ttl)
-    }
-
-    /// Reserved slots one subject may hold at once: a quarter of the reserve, at least 1.
-    fn per_subject(&self) -> usize {
-        (self.reserved / 4).max(1)
-    }
-
-    /// A slot for a review of `subject`, or `None` when none is open to it: a
-    /// shared one while the shared slots and rate allow, else a reserved one
-    /// for a subject seen recently that holds less than its share.
-    pub(crate) fn acquire(&self, subject: &str, now: Instant) -> Option<ReviewSlot<'_>> {
-        if let Ok(permit) = self.shared.try_acquire()
-            && self.shared_rate.take(now)
-        {
-            return Some(ReviewSlot {
-                _permit: permit,
-                reserved_for: None,
-            });
-        }
-        if !self.seen_recently(subject, now) {
-            return None;
-        }
-        let mut held = lock(&self.held);
-        let n = held.get(subject).copied().unwrap_or(0);
-        if n >= self.per_subject() {
-            return None;
-        }
-        let permit = self.reserve.try_acquire().ok()?;
-        held.insert(subject.to_owned(), n + 1);
-        Some(ReviewSlot {
-            _permit: permit,
-            reserved_for: Some((self, subject.to_owned())),
-        })
-    }
-
-    /// Free reserved slots (tests).
-    #[cfg(test)]
-    pub(crate) fn reserve_free(&self) -> usize {
-        self.reserve.available_permits()
-    }
-
-    fn seen_recently(&self, subject: &str, now: Instant) -> bool {
-        lock(&self.recent)
-            .get(subject)
-            .is_some_and(|t| now.duration_since(*t) < self.ttl)
-    }
-
-    /// Records that `subject` passed a review. Only a review that succeeded
-    /// calls this, so unauthenticated callers cannot fill the set.
-    pub(crate) fn note_authenticated(&self, subject: &str, now: Instant) {
-        let mut recent = lock(&self.recent);
-        if recent.len() >= RECENT_SUBJECTS && !recent.contains_key(subject) {
-            recent.retain(|_, t| now.duration_since(*t) < self.ttl);
-            if recent.len() >= RECENT_SUBJECTS {
-                let oldest = recent
-                    .iter()
-                    .min_by_key(|(_, t)| **t)
-                    .map(|(k, _)| k.clone());
-                if let Some(k) = oldest {
-                    recent.remove(&k);
-                }
-            }
-        }
-        recent.insert(subject.to_owned(), now);
+    /// A slot for one review, or `None` when every slot is busy or the rate is spent.
+    pub(crate) fn acquire(&self, now: Instant) -> Option<SemaphorePermit<'_>> {
+        let permit = self.slots.try_acquire().ok()?;
+        self.rate.take(now).then_some(permit)
     }
 }
 

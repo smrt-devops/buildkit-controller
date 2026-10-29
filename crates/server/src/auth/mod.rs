@@ -19,8 +19,8 @@ use serde_json::{Map, Value};
 pub use access::{AccessRule, AccessRules, RuleError};
 pub use oidc::{OidcIssuer, REFETCH_INTERVAL, https_client, public_roots};
 pub use token_review::{
-    DEFAULT_MAX_CONCURRENT_REVIEWS, DEFAULT_MAX_REVIEWS_PER_IP, DEFAULT_RECENT_SUBJECT_TTL,
-    DEFAULT_RESERVED_REVIEWS, KubeTokenReviewer, REVIEW_CACHE_TTL, ReviewError, TokenReviewer,
+    DEFAULT_MAX_CONCURRENT_REVIEWS, DEFAULT_MAX_REVIEWS_PER_IP, KubeTokenReviewer,
+    REVIEW_CACHE_TTL, ReviewError, TokenReviewer,
 };
 
 /// `Retry-After` seconds of a 503 from a busy, throttled or timed-out `TokenReview`.
@@ -256,7 +256,7 @@ pub struct Authenticator<R> {
     reviewer: R,
     /// `TokenReview` answers by token hash.
     reviews: token_review::ReviewCache,
-    /// Bounds `TokenReview` calls in flight, with a reserve for recently seen subjects.
+    /// Bounds `TokenReview` calls in flight and per second.
     review_slots: token_review::ReviewSlots,
     /// Bounds `TokenReview` calls in flight per client address.
     review_peers: crate::edge::PerPeer,
@@ -315,11 +315,7 @@ impl<R: TokenReviewer> Authenticator<R> {
             http,
             reviewer,
             reviews: token_review::ReviewCache::default(),
-            review_slots: token_review::ReviewSlots::new(
-                DEFAULT_MAX_CONCURRENT_REVIEWS,
-                DEFAULT_RESERVED_REVIEWS,
-                DEFAULT_RECENT_SUBJECT_TTL,
-            ),
+            review_slots: token_review::ReviewSlots::new(DEFAULT_MAX_CONCURRENT_REVIEWS),
             review_peers: crate::edge::PerPeer::new(DEFAULT_MAX_REVIEWS_PER_IP),
         })
     }
@@ -327,18 +323,7 @@ impl<R: TokenReviewer> Authenticator<R> {
     /// Allows at most `n` (at least 1) `TokenReview` calls in flight; more callers get 503.
     #[must_use]
     pub fn with_max_concurrent_reviews(mut self, n: usize) -> Self {
-        self.review_slots = self.review_slots.with_max(n);
-        self
-    }
-
-    /// Holds `n` of the review slots back for service accounts that passed a review
-    /// within `recent` (fewer than the total; a larger `n` is cut to fit). A token
-    /// whose unverified `sub` names such an account may use them once the shared
-    /// slots are taken, a quarter of them at a time per account. Forging a known
-    /// `sub` wins no more than that share. The review decides who the caller is.
-    #[must_use]
-    pub fn with_reserved_reviews(mut self, n: usize, recent: Duration) -> Self {
-        self.review_slots = self.review_slots.with_reserved(n).with_ttl(recent);
+        self.review_slots = token_review::ReviewSlots::new(n);
         self
     }
 
@@ -388,7 +373,7 @@ impl<R: TokenReviewer> Authenticator<R> {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let Some((exp, subject)) = token_review::sa_token_claims(token, audiences, now_secs) else {
+        let Some(exp) = token_review::sa_token_claims(token, audiences, now_secs) else {
             return Err(AuthError::Invalid("not a service account token"));
         };
         let key = token_review::token_key(token);
@@ -407,7 +392,7 @@ impl<R: TokenReviewer> Authenticator<R> {
             },
             None => None,
         };
-        let Some(_slot) = self.review_slots.acquire(&subject, now) else {
+        let Some(_slot) = self.review_slots.acquire(now) else {
             return Err(AuthError::Upstream("tokenreview saturated".into()));
         };
         let status = self
@@ -419,13 +404,6 @@ impl<R: TokenReviewer> Authenticator<R> {
                 ReviewError::Unexpected(m) => AuthError::Internal(m),
             })?;
         let r = token_review::identity_from_status(&status, audiences);
-        if let Ok(Identity::ServiceAccount {
-            namespace, name, ..
-        }) = &r
-        {
-            self.review_slots
-                .note_authenticated(&format!("{namespace}/{name}"), now);
-        }
         // A positive answer never outlives the token's own `exp`.
         let left = Duration::from_secs(exp.saturating_sub(now_secs));
         let ttl = if r.is_ok() {
