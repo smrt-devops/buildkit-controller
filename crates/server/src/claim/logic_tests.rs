@@ -315,3 +315,40 @@ fn statuses_and_the_secret() {
     let no_ca = secret(&c, &binding("a1"), "KEY", None).unwrap();
     assert!(!no_ca.data.unwrap().contains_key("ca.crt"));
 }
+
+/// Pods bound for in-cluster claims before every allocation was a claim have
+/// no `P claim`: they are strays once their claim (by uid) is gone, has ended
+/// or names another allocation; API callers' pods are left to `DELETE`.
+#[test]
+fn pre_claim_pods_of_ended_claims_are_strays() {
+    let owned = |name: &str, owner: &str, alloc: &str| {
+        let mut p = pod(name, None, alloc);
+        p.metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(ANN_OWNER.to_owned(), owner.to_owned());
+        p
+    };
+    let mut live = claim("ci", "live", "u1", "2026-10-21T12:00:00Z");
+    live.status = Some(bound_status(&live, &binding("aaaa"), true));
+    let ended = with_phase(
+        claim("ci", "ended", "u2", "2026-10-21T12:00:00Z"),
+        ClaimPhase::Expired,
+    );
+    let claims: Vec<Arc<BuildKitClaim>> = [live, ended].into_iter().map(Arc::new).collect();
+    let pods = vec![
+        owned("default-0", "claim:ci/live#u1", "aaaa"),
+        owned("default-1", "claim:ci/live#u1", "bbbb"),
+        owned("default-2", "claim:ci/ended#u2", "cccc"),
+        owned("default-3", "claim:ci/gone#u9", "dddd"),
+        owned("default-4", "claim:unwatched/x#u8", "eeee"),
+        owned("default-5", "sa:ci/builder", "ffff"),
+        owned("default-6", "claim:ci/gone#u9", FREE),
+    ];
+    let got: Vec<&str> = strays(&pods, &claims, &served(), OWN)
+        .into_iter()
+        .map(|p| p.metadata.name.as_deref().unwrap())
+        .collect();
+    assert_eq!(got, ["default-1", "default-2", "default-3"]);
+}

@@ -12,21 +12,24 @@ use buildkit_controller_api::dto::{
     AllocationResponse, AllocationState, CreateAllocationRequest, PendingAllocation,
 };
 use buildkit_controller_api::v1alpha1::{self as crd, BuildKitPool};
+use k8s_openapi::api::core::v1::Pod;
 use kube::runtime::reflector::{ObjectRef, Store};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use super::backend::{Backend, Write};
+use super::bind::retire_pod;
 use super::bind::{MIN_TTL, access_rules, pool_ready, seconds};
 use super::cache;
 use super::certs::CertSource;
 use super::error::AllocError;
 use super::metrics::AllocMetrics;
-use super::pods::new_alloc_id;
+use super::pods::{ANN_CLAIM, ann, new_alloc_id, of_pool};
 use crate::auth::Identity;
 use crate::claim::logic;
 use crate::pki::{AllocId, ClientPublicKey, Namespace, PoolName};
+use crate::render::{ANN_ALLOC, ANN_OWNER, LABEL_POOL};
 use crate::runtime::stores::{ClaimEvent, ClaimSubscription};
 
 /// How long `POST /v1/allocations` waits for the claim to bind.
@@ -55,6 +58,8 @@ pub struct Front {
     served: HashSet<String>,
     metrics: AllocMetrics,
     stopping: CancellationToken,
+    /// Worker pods, for releasing allocations made before claims existed.
+    pods: Option<Store<Pod>>,
 }
 
 impl Front {
@@ -81,7 +86,16 @@ impl Front {
             served,
             metrics,
             stopping: CancellationToken::new(),
+            pods: None,
         }
+    }
+
+    /// Releases of allocations made before every allocation was a claim
+    /// retire their pods from this store.
+    #[must_use]
+    pub fn with_pods(mut self, pods: Store<Pod>) -> Self {
+        self.pods = Some(pods);
+        self
     }
 
     /// Waits end early once `stopping` fires: the caller polls another replica.
@@ -141,7 +155,12 @@ impl Front {
             .await;
         guard.armed = false;
         let r = match found {
-            Some(c) => self.outcome(&c),
+            // Bound, but this replica cannot name the CA yet: the client polls
+            // for the response rather than lose the id.
+            Some(c) => match self.outcome(&c) {
+                Err(AllocError::CaUnavailable) => Ok(pending(&id, None)),
+                r => r,
+            },
             // Created, but not seen yet.
             None => Ok(pending(&id, None)),
         };
@@ -172,7 +191,10 @@ impl Front {
 
     /// `DELETE /v1/allocations/{id}`: deletes the claim; the leader retires its pod.
     pub async fn release(&self, who: &Identity, id: &str) -> Result<(), AllocError> {
-        let c = self.owned(who, id).await?;
+        let c = match self.owned(who, id).await {
+            Err(AllocError::NotFound) => return self.release_unclaimed(who, id).await,
+            r => r?,
+        };
         let uid = c.metadata.uid.as_deref().unwrap_or_default();
         match self.backend.delete_claim(&self.namespace, id, uid).await {
             Write::Done => {
@@ -186,6 +208,71 @@ impl Front {
                 Err(AllocError::Internal)
             }
         }
+    }
+
+    /// Release an allocation made before every allocation was a claim: its
+    /// pods carry the id and the caller's owner but no `P claim`. Each retire
+    /// tests the uid and `alloc == id`, so a look-alike pod is harmless.
+    async fn release_unclaimed(&self, who: &Identity, id: &str) -> Result<(), AllocError> {
+        let Some(pods) = &self.pods else {
+            return Err(AllocError::NotFound);
+        };
+        let found: Vec<Arc<Pod>> = pods
+            .state()
+            .into_iter()
+            .filter(|p| ann(p, ANN_ALLOC) == Some(id) && ann(p, ANN_CLAIM).is_none())
+            .filter(|p| p.metadata.deletion_timestamp.is_none() && self.in_known_pool(p))
+            .collect();
+        if found.is_empty() {
+            return Err(AllocError::NotFound);
+        }
+        let owner = who.owner();
+        let mine: Vec<&Arc<Pod>> = found
+            .iter()
+            .filter(|p| ann(p, ANN_OWNER).map(str::as_bytes) == Some(owner.as_bytes()))
+            .collect();
+        if mine.is_empty() {
+            warn!(alloc_id = id, result = "forbidden", "release refused");
+            return Err(AllocError::Forbidden);
+        }
+        let mut released = false;
+        for p in mine {
+            let ns = p.metadata.namespace.as_deref().unwrap_or_default();
+            let pool = p
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(LABEL_POOL))
+                .map_or("", String::as_str);
+            released |=
+                retire_pod(&*self.backend, &self.metrics, ns, pool, p, id, "released").await;
+        }
+        if released {
+            info!(
+                alloc_id = id,
+                result = "released",
+                "release of an allocation without a claim"
+            );
+            Ok(())
+        } else {
+            Err(AllocError::NotFound)
+        }
+    }
+
+    /// A pod of a pool in the store: pool label, namespace and a controller
+    /// ownerReference to that pool's uid. The id is public, so a pod outside a
+    /// pool must never match.
+    fn in_known_pool(&self, pod: &Pod) -> bool {
+        let (Some(ns), Some(pool)) = (
+            pod.metadata.namespace.as_deref(),
+            pod.metadata.labels.as_ref().and_then(|l| l.get(LABEL_POOL)),
+        ) else {
+            return false;
+        };
+        self.pools
+            .get(&ObjectRef::new(pool).within(ns))
+            .and_then(|p| p.metadata.uid.clone())
+            .is_some_and(|uid| of_pool(pod, ns, pool, &uid))
     }
 
     /// The claim of allocation `id`, if `who` owns it. A claim created on

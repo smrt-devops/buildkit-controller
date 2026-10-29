@@ -16,7 +16,7 @@ use time::OffsetDateTime;
 use crate::alloc::pods::{ANN_CLAIM, DRAINING, FREE, ann, derived_alloc_id, parse_ts};
 use crate::auth::Identity;
 use crate::pki::AllocId;
-use crate::render::ANN_ALLOC;
+use crate::render::{ANN_ALLOC, ANN_OWNER};
 
 /// `(namespace, name)` of a pool.
 pub type PoolKey = (String, String);
@@ -313,9 +313,11 @@ pub fn collectable(c: &BuildKitClaim, own: &str, now: OffsetDateTime) -> bool {
 
 /// Pods whose allocation no longer has a claim to serve, by `(namespace, name)`
 /// of the pod: the claim is gone or replaced, has ended, or is bound to another
-/// pod (a bind a deposed leader made). Only allocated pods that carry `P claim`
-/// for a served namespace count; workers from before v3 and claims nobody
-/// watches are left to their expiry.
+/// pod (a bind a deposed leader made). Pods bound before every allocation was
+/// a claim carry no `P claim`: the ones an in-cluster claim owned count when
+/// that claim (by uid) is gone, has ended, or names another allocation id.
+/// Only served namespaces count; claims nobody watches, and pre-claim
+/// allocations of API callers (released by `DELETE`), are left to their expiry.
 #[must_use]
 pub fn strays<'a, S: std::hash::BuildHasher>(
     pods: impl IntoIterator<Item = &'a Pod>,
@@ -327,15 +329,19 @@ pub fn strays<'a, S: std::hash::BuildHasher>(
         .iter()
         .filter_map(|c| Some((claim_ref(c)?, c.as_ref())))
         .collect();
+    let by_uid: HashMap<&str, &BuildKitClaim> = claims
+        .iter()
+        .filter_map(|c| Some((c.metadata.uid.as_deref()?, c.as_ref())))
+        .collect();
     pods.into_iter()
         .filter(|p| p.metadata.deletion_timestamp.is_none())
         .filter(|p| {
-            let (Some(cref), Some(id)) = (ann(p, ANN_CLAIM), ann(p, ANN_ALLOC)) else {
+            let Some(id) = ann(p, ANN_ALLOC).filter(|a| *a != FREE && *a != DRAINING) else {
                 return false;
             };
-            if id == FREE || id == DRAINING {
-                return false;
-            }
+            let Some(cref) = ann(p, ANN_CLAIM) else {
+                return unclaimed_stray(p, id, &by_uid, served_ns);
+            };
             let ns = cref.split_once('/').map_or("", |(ns, _)| ns);
             if !served_ns.contains(ns) {
                 return false;
@@ -355,6 +361,34 @@ pub fn strays<'a, S: std::hash::BuildHasher>(
             }
         })
         .collect()
+}
+
+/// A pod bound for an in-cluster claim before every allocation was a claim
+/// (owner `claim:<ns>/<name>#<uid>`, no `P claim`) whose claim is gone, has
+/// ended, or records another allocation id.
+fn unclaimed_stray<S: std::hash::BuildHasher>(
+    p: &Pod,
+    id: &str,
+    by_uid: &HashMap<&str, &BuildKitClaim>,
+    served_ns: &HashSet<String, S>,
+) -> bool {
+    let Some((ns, uid)) = ann(p, ANN_OWNER).and_then(claim_owner) else {
+        return false;
+    };
+    if !served_ns.contains(ns) {
+        return false;
+    }
+    by_uid.get(uid).is_none_or(|c| {
+        phase(c).is_terminal()
+            || c.status.as_ref().and_then(|s| s.allocation_id.as_deref()) != Some(id)
+    })
+}
+
+/// `(namespace, uid)` of a claim owner string `claim:<ns>/<name>#<uid>`.
+fn claim_owner(s: &str) -> Option<(&str, &str)> {
+    let (ns, rest) = s.strip_prefix("claim:")?.split_once('/')?;
+    let (name, uid) = rest.split_once('#')?;
+    (!ns.is_empty() && !name.is_empty() && !uid.is_empty()).then_some((ns, uid))
 }
 
 fn condition(status: bool, reason: &str, message: &str, generation: Option<i64>) -> Condition {

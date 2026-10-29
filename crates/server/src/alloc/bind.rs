@@ -816,29 +816,7 @@ impl Binder {
 
     /// Retire a pod: the retire patch, then delete on success.
     pub async fn retire(&self, ns: &str, pool: &str, pod: &Pod, expected: &str, why: &str) -> bool {
-        let (Some(name), Some(uid)) = (&pod.metadata.name, &pod.metadata.uid) else {
-            return false;
-        };
-        let patch = retire_patch(Some(uid), expected);
-        match self.backend.patch_pod(ns, name, patch).await {
-            PatchOutcome::Applied(_) => {
-                let grace = pod
-                    .spec
-                    .as_ref()
-                    .and_then(|s| s.termination_grace_period_seconds)
-                    .and_then(|g| u32::try_from(g).ok());
-                if let Err(error) = self.backend.delete_pod(ns, name, uid, grace).await {
-                    warn!(namespace = %ns, pod = %name, error, "deleting retired pod");
-                }
-                self.metrics.release(ns, pool, why);
-                true
-            }
-            PatchOutcome::Lost => false,
-            PatchOutcome::Unknown | PatchOutcome::Failed(_) => {
-                warn!(namespace = %ns, pod = %name, "retire patch failed");
-                false
-            }
-        }
+        retire_pod(&*self.backend, &self.metrics, ns, pool, pod, expected, why).await
     }
 
     /// Retire one warm pod of a cached slot that serves another cache scope,
@@ -952,4 +930,40 @@ fn waited(c: &BuildKitClaim) -> f64 {
 /// The claim's `resourceVersion`, the precondition of its status writes.
 fn rv(c: &BuildKitClaim) -> &str {
     c.metadata.resource_version.as_deref().unwrap_or_default()
+}
+
+/// Retire `pod` of `pool`: the retire patch (uid and `alloc == expected`
+/// tested), then delete it on success. False when the patch lost or failed.
+pub(super) async fn retire_pod(
+    backend: &dyn Backend,
+    metrics: &AllocMetrics,
+    ns: &str,
+    pool: &str,
+    pod: &Pod,
+    expected: &str,
+    why: &str,
+) -> bool {
+    let (Some(name), Some(uid)) = (&pod.metadata.name, &pod.metadata.uid) else {
+        return false;
+    };
+    let patch = retire_patch(Some(uid), expected);
+    match backend.patch_pod(ns, name, patch).await {
+        PatchOutcome::Applied(_) => {
+            let grace = pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.termination_grace_period_seconds)
+                .and_then(|g| u32::try_from(g).ok());
+            if let Err(error) = backend.delete_pod(ns, name, uid, grace).await {
+                warn!(namespace = %ns, pod = %name, error, "deleting retired pod");
+            }
+            metrics.release(ns, pool, why);
+            true
+        }
+        PatchOutcome::Lost => false,
+        PatchOutcome::Unknown | PatchOutcome::Failed(_) => {
+            warn!(namespace = %ns, pod = %name, "retire patch failed");
+            false
+        }
+    }
 }

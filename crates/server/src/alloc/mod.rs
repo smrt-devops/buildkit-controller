@@ -173,7 +173,8 @@ impl Component for AllocService {
                 served.clone(),
                 metrics.clone(),
             )
-            .with_stopping(shutdown.clone());
+            .with_stopping(shutdown.clone())
+            .with_pods(ctx.pods());
             let binder = Arc::new(Binder::new(
                 backend,
                 (ctx.pools(), ctx.pods(), ctx.claims()),

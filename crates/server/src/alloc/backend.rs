@@ -247,10 +247,7 @@ impl Backend for KubeBackend {
         status: &BuildKitClaimStatus,
     ) -> BoxFuture<'static, Write> {
         let (api, name, t) = (self.api::<BuildKitClaim>(ns), name.to_owned(), self.timeout);
-        let body = Patch::Merge(json!({
-            "metadata": {"resourceVersion": resource_version},
-            "status": status,
-        }));
+        let body = Patch::Merge(status_patch(resource_version, status));
         Box::pin(async move {
             written(done(t, api.patch_status(&name, &PatchParams::default(), &body)).await)
         })
@@ -275,5 +272,47 @@ impl Backend for KubeBackend {
         let (api, name, t) = (self.api::<Secret>(ns), name.to_owned(), self.timeout);
         let dp = delete_params(uid, None);
         Box::pin(async move { written(done(t, api.delete(&name, &dp)).await) })
+    }
+}
+
+/// The merge patch of a claim status write, preconditioned on
+/// `resource_version`. A status without a queue place sends `queuePosition:
+/// null`, so a claim that leaves `Pending` loses its place; the other fields are
+/// always written in full.
+pub(super) fn status_patch(resource_version: &str, status: &BuildKitClaimStatus) -> Value {
+    let mut s = json!(status);
+    if let Some(m) = s.as_object_mut() {
+        m.entry("queuePosition").or_insert(Value::Null);
+    }
+    json!({"metadata": {"resourceVersion": resource_version}, "status": s})
+}
+
+#[cfg(test)]
+mod tests {
+    use buildkit_controller_api::claim::{BuildKitClaimStatus, ClaimPhase};
+    use serde_json::json;
+
+    use super::status_patch;
+
+    #[test]
+    fn leaving_pending_clears_the_queue_position() {
+        let bound = BuildKitClaimStatus {
+            phase: Some(ClaimPhase::Bound),
+            ..BuildKitClaimStatus::default()
+        };
+        let p = status_patch("7", &bound);
+        assert_eq!(p["metadata"]["resourceVersion"], "7");
+        assert_eq!(p["status"]["queuePosition"], json!(null));
+        assert!(
+            p["status"]
+                .as_object()
+                .is_some_and(|m| m.contains_key("queuePosition"))
+        );
+        let pending = BuildKitClaimStatus {
+            phase: Some(ClaimPhase::Pending),
+            queue_position: Some(3),
+            ..BuildKitClaimStatus::default()
+        };
+        assert_eq!(status_patch("7", &pending)["status"]["queuePosition"], 3);
     }
 }
