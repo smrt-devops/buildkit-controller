@@ -147,10 +147,8 @@ impl Client {
         id: &str,
         wait: Option<Duration>,
     ) -> Result<AllocationStatus, ClientError> {
-        let mut url = self.url(&format!("/v1/allocations/{id}"));
-        if let Some(w) = wait {
-            url.push_str(&format!("?wait={}s", w.as_secs()));
-        }
+        let query = wait.map_or_else(String::new, |w| format!("?wait={}s", w.as_secs()));
+        let url = self.url(&format!("/v1/allocations/{id}{query}"));
         let resp = self
             .http
             .get(url)

@@ -7,7 +7,6 @@
 //! applied per connection, so a rotation needs no restart.
 
 pub mod api;
-pub mod body;
 pub mod listener;
 pub mod metrics;
 #[cfg(test)]
@@ -21,7 +20,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-pub use api::{Allocator, ApiState, Authenticate, EdgeInfo, Grant, router};
+pub use api::{Allocator, ApiState, Authenticate, EdgeInfo, router};
 pub use listener::{Limits, ServingCerts, Stopping, serve, serve_with_proxy, server_config};
 pub use metrics::HttpMetrics;
 

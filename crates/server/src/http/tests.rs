@@ -13,10 +13,12 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use buildkit_controller_api::dto::{AllocationResponse, CreateAllocationRequest, ErrorCode};
+use buildkit_controller_api::claim::{BuildKitClaim, BuildKitClaimStatus};
+use buildkit_controller_api::dto::{
+    AllocationResponse, AllocationState, CreateAllocationRequest, ErrorCode, PendingAllocation,
+};
 use buildkit_controller_api::v1alpha1::BuildKitPool;
 use futures::future::BoxFuture;
-use http_body::Body as _;
 use k8s_openapi::api::authentication::v1::{TokenReviewStatus, UserInfo};
 use kube::runtime::reflector::{self, Store};
 use kube::runtime::watcher;
@@ -29,21 +31,19 @@ use tokio::sync::{Notify, broadcast, watch};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
-use super::api::{Allocator, ApiState, EdgeInfo, Grant, router};
-use super::body::CommitBody;
+use super::api::{Allocator, ApiState, EdgeInfo, router};
 use super::listener::Limits;
 use super::metrics::HttpMetrics;
-use crate::alloc::backend::{Backend, CreateOutcome, PatchOutcome};
+use crate::alloc::backend::{Backend, PatchOutcome, Write};
 use crate::alloc::metrics::AllocMetrics;
-use crate::alloc::queue::{MAX_WAITERS, Queues};
-use crate::alloc::{AllocError, AllocService, CertSource, Engine, EngineConfig};
+use crate::alloc::{AllocError, AllocService, CertSource, Front, Outcome};
 use crate::auth::{
     AuthConfig, Authenticator, Identity, OidcIssuer, ReviewError, TokenReviewer, https_client,
 };
 use crate::pki::{CaBundle, UserServingCert};
 use crate::render::fixtures;
 use crate::runtime::metrics::Metrics;
-use crate::runtime::stores::PodSubscription;
+use crate::runtime::stores::ClaimSubscription;
 
 const NS: &str = fixtures::POOL_NAMESPACE;
 const ISSUER: &str = "https://issuer.invalid";
@@ -117,45 +117,29 @@ impl TokenReviewer for Reviewer {
     }
 }
 
+/// `Fake::calls` before any allocation.
 const PENDING: u8 = 0;
-const COMMITTED: u8 = 1;
-const RETIRED: u8 = 2;
-
-struct FakeGrant(AllocationResponse, Arc<AtomicU8>);
-
-impl Grant for FakeGrant {
-    fn response(&self) -> &AllocationResponse {
-        &self.0
-    }
-    fn commit(self) {
-        self.1.store(COMMITTED, Ordering::SeqCst);
-    }
-}
-
-impl Drop for FakeGrant {
-    fn drop(&mut self) {
-        let _ = self
-            .1
-            .compare_exchange(PENDING, RETIRED, Ordering::SeqCst, Ordering::SeqCst);
-    }
-}
 
 enum Next {
-    Grant,
+    Bound,
+    Pending,
     Fail(AllocError),
     /// Never resolves; signals `started`, marks `cancelled` when dropped.
     Hang,
-    /// Grants after the delay.
+    /// Binds after the delay.
     Slow(Duration),
 }
 
 struct Fake {
     next: Mutex<Option<Next>>,
     release: Mutex<Result<(), AllocError>>,
-    grant: Arc<AtomicU8>,
+    get: Mutex<Result<Outcome, AllocError>>,
+    /// Allocations made.
+    calls: Arc<AtomicU8>,
     started: Arc<Notify>,
     cancelled: Arc<AtomicU8>,
     seen: Mutex<Vec<String>>,
+    waits: Mutex<Vec<Duration>>,
     rejected: Arc<Mutex<Vec<ErrorCode>>>,
 }
 
@@ -164,10 +148,12 @@ impl Fake {
         Self {
             next: Mutex::new(Some(next)),
             release: Mutex::new(Ok(())),
-            grant: Arc::new(AtomicU8::new(PENDING)),
+            get: Mutex::new(Err(AllocError::NotFound)),
+            calls: Arc::new(AtomicU8::new(PENDING)),
             started: Arc::new(Notify::new()),
             cancelled: Arc::new(AtomicU8::new(0)),
             seen: Mutex::new(Vec::new()),
+            waits: Mutex::new(Vec::new()),
             rejected: Arc::default(),
         }
     }
@@ -180,9 +166,11 @@ impl Drop for SetOnDrop {
     }
 }
 
+const ID: &str = "k3q7m2x4b5n6p7r2s3t4v5w6y7";
+
 fn response(req: &CreateAllocationRequest, owner: String) -> AllocationResponse {
     AllocationResponse {
-        id: "k3q7m2x4b5n6p7r2s3t4v5w6y7".into(),
+        id: ID.into(),
         namespace: req.namespace.clone(),
         pool: req.pool.clone(),
         owner,
@@ -196,28 +184,37 @@ fn response(req: &CreateAllocationRequest, owner: String) -> AllocationResponse 
     }
 }
 
+fn pending(position: u32) -> Outcome {
+    Outcome::Pending(PendingAllocation {
+        id: ID.into(),
+        state: AllocationState::Pending,
+        position: Some(position),
+    })
+}
+
 impl Allocator for Fake {
-    type Grant = FakeGrant;
     fn allocate<'a>(
         &'a self,
         who: &'a Identity,
         req: &'a CreateAllocationRequest,
-    ) -> BoxFuture<'a, Result<FakeGrant, AllocError>> {
+    ) -> BoxFuture<'a, Result<Outcome, AllocError>> {
         self.seen.lock().unwrap().push(who.owner());
-        let next = self.next.lock().unwrap().take().unwrap_or(Next::Grant);
+        let next = self.next.lock().unwrap().take().unwrap_or(Next::Bound);
         Box::pin(async move {
+            let bound = || {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Outcome::Bound(Box::new(response(req, who.owner()))))
+            };
             match next {
-                Next::Grant => Ok(FakeGrant(
-                    response(req, who.owner()),
-                    Arc::clone(&self.grant),
-                )),
+                Next::Bound => bound(),
+                Next::Pending => {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(pending(3))
+                }
                 Next::Fail(e) => Err(e),
                 Next::Slow(d) => {
                     tokio::time::sleep(d).await;
-                    Ok(FakeGrant(
-                        response(req, who.owner()),
-                        Arc::clone(&self.grant),
-                    ))
+                    bound()
                 }
                 Next::Hang => {
                     let _guard = SetOnDrop(Arc::clone(&self.cancelled));
@@ -226,6 +223,17 @@ impl Allocator for Fake {
                 }
             }
         })
+    }
+    fn get<'a>(
+        &'a self,
+        who: &'a Identity,
+        _: &'a str,
+        wait: Duration,
+    ) -> BoxFuture<'a, Result<Outcome, AllocError>> {
+        self.seen.lock().unwrap().push(who.owner());
+        self.waits.lock().unwrap().push(wait);
+        let r = self.get.lock().unwrap().clone();
+        Box::pin(async move { r })
     }
     fn rejected(&self, code: ErrorCode) {
         self.rejected.lock().unwrap().push(code);
@@ -350,7 +358,7 @@ const ALICE: &str = "sa.render-verify.alice";
 #[tokio::test]
 async fn unauthenticated_is_401_with_www_authenticate_and_exact_body() {
     let metrics = Metrics::new();
-    let app = router(state(Fake::new(Next::Grant), &metrics));
+    let app = router(state(Fake::new(Next::Bound), &metrics));
     for token in [None, Some("garbage"), Some("sa.")] {
         let (st, h, body) = call(&app, post(token, "application/json", OK_BODY)).await;
         assert_eq!(st, StatusCode::UNAUTHORIZED, "{token:?}");
@@ -383,8 +391,8 @@ async fn forged_or_unsigned_jwt_is_401() {
     use crate::auth::tests::{Signer, TestIssuer, claims};
     let key = Signer::rsa("k", "RS256");
     let iss = TestIssuer::start(&[&key]).await;
-    let fake = Fake::new(Next::Grant);
-    let grant = Arc::clone(&fake.grant);
+    let fake = Fake::new(Next::Bound);
+    let grant = Arc::clone(&fake.calls);
     let app = router(state_with(
         fake,
         &Metrics::new(),
@@ -429,8 +437,8 @@ async fn forged_or_unsigned_jwt_is_401() {
 /// earlier retry cannot change the answer.
 #[tokio::test]
 async fn unreachable_issuer_is_503_with_retry_after() {
-    let fake = Fake::new(Next::Grant);
-    let grant = Arc::clone(&fake.grant);
+    let fake = Fake::new(Next::Bound);
+    let grant = Arc::clone(&fake.calls);
     let app = router(state(fake, &Metrics::new()));
     let claims = b64(
         &json!({"iss": ISSUER, "sub": "x", "aud": "buildkit-controller", "exp": 4_102_444_800_u64}),
@@ -459,13 +467,6 @@ impl Backend for NoBackend {
     fn patch_pod(&self, _: &str, _: &str, _: Value) -> BoxFuture<'static, PatchOutcome> {
         Box::pin(async { PatchOutcome::Unknown })
     }
-    fn create_pod(
-        &self,
-        _: &str,
-        _: k8s_openapi::api::core::v1::Pod,
-    ) -> BoxFuture<'static, CreateOutcome> {
-        Box::pin(async { CreateOutcome::Exists })
-    }
     fn delete_pod(
         &self,
         _: &str,
@@ -473,34 +474,6 @@ impl Backend for NoBackend {
         _: &str,
         _: Option<u32>,
     ) -> BoxFuture<'static, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn apply_waiters(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: i32,
-        _: &str,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn get_pvc(
-        &self,
-        _: &str,
-        _: &str,
-    ) -> BoxFuture<'static, Result<Option<k8s_openapi::api::core::v1::PersistentVolumeClaim>, String>>
-    {
-        Box::pin(async { Ok(None) })
-    }
-    fn create_pvc(
-        &self,
-        _: &str,
-        _: k8s_openapi::api::core::v1::PersistentVolumeClaim,
-    ) -> BoxFuture<'static, crate::alloc::backend::PvcCreate> {
-        Box::pin(async { crate::alloc::backend::PvcCreate::Created })
-    }
-    fn delete_pvc(&self, _: &str, _: &str, _: &str) -> BoxFuture<'static, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
     fn annotate_pvc(
@@ -511,6 +484,41 @@ impl Backend for NoBackend {
         _: &str,
     ) -> BoxFuture<'static, Result<(), String>> {
         Box::pin(async { Ok(()) })
+    }
+    fn create_claim(&self, _: BuildKitClaim) -> BoxFuture<'static, Write> {
+        Box::pin(async { Write::Unknown })
+    }
+    fn get_claim(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> BoxFuture<'static, Result<Option<BuildKitClaim>, Write>> {
+        Box::pin(async { Ok(None) })
+    }
+    fn delete_claim(&self, _: &str, _: &str, _: &str) -> BoxFuture<'static, Write> {
+        Box::pin(async { Write::Gone })
+    }
+    fn patch_claim_status(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &BuildKitClaimStatus,
+    ) -> BoxFuture<'static, Write> {
+        Box::pin(async { Write::Unknown })
+    }
+    fn get_secret(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> BoxFuture<'static, Result<Option<k8s_openapi::api::core::v1::Secret>, Write>> {
+        Box::pin(async { Ok(None) })
+    }
+    fn create_secret(&self, _: k8s_openapi::api::core::v1::Secret) -> BoxFuture<'static, Write> {
+        Box::pin(async { Write::Unknown })
+    }
+    fn delete_secret(&self, _: &str, _: &str, _: &str) -> BoxFuture<'static, Write> {
+        Box::pin(async { Write::Gone })
     }
 }
 
@@ -524,29 +532,51 @@ impl CertSource for NoCa {
     }
 }
 
-fn engine() -> Engine {
-    let (pods, _) = reflector::store();
+/// The real front door over the test pools, with no API server and no CA.
+fn front() -> Front {
+    let (claims, _) = reflector::store();
     let (tx, _) = broadcast::channel(4);
-    let m = AllocMetrics::default();
-    Engine::new(
+    Front::new(
         Arc::new(NoBackend),
         pools(),
-        pods,
-        Box::new(move || PodSubscription::new(tx.subscribe())),
+        claims,
+        Box::new(move || ClaimSubscription::new(tx.subscribe())),
         Arc::new(NoCa),
-        EngineConfig {
-            endpoint: "tcp://bk.example.com:8444".into(),
-            server_name: "bk.example.com".into(),
-            allocation_domain: None,
-        },
-        m.clone(),
-        Arc::new(Queues::new(MAX_WAITERS, m)),
+        "bk-system".into(),
+        HashSet::from(["bk-system".to_owned()]),
+        AllocMetrics::default(),
     )
+}
+
+/// [`Front`] as the router's allocator.
+impl Allocator for Front {
+    fn allocate<'a>(
+        &'a self,
+        who: &'a Identity,
+        req: &'a CreateAllocationRequest,
+    ) -> BoxFuture<'a, Result<Outcome, AllocError>> {
+        Box::pin(Front::allocate(self, who, req))
+    }
+    fn get<'a>(
+        &'a self,
+        who: &'a Identity,
+        id: &'a str,
+        wait: Duration,
+    ) -> BoxFuture<'a, Result<Outcome, AllocError>> {
+        Box::pin(Front::get(self, who, id, wait))
+    }
+    fn release<'a>(
+        &'a self,
+        who: &'a Identity,
+        id: &'a str,
+    ) -> BoxFuture<'a, Result<(), AllocError>> {
+        Box::pin(Front::release(self, who, id))
+    }
 }
 
 #[tokio::test]
 async fn no_access_is_identical_to_a_missing_pool() {
-    let app = router(state(engine(), &Metrics::new()));
+    let app = router(state(front(), &Metrics::new()));
     let denied = call(
         &app,
         post(Some("sa.elsewhere.mallory"), "application/json", OK_BODY),
@@ -594,7 +624,7 @@ impl super::api::Authenticate for ReviewDown {
 #[tokio::test]
 async fn auth_upstream_failure_is_503_with_retry_after() {
     let metrics = Metrics::new();
-    let mut s = Arc::into_inner(state(Fake::new(Next::Grant), &metrics)).unwrap();
+    let mut s = Arc::into_inner(state(Fake::new(Next::Bound), &metrics)).unwrap();
     s.auth = Arc::new(ReviewDown);
     let app = router(Arc::new(s));
     let (st, h, body) = call(&app, post(Some(ALICE), "application/json", OK_BODY)).await;
@@ -610,8 +640,7 @@ async fn alloc_errors_map_to_spec_status_code_and_retry_after() {
         AllocError::PoolNotFound,
         AllocError::Internal,
         AllocError::PoolExhausted("render-verify/a".into()),
-        AllocError::StartTimeout,
-        AllocError::PodLost,
+        AllocError::PodLost("the worker pod is gone".into()),
         AllocError::NotReady,
         AllocError::CaUnavailable,
         AllocError::UpstreamError,
@@ -629,8 +658,11 @@ async fn alloc_errors_map_to_spec_status_code_and_retry_after() {
         let retry = h
             .get(header::RETRY_AFTER)
             .map(|v| v.to_str().unwrap().to_owned());
-        let want = matches!(code, ErrorCode::PoolExhausted | ErrorCode::StartTimeout)
-            .then(|| "5".to_owned());
+        let want = match code {
+            ErrorCode::PoolExhausted => Some("5".to_owned()),
+            ErrorCode::UpstreamError => Some("2".to_owned()),
+            _ => None,
+        };
         assert_eq!(retry, want, "{code:?}");
         let line = format!(
             r#"buildkit_http_requests_total{{route="/v1/allocations",status="{}"}} 1"#,
@@ -655,7 +687,7 @@ async fn release_is_204_owner_only_403_and_404() {
             Some("not_found"),
         ),
     ] {
-        let fake = Fake::new(Next::Grant);
+        let fake = Fake::new(Next::Bound);
         *fake.release.lock().unwrap() = r;
         let app = router(state(fake, &Metrics::new()));
         let req = Request::delete("/v1/allocations/k3q7m2x4b5n6p7r2s3t4v5w6y7")
@@ -669,7 +701,7 @@ async fn release_is_204_owner_only_403_and_404() {
             Some(c) => assert!(body.contains(&format!(r#""code":"{c}""#)), "{body}"),
         }
     }
-    let app = router(state(Fake::new(Next::Grant), &Metrics::new()));
+    let app = router(state(Fake::new(Next::Bound), &Metrics::new()));
     let req = Request::delete("/v1/allocations/x")
         .body(Body::empty())
         .unwrap();
@@ -678,7 +710,7 @@ async fn release_is_204_owner_only_403_and_404() {
 
 #[tokio::test]
 async fn body_rules_415_413_400_then_201() {
-    let app = router(state(Fake::new(Next::Grant), &Metrics::new()));
+    let app = router(state(Fake::new(Next::Bound), &Metrics::new()));
     let cases: Vec<(Request<Body>, StatusCode, &str)> = vec![
         (
             post(Some(ALICE), "text/plain", OK_BODY),
@@ -745,53 +777,8 @@ async fn body_rules_415_413_400_then_201() {
 }
 
 #[tokio::test]
-async fn grant_commits_only_after_the_body_is_consumed() {
-    let fake = Fake::new(Next::Grant);
-    let grant = Arc::clone(&fake.grant);
-    let app = router(state(fake, &Metrics::new()));
-    let r = app
-        .clone()
-        .oneshot(post(Some(ALICE), "application/json", OK_BODY))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::CREATED);
-    assert_eq!(
-        grant.load(Ordering::SeqCst),
-        PENDING,
-        "head sent, body not yet written"
-    );
-    let _ = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
-    assert_eq!(grant.load(Ordering::SeqCst), COMMITTED);
-
-    // The client drops after the data frame but before the end, so the allocation retires and does not commit.
-    let state = Arc::new(AtomicU8::new(PENDING));
-    let req = CreateAllocationRequest {
-        namespace: "n".into(),
-        pool: "p".into(),
-        ttl_seconds: None,
-        queue_timeout_seconds: None,
-        public_key: None,
-        cache_key: None,
-        cache: None,
-    };
-    let mut body = CommitBody::new(
-        "{}".into(),
-        FakeGrant(response(&req, "o".into()), Arc::clone(&state)),
-    );
-    assert!(!body.is_end_stream());
-    let waker = futures::task::noop_waker();
-    let mut cx = std::task::Context::from_waker(&waker);
-    assert!(matches!(
-        std::pin::Pin::new(&mut body).poll_frame(&mut cx),
-        std::task::Poll::Ready(Some(Ok(_)))
-    ));
-    drop(body);
-    assert_eq!(state.load(Ordering::SeqCst), RETIRED);
-}
-
-#[tokio::test]
 async fn pools_lists_accessible_pools_sorted() {
-    let app = router(state(Fake::new(Next::Grant), &Metrics::new()));
+    let app = router(state(Fake::new(Next::Bound), &Metrics::new()));
     let (st, h, body) = call(&app, get("/v1/pools", ALICE)).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(h[header::CONTENT_TYPE], "application/json");
@@ -834,7 +821,7 @@ async fn pools_lists_accessible_pools_sorted() {
 #[tokio::test]
 async fn other_paths_and_methods_are_404_not_found() {
     let metrics = Metrics::new();
-    let app = router(state(Fake::new(Next::Grant), &metrics));
+    let app = router(state(Fake::new(Next::Bound), &metrics));
     for req in [
         get("/nope", ALICE),
         get("/v1/allocations", ALICE),
@@ -940,7 +927,7 @@ async fn dial_alpn(
 async fn tls_alpn_and_hot_swapped_serving_cert() {
     let (k1, c1) = serving("api.test");
     let (k2, c2) = serving("api.test");
-    let (addr, tx, stop) = spawn_api(Fake::new(Next::Grant), None).await;
+    let (addr, tx, stop) = spawn_api(Fake::new(Next::Bound), None).await;
     assert!(
         dial(addr, &c1).await.is_err(),
         "no cert yet: connection closed"
@@ -986,15 +973,14 @@ async fn client_disconnect_mid_allocation_cancels_it() {
 }
 
 /// After shutdown, an allocation sent on an HTTP/1 keep-alive connection that
-/// was open before gets 503 `shutting_down` with `Retry-After` and
-/// `Connection: close`, not a reset, and never reaches the allocator. New
-/// connections are refused.
+/// was open before is still served, with `Connection: close`: the claim it
+/// creates outlives the replica. New connections are refused.
 #[tokio::test]
-async fn shutdown_answers_keep_alive_allocations_with_503() {
+async fn shutdown_still_answers_keep_alive_allocations() {
     let (k, c) = serving("api.test");
-    let fake = Fake::new(Next::Grant);
+    let fake = Fake::new(Next::Bound);
     let rejected = Arc::clone(&fake.rejected);
-    let grant = Arc::clone(&fake.grant);
+    let grant = Arc::clone(&fake.calls);
     let (addr, _tx, stop) = spawn_api(fake, Some(k)).await;
     let mut s = dial_alpn(addr, &c, &[b"http/1.1"]).await.unwrap();
     stop.cancel();
@@ -1010,19 +996,17 @@ async fn shutdown_answers_keep_alive_allocations_with_503() {
         .await
         .expect("the server closes after the response")
         .unwrap();
-    assert!(out.starts_with("HTTP/1.1 503"), "{out}");
-    assert!(out.contains("retry-after: 1\r\n"), "{out}");
+    assert!(out.starts_with("HTTP/1.1 201"), "{out}");
     assert!(out.contains("connection: close\r\n"), "{out}");
-    assert!(out.contains(r#""code":"shutting_down""#), "{out}");
-    assert_eq!(*rejected.lock().unwrap(), [ErrorCode::ShuttingDown]);
-    assert_eq!(grant.load(Ordering::SeqCst), PENDING, "no grant was made");
+    assert!(rejected.lock().unwrap().is_empty());
+    assert_eq!(grant.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn full_201_over_tls_commits() {
+async fn full_201_over_tls() {
     let (k, c) = serving("api.test");
-    let fake = Fake::new(Next::Grant);
-    let grant = Arc::clone(&fake.grant);
+    let fake = Fake::new(Next::Bound);
+    let grant = Arc::clone(&fake.calls);
     let (addr, _tx, stop) = spawn_api(fake, Some(k)).await;
     let mut s = dial_alpn(addr, &c, &[b"http/1.1"]).await.unwrap();
     let req = format!(
@@ -1034,7 +1018,7 @@ async fn full_201_over_tls_commits() {
     let _ = s.read_to_string(&mut out).await;
     assert!(out.starts_with("HTTP/1.1 201"), "{out}");
     assert!(out.contains("cache-control: no-store"));
-    assert_eq!(grant.load(Ordering::SeqCst), COMMITTED);
+    assert_eq!(grant.load(Ordering::SeqCst), 1);
     stop.cancel();
 }
 
@@ -1097,7 +1081,7 @@ async fn alloc_service_counts_rejections_with_empty_labels() {
 
 #[tokio::test]
 async fn delete_with_undecodable_id_authenticates_first() {
-    let app = router(state(Fake::new(Next::Grant), &Metrics::new()));
+    let app = router(state(Fake::new(Next::Bound), &Metrics::new()));
     let req = Request::delete("/v1/allocations/%FF")
         .body(Body::empty())
         .unwrap();
@@ -1137,7 +1121,7 @@ async fn idle_after_tls_is_closed_for_h1_and_h2() {
         idle_timeout: Duration::from_millis(200),
         ..Limits::default()
     };
-    let (addr, _tx, stop) = spawn_api_with(Fake::new(Next::Grant), Some(k), limits).await;
+    let (addr, _tx, stop) = spawn_api_with(Fake::new(Next::Bound), Some(k), limits).await;
     for alpn in [&b"h2"[..], &b"http/1.1"[..]] {
         let mut s = dial_alpn(addr, &c, &[alpn]).await.unwrap();
         assert_eq!(s.get_ref().1.alpn_protocol(), Some(alpn));
@@ -1160,7 +1144,7 @@ async fn connection_cap_is_enforced() {
         max_connections: 1,
         ..Limits::default()
     };
-    let (addr, _tx, stop) = spawn_api_with(Fake::new(Next::Grant), Some(k), limits).await;
+    let (addr, _tx, stop) = spawn_api_with(Fake::new(Next::Bound), Some(k), limits).await;
     let first = dial(addr, &c).await.unwrap();
     assert!(dial(addr, &c).await.is_err(), "second connection refused");
     drop(first);
@@ -1187,7 +1171,7 @@ async fn per_address_connection_cap_is_enforced() {
         max_connections_per_ip: 2,
         ..Limits::default()
     };
-    let (addr, _tx, stop) = spawn_api_with(Fake::new(Next::Grant), Some(k), limits).await;
+    let (addr, _tx, stop) = spawn_api_with(Fake::new(Next::Bound), Some(k), limits).await;
     let first = dial(addr, &c).await.unwrap();
     let _second = dial(addr, &c).await.unwrap();
     assert!(dial(addr, &c).await.is_err(), "third connection refused");
@@ -1235,7 +1219,7 @@ async fn h2_idle_after_its_streams_finish_is_closed() {
         idle_timeout: Duration::from_millis(300),
         ..Limits::default()
     };
-    let (addr, _tx, stop) = spawn_api_with(Fake::new(Next::Grant), Some(k), limits).await;
+    let (addr, _tx, stop) = spawn_api_with(Fake::new(Next::Bound), Some(k), limits).await;
     let (mut send, conn) = h2_client(addr, &c).await;
     // Busy for longer than the idle bound, one stream at a time.
     for _ in 0..4 {
@@ -1298,7 +1282,7 @@ async fn h2_peer_with_a_zero_window_cannot_hold_the_connection() {
         idle_timeout: Duration::from_millis(200),
         ..Limits::default()
     };
-    let (addr, _tx, stop) = spawn_api_with(Fake::new(Next::Grant), Some(k), limits).await;
+    let (addr, _tx, stop) = spawn_api_with(Fake::new(Next::Bound), Some(k), limits).await;
     let s = dial_alpn(addr, &c, &[b"h2"]).await.unwrap();
     // With SETTINGS_INITIAL_WINDOW_SIZE=0 and no WINDOW_UPDATE, no body byte can be sent.
     let (mut send, conn) =
@@ -1370,22 +1354,6 @@ fn refusal_log_is_sampled() {
         Some(1000 - u64::from(LogSampler::PER_SECOND))
     );
     assert_eq!(s.admit(later), Some(0));
-}
-
-impl crate::reconcile::spawn::WorkerSecrets for NoBackend {
-    fn create_worker_secret(
-        &self,
-        _: &k8s_openapi::api::core::v1::Secret,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        Box::pin(async { Err("no backend".into()) })
-    }
-    fn get_worker_pod(
-        &self,
-        _: &str,
-        _: &str,
-    ) -> BoxFuture<'static, Result<Option<k8s_openapi::api::core::v1::Pod>, String>> {
-        Box::pin(async { Err("no backend".into()) })
-    }
 }
 
 /// A PROXY v2 header over TCP/IPv4 from `src` to 10.0.0.1:8443.
@@ -1546,7 +1514,7 @@ async fn untrusted_source_cannot_forge_its_address() {
 /// `publicKey` is a 400 before the allocator runs.
 #[tokio::test]
 async fn a_request_without_public_key_is_400_and_never_allocates() {
-    let fake = Fake::new(Next::Grant);
+    let fake = Fake::new(Next::Bound);
     let rejected = Arc::clone(&fake.rejected);
     let state = state(fake, &Metrics::new());
     let app = router(Arc::clone(&state));
@@ -1579,4 +1547,94 @@ async fn a_request_without_public_key_is_400_and_never_allocates() {
     )
     .await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
+}
+
+/// A POST whose claim is still waiting after the create wait is a 202 with
+/// the id and the place in the queue.
+#[tokio::test]
+async fn pending_allocation_is_202_with_id_and_position() {
+    let app = router(state(Fake::new(Next::Pending), &Metrics::new()));
+    let (st, h, body) = call(&app, post(Some(ALICE), "application/json", OK_BODY)).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(h[header::CACHE_CONTROL], "no-store");
+    assert_eq!(h[header::CONTENT_TYPE], "application/json");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v, json!({"id": ID, "state": "pending", "position": 3}));
+}
+
+/// `GET /v1/allocations/{id}`: 200 bound, 202 pending, the error of a failed
+/// allocation; `wait` reaches the allocator capped at 25 s.
+#[tokio::test]
+async fn get_answers_bound_pending_and_failed() {
+    let req: CreateAllocationRequest =
+        serde_json::from_value(json!({"namespace": NS, "pool": "a"})).unwrap();
+    let bound = Outcome::Bound(Box::new(response(&req, "sa:render-verify/alice".into())));
+    let path = format!("/v1/allocations/{ID}");
+    for (r, query, want, wait) in [
+        (Ok(bound), "", StatusCode::OK, 0),
+        (Ok(pending(1)), "?wait=25s", StatusCode::ACCEPTED, 25),
+        (Ok(pending(1)), "?wait=1m", StatusCode::ACCEPTED, 25),
+        (Ok(pending(1)), "?x=1&wait=3s", StatusCode::ACCEPTED, 3),
+        (
+            Err(AllocError::PoolExhausted("no worker became free".into())),
+            "?wait=25s",
+            StatusCode::SERVICE_UNAVAILABLE,
+            25,
+        ),
+        (Err(AllocError::Forbidden), "", StatusCode::FORBIDDEN, 0),
+    ] {
+        let fake = Fake::new(Next::Bound);
+        *fake.get.lock().unwrap() = r.clone();
+        let s = state(fake, &Metrics::new());
+        let app = router(Arc::clone(&s));
+        let (st, h, body) = call(&app, get(&format!("{path}{query}"), ALICE)).await;
+        assert_eq!(st, want, "{query}: {body}");
+        assert_eq!(*s.alloc.waits.lock().unwrap(), [Duration::from_secs(wait)]);
+        assert_eq!(*s.alloc.seen.lock().unwrap(), ["sa:render-verify/alice"]);
+        match r {
+            Ok(Outcome::Bound(b)) => {
+                assert_eq!(
+                    serde_json::from_str::<AllocationResponse>(&body).unwrap(),
+                    *b
+                );
+            }
+            Ok(Outcome::Pending(p)) => {
+                assert_eq!(serde_json::from_str::<PendingAllocation>(&body).unwrap(), p);
+            }
+            Err(e) => {
+                let v: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(v["error"]["code"], e.code().as_str());
+                if e.code() == ErrorCode::PoolExhausted {
+                    assert_eq!(h[header::RETRY_AFTER], "5");
+                }
+            }
+        }
+    }
+    // A wait that is not a duration is refused before the allocator runs.
+    let s = state(Fake::new(Next::Bound), &Metrics::new());
+    let app = router(Arc::clone(&s));
+    let (st, _, body) = call(&app, get(&format!("{path}?wait=soon"), ALICE)).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    assert!(s.alloc.waits.lock().unwrap().is_empty());
+    // Unauthenticated first.
+    let req = Request::get(&path).body(Body::empty()).unwrap();
+    assert_eq!(call(&app, req).await.0, StatusCode::UNAUTHORIZED);
+    assert!(s.alloc.seen.lock().unwrap().is_empty());
+}
+
+/// A release that meets a transient API server failure is a 503 the clients
+/// retry: it carries `Retry-After`.
+#[tokio::test]
+async fn release_upstream_failure_is_503_with_retry_after() {
+    let fake = Fake::new(Next::Bound);
+    *fake.release.lock().unwrap() = Err(AllocError::UpstreamError);
+    let app = router(state(fake, &Metrics::new()));
+    let req = Request::delete(format!("/v1/allocations/{ID}"))
+        .header(header::AUTHORIZATION, format!("Bearer {ALICE}"))
+        .body(Body::empty())
+        .unwrap();
+    let (st, h, body) = call(&app, req).await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(h[header::RETRY_AFTER], "2");
+    assert!(body.contains(r#""code":"upstream_error""#), "{body}");
 }

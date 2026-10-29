@@ -278,22 +278,12 @@ pub async fn execute<O: KubeOps>(ops: &O, guard: &CaGuard, env: &Env<'_>, plan: 
                 }
                 r.status_sent = Some(status);
             }
-            Action::PruneWaiters { entries } => {
-                for w in entries {
-                    r.trace.push(format!("prune_waiter:{}", w.index));
-                    match ops.prune_waiter(&ns, &pool, w).await {
-                        Ok(()) | Err(OpError::Invalid(_) | OpError::NotFound) => {}
-                        Err(e) => r.errors.push(format!("prune waiter {}: {e}", w.index)),
-                    }
-                }
-            }
         }
     }
     // The planner patches the status only when it changed, so a failed apply
     // under an unchanged status would leave `Ready=True` standing.
     if let (Some(why), None) = (&apply_failed, &r.status_sent) {
         let mut status = env.pool.status.clone().unwrap_or_default();
-        status.waiters.clear();
         let planned = status.clone();
         downgrade_ready(&mut status, env, reason::SANDBOX_PENDING, why);
         if status != planned {

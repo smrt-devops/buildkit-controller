@@ -303,7 +303,10 @@ fn template_schema_prunes_volume_sources_and_matches_spec_names() {
         assert!(spec["allocation"]["properties"].get(f).is_some(), "{f}");
     }
     let st = &v["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]["properties"];
-    assert!(st.get("waiters").is_none(), "the per-replica waiters list is gone");
+    assert!(
+        st.get("waiters").is_none(),
+        "the per-replica waiters list is gone"
+    );
     for f in ["waiting", "platforms"] {
         assert!(st.get(f).is_some(), "status.{f}");
     }
