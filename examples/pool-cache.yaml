@@ -1,19 +1,12 @@
-# A pool with both cache layers (see docs/architecture.md, Build cache).
+# Build cache settings of a pool. Every pool uses the chart's built-in cache
+# registry (cache.enabled, on by default); this one changes who may write it.
 #
-# Registry: every build of a cache key imports and exports
-# ghcr.io/example/buildkit-cache:<key>, so concurrent builds share it. A branch
-# build also reads the trunk cache through importFrom, without writing to it.
-# CI jobs log in to ghcr.io themselves. The controller holds no credentials.
-#
-# Local: slots 0 and 1 each keep a 50Gi PVC as the buildkitd state directory.
-# A volume serves one build at a time, so it speeds up only the build that
-# lands on its slot. Use a StorageClass with volumeBindingMode: WaitForFirstConsumer.
-# Each volume belongs to one repository (scope: identity, the default). Before
-# a build of another repository lands on it, the volume is emptied. The pool
-# records no build history, so build logs and arguments do not reach later builds.
-#
-# The registry cache is shared by every caller this pool admits, so the rule
-# admits one repository only.
+# Each repository has its own cache (scope: identity, the default). A build
+# reads its repository's cache, and writes it only when a writers rule matches
+# the caller. Without writers, push, schedule, workflow_dispatch and
+# merge_group events and in-cluster callers write; pull requests only read.
+# Here only pushes to main write, so branch builds start warm from main
+# without changing it.
 apiVersion: buildkit.smrt-devops.net/v1alpha1
 kind: BuildKitPool
 metadata:
@@ -23,17 +16,14 @@ spec:
   scaling: {min: 2, max: 8}
   workers:
     cache:
-      registry:
-        repository: ghcr.io/example/buildkit-cache
-        importFrom: [app-main]
-      local:
-        size: 50Gi
-        maxVolumes: 2
-        scope: identity
+      maxSize: 20Gi
+      writers:
+        - oidc:
+            issuer: https://token.actions.githubusercontent.com
+            claims: {event_name: push, ref: refs/heads/main}
   access:
     rules:
       - oidc:
           issuer: https://token.actions.githubusercontent.com
           claims:
             repository_id: "87654321"   # gh api repos/example/app --jq .id; names can be re-registered
-            event_name: push

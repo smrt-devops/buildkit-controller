@@ -2,7 +2,6 @@
 //! executor that applies its actions ([`exec`], [`pass`]) and the leader's
 //! per-term loop ([`driver`]).
 
-mod cache;
 pub mod driver;
 pub mod exec;
 pub mod metrics;
@@ -10,8 +9,10 @@ pub mod ops;
 pub mod pass;
 pub mod plan;
 pub mod pods;
+pub mod registry_tls;
 pub mod schedule;
 pub mod spawn;
+pub mod sweep;
 
 #[cfg(test)]
 mod tests;

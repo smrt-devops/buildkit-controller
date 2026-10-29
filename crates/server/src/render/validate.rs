@@ -9,7 +9,7 @@ use buildkit_controller_api::v1alpha1::{
 };
 use serde_json::Value;
 
-use super::cache::with_cache_settings;
+use super::config::with_registry;
 use super::{RenderError, TemplateConflictField, WorkerNetwork};
 
 /// Re-exported name of a single offending field.
@@ -97,16 +97,13 @@ pub fn validate_template(spec: &BuildKitPoolSpec) -> Vec<Conflict> {
     }
     volumes(spec, &mut out);
     containers(spec, &mut out);
-    local_cache(spec, &mut out);
+    registry_entry(spec, &mut out);
     out
 }
 
-/// With `cache.local`: `buildkitdConfig` must take the cache settings.
-fn local_cache(spec: &BuildKitPoolSpec, out: &mut Vec<Conflict>) {
-    if spec.workers.cache.local.is_none() {
-        return;
-    }
-    if let Err(why) = with_cache_settings(&spec.workers.buildkitd_config, None) {
+/// `buildkitdConfig` must take the cache registry entry.
+fn registry_entry(spec: &BuildKitPoolSpec, out: &mut Vec<Conflict>) {
+    if let Err(why) = with_registry(&spec.workers.buildkitd_config, "cache.invalid:5000") {
         conflict(out, "spec.workers.buildkitdConfig".into(), &why);
     }
 }

@@ -6,8 +6,8 @@
 //! Startup runs config (exit 2 when invalid), telemetry, kube client, shared
 //! stores, election, ops server, then the module hooks. On SIGTERM or SIGINT,
 //! `/readyz` fails, leader work stops and the Lease is released, then after
-//! `shutdown.delay` the components stop in stages: the API (queued and new
-//! allocations get 503 `shutting_down`), the edge (open connections drain until
+//! `shutdown.delay` the components stop in stages: the API (queued
+//! allocations are claims and outlive the replica), the edge (open connections drain until
 //! each ends on its own), the certificate loader. The delay and the drain
 //! budget count from the signal. The drain is bounded by
 //! `shutdown.drainTimeout`, or when unset by the longest connection lifetime.
@@ -27,7 +27,6 @@ use tracing::{error, info, warn};
 
 use buildkit_controller::alloc::AllocService;
 use buildkit_controller::certs::{Certs, InvalidServingSecret};
-use buildkit_controller::claim::ClaimController;
 use buildkit_controller::config::{Cli, ConfigError, Settings};
 use buildkit_controller::edge::EdgeComponent;
 use buildkit_controller::election::kube_api::KubeLeaseApi;
@@ -76,22 +75,13 @@ fn main() -> ExitCode {
     };
     let certs = Arc::new(Certs::new());
     let alloc = AllocService::new(certs.subscribe());
-    // The claim controller is opt-in: config key `claims.enabled`.
-    let extra: Vec<Arc<dyn Component>> = if settings.config.claims.enabled {
-        vec![Arc::new(ClaimController::new(
-            alloc.clone(),
-            settings.config.claims.namespaces.clone(),
-        ))]
-    } else {
-        Vec::new()
-    };
     let hooks = Hooks {
         reconcile: |ctx| -> Arc<dyn LeaderWork> { Arc::new(Reconciler::new(ctx)) },
         pki: Arc::clone(&certs) as Arc<dyn Component>,
         alloc: Arc::new(alloc.clone()),
         http: Arc::new(HttpComponent::new(alloc, certs.subscribe())),
         edge: Arc::new(EdgeComponent::proxy(certs.subscribe())),
-        extra,
+        extra: Vec::new(),
     };
     match rt.block_on(run(settings, hooks)) {
         Ok(()) => ExitCode::SUCCESS,

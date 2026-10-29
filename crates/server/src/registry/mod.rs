@@ -15,6 +15,7 @@ mod config;
 mod gc;
 mod listener;
 mod metrics;
+mod pods;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -33,10 +34,12 @@ pub use config::{CacheArgs, parse_duration, parse_size};
 pub use gc::{Budgets, FixedBudgets, Reason};
 pub use listener::{Limits, server_config};
 pub use metrics::RegistryMetrics;
+pub use pods::{PodGrants, PoolBudgets, grant_of};
 pub use store::{Digest, Reference, Stats, Store, StoreError, StoreLimits};
 
 use crate::runtime::metrics::Metrics;
 use crate::runtime::readiness::Readiness;
+use crate::runtime::stores::StoreFreshness;
 use crate::telemetry::ops;
 
 /// Upload sessions idle this long are deleted; also the grace period of a
@@ -62,12 +65,8 @@ pub async fn run(args: CacheArgs, shutdown: CancellationToken) -> anyhow::Result
         ops_stop.clone(),
     ));
 
-    let auth: Arc<dyn Authorizer> = if let Some(p) = &args.grants_file {
-        Arc::new(StaticGrants::load(p)?)
-    } else {
-        warn!("no grants file; every cache request is denied");
-        Arc::new(StaticGrants::default())
-    };
+    let stop = CancellationToken::new();
+    let (auth, budgets) = authorizer(&args, &metrics, &readiness, &stop).await?;
     let (files, tls) = listener::load(&args.tls_dir)?;
     let store = {
         let dir = args.data_dir.clone();
@@ -85,11 +84,6 @@ pub async fn run(args: CacheArgs, shutdown: CancellationToken) -> anyhow::Result
         metrics: RegistryMetrics::register(&metrics),
     });
 
-    let stop = CancellationToken::new();
-    let budgets = FixedBudgets {
-        pool: args.pool_max_size,
-        total: args.max_size,
-    };
     let gc_task = tokio::spawn(collect(
         Arc::clone(&reg),
         budgets,
@@ -126,13 +120,13 @@ pub async fn run(args: CacheArgs, shutdown: CancellationToken) -> anyhow::Result
 /// Garbage collection and upload expiry, every `interval` until `stop`.
 async fn collect(
     reg: Arc<Registry>,
-    budgets: FixedBudgets,
+    budgets: Arc<dyn Budgets>,
     interval: Duration,
     stop: CancellationToken,
 ) {
     loop {
         let expired = reg.store.expire_uploads(UPLOAD_TTL).await;
-        let r = reg.store.gc(&budgets, UPLOAD_TTL).await;
+        let r = reg.store.gc(&*budgets, UPLOAD_TTL).await;
         reg.metrics.gc(&r);
         let stats = reg.store.stats().await;
         reg.metrics.stats(stats);
@@ -152,4 +146,52 @@ async fn collect(
             () = tokio::time::sleep(interval) => {}
         }
     }
+}
+
+/// Who may do what, and each pool's budget: from the worker pods and pools
+/// in the watched namespaces, or, with `--grants-file`, from the file.
+async fn authorizer(
+    args: &CacheArgs,
+    metrics: &Arc<Metrics>,
+    readiness: &Arc<Readiness>,
+    stop: &CancellationToken,
+) -> anyhow::Result<(Arc<dyn Authorizer>, Arc<dyn Budgets>)> {
+    if let Some(p) = &args.grants_file {
+        warn!(file = %p.display(), "grants come from a file, not from worker pods");
+        let fixed = FixedBudgets {
+            pool: args.pool_max_size,
+            total: args.max_size,
+        };
+        return Ok((Arc::new(StaticGrants::load(p)?), Arc::new(fixed)));
+    }
+    let client = crate::runtime::kube_client()
+        .await
+        .context("building the kube client")?;
+    let namespaces: Vec<String> = args
+        .watch_namespaces
+        .iter()
+        .filter(|n| !n.is_empty())
+        .cloned()
+        .collect();
+    info!(?namespaces, "watching worker pods, [] = all namespaces");
+    let (pools, pods, _) =
+        crate::runtime::stores::worker_watches(&client, &namespaces, metrics, readiness, stop);
+    let fresh = || {
+        StoreFreshness::new(
+            readiness.register("pool_store").subscribe(),
+            readiness.register("pod_store").subscribe(),
+        )
+    };
+    let budgets = PoolBudgets {
+        pools: pools.clone(),
+        fresh: fresh(),
+        default: args.pool_max_size,
+        total: args.max_size,
+    };
+    let grants = PodGrants {
+        pods,
+        pools,
+        fresh: fresh(),
+    };
+    Ok((Arc::new(grants), Arc::new(budgets)))
 }

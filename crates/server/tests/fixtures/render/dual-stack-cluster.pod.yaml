@@ -11,7 +11,7 @@ metadata:
     app.kubernetes.io/name: buildkitd
     buildkit.smrt-devops.net/pool: dual-stack-cluster
     buildkit.smrt-devops.net/state: free
-    buildkit.smrt-devops.net/template-hash: 0f4139a8d7
+    buildkit.smrt-devops.net/template-hash: a671230d74
   name: dual-stack-cluster-0
   namespace: render-verify
   ownerReferences:
@@ -107,6 +107,10 @@ spec:
         path: tls.key
       - key: ca.crt
         path: ca.crt
+      - key: client.crt
+        path: client.crt
+      - key: client.key
+        path: client.key
       - key: buildkitd.toml
         path: buildkitd.toml
       secretName: dual-stack-cluster-0-00000000000000aa

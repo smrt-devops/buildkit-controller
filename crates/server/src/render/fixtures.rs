@@ -7,8 +7,8 @@ use buildkit_controller_api::v1alpha1::{BuildKitPool, BuildKitPoolSpec};
 use serde_json::{Value, json};
 
 use super::{
-    Claim, PodInputs, RenderConfig, RenderError, WorkerNetwork, WorkerTlsPem, ca_bundle_config_map,
-    cache_volume, network_policy, service_account, worker_pod, worker_secret,
+    PodInputs, RenderConfig, RenderError, WorkerNetwork, WorkerTlsPem, ca_bundle_config_map,
+    network_policy, service_account, worker_pod, worker_secret,
 };
 
 /// Namespace the pools of every scenario live in.
@@ -66,6 +66,7 @@ pub fn default_config() -> RenderConfig {
     RenderConfig {
         controller_namespace: CONTROLLER_NAMESPACE.into(),
         worker_network: WorkerNetwork::default(),
+        cache_host: None,
     }
 }
 
@@ -78,7 +79,6 @@ pub fn default_inputs() -> PodInputs {
             .into(),
         worker_cert_not_after: "2026-11-19T12:00:00Z".into(),
         nonce: "00000000000000aa".into(),
-        claim: None,
     }
 }
 
@@ -152,14 +152,12 @@ fn full_template() -> Value {
 /// # Errors
 /// [`FixtureError::Spec`] when a scenario spec does not deserialize.
 pub fn scenarios() -> Result<Vec<Scenario>, FixtureError> {
-    let mut preclaimed = scenario("preclaimed", json!({}))?;
-    preclaimed.inputs.slot = 3;
-    preclaimed.inputs.claim = Some(Claim {
-        alloc_id: "mfrggzdfmztwq2lknnwg23tpoa".into(),
-        owner: "oidc:https://token.actions.githubusercontent.com#repo:smrt-devops/app:ref:refs/heads/main".into(),
-        allocated_at: "2026-10-20T12:00:00Z".into(),
-        expires_at: "2026-10-20T13:00:00Z".into(),
-    });
+    // The cache registry entry, beside a registry entry of the pool's own.
+    let mut cache = scenario(
+        "cache-registry",
+        json!({"workers": {"buildkitdConfig": "[registry.\"docker.io\"]\n  mirrors = [\"mirror.internal\"]\n"}}),
+    )?;
+    cache.config.cache_host = Some(format!("buildkit-registry.{CONTROLLER_NAMESPACE}.svc:5000"));
     let mut nodelocal = scenario("nodelocal-dns", json!({}))?;
     nodelocal.config.worker_network.dns.cidrs = vec!["169.254.20.10/32".into()];
     nodelocal.config.worker_network.extra_denied_cidrs = vec!["203.0.113.7/32".into()];
@@ -198,11 +196,7 @@ pub fn scenarios() -> Result<Vec<Scenario>, FixtureError> {
             "template-arch-selector",
             json!({"platforms": ["linux/amd64"], "template": {"spec": {"nodeSelector": {"kubernetes.io/arch": "amd64"}}}}),
         ),
-        scenario(
-            "cache-local",
-            json!({"workers": {"cache": {"local": {"size": "50Gi", "storageClass": "local-path", "maxVolumes": 2}}}}),
-        ),
-        Ok(preclaimed),
+        Ok(cache),
         Ok(nodelocal),
         Ok(dual_stack),
         Ok(permitted),
@@ -218,6 +212,8 @@ pub fn fake_tls() -> WorkerTlsPem {
         cert: FAKE_CERT.into(),
         key: "fixture-key-not-a-real-key\n".into(),
         ca: FAKE_CERT.into(),
+        client_cert: FAKE_CERT.into(),
+        client_key: "fixture-client-key-not-a-real-key\n".into(),
     }
 }
 
@@ -228,19 +224,20 @@ fn yaml<T: serde::Serialize>(o: &T) -> Result<String, FixtureError> {
 /// The pod, Secret, `ServiceAccount` and `NetworkPolicy` of one scenario as
 /// `(kind, yaml)`; `kind` is the fixture file suffix.
 pub fn render_scenario(s: &Scenario) -> Result<Vec<(&'static str, String)>, FixtureError> {
-    let mut out = vec![
+    Ok(vec![
         ("pod", yaml(&worker_pod(&s.pool, &s.inputs)?)?),
         (
             "secret",
-            yaml(&worker_secret(&s.pool, &s.inputs, &fake_tls())?)?,
+            yaml(&worker_secret(
+                &s.pool,
+                &s.inputs,
+                &fake_tls(),
+                s.config.cache_host.as_deref(),
+            )?)?,
         ),
         ("serviceaccount", yaml(&service_account(&s.pool)?)?),
         ("networkpolicy", yaml(&network_policy(&s.pool, &s.config)?)?),
-    ];
-    if let Some(pvc) = cache_volume(&s.pool, s.inputs.slot)? {
-        out.push(("pvc", yaml(&pvc)?));
-    }
-    Ok(out)
+    ])
 }
 
 /// Every fixture as `(file name, yaml)`, including the CA bundle `ConfigMap`.

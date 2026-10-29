@@ -122,9 +122,6 @@ pub enum CreateResult {
         /// Error text.
         message: String,
     },
-    /// The slot's cache volume is terminating or was just replaced.
-    /// No hold and no `Degraded`; the pass requeues under the error backoff to retry.
-    VolumePending,
 }
 
 /// A recent create of the leader for this pool.
@@ -198,7 +195,7 @@ pub enum RetireReason {
     StartTimeout,
     /// Free, seen Ready earlier in this term, and not Ready again within
     /// `startTimeout` of the leader first seeing it unready. Not a start
-    /// failure: no `Degraded`, no create backoff, and the slot keeps its cache volume.
+    /// failure: no `Degraded`, no create backoff.
     Unready,
     /// `P internal-ca` differs from the loaded internal CA.
     CaRotated,
@@ -382,12 +379,10 @@ impl Plan {
     /// A failure outranks a 409 so a failing create is never retried at once.
     #[must_use]
     pub fn requeue_after_outcomes(outcomes: &[CreateOutcome]) -> Requeue {
-        if outcomes.iter().any(|c| {
-            matches!(
-                c.result,
-                CreateResult::Failed { .. } | CreateResult::VolumePending
-            )
-        }) {
+        if outcomes
+            .iter()
+            .any(|c| matches!(c.result, CreateResult::Failed { .. }))
+        {
             Requeue::ErrorBackoff
         } else if outcomes.iter().any(|c| c.result == CreateResult::SlotTaken) {
             Requeue::Immediately
@@ -856,7 +851,6 @@ impl<'a> Planner<'_, 'a> {
                 CreateResult::Created => {
                     holds.remove(&c.slot);
                 }
-                CreateResult::VolumePending => {}
                 CreateResult::Failed { message } => self.degraded.push((
                     "PodCreateFailed",
                     format!("create `{}`: {message}", slot_name(&pool, c.slot)),
@@ -1063,7 +1057,6 @@ impl<'a> Planner<'_, 'a> {
             platforms: o.platforms.clone(),
             endpoint: Some(self.cfg.endpoint.clone()).filter(|s| !s.is_empty()),
             server_name: Some(self.cfg.server_name.clone()).filter(|s| !s.is_empty()),
-            cache: cache_status(o.pool),
             conditions,
         })
     }
@@ -1120,14 +1113,4 @@ fn truncate(m: &str) -> String {
         end -= 1;
     }
     m[..end].to_owned()
-}
-
-/// `status.cache`: the registry flags for the pool's default key.
-fn cache_status(pool: &BuildKitPool) -> Option<buildkit_controller_api::v1alpha1::CacheStatus> {
-    let c = &pool.spec.workers.cache;
-    let name = pool.metadata.name.as_deref()?;
-    let r = c.registry_enabled()?;
-    Some(buildkit_controller_api::v1alpha1::CacheStatus {
-        registry: Some(r.resolve(name, c.default_key(name))),
-    })
 }

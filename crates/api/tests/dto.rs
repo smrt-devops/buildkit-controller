@@ -18,7 +18,7 @@ where
 #[test]
 fn create_request() {
     roundtrip(
-        r#"{"namespace": "ci", "pool": "default", "ttlSeconds": 3600, "queueTimeoutSeconds": 300, "publicKey": "-----BEGIN PUBLIC KEY-----...", "cacheKey": "org-app.main_1", "cache": "registry"}"#,
+        r#"{"namespace": "ci", "pool": "default", "ttlSeconds": 3600, "queueTimeoutSeconds": 300, "publicKey": "-----BEGIN PUBLIC KEY-----...", "cacheKey": "org-app.main_1", "cache": "none"}"#,
         &CreateAllocationRequest {
             namespace: "ci".into(),
             pool: "default".into(),
@@ -26,7 +26,7 @@ fn create_request() {
             queue_timeout_seconds: Some(300),
             public_key: Some("-----BEGIN PUBLIC KEY-----...".into()),
             cache_key: Some("org-app.main_1".to_owned().try_into().unwrap()),
-            cache: Some(buildkit_controller_api::dto::CacheChoice::Registry),
+            cache: Some(buildkit_controller_api::dto::CacheChoice::None),
         },
     );
     let min: CreateAllocationRequest =

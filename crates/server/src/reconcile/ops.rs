@@ -7,9 +7,9 @@ use std::future::Future;
 
 use buildkit_controller_api::v1alpha1::{BuildKitPool, BuildKitPoolStatus};
 use k8s_openapi::NamespaceResourceScope;
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret};
+use k8s_openapi::api::core::v1::{Pod, Secret};
 use k8s_openapi::api::events::v1::Event;
-use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions};
+use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::{Client, Resource};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -134,22 +134,6 @@ pub trait KubeOps: WorkerSecrets + Send + Sync {
     fn replace_secret(&self, secret: &Secret) -> impl Future<Output = OpResult> + Send;
     /// POST an `events.k8s.io/v1` Event.
     fn create_event(&self, event: &Event) -> impl Future<Output = OpResult> + Send;
-    /// GET a PVC; `None` on 404.
-    fn get_pvc(
-        &self,
-        ns: &str,
-        name: &str,
-    ) -> impl Future<Output = OpResult<Option<PersistentVolumeClaim>>> + Send;
-    /// POST a PVC.
-    fn create_pvc(&self, pvc: &PersistentVolumeClaim) -> impl Future<Output = OpResult> + Send;
-    /// DELETE a PVC with a uid precondition.
-    fn delete_pvc(&self, ns: &str, name: &str, uid: &str) -> impl Future<Output = OpResult> + Send;
-    /// LIST the PVCs in `ns` that match `selector`.
-    fn list_pvcs(
-        &self,
-        ns: &str,
-        selector: &str,
-    ) -> impl Future<Output = OpResult<Vec<PersistentVolumeClaim>>> + Send;
 }
 
 /// [`KubeOps`] over a `kube::Client`.
@@ -298,40 +282,6 @@ impl KubeOps for KubeClient {
             .await?;
         Ok(())
     }
-
-    async fn get_pvc(&self, ns: &str, name: &str) -> OpResult<Option<PersistentVolumeClaim>> {
-        Ok(self.api::<PersistentVolumeClaim>(ns).get_opt(name).await?)
-    }
-
-    async fn create_pvc(&self, pvc: &PersistentVolumeClaim) -> OpResult {
-        let pp = PostParams {
-            field_manager: Some(FIELD_MANAGER.into()),
-            ..PostParams::default()
-        };
-        self.api::<PersistentVolumeClaim>(&ns_of(pvc))
-            .create(&pp, pvc)
-            .await?;
-        Ok(())
-    }
-
-    async fn delete_pvc(&self, ns: &str, name: &str, uid: &str) -> OpResult {
-        let dp = DeleteParams {
-            preconditions: Some(Preconditions {
-                uid: Some(uid.to_owned()),
-                resource_version: None,
-            }),
-            ..DeleteParams::default()
-        };
-        self.api::<PersistentVolumeClaim>(ns)
-            .delete(name, &dp)
-            .await?;
-        Ok(())
-    }
-
-    async fn list_pvcs(&self, ns: &str, selector: &str) -> OpResult<Vec<PersistentVolumeClaim>> {
-        let lp = ListParams::default().labels(selector);
-        Ok(self.api::<PersistentVolumeClaim>(ns).list(&lp).await?.items)
-    }
 }
 
 /// [`KubeOps`] with every call cut off after a fixed time.
@@ -427,24 +377,6 @@ impl<O: KubeOps> KubeOps for Timed<O> {
 
     async fn create_event(&self, event: &Event) -> OpResult {
         self.run("create event", self.inner.create_event(event))
-            .await
-    }
-
-    async fn get_pvc(&self, ns: &str, name: &str) -> OpResult<Option<PersistentVolumeClaim>> {
-        self.run("get pvc", self.inner.get_pvc(ns, name)).await
-    }
-
-    async fn create_pvc(&self, pvc: &PersistentVolumeClaim) -> OpResult {
-        self.run("create pvc", self.inner.create_pvc(pvc)).await
-    }
-
-    async fn delete_pvc(&self, ns: &str, name: &str, uid: &str) -> OpResult {
-        self.run("delete pvc", self.inner.delete_pvc(ns, name, uid))
-            .await
-    }
-
-    async fn list_pvcs(&self, ns: &str, selector: &str) -> OpResult<Vec<PersistentVolumeClaim>> {
-        self.run("list pvcs", self.inner.list_pvcs(ns, selector))
             .await
     }
 }
