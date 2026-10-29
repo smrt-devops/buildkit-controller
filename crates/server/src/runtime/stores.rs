@@ -4,7 +4,7 @@
 //! every replica. The root task consumes the reflector output itself (which
 //! carries `Delete`) and forwards pod events on a `broadcast` channel; it never
 //! uses `store_shared`/`Writer::subscribe`. A receiver that lags is told to
-//! rescan with [`PodEvent::Resync`].
+//! rescan with [`Event::Resync`].
 
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Debug;
@@ -27,43 +27,54 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use buildkit_controller_api::claim::BuildKitClaim;
 use buildkit_controller_api::v1alpha1::BuildKitPool;
 
 use super::metrics::Metrics;
 use super::readiness::{Readiness, ReadyFlag};
 use crate::render::{CONTROLLER, LABEL_MANAGED_BY, LABEL_POOL};
 
-/// Capacity of the pod event broadcast.
+/// Capacity of the pod and claim event broadcasts.
 pub const POD_EVENT_CAPACITY: usize = 1024;
 
-/// A pod change, applied to the store before it is broadcast.
+/// A change to a watched object, applied to the store before it is broadcast.
 #[derive(Clone, Debug)]
-pub enum PodEvent {
+pub enum Event<K> {
     /// Added or modified.
-    Apply(Arc<Pod>),
+    Apply(Arc<K>),
     /// Deleted.
-    Delete(Arc<Pod>),
+    Delete(Arc<K>),
     /// A relist completed, or this receiver lagged. Rescan the whole store.
     Resync,
 }
 
-/// A subscription to pod events that turns lag into [`PodEvent::Resync`].
-#[derive(Debug)]
-pub struct PodSubscription(broadcast::Receiver<PodEvent>);
+/// A worker pod change.
+pub type PodEvent = Event<Pod>;
+/// A `BuildKitClaim` change.
+pub type ClaimEvent = Event<BuildKitClaim>;
 
-impl PodSubscription {
+/// A subscription to store events that turns lag into [`Event::Resync`].
+#[derive(Debug)]
+pub struct Subscription<K>(broadcast::Receiver<Event<K>>);
+
+/// Pod events.
+pub type PodSubscription = Subscription<Pod>;
+/// Claim events.
+pub type ClaimSubscription = Subscription<BuildKitClaim>;
+
+impl<K: Clone> Subscription<K> {
     /// Wrap a receiver.
     #[must_use]
-    pub fn new(rx: broadcast::Receiver<PodEvent>) -> Self {
+    pub fn new(rx: broadcast::Receiver<Event<K>>) -> Self {
         Self(rx)
     }
 
     /// Next event; `None` when the runtime has shut down. After `Lagged`
-    /// returns `Resync`; the caller rescans its pod store.
-    pub async fn recv(&mut self) -> Option<PodEvent> {
+    /// returns `Resync`; the caller rescans its store.
+    pub async fn recv(&mut self) -> Option<Event<K>> {
         match self.0.recv().await {
             Ok(ev) => Some(ev),
-            Err(broadcast::error::RecvError::Lagged(_)) => Some(PodEvent::Resync),
+            Err(broadcast::error::RecvError::Lagged(_)) => Some(Event::Resync),
             Err(broadcast::error::RecvError::Closed) => None,
         }
     }
@@ -220,12 +231,12 @@ async fn clear_at<T>(
     fut.await
 }
 
-/// Forward pod watcher events into the broadcast channel.
-pub fn forward_pod(tx: &broadcast::Sender<PodEvent>, ev: &watcher::Event<Pod>) {
+/// Forward watcher events into the broadcast channel.
+pub fn forward<K: Clone>(tx: &broadcast::Sender<Event<K>>, ev: &watcher::Event<K>) {
     let out = match ev {
-        watcher::Event::Apply(p) => PodEvent::Apply(Arc::new(p.clone())),
-        watcher::Event::Delete(p) => PodEvent::Delete(Arc::new(p.clone())),
-        watcher::Event::InitDone => PodEvent::Resync,
+        watcher::Event::Apply(p) => Event::Apply(Arc::new(p.clone())),
+        watcher::Event::Delete(p) => Event::Delete(Arc::new(p.clone())),
+        watcher::Event::InitDone => Event::Resync,
         // InitApply is buffered by kube-runtime until InitDone; the Resync covers it.
         watcher::Event::Init | watcher::Event::InitApply(_) => return,
     };
@@ -301,6 +312,10 @@ pub struct Stores {
     pub pods: Store<Pod>,
     /// Pod event broadcast.
     pub pod_events: broadcast::Sender<PodEvent>,
+    /// `BuildKitClaim` store.
+    pub claims: Store<BuildKitClaim>,
+    /// Claim event broadcast.
+    pub claim_events: broadcast::Sender<ClaimEvent>,
     /// CA Secret watch.
     pub ca_secret: watch::Receiver<SecretState>,
     /// User serving Secret watch (always `init_done` with no secret when none is configured).
@@ -313,6 +328,8 @@ pub struct StoreSpec<'a> {
     pub client: Client,
     /// Watched namespaces, `[]` = all.
     pub watch_namespaces: &'a [String],
+    /// Namespaces whose claims are watched, `[]` = all.
+    pub claim_namespaces: &'a [String],
     /// Controller namespace.
     pub namespace: &'a str,
     /// CA Secret name.
@@ -817,6 +834,44 @@ fn strip<K: ResourceExt>(o: &mut K) {
     o.managed_fields_mut().clear();
 }
 
+/// The claim store and its event broadcast. Every allocation is a claim. The
+/// watch is strict, because the leader releases workers of claims missing from
+/// the store, so a partial list must never count as synced.
+fn claim_watch(
+    client: &Client,
+    claim_namespaces: &[String],
+    metrics: &Arc<Metrics>,
+    readiness: &Arc<Readiness>,
+    shutdown: &CancellationToken,
+) -> (Store<BuildKitClaim>, broadcast::Sender<ClaimEvent>) {
+    let (claim_store, claim_writer) = reflector::store::<BuildKitClaim>();
+    let (claim_tx, _) = broadcast::channel(POD_EVENT_CAPACITY);
+    let events = scoped_watch(
+        client.clone(),
+        claim_namespaces,
+        &watcher::Config::default(),
+        claim_store.clone(),
+    )
+    .default_backoff()
+    .modify(strip);
+    let m = Arc::clone(metrics);
+    let ctx = claim_tx.clone();
+    spawn_until(
+        shutdown.clone(),
+        drive(
+            claim_writer,
+            events,
+            readiness.register("claim_store"),
+            move |e| {
+                warn!(error = %e, kind = "claim", "watch error");
+                m.watch_error("claim");
+            },
+            move |ev| forward(&ctx, ev),
+        ),
+    );
+    (claim_store, claim_tx)
+}
+
 impl Stores {
     /// Start the root watch tasks.
     #[must_use]
@@ -824,6 +879,7 @@ impl Stores {
         let StoreSpec {
             client,
             watch_namespaces,
+            claim_namespaces,
             namespace,
             ca_secret_name,
             serving_secret_name,
@@ -881,9 +937,12 @@ impl Stores {
                     warn!(error = %e, kind = "pod", "watch error");
                     m.watch_error("pod");
                 },
-                move |ev| forward_pod(&ptx, ev),
+                move |ev| forward(&ptx, ev),
             ),
         );
+
+        let (claim_store, claim_tx) =
+            claim_watch(&client, claim_namespaces, &metrics, &readiness, shutdown);
 
         let ca_secret = secret_watch(
             client.clone(),
@@ -905,6 +964,8 @@ impl Stores {
             pools: pool_store,
             pods: pod_store,
             pod_events: tx,
+            claims: claim_store,
+            claim_events: claim_tx,
             ca_secret,
             serving_secret,
         }

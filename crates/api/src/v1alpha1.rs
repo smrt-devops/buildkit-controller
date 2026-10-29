@@ -11,7 +11,7 @@ use k8s_openapi::api::core::v1::{
     TopologySpreadConstraint, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube_derive::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -949,8 +949,7 @@ impl Default for AllocationSpec {
     }
 }
 
-/// `BuildKitPool` status. The leader owns every field except `waiters`, which
-/// each API replica owns for its own entry.
+/// `BuildKitPool` status, written by the leader.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildKitPoolStatus {
@@ -969,13 +968,9 @@ pub struct BuildKitPoolStatus {
     /// Minimum number of warm pods in effect now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desired_warm: Option<i32>,
-    /// Sum of the non-stale `waiters[].count` values.
+    /// Number of pending claims of this pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting: Option<i32>,
-    /// Queued allocation requests per API replica.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 64), extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["replica"]))]
-    pub waiters: Vec<Waiter>,
     /// Platforms from `spec.platforms`, or derived from the template's arch selector.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub platforms: Vec<String>,
@@ -992,18 +987,6 @@ pub struct BuildKitPoolStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["type"]))]
     pub conditions: Vec<Condition>,
-}
-
-/// One API replica's queue length (`status.waiters`).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct Waiter {
-    /// Replica (pod) name. It is the list key.
-    pub replica: String,
-    /// Queued POSTs on that replica.
-    pub count: i32,
-    /// When the replica last wrote the entry. Entries older than 90 s are stale.
-    pub updated_at: Time,
 }
 
 /// Condition types.

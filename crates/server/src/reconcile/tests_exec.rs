@@ -20,7 +20,7 @@ use super::driver::{PoolKey, Trigger, schedule};
 use super::exec::{CaGuard, Env, execute};
 use super::ops::{Applied, KubeOps, OpError, OpResult};
 use super::pass::{PoolMemory, remember};
-use super::plan::{Action, CaEvent, CreateOutcome, CreateResult, Plan, RetireReason, WaiterRef};
+use super::plan::{Action, CaEvent, CreateOutcome, CreateResult, Plan, RetireReason};
 use super::spawn::WorkerSecrets;
 use crate::pki::{CaBundle, LoadOutcome};
 use crate::render::fixtures;
@@ -124,9 +124,6 @@ impl KubeOps for Fake {
     async fn patch_status(&self, _ns: &str, _pool: &str, status: &BuildKitPoolStatus) -> OpResult {
         self.statuses.lock().unwrap().push(status.clone());
         self.call("status".into())
-    }
-    async fn prune_waiter(&self, _ns: &str, _pool: &str, e: &WaiterRef) -> OpResult {
-        self.call(format!("prune:{}", e.index))
     }
     async fn create_secret(&self, s: &Secret) -> OpResult {
         let name = s.metadata.name.clone().unwrap_or_default();
@@ -257,20 +254,6 @@ fn full_pass() -> Vec<Action> {
             name: "p-0".into(),
         },
         Action::PatchStatus(ready_status()),
-        Action::PruneWaiters {
-            entries: vec![
-                WaiterRef {
-                    index: 1,
-                    replica: "b".into(),
-                    updated_at: Time(now()),
-                },
-                WaiterRef {
-                    index: 0,
-                    replica: "a".into(),
-                    updated_at: Time(now()),
-                },
-            ],
-        },
     ]
 }
 
@@ -299,8 +282,6 @@ async fn actions_run_in_plan_order() {
             "create:p-0",
             "secret_create:p-0-N:Pod/uid-p-0",
             "status",
-            "prune:1",
-            "prune:0",
         ]
     );
     assert!(r.errors.is_empty(), "{:?}", r.errors);
@@ -356,7 +337,7 @@ async fn failed_apply_skips_creates_and_downgrades_ready() {
             !calls.iter().any(|c| c.starts_with("create:")),
             "{failing}: {calls:?}"
         );
-        // Deletes, retires, status and prunes still run.
+        // Deletes, retires and status still run.
         assert!(calls.contains(&"retire:p-2:free".to_owned()));
         assert!(calls.contains(&"status".to_owned()));
         assert!(r.creates.is_empty());
@@ -945,9 +926,6 @@ impl KubeOps for Hang {
     }
     async fn patch_status(&self, _: &str, _: &str, _: &BuildKitPoolStatus) -> OpResult {
         self.hang("status").await
-    }
-    async fn prune_waiter(&self, _: &str, _: &str, _: &WaiterRef) -> OpResult {
-        self.hang("prune").await
     }
     async fn create_secret(&self, _: &Secret) -> OpResult {
         self.hang("create_secret").await

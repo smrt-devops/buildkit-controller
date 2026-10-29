@@ -1,0 +1,14 @@
+# A claim as the API writes it for a CI caller.
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitClaim
+metadata: {name: k3q7m2x4b5n6p7r2s3t4v5w6y7, namespace: default}
+spec:
+  poolRef: {namespace: ci, name: default}
+  ttl: 600s
+  queueTimeout: 120s
+  owner: "oidc:https://token.actions.githubusercontent.com#repo:smrt-devops/app:ref:refs/heads/main"
+  cacheScope: 0123456789abcdef0123456789abcdef
+  publicKey: |
+    -----BEGIN PUBLIC KEY-----
+    MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEcnEBKMt6kfdQc1ZXz8y0YXoT0jyG
+    -----END PUBLIC KEY-----

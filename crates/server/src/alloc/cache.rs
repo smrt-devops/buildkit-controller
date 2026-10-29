@@ -1,24 +1,21 @@
-//! Build cache on the API replicas: which layers a request
-//! uses, candidate order, ensure volume before a cold create, and the
-//! `cache-keys` annotation after a win.
+//! Build cache in allocation: which layers a claim uses, candidate order,
+//! and the `cache-keys` and `cache-scope` annotations after a win.
 
 use std::sync::Arc;
 
 use buildkit_controller_api::dto::{CacheChoice, CacheKey, CacheResponse, LocalCacheResult};
 use buildkit_controller_api::v1alpha1::{BuildKitPool, CacheAffinity, CacheScope};
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use k8s_openapi::api::core::v1::Pod;
 use kube::ResourceExt;
 use serde_json::{Value, json};
-use tracing::{error, warn};
+use tracing::warn;
 
-use super::backend::{Backend, PvcCreate};
+use super::backend::Backend;
 use super::error::AllocError;
 use super::metrics::AllocMetrics;
 use super::pods::{FREE, ann, ptr, shuffle, slot_of};
 use crate::auth::Identity;
-use crate::render::{
-    self, ANN_ALLOC, Binding, KEY_CACHE_KEYS, KEY_CACHE_SCOPE, LABEL_VOLUME_HASH, keys_contain,
-};
+use crate::render::{self, ANN_ALLOC, KEY_CACHE_KEYS, KEY_CACHE_SCOPE, keys_contain};
 
 /// The cache layers that apply to one request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,130 +127,18 @@ pub(super) fn order_warm<P: AsRef<Pod>>(
     });
 }
 
-/// Cold-path order: free cached slots first with the local layer, last
-/// without it. Each group is shuffled.
-pub(super) fn order_cold(pool: &BuildKitPool, slots: &mut [u32], local: bool) {
-    shuffle(slots);
-    slots.sort_by_key(|&s| render::is_cached_slot(pool, s) != local);
-}
-
-/// What a slot's volume holds, as its annotations say.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct Have {
-    /// `PVC cache-keys`.
-    pub keys: Option<String>,
-    /// `PVC cache-scope`, `None` when unset, empty or malformed.
-    pub binding: Option<Binding>,
-}
-
-impl Have {
-    fn of(pvc: &PersistentVolumeClaim) -> Self {
-        let a = pvc.annotations();
-        Self {
-            keys: a.get(KEY_CACHE_KEYS).cloned(),
-            binding: a.get(KEY_CACHE_SCOPE).and_then(|v| Binding::parse(v)),
-        }
-    }
-}
-
-/// What a cold create in a slot may do about its volume.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum Volume {
-    /// No volume, or a current one with its `PVC cache-keys` and `PVC cache-scope`: create the pod.
-    Ready(Have),
-    /// Terminating, replaced, or not the pool's: try the next slot.
-    Skip,
-    /// 403 `exceeded quota`: queue the request.
-    Quota,
-}
-fn owned_by(pvc: &PersistentVolumeClaim, pool: &BuildKitPool) -> bool {
-    let uid = pool.uid();
-    pvc.owner_references()
-        .iter()
-        .any(|o| o.controller == Some(true) && Some(&o.uid) == uid.as_ref())
-}
-
-/// Ensure volume before a cold create in `slot`.
-pub(super) async fn ensure_volume(
-    backend: &dyn Backend,
-    metrics: &AllocMetrics,
-    pool: &BuildKitPool,
-    slot: u32,
-) -> Result<Volume, AllocError> {
-    let want = match render::cache_volume(pool, slot) {
-        Ok(Some(v)) => v,
-        Ok(None) => return Ok(Volume::Ready(Have::default())),
-        Err(e) => {
-            error!(error = %e, "rendering cache volume");
-            return Err(AllocError::Internal);
-        }
-    };
-    let (ns, name) = (want.namespace().unwrap_or_default(), want.name_any());
-    // The read changed nothing, so its failure is the API server's (logged in
-    // full, since a missing permission also lands here).
-    let have = backend.get_pvc(&ns, &name).await.map_err(|error| {
-        error!(namespace = %ns, volume = %name, error, "get cache volume");
-        AllocError::UpstreamError
-    })?;
-    let label = |p: &PersistentVolumeClaim| p.labels().get(LABEL_VOLUME_HASH).cloned();
-    let Some(have) = have else {
-        return match backend.create_pvc(&ns, want).await {
-            PvcCreate::Created => {
-                metrics.volume_op("create", "ok");
-                Ok(Volume::Ready(Have::default()))
-            }
-            PvcCreate::Quota => {
-                metrics.volume_op("create", "error");
-                Ok(Volume::Quota)
-            }
-            PvcCreate::Unknown(error) => {
-                metrics.volume_op("create", "error");
-                warn!(namespace = %ns, volume = %name, error, "create cache volume");
-                Err(AllocError::UpstreamError)
-            }
-            PvcCreate::Failed(error) => {
-                metrics.volume_op("create", "error");
-                error!(namespace = %ns, volume = %name, error, "create cache volume");
-                Err(AllocError::Internal)
-            }
-        };
-    };
-    if !owned_by(&have, pool) || have.metadata.deletion_timestamp.is_some() {
-        return Ok(Volume::Skip);
-    }
-    if label(&have) != label(&want) {
-        // Nobody holds it: the pod about to be created is the only one that may hold the slot.
-        let uid = have.uid().unwrap_or_default();
-        let result = match backend.delete_pvc(&ns, &name, &uid).await {
-            Ok(()) => "ok",
-            Err(error) => {
-                warn!(namespace = %ns, volume = %name, error, "delete replaced cache volume");
-                "error"
-            }
-        };
-        metrics.volume_op("delete", result);
-        return Ok(Volume::Skip);
-    }
-    Ok(Volume::Ready(Have::of(&have)))
-}
-
 /// The cache result of a won pod. `before` is its `P cache-keys` before the
-/// claim. `created` is `Some(wiped)` when the pod was created for this
-/// request, `wiped` when on a volume another scope owned. `spill` counts only busy
-/// volumes of `scope`.
+/// claim. `spill` counts only busy volumes of `scope`.
 pub(super) fn result(
     pool: &BuildKitPool,
     won: &Pod,
     before: Option<&str>,
-    created: Option<bool>,
     scope: Option<&str>,
     key: &str,
     pods: &[Arc<Pod>],
 ) -> &'static str {
     if !cached(pool, won) {
         "uncached"
-    } else if let Some(wiped) = created {
-        if wiped { "wiped" } else { "cold" }
     } else if keys_contain(before, key) {
         "hit"
     } else if pods.iter().any(|p| {

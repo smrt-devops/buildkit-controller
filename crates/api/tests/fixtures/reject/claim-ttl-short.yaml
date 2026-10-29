@@ -1,0 +1,6 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitClaim
+metadata: {name: claim-ttl-short, namespace: default}
+spec:
+  poolRef: {namespace: ci, name: default}
+  ttl: 30s

@@ -11,6 +11,9 @@
 //! 5. A 60 s claim expires and loses its Secret.
 //! 6. Deleting a bound claim's worker pod makes the claim `Lost`.
 //! 7. A claim with an invalid `cacheKey` is rejected at admission; c1 carries a valid one.
+//! 8. With both workers bound, claims queue in order (`queuePosition`, the
+//!    pool's `status.waiting`), one fails at its `queueTimeout`, the next binds
+//!    once a worker frees; a tenant's written `owner` is ignored.
 //!
 //! The cluster name is `bk-claim-verify`, plus `-$BK_KIND_SUFFIX` when that is set.
 //! Every call uses the private kubeconfig under `target/claim-verify`, and
@@ -161,7 +164,31 @@ fn verify(env: &Cluster) -> Result<()> {
         ])?;
         Ok(s.starts_with("True warm=1").then_some(()))
     })?;
-    println!("installed chart with claims.enabled; pool Ready");
+    // The build reaches the edge through the controller's Service: wait until a
+    // ready replica backs it, or the first connect may be refused.
+    env.kubectl(&[
+        "rollout",
+        "status",
+        "deploy/bkc",
+        "-n",
+        NS,
+        "--timeout=300s",
+    ])?;
+    until("edge Service endpoints", Duration::from_mins(2), || {
+        let ips = env.kubectl(&[
+            "get",
+            "endpoints",
+            "bkc",
+            "-n",
+            NS,
+            "-o",
+            "jsonpath={.subsets[*].addresses[*].ip}",
+        ])?;
+        Ok((!ips.trim().is_empty()).then_some(()))
+    })?;
+    println!(
+        "installed chart with claims.enabled; pool Ready, controller in the Service endpoints"
+    );
 
     // 7. A cacheKey that starts with a hyphen is rejected at admission.
     let path = work.join("cache-key.yaml");
@@ -317,6 +344,84 @@ spec:
     let s = state(env, OK_NS, "c3")?;
     ensure!(s.starts_with("Lost"), "lost claim was rebound: {s}");
     println!("PASS deleting worker {pod} made c3 Lost (WorkerLost), Secret deleted, no rebind");
+    queue(env, &work)?;
     println!("claim-verify: all checks passed");
+    Ok(())
+}
+
+/// Check 8, the queue: with both workers bound, later claims wait in order with
+/// their place and the pool's exact `waiting`; one times out, the next binds
+/// once a worker frees. A tenant's written `owner` is ignored.
+fn queue(env: &Cluster, work: &std::path::Path) -> Result<()> {
+    for n in ["c1", "c2", "c3"] {
+        env.kubectl(&["delete", "bkc", n, "-n", OK_NS, "--ignore-not-found"])?;
+    }
+    let forged = "  owner: \"oidc:https://token.actions.githubusercontent.com#repo:x\"\n";
+    for n in ["q1", "q2"] {
+        apply(
+            env,
+            work,
+            &format!("{n}.yaml"),
+            &claim_yaml(OK_NS, n, "10m", forged),
+        )?;
+        wait_phase(env, OK_NS, n, "Bound", Duration::from_mins(3))?;
+    }
+    let owners = workers(env)?;
+    ensure!(
+        owners.contains(&format!("claim:{OK_NS}/q1#")) && !owners.contains("oidc:"),
+        "a tenant's written owner was honoured: {owners}"
+    );
+    println!("PASS a written owner outside the controller namespace is ignored");
+    apply(
+        env,
+        work,
+        "q3.yaml",
+        &claim_yaml(OK_NS, "q3", "10m", "  queueTimeout: 15s\n"),
+    )?;
+    std::thread::sleep(Duration::from_secs(1));
+    apply(
+        env,
+        work,
+        "q4.yaml",
+        &claim_yaml(OK_NS, "q4", "10m", "  queueTimeout: 4m\n"),
+    )?;
+    let position = |n: &str| {
+        env.kubectl(&[
+            "get",
+            "bkc",
+            n,
+            "-n",
+            OK_NS,
+            "-o",
+            "jsonpath={.status.phase} {.status.queuePosition}",
+        ])
+    };
+    until(
+        "q3 and q4 waiting at places 1 and 2",
+        Duration::from_mins(1),
+        || Ok((position("q3")? == "Pending 1" && position("q4")? == "Pending 2").then_some(())),
+    )?;
+    let waiting = until("pool waiting 2", Duration::from_secs(30), || {
+        let w = env.kubectl(&[
+            "get",
+            "buildkitpool",
+            "verify",
+            "-n",
+            POOL_NS,
+            "-o",
+            "jsonpath={.status.waiting}",
+        ])?;
+        Ok((w == "2").then_some(w))
+    })?;
+    println!("PASS q3, q4 Pending at places 1, 2; pool status.waiting {waiting}");
+    let s = wait_phase(env, OK_NS, "q3", "Failed", Duration::from_mins(1))?;
+    ensure!(s.ends_with("QueueTimeout"), "q3: {s}");
+    until("q4 moves up", Duration::from_secs(30), || {
+        Ok((position("q4")? == "Pending 1").then_some(()))
+    })?;
+    println!("PASS q3 {s} at its 15s queue timeout; q4 now at place 1");
+    env.kubectl(&["delete", "bkc", "q1", "-n", OK_NS])?;
+    let s = wait_phase(env, OK_NS, "q4", "Bound", Duration::from_mins(3))?;
+    println!("PASS deleting q1 freed a worker; q4 {s}");
     Ok(())
 }

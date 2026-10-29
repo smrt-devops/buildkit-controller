@@ -2,8 +2,6 @@
 
 use std::collections::BTreeSet;
 
-use buildkit_controller_api::v1alpha1::Waiter;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use k8s_openapi::jiff::{SignedDuration, Timestamp};
 use proptest::prelude::*;
 
@@ -137,7 +135,7 @@ proptest! {
         foreign_slots in prop::collection::btree_set(0u32..14, 0..3),
         holds in prop::collection::btree_map(0u32..14, -100i64..700, 0..3),
         creates in prop::collection::vec(arb_create(), 0..3),
-        waiters in prop::collection::vec((0i32..6, 0i64..200), 0..4),
+        waiting in 0i32..12,
         backoff in prop::option::of(-100i64..100),
         (tz_none, conflict) in any::<(bool, bool)>(),
     ) {
@@ -154,10 +152,7 @@ proptest! {
         f.backoff = backoff.map(later);
         if tz_none { f.tz = None; }
         if conflict { f.template = TemplateCheck::Conflict { message: "x".into() }; }
-        let s = f.pool.status.get_or_insert_with(Default::default);
-        for (i, (count, age)) in waiters.iter().enumerate() {
-            s.waiters.push(Waiter { replica: format!("r{i}"), count: *count, updated_at: Time(ago(*age)) });
-        }
+        f.waiting = waiting;
         let ca_valid = ca == 0;
         let p = plan(&f.observed(), *NOW, &PlanConfig::default());
         let max_u = u32::try_from(max).unwrap();
@@ -214,7 +209,6 @@ proptest! {
 
         // Idle retires never take free below desiredWarm.
         if p.actions.iter().any(|a| matches!(a, Action::RetireFree { reason: RetireReason::Idle, .. })) {
-            let waiting: i32 = waiters.iter().filter(|(_, age)| *age <= 90).map(|(c, _)| *c).sum();
             let desired = min.min(max).max(waiting);
             let free = pods.iter().filter(|w| {
                 w.alloc == Alloc::Free && w.deletion.is_none() && !retired.contains(&w.uid)

@@ -13,11 +13,12 @@
 //! | [`AppContext::replica`] / [`AppContext::namespace`] | `POD_NAME`, `POD_NAMESPACE` |
 //! | [`AppContext::pools`] / [`AppContext::pods`] | cloned `Store<BuildKitPool>` / `Store<Pod>` readers |
 //! | [`AppContext::pod_events`] | a [`PodSubscription`]; `Resync` means rescan [`AppContext::pods`] |
+//! | [`AppContext::claims`] / [`AppContext::claim_events`] | the `BuildKitClaim` store and its events |
 //! | [`AppContext::ca_secret`] / [`AppContext::serving_secret`] | `watch::Receiver<SecretState>` of the Secret watches |
 //! | [`AppContext::leader`] | `watch::Receiver<LeaderState>` |
 //! | [`AppContext::metrics`] | the registry ([`Metrics::with_registry`]) |
 //! | [`AppContext::readiness`] | register `/readyz` checks: `ca_loaded`, `serving_cert`, `api_listener`, `edge_listener` |
-//! | [`AppContext::wait_synced`] | resolves once Pool and Pod stores and the CA Secret watch saw `InitDone` |
+//! | [`AppContext::wait_synced`] | resolves once the Pool, Pod and claim stores and the CA Secret watch saw `InitDone` |
 //!
 //! Long-running modules implement [`hooks::Component`] (alloc, http, edge and
 //! the certificate loader run on every replica until their stage's shutdown
@@ -46,13 +47,14 @@ use kube::runtime::reflector::Store;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use buildkit_controller_api::claim::BuildKitClaim;
 use buildkit_controller_api::v1alpha1::BuildKitPool;
 
 use crate::config::{Config, Settings};
 use crate::election::LeaderState;
 use metrics::Metrics;
 use readiness::Readiness;
-use stores::{PodSubscription, SecretState, StoreFreshness, StoreSpec, Stores};
+use stores::{ClaimSubscription, PodSubscription, SecretState, StoreFreshness, StoreSpec, Stores};
 
 /// Longest a request to the API server may go without receiving anything
 /// before it fails: from sending the request to its response headers, and
@@ -147,6 +149,9 @@ impl AppContext {
             StoreSpec {
                 client: client.clone(),
                 watch_namespaces: settings.config.watched_namespaces(),
+                claim_namespaces: &settings
+                    .config
+                    .claim_namespaces(&settings.cli.pod_namespace),
                 namespace: &settings.cli.pod_namespace,
                 ca_secret_name: &settings.config.pki.ca_secret_name,
                 serving_secret_name: &settings.config.edge.tls.secret_name,
@@ -225,6 +230,18 @@ impl AppContext {
         PodSubscription::new(self.inner.stores.pod_events.subscribe())
     }
 
+    /// Claim store reader.
+    #[must_use]
+    pub fn claims(&self) -> Store<BuildKitClaim> {
+        self.inner.stores.claims.clone()
+    }
+
+    /// A new claim event subscription.
+    #[must_use]
+    pub fn claim_events(&self) -> ClaimSubscription {
+        ClaimSubscription::new(self.inner.stores.claim_events.subscribe())
+    }
+
     /// CA Secret watch.
     #[must_use]
     pub fn ca_secret(&self) -> watch::Receiver<SecretState> {
@@ -255,11 +272,11 @@ impl AppContext {
         &self.inner.readiness
     }
 
-    /// Resolve once the Pool and Pod stores and the CA Secret watch have seen `InitDone`.
+    /// Resolve once the Pool, Pod and claim stores and the CA Secret watch have seen `InitDone`.
     pub async fn wait_synced(&self) {
         self.inner
             .readiness
-            .wait_for(&["pool_store", "pod_store"])
+            .wait_for(&["pool_store", "pod_store", "claim_store"])
             .await;
         let mut ca = self.ca_secret();
         let _ = ca.wait_for(|s| s.init_done).await;

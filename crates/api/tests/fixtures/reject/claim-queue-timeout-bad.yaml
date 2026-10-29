@@ -1,0 +1,6 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitClaim
+metadata: {name: claim-queue-timeout-bad, namespace: default}
+spec:
+  poolRef: {namespace: ci, name: default}
+  queueTimeout: 2 minutes
