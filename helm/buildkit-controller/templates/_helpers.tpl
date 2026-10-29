@@ -57,6 +57,9 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
   "workerNetwork" .Values.workerNetwork
   "shutdown" (ternary .Values.shutdown (omit .Values.shutdown "drainTimeout") (not (empty .Values.shutdown.drainTimeout)))
   "claims" (dict "namespaces" .Values.claims.namespaces) -}}
+{{- if has .Release.Namespace (default (list) .Values.claims.namespaces) -}}
+{{- fail (printf "claims.namespaces must not include the release namespace %s: the API's claims live there and the leader trusts their owner and cache fields, so only cluster admins may create claims there" .Release.Namespace) -}}
+{{- end -}}
 {{- if .Values.cache.enabled -}}
   {{- $_ := set $cfg "registry" (dict "host" (include "bkc.registryHost" .) "tlsSecretName" (printf "%s-registry-tls" $fn)) -}}
 {{- end -}}

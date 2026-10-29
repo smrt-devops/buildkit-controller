@@ -343,21 +343,14 @@ pub struct StoreSpec<'a> {
     pub readiness: Arc<Readiness>,
 }
 
-/// A watch of `K` in `namespaces`, `[]` = all namespaces. More than one
-/// namespace runs one watcher per namespace, merged by [`merge_namespaces`];
-/// `store` is the reader of the store the events are applied to.
-///
-/// The merged watch completes its first list only once every namespace has
-/// listed, so one namespace that cannot be listed holds it forever. Use it
-/// where acting on a partial list is unsafe (the claim sweep releases workers
-/// of claims missing from its store); elsewhere use [`tolerant_watch`].
-#[must_use]
-pub fn scoped_watch<K>(
+/// A factory of kube watches: of one namespace, or of all when `None`.
+fn api_watch<K>(
     client: Client,
-    namespaces: &[String],
     cfg: &watcher::Config,
-    store: Store<K>,
-) -> BoxStream<'static, watcher::Result<watcher::Event<K>>>
+) -> impl Fn(Option<&str>) -> BoxStream<'static, watcher::Result<watcher::Event<K>>>
++ Clone
++ Send
++ 'static
 where
     K: Resource<Scope = NamespaceResourceScope>
         + Clone
@@ -368,16 +361,46 @@ where
         + 'static,
     K::DynamicType: Default + Clone + Eq + Hash,
 {
+    let cfg = cfg.clone();
+    move |ns| {
+        let api = match ns {
+            Some(ns) => Api::namespaced(client.clone(), ns),
+            None => Api::all(client.clone()),
+        };
+        watcher(api, cfg.clone()).boxed()
+    }
+}
+
+/// Restarting watches (see [`restarting`]) of `namespaces`, `[]` = all, made
+/// by `watch`. More than one namespace is merged: strictly without `report`
+/// (see [`merge_namespaces`]), tolerantly with it (see [`merge_tolerant`]).
+pub fn merged_watch<K, S>(
+    namespaces: &[String],
+    store: Store<K>,
+    report: Option<NamespaceReport>,
+    watch: impl Fn(Option<&str>) -> S + Clone + Send + 'static,
+) -> BoxStream<'static, watcher::Result<watcher::Event<K>>>
+where
+    K: Resource + Clone + Send + Sync + 'static,
+    K::DynamicType: Default + Clone + Eq + Hash,
+    S: Stream<Item = watcher::Result<watcher::Event<K>>> + Send + 'static,
+{
+    let one = |ns: Option<String>| {
+        let watch = watch.clone();
+        restarting(move || watch(ns.as_deref()))
+    };
     match namespaces {
-        [] => watcher(Api::all(client), cfg.clone()).boxed(),
-        [ns] => watcher(Api::namespaced(client, ns), cfg.clone()).boxed(),
+        [] => one(None).boxed(),
+        [ns] => one(Some(ns.clone())).boxed(),
         many => {
-            let tagged = stream::select_all(many.iter().enumerate().map(|(i, ns)| {
-                watcher(Api::<K>::namespaced(client.clone(), ns), cfg.clone())
-                    .map(move |ev| (i, ev))
-                    .boxed()
-            }));
-            merge_namespaces(tagged.boxed(), many.to_vec(), store).boxed()
+            let tagged = stream::select_all(
+                many.iter()
+                    .enumerate()
+                    .map(|(i, ns)| one(Some(ns.clone())).map(move |ev| (i, ev)).boxed()),
+            );
+            Merge::new(many.to_vec(), store, report)
+                .run(tagged.boxed())
+                .boxed()
         }
     }
 }
@@ -476,34 +499,22 @@ where
         + 'static,
     K::DynamicType: Default + Clone + Eq + Hash,
 {
-    let one = |api: Api<K>, cfg: &watcher::Config| {
-        let cfg = cfg.clone();
-        restarting(move || watcher(api.clone(), cfg.clone()))
-    };
-    match namespaces {
-        [] => one(Api::all(client), cfg).boxed(),
-        [ns] => one(Api::namespaced(client, ns), cfg).boxed(),
-        many => {
-            let tagged = stream::select_all(many.iter().enumerate().map(|(i, ns)| {
-                one(Api::namespaced(client.clone(), ns), cfg)
-                    .map(move |ev| (i, ev))
-                    .boxed()
-            }));
-            merge_tolerant(tagged.boxed(), many.to_vec(), store, report).boxed()
-        }
-    }
+    merged_watch(namespaces, store, Some(report), api_watch(client, cfg))
 }
 
 /// Merge watch streams of single namespaces into one stream that a single
 /// reflector writer can apply. Each item is tagged with its index in
-/// `namespaces`.
+/// `namespaces`; each tagged stream must restart itself after an error (see
+/// [`restarting`]).
 ///
 /// The writer replaces its whole store at `InitDone`, so the merged stream
 /// sends one `Init`, `InitApply`.., `InitDone` once every namespace finished
 /// its first list, and holds earlier events until then. A later relist of one
 /// namespace becomes `Apply` for each listed object and `Delete` for each
-/// object `store` holds in that namespace that the list lacked. Errors pass
-/// through unchanged.
+/// object `store` holds in that namespace that the list lacked. After an
+/// error, the relist that leaves every namespace current again sends the whole
+/// store as a fresh list instead, so the store's readiness (see [`drive`])
+/// comes back once every namespace recovered. Errors pass through unchanged.
 pub fn merge_namespaces<K>(
     tagged: BoxStream<'static, (usize, watcher::Result<watcher::Event<K>>)>,
     namespaces: Vec<String>,
@@ -560,6 +571,15 @@ where
     out: VecDeque<watcher::Result<watcher::Event<K>>>,
     /// `Some` for a tolerant merge.
     report: Option<NamespaceReport>,
+    /// A namespace failed since the last full list was sent.
+    erred: bool,
+    /// Items handed to the consumer so far.
+    sent: u64,
+    /// Namespaces listed again, each reported once the consumer has taken
+    /// (and so applied) the first `.0` items: clearing the degraded mark
+    /// earlier would show the leader a namespace whose objects are not in the
+    /// store yet.
+    listed_after: VecDeque<(u64, String)>,
 }
 
 fn same<K: Resource>(a: &K, b: &K) -> bool {
@@ -589,6 +609,9 @@ where
             store,
             out: VecDeque::new(),
             report,
+            erred: false,
+            sent: 0,
+            listed_after: VecDeque::new(),
         }
     }
 
@@ -598,7 +621,9 @@ where
     ) -> impl Stream<Item = watcher::Result<watcher::Event<K>>> + Send + 'static {
         stream::unfold((tagged, self), |(mut tagged, mut m)| async move {
             loop {
+                m.report_listed();
                 if let Some(ev) = m.out.pop_front() {
+                    m.sent += 1;
                     return Some((ev, (tagged, m)));
                 }
                 let give_up = m.next_give_up();
@@ -658,6 +683,7 @@ where
         }
         n.failing_since.get_or_insert_with(Instant::now);
         n.last_error = e.to_string();
+        self.erred = true;
         self.out.push_back(Err(e));
     }
 
@@ -687,14 +713,33 @@ where
         let Some(n) = self.ns.get_mut(i) else {
             return;
         };
+        let regained = std::mem::take(&mut n.given_up).then(|| n.name.clone());
+        self.merge_list(i, objs);
+        if let Some(name) = regained {
+            let at = self.sent + self.out.len() as u64;
+            self.listed_after.push_back((at, name));
+        }
+    }
+
+    /// Report the namespaces whose relist the consumer has taken.
+    fn report_listed(&mut self) {
+        while let Some((at, _)) = self.listed_after.front()
+            && *at <= self.sent
+            && let Some((_, name)) = self.listed_after.pop_front()
+        {
+            if let Some(r) = &self.report {
+                r.listed(&name);
+            }
+        }
+    }
+
+    fn merge_list(&mut self, i: usize, objs: Vec<K>) {
+        let Some(n) = self.ns.get_mut(i) else {
+            return;
+        };
         n.listed = true;
         n.current = true;
         n.failing_since = None;
-        if std::mem::take(&mut n.given_up)
-            && let Some(r) = &self.report
-        {
-            r.listed(&n.name);
-        }
         let ns = n.name.clone();
         if let Some(held) = &mut self.initial {
             held.retain(|x| x.meta().namespace.as_ref() != Some(&ns));
@@ -702,7 +747,9 @@ where
             self.release();
             return;
         }
-        if self.report.is_some() && self.whole() {
+        // A strict merge sends a full list only after an error, the one event
+        // that can clear the store's readiness.
+        if self.whole() && (self.report.is_some() || self.erred) {
             let others = self
                 .store
                 .state()
@@ -745,6 +792,7 @@ where
 
     /// `objs` as one full list.
     fn relist(&mut self, objs: Vec<K>) {
+        self.erred = false;
         self.out.push_back(Ok(watcher::Event::Init));
         self.out
             .extend(objs.into_iter().map(|o| Ok(watcher::Event::InitApply(o))));
@@ -835,8 +883,11 @@ fn strip<K: ResourceExt>(o: &mut K) {
 }
 
 /// The claim store and its event broadcast. Every allocation is a claim. The
-/// watch is strict, because the leader releases workers of claims missing from
-/// the store, so a partial list must never count as synced.
+/// watch is tolerant: a namespace that cannot be listed (its `RoleBinding` was
+/// deleted, say) is given up and listed as `claim_store/<namespace>` on
+/// `/readyz`, instead of holding readiness and leadership on every replica.
+/// The leader leaves the claims and workers of such a namespace alone (see
+/// [`AppContext::unlisted_claim_namespaces`](super::AppContext::unlisted_claim_namespaces)).
 fn claim_watch(
     client: &Client,
     claim_namespaces: &[String],
@@ -846,13 +897,13 @@ fn claim_watch(
 ) -> (Store<BuildKitClaim>, broadcast::Sender<ClaimEvent>) {
     let (claim_store, claim_writer) = reflector::store::<BuildKitClaim>();
     let (claim_tx, _) = broadcast::channel(POD_EVENT_CAPACITY);
-    let events = scoped_watch(
+    let events = tolerant_watch(
         client.clone(),
         claim_namespaces,
         &watcher::Config::default(),
         claim_store.clone(),
+        NamespaceReport::full("claim", Arc::clone(metrics), Arc::clone(readiness)),
     )
-    .default_backoff()
     .modify(strip);
     let m = Arc::clone(metrics);
     let ctx = claim_tx.clone();
@@ -883,13 +934,30 @@ pub fn worker_watches(
     readiness: &Arc<Readiness>,
     shutdown: &CancellationToken,
 ) -> (Store<BuildKitPool>, Store<Pod>, broadcast::Sender<PodEvent>) {
+    worker_watches_except(client, namespaces, None, metrics, readiness, shutdown)
+}
+
+/// [`worker_watches`] whose Pool store leaves out the pools of namespace `except`.
+#[must_use]
+pub fn worker_watches_except(
+    client: &Client,
+    namespaces: &[String],
+    except: Option<&str>,
+    metrics: &Arc<Metrics>,
+    readiness: &Arc<Readiness>,
+    shutdown: &CancellationToken,
+) -> (Store<BuildKitPool>, Store<Pod>, broadcast::Sender<PodEvent>) {
     let report = |kind| NamespaceReport::full(kind, Arc::clone(metrics), Arc::clone(readiness));
 
     let (pool_store, pool_writer) = reflector::store::<BuildKitPool>();
+    let pool_cfg = match except {
+        Some(ns) => watcher::Config::default().fields(&format!("metadata.namespace!={ns}")),
+        None => watcher::Config::default(),
+    };
     let events = tolerant_watch(
         client.clone(),
         namespaces,
-        &watcher::Config::default(),
+        &pool_cfg,
         pool_store.clone(),
         report("pool"),
     )
@@ -953,8 +1021,16 @@ impl Stores {
             metrics,
             readiness,
         } = spec;
-        let (pool_store, pod_store, tx) =
-            worker_watches(&client, watch_namespaces, &metrics, &readiness, shutdown);
+        // A pool in the controller's namespace is never served: that namespace
+        // holds the CA Secret, which a worker there could mount.
+        let (pool_store, pod_store, tx) = worker_watches_except(
+            &client,
+            watch_namespaces,
+            Some(namespace),
+            &metrics,
+            &readiness,
+            shutdown,
+        );
 
         let (claim_store, claim_tx) =
             claim_watch(&client, claim_namespaces, &metrics, &readiness, shutdown);
