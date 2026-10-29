@@ -506,11 +506,10 @@ fn run(env: &Cluster, work: &Path, long: bool) -> Result<()> {
     );
     println!("PASS a: docker buildx build with RUN through the edge ({pool})");
 
-    // b. Mock-issuer OIDC (above) and ServiceAccount TokenReview both work,
-    // and a token from nobody is refused.
+    // b. Mock-issuer OIDC (above) and ServiceAccount TokenReview both allocate,
+    // and a token from nobody is refused. Scenario h builds with the account.
     let sa = c.sa_token()?;
-    let out = c.build(&pool, &sa, "")?;
-    ensure!(out.contains("built-through-edge"), "SA build:\n{out}");
+    output(&mut c.recipe(&pool, &sa, "true")).context("SA allocation")?;
     let bad = c.recipe(&pool, "not-a-token", "true").output()?;
     let why = String::from_utf8_lossy(&bad.stderr);
     ensure!(
@@ -518,7 +517,7 @@ fn run(env: &Cluster, work: &Path, long: bool) -> Result<()> {
         "bogus token not refused with 401:\n{why}"
     );
     println!(
-        "PASS b: mock OIDC and ServiceAccount TokenReview allocate and build; a bogus token is refused with 401"
+        "PASS b: mock OIDC and ServiceAccount TokenReview allocate; a bogus token is refused with 401"
     );
 
     // c. Registry cache. The second build, on a fresh worker, hits it.
