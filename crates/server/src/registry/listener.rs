@@ -1,6 +1,6 @@
 //! The registry's mTLS listener.
 //!
-//! A client must present a cert that chains to the internal CA (rustls checks
+//! A client must present a cert that chains to `ca.crt`, the client CA (rustls checks
 //! the chain, validity and that the EKU allows client auth), and the cert must
 //! name a worker ([`peer_identity`]). Otherwise the connection closes before
 //! any request. HTTP/1.1 only: containerd opens a connection per parallel

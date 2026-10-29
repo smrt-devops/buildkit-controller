@@ -1,5 +1,0 @@
-apiVersion: buildkit.smrt-devops.net/v1alpha1
-kind: BuildKitPool
-metadata: {name: cache-registry-default-key-slash, namespace: default}
-spec:
-  workers: {cache: {registry: {repository: r.io/x, defaultKey: a/b}}}

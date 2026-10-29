@@ -168,7 +168,6 @@ impl H {
                 internal_ca_fingerprint: self.fp.clone(),
                 worker_cert_not_after: "2099-01-01T00:00:00Z".into(),
                 nonce: "00000000000000aa".into(),
-                claim: None,
             },
         )
         .unwrap();

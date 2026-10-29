@@ -1,6 +1,6 @@
 //! Reconciler metric families (leader only).
 
-use buildkit_controller_api::v1alpha1::{BuildKitPool, BuildKitPoolStatus};
+use buildkit_controller_api::v1alpha1::BuildKitPoolStatus;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
@@ -17,27 +17,17 @@ type Labels = Vec<(&'static str, String)>;
 pub struct PodCounts {
     /// Pods with `alloc=draining`.
     pub draining: usize,
-    /// Pods in cached slots, each of which mounts its slot's volume; `None` when `cache.local` is unset.
-    pub volumes_in_use: Option<usize>,
 }
 
 impl PodCounts {
-    /// Count `workers` of `pool`. A pod in a slot at or above the limit mounts
-    /// no volume.
+    /// Count `workers`.
     #[must_use]
-    pub fn of(pool: &BuildKitPool, workers: &[WorkerPod]) -> Self {
-        let limit = crate::render::cache_limit(pool);
+    pub fn of(workers: &[WorkerPod]) -> Self {
         Self {
             draining: workers
                 .iter()
                 .filter(|p| p.alloc == Alloc::Draining)
                 .count(),
-            volumes_in_use: pool.spec.workers.cache.local.is_some().then(|| {
-                workers
-                    .iter()
-                    .filter(|p| p.slot.is_some_and(|s| s < limit))
-                    .count()
-            }),
         }
     }
 }
@@ -55,10 +45,6 @@ pub struct ReconcileMetrics {
     desired_warm: Family<Labels, Gauge>,
     waiting: Family<Labels, Gauge>,
     pod_ops: Family<Labels, Counter>,
-    /// `buildkit_cache_volume_operations_total{op,result}`.
-    volume_ops: Family<Labels, Counter>,
-    /// `buildkit_cache_volumes_in_use{namespace,pool}`.
-    volumes_in_use: Family<Labels, Gauge>,
     reconcile: Family<Labels, Counter>,
     duration: Histogram,
     ca_replacements: Family<Labels, Counter>,
@@ -74,8 +60,6 @@ impl ReconcileMetrics {
             desired_warm: Family::default(),
             waiting: Family::default(),
             pod_ops: Family::default(),
-            volume_ops: Family::default(),
-            volumes_in_use: Family::default(),
             reconcile: Family::default(),
             duration: Histogram::new(BUCKETS),
             ca_replacements: Family::default(),
@@ -93,16 +77,6 @@ impl ReconcileMetrics {
                 "pod_operations",
                 "Pod creates, retires and deletes",
                 m.pod_ops.clone(),
-            );
-            r.register(
-                "cache_volume_operations",
-                "Cache volume creates and deletes",
-                m.volume_ops.clone(),
-            );
-            r.register(
-                "cache_volumes_in_use",
-                "Cache volumes mounted by a pod of the pool",
-                m.volumes_in_use.clone(),
             );
             r.register("reconcile", "Pool passes by result", m.reconcile.clone());
             r.register(
@@ -163,23 +137,8 @@ impl ReconcileMetrics {
         self.pool_pods
             .get_or_create(&p(Some(("state", "draining".into()))))
             .set(i64::try_from(counts.draining).unwrap_or(i64::MAX));
-        match counts.volumes_in_use {
-            Some(n) => {
-                self.volumes_in_use
-                    .get_or_create(&p(None))
-                    .set(i64::try_from(n).unwrap_or(i64::MAX));
-            }
-            None => {
-                self.volumes_in_use.remove(&p(None));
-            }
-        }
         for (op, result) in &report.pod_ops {
             self.pod_ops
-                .get_or_create(&vec![("op", (*op).into()), ("result", (*result).into())])
-                .inc();
-        }
-        for (op, result) in &report.volume_ops {
-            self.volume_ops
                 .get_or_create(&vec![("op", (*op).into()), ("result", (*result).into())])
                 .inc();
         }
@@ -205,7 +164,6 @@ impl ReconcileMetrics {
         self.pool_pods.clear();
         self.desired_warm.clear();
         self.waiting.clear();
-        self.volumes_in_use.clear();
     }
 
     /// Drops a deleted pool's gauges.
@@ -218,7 +176,6 @@ impl ReconcileMetrics {
         }
         self.desired_warm.remove(&base());
         self.waiting.remove(&base());
-        self.volumes_in_use.remove(&base());
     }
 }
 
@@ -299,10 +256,7 @@ mod tests {
                     "ns",
                     "p",
                     Some(&status()),
-                    PodCounts {
-                        draining: 1,
-                        volumes_in_use: Some(1),
-                    },
+                    PodCounts { draining: 1 },
                     &Report::default(),
                     0.01,
                 );
@@ -320,68 +274,10 @@ mod tests {
             "buildkit_pool_pods{",
             "buildkit_pool_desired_warm{",
             "buildkit_pool_waiting{",
-            "buildkit_cache_volumes_in_use{",
         ] {
             assert!(!text.contains(g), "{g} survived the term:\n{text}");
         }
         assert!(text.contains("buildkit_reconcile_total{"), "counters stay");
-    }
-
-    #[test]
-    fn volumes_in_use_follows_the_pass_and_goes_with_cache_local() {
-        let m = Metrics::new();
-        let rec = ReconcileMetrics::register(&m);
-        let sample = "buildkit_cache_volumes_in_use{namespace=\"ns\",pool=\"p\"}";
-        let counts = |n| PodCounts {
-            draining: 0,
-            volumes_in_use: n,
-        };
-        rec.pass(
-            "ns",
-            "p",
-            Some(&status()),
-            counts(Some(3)),
-            &Report::default(),
-            0.0,
-        );
-        assert!(
-            m.render().contains(&format!("{sample} 3")),
-            "{}",
-            m.render()
-        );
-        rec.pass(
-            "ns",
-            "p",
-            Some(&status()),
-            counts(Some(1)),
-            &Report::default(),
-            0.0,
-        );
-        assert!(
-            m.render().contains(&format!("{sample} 1")),
-            "{}",
-            m.render()
-        );
-        // cache.local was removed from the pool: the series goes.
-        rec.pass(
-            "ns",
-            "p",
-            Some(&status()),
-            counts(None),
-            &Report::default(),
-            0.0,
-        );
-        assert!(!m.render().contains(sample), "{}", m.render());
-        rec.pass(
-            "ns",
-            "p",
-            Some(&status()),
-            counts(Some(2)),
-            &Report::default(),
-            0.0,
-        );
-        rec.forget("ns", "p");
-        assert!(!m.render().contains(sample), "{}", m.render());
     }
 
     /// Per-pod worker certs live no longer than an allocation or the pod, so

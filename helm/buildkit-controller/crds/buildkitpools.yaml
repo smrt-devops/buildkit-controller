@@ -2059,7 +2059,8 @@ spec:
               workers:
                 default:
                   buildkitdConfig: ""
-                  cache: {}
+                  cache:
+                    scope: identity
                   startTimeout: 2m
                 description: Worker pod settings.
                 properties:
@@ -2069,151 +2070,113 @@ spec:
                     maxLength: 65536
                     type: string
                   cache:
-                    default: {}
-                    description: Cache volume settings.
+                    default:
+                      scope: identity
+                    description: Build cache settings.
                     properties:
-                      local:
+                      maxSize:
                         description: |-
-                          Persistent state volumes for cache affinity. Unset turns the
-                          feature off. A volume is shared only by callers of one cache scope, see `local.scope`,
-                          and is emptied before a pod of another scope starts on it. With it set, buildkitd runs
-                          with build history off (`[history] maxEntries = 0`) and `history.db` is deleted at
-                          every start, so no build logs or build arguments reach a later allocation and
-                          `buildx history` shows nothing on this pool.
-                        properties:
-                          affinity:
-                            default: soft
-                            description: "`soft` prefers a free pod whose volume served the request's key; `off` ignores keys."
-                            enum:
-                            - soft
-                            - "off"
-                            type: string
-                          gcKeepStorage:
-                            description: buildkitd GC bound (`[worker.oci] maxUsedSpace`). Unset uses 80% of `size`.
-                            nullable: true
-                            x-kubernetes-int-or-string: true
-                          keysPerVolume:
-                            default: 8
-                            description: Recent keys tracked per volume in the `cache-keys` annotation.
-                            format: int32
-                            maximum: 32.0
-                            minimum: 1.0
-                            type: integer
-                          maxVolumes:
-                            default: 10
-                            description: >-
-                              Slots `0..min(maxVolumes, scaling.max)` get a volume; other slots use an
-                              `emptyDir`.
-                            format: int32
-                            maximum: 500.0
-                            minimum: 1.0
-                            type: integer
-                          scope:
-                            default: identity
-                            description: |-
-                              Who shares a volume. `identity` (the default) gives each caller its own cache. An
-                              OIDC token is scoped to its issuer and its `repository_id` claim (GitHub Actions),
-                              else its `repository` claim, else its `sub`. A `ServiceAccount` is scoped to its
-                              namespace and name, and a `BuildKitClaim` to its namespace. `pool` lets every caller
-                              the pool admits read and write the same volumes, so use it only when they are one
-                              trust domain.
-                            enum:
-                            - identity
-                            - pool
-                            type: string
-                          size:
-                            default: 20Gi
-                            description: Storage request of each volume, from 1Gi to 10Ti.
-                            nullable: false
-                            x-kubernetes-int-or-string: true
-                            x-kubernetes-validations:
-                            - message: size must be between 1Gi and 10Ti
-                              rule: >-
-                                quantity(string(self)).compareTo(quantity('1Gi')) >= 0 &&
-                                quantity(string(self)).compareTo(quantity('10Ti')) <= 0
-                          storageClass:
-                            description: |-
-                              Storage class of the volumes; unset uses the cluster default. Use one with
-                              `volumeBindingMode: WaitForFirstConsumer`.
-                            maxLength: 253
-                            minLength: 1
-                            nullable: true
-                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
-                            type: string
-                        type: object
-                        x-kubernetes-validations:
-                        - message: gcKeepStorage must not exceed size
-                          rule: "!has(self.gcKeepStorage) || quantity(string(self.gcKeepStorage)).compareTo(quantity(string(self.size))) <= 0"
-                      registry:
-                        description: |-
-                          Shared registry cache that clients import and export. Every caller
-                          this pool admits, and anyone who can push to the repository, can write cache that
-                          later callers read.
-                        properties:
-                          defaultKey:
-                            description: Key for requests that name no `cacheKey`. Unset uses the pool name.
-                            maxLength: 63
-                            minLength: 1
-                            nullable: true
-                            pattern: ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$
-                            type: string
-                          enabled:
-                            default: true
-                            description: Whether allocations return the registry cache flags.
-                            type: boolean
-                          importFrom:
-                            description: |-
-                              Read-only fallbacks after the request's own ref: a cache key, rendered through `ref`,
-                              or an image reference (an entry with `/` or `:`).
-                            items:
-                              maxLength: 255
-                              minLength: 1
-                              type: string
-                            maxItems: 8
-                            type: array
-                            x-kubernetes-validations:
-                            - message: importFrom entries must be cache keys or image references
-                              rule: >-
-                                self.all(e, (size(e) <= 63 &&
-                                e.matches(r'^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$')) || ((e.contains('/') || e.contains(':')) &&
-                                e.matches(r'^[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]{1,5})?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(@sha256:[a-f0-9]{64})?$')))
-                          mode:
-                            default: max
-                            description: Export mode of `--cache-to`.
-                            enum:
-                            - max
-                            - min
-                            type: string
-                          ref:
-                            default: "{repository}:{cacheKey}"
-                            description: "Ref template. Placeholders: `{repository}`, `{cacheKey}`, `{pool}`."
-                            maxLength: 255
-                            minLength: 1
-                            type: string
-                            x-kubernetes-validations:
-                            - message: >-
-                                ref may use only {repository}, {cacheKey} and {pool} and must render to an
-                                image reference
-                              rule: >-
-                                self.replace('{repository}', 'r.example/x').replace('{cacheKey}',
-                                'k').replace('{pool}',
-                                'p').matches(r'^[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]{1,5})?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$')
-                          repository:
-                            description: Image name of the cache, without tag or digest, for example `ghcr.io/org/cache`.
-                            maxLength: 255
-                            minLength: 1
-                            type: string
-                            x-kubernetes-validations:
-                            - message: repository must be an image name without tag or digest
-                              rule: >-
-                                self.matches(r'^[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]{1,5})?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*$')
-                        required:
-                        - repository
-                        type: object
-                      sizeLimit:
-                        description: Size limit of the `emptyDir`. When unset, the ephemeral-storage limit bounds it.
+                          Bytes the pool's caches may hold in the built-in registry together. Over it, the
+                          least recently used caches go first. Unset uses the registry's default.
                         nullable: true
                         x-kubernetes-int-or-string: true
+                        x-kubernetes-validations:
+                        - message: maxSize must be at least 1Mi
+                          rule: quantity(string(self)).compareTo(quantity('1Mi')) >= 0
+                      scope:
+                        default: identity
+                        description: |-
+                          Who shares a cache in the built-in registry. `identity` (the default) gives each
+                          caller its own cache. An OIDC token is scoped to its issuer and its `repository_id`
+                          claim (GitHub Actions), else its `repository` claim, else its `sub`. A
+                          `ServiceAccount` is scoped to its namespace and name, and a `BuildKitClaim` to its
+                          namespace. `pool` gives every caller the pool admits one cache, so use it only
+                          when they are one trust domain.
+                        enum:
+                        - identity
+                        - pool
+                        type: string
+                      sizeLimit:
+                        description: |-
+                          Size limit of the buildkitd state `emptyDir`. When unset, the
+                          ephemeral-storage limit bounds it.
+                        nullable: true
+                        x-kubernetes-int-or-string: true
+                      writers:
+                        description: |-
+                          Callers whose builds may write the cache, in the syntax of `access.rules`; the
+                          rest only read it. Unset trusts OIDC tokens whose `event_name` claim is `push`,
+                          `schedule`, `workflow_dispatch` or `merge_group`, and every `ServiceAccount` and
+                          `BuildKitClaim` caller. `[]` trusts nobody.
+                        items:
+                          description: One access rule. Set exactly one of `oidc`, `serviceAccount` or `claims`.
+                          properties:
+                            claims:
+                              description: Match `BuildKitClaim` objects by their namespace.
+                              properties:
+                                namespaces:
+                                  description: Namespaces whose claims match (1 to 32 DNS-1123 labels, no wildcards).
+                                  items:
+                                    maxLength: 63
+                                    minLength: 1
+                                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                                    type: string
+                                  maxItems: 32
+                                  minItems: 1
+                                  type: array
+                                  x-kubernetes-list-type: set
+                              required:
+                              - namespaces
+                              type: object
+                            oidc:
+                              description: Match OIDC token claims.
+                              properties:
+                                claims:
+                                  additionalProperties:
+                                    description: >-
+                                      A claim pattern. `*` matches any run of characters, and the pattern needs at
+                                      least one character that is not `*`.
+                                    maxLength: 256
+                                    pattern: ^.*[^*].*$
+                                    type: string
+                                  description: Claims that must all match.
+                                  maxProperties: 16
+                                  minProperties: 1
+                                  type: object
+                                issuer:
+                                  description: Issuer URL. It must equal a configured issuer byte for byte.
+                                  maxLength: 512
+                                  pattern: ^https://
+                                  type: string
+                              required:
+                              - claims
+                              - issuer
+                              type: object
+                            serviceAccount:
+                              description: Match a Kubernetes service account.
+                              properties:
+                                name:
+                                  description: Name. When unset, any service account in the namespace matches.
+                                  maxLength: 253
+                                  minLength: 1
+                                  nullable: true
+                                  pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+                                  type: string
+                                namespace:
+                                  description: Namespace. When unset, the pool's namespace applies.
+                                  maxLength: 63
+                                  minLength: 1
+                                  nullable: true
+                                  pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                                  type: string
+                              type: object
+                          type: object
+                          x-kubernetes-validations:
+                          - message: exactly one of oidc, serviceAccount or claims must be set
+                            rule: "[has(self.oidc), has(self.serviceAccount), has(self.claims)].filter(x, x).size() == 1"
+                        maxItems: 64
+                        nullable: true
+                        type: array
                     type: object
                   startTimeout:
                     default: 2m
@@ -2236,27 +2199,6 @@ spec:
                 format: int32
                 nullable: true
                 type: integer
-              cache:
-                description: Resolved cache flags for the pool's default key.
-                nullable: true
-                properties:
-                  registry:
-                    description: Registry flags for `registry.defaultKey`.
-                    nullable: true
-                    properties:
-                      from:
-                        description: "`--cache-from` values, in order."
-                        items:
-                          type: string
-                        type: array
-                      to:
-                        description: "`--cache-to` value."
-                        type: string
-                    required:
-                    - from
-                    - to
-                    type: object
-                type: object
               conditions:
                 description: Conditions (`Ready`, `Degraded`, `CAExpiringSoon`).
                 items:

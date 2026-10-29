@@ -31,7 +31,7 @@ logFormat: json
 
 # Namespaces whose pools the controller serves, e.g. [ci-builders, team-b-builders].
 # Recommended. Each listed namespace gets a Role for the worker pods, Secrets,
-# ServiceAccounts, PVCs and NetworkPolicies, and the controller can write nothing
+# ServiceAccounts and NetworkPolicies, and the controller can write nothing
 # outside them, the release namespace and claims.namespaces. A pool in another
 # namespace is ignored. [] = every namespace, through a ClusterRole that can create
 # pods and Secrets in any namespace, kube-system included.
@@ -229,23 +229,33 @@ claims:
 # The chart does not create namespaces; label each one
 # pod-security.kubernetes.io/enforce=privileged.
 #
-# An item may also set `cache: {registry: {...}, local: {...}}`, which the chart merges
-# over spec.workers.cache (see docs/architecture.md, Build cache). Every caller a pool admits can
-# write cache that later callers of that pool read, so enable cache only on pools whose
-# rules admit one trust domain.
-#
 #   pools:
 #     - name: amd64
 #       namespace: ci-builders
-#       cache:
-#         registry: {repository: ghcr.io/org/buildkit-cache, importFrom: [app-main]}
-#         local: {size: 50Gi, maxVolumes: 4}
 #       spec: {scaling: {min: 2, max: 10}, access: {rules: [...]}}
 pools: []
 
-# Chart-wide cache defaults. registry.repository goes into every pool that sets no
-# registry repository of its own, which turns the registry cache on for it. A pool
-# opts out with `cache: {registry: {enabled: false}}`.
-cacheDefaults:
-  registry:
-    repository: ""
+
+# The built-in build cache: a registry that only worker pods reach, over mTLS with the
+# internal CA. Allocations name it in their --cache-to and --cache-from flags; callers a
+# pool's spec.workers.cache.writers rules do not trust (fork pull requests, by default)
+# get --cache-from only. One replica with one volume: while it restarts, builds run
+# uncached. false: no registry, and allocations carry no cache flags.
+cache:
+  enabled: true
+  maxSize: 40Gi          # all caches together; the oldest go first beyond it
+  poolMaxSize: 10Gi      # a pool without spec.workers.cache.maxSize
+  maxBlobSize: 5Gi       # larger layers are refused
+  maxUploadSize: 10Gi    # uploads in progress, together
+  gcInterval: 10m
+  # Needs room for maxSize plus maxUploadSize. "" storageClass = the cluster default.
+  persistence:
+    size: 60Gi
+    storageClass: ""
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {memory: 512Mi}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}

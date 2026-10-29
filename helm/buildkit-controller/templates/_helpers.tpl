@@ -58,6 +58,9 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
   "workerNetwork" .Values.workerNetwork
   "shutdown" (ternary .Values.shutdown (omit .Values.shutdown "drainTimeout") (not (empty .Values.shutdown.drainTimeout)))
   "claims" (dict "enabled" .Values.claims.enabled "namespaces" .Values.claims.namespaces) -}}
+{{- if .Values.cache.enabled -}}
+  {{- $_ := set $cfg "cache" (dict "host" (include "bkc.cacheHost" .) "tlsSecretName" (printf "%s-registry-tls" $fn)) -}}
+{{- end -}}
 {{- /* PROXY protocol only when on, so configs without it (and their checksum) stay the same. */ -}}
 {{- range $l := list "api" "edge" -}}
   {{- $p := (get $.Values $l).proxyProtocol -}}
@@ -72,6 +75,17 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
   {{- $_ := set $cfg "watchNamespaces" . -}}
 {{- end -}}
 {{- toYaml $cfg -}}
+{{- end -}}
+
+{{/* The cache registry Service, as workers reach it. */}}
+{{- define "bkc.cacheHost" -}}
+{{- printf "%s-registry.%s.svc:5000" (include "bkc.fullname" .) .Release.Namespace -}}
+{{- end -}}
+
+{{/* Labels of the cache registry pod. app.kubernetes.io/name is fixed: worker NetworkPolicies admit it. */}}
+{{- define "bkc.registrySelectorLabels" -}}
+app.kubernetes.io/name: buildkit-registry
+app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{/* Total seconds of "1h2m3s"-style durations. */}}

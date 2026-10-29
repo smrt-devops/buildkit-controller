@@ -5,7 +5,7 @@
 #   TOKEN=<oidc or sa token> API=https://bk.example.com:8443 POOL=ci/amd64 \
 #     sh buildkit-allocate.sh sh -c 'docker buildx build --builder "$BUILDER" .'
 #
-# The builder name is exported to the command as $BUILDER, and the registry cache
+# The builder name is exported to the command as $BUILDER, and the build cache
 # flags as $CACHE_ARGS:
 #
 #   CACHE_KEY=app-main ... sh buildkit-allocate.sh \
@@ -18,7 +18,8 @@
 #
 # Env: API, POOL (<namespace>/<pool>), TOKEN; optional TTL (seconds),
 # QUEUE_TIMEOUT (seconds), API_CA (PEM file trusted for the API listener),
-# CACHE_KEY (cache key of both layers) and CACHE (auto, registry, local or none).
+# CACHE_KEY (cache tag, default the pool name) and CACHE (auto or none). A build
+# the pool does not trust to write the cache gets --cache-from only.
 set -eu
 
 : "${API:?set API}" "${POOL:?set POOL}" "${TOKEN:?set TOKEN}"
@@ -26,7 +27,7 @@ set -eu
 NS=${POOL%%/*}; NAME=${POOL#*/}
 case $POOL in */*) ;; *) echo "POOL must be <namespace>/<pool>" >&2; exit 2 ;; esac
 case $API in https://*) ;; *) echo "API must be https://" >&2; exit 2 ;; esac
-case ${CACHE:-auto} in auto|registry|local|none) ;; *) echo "CACHE must be auto, registry, local or none" >&2; exit 2 ;; esac
+case ${CACHE:-auto} in auto|none) ;; *) echo "CACHE must be auto or none" >&2; exit 2 ;; esac
 case ${TTL:-} in *[!0-9]*) echo "TTL must be whole seconds, e.g. 3600" >&2; exit 2 ;; esac
 case ${QUEUE_TIMEOUT:-} in *[!0-9]*) echo "QUEUE_TIMEOUT must be whole seconds, e.g. 300" >&2; exit 2 ;; esac
 
@@ -250,8 +251,6 @@ docker buildx create --name "$BUILDER" --driver remote --driver-opt "$OPTS" \
 # Cache values hold no spaces, so an unquoted $CACHE_ARGS splits into one word per flag.
 CACHE_ARGS=$(jq -r '[(.cache.registry.from // [])[] | "--cache-from=\(.)"]
   + [.cache.registry.to // empty | "--cache-to=\(.)"] | join(" ")' "$D/alloc.json")
-CACHE_LOCAL=$(jq -r '.cache.local.result // empty' "$D/alloc.json")
-[ -z "$CACHE_LOCAL" ] || echo "cache: key $(jq -r .cache.key "$D/alloc.json"), local $CACHE_LOCAL" >&2
 [ -z "$CACHE_ARGS" ] || echo "cache flags: $CACHE_ARGS" >&2
 export BUILDER CACHE_ARGS
 # The command runs in the background with the original stdin, so a TERM reaches the release trap
