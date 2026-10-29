@@ -68,7 +68,7 @@ fn replicas() -> Result<[Replica; 2]> {
     ])
 }
 
-fn http(port: u16, path: &str) -> Option<(u16, String)> {
+pub(crate) fn http(port: u16, path: &str) -> Option<(u16, String)> {
     let out = Command::new("curl")
         .args(["-s", "-m", "2", "-w", "\n%{http_code}"])
         .arg(format!("http://127.0.0.1:{port}{path}"))
@@ -262,10 +262,7 @@ pub fn runtime_verify() -> Result<()> {
     let work = root.join("target/runtime-verify");
     std::fs::create_dir_all(&work)?;
     let bin = crate::build_controller()?;
-    let cluster = Cluster::new(
-        &super::kind_cluster("bk-runtime-verify"),
-        work.join("kubeconfig"),
-    );
+    let cluster = Cluster::for_suite("bk-runtime-verify", &work)?;
     // Declared after the cluster, so the replicas are killed before it is deleted.
     let mut children: Vec<Spawned> = Vec::new();
     cluster.create(None, "120s")?;

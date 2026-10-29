@@ -12,7 +12,9 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, waitid};
 
 /// Runs `c` and fails when it exits non-zero. Output goes to the terminal.
 pub(crate) fn status(c: &mut Command) -> Result<()> {
+    let t = Timed::start(c);
     let st = Spawned::spawn(c)?.wait()?;
+    drop(t);
     ensure!(st.success(), "{c:?} failed: {st}");
     Ok(())
 }
@@ -94,13 +96,13 @@ pub(crate) fn poll<T>(
     }
 }
 
-/// [`poll`] every 3 s, for cluster state.
+/// [`poll`] every second, for cluster state.
 pub(crate) fn until<T>(
     what: &str,
     timeout: Duration,
     f: impl FnMut() -> Result<Option<T>>,
 ) -> Result<T> {
-    poll(what, timeout, Duration::from_secs(3), f)
+    poll(what, timeout, Duration::from_secs(1), f)
 }
 
 /// Process groups whose leader is a [`Spawned`] child that has not been reaped.
@@ -185,9 +187,66 @@ fn stop_groups(pgids: &[u32]) {
         signal_group(*pgid, Some(Signal::KILL));
     }
 }
+
+/// Prints how long a slow harness step took, as `timing: <step> <secs>s` on
+/// stderr, when dropped. Only the steps that dominate a suite's wall time are
+/// reported: cluster create and delete, image loads, chart installs and builds.
+pub(crate) struct Timed {
+    label: String,
+    start: Instant,
+}
+
+impl Timed {
+    /// A timer named `label`.
+    pub(crate) fn named(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            start: Instant::now(),
+        }
+    }
+
+    /// A timer for `c` when it is one of the reported steps.
+    pub(crate) fn start(c: &Command) -> Option<Self> {
+        step(c).map(Self::named)
+    }
+}
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        eprintln!(
+            "timing: {} {:.1}s",
+            self.label,
+            self.start.elapsed().as_secs_f64()
+        );
+    }
+}
+
+/// The step `c` performs, if it is one [`Timed`] reports.
+fn step(c: &Command) -> Option<String> {
+    let program = c.get_program().to_str()?;
+    let args: Vec<&str> = c.get_args().filter_map(|a| a.to_str()).collect();
+    let has = |seq: &[&str]| args.windows(seq.len()).any(|w| w == seq);
+    let label = match program {
+        "kind" if has(&["create", "cluster"]) => "kind create".to_owned(),
+        "kind" if has(&["delete", "cluster"]) => "kind delete".to_owned(),
+        "kind" if has(&["load", "docker-image"]) => {
+            let image = args.iter().skip_while(|a| **a != "docker-image").nth(1)?;
+            format!("kind load {image}")
+        }
+        "helm" if args.iter().any(|a| *a == "install" || *a == "upgrade") => {
+            "helm install".to_owned()
+        }
+        "cargo" => format!("cargo {}", args.iter().find(|a| !a.starts_with('-'))?),
+        "docker" if has(&["build"]) => "docker build".to_owned(),
+        _ => return None,
+    };
+    Some(label)
+}
+
 /// Runs `c` in its own process group, like [`Command::output`]: stdin empty,
 /// stdout and stderr captured. SIGINT or SIGTERM to the task stops it too.
 pub(crate) fn run(c: &mut Command) -> Result<Output> {
+    let _t = Timed::start(c);
     Spawned::spawn(
         c.stdin(Stdio::null())
             .stdout(Stdio::piped())

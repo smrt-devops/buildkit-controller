@@ -18,10 +18,7 @@ pub fn api_verify() -> Result<()> {
     let work = crate::root().join("target/api-verify");
     std::fs::create_dir_all(&work)?;
     crate::image::ensure(PAUSE)?;
-    let cluster = Cluster::new(
-        &super::kind_cluster("bk-api-verify"),
-        work.join("kubeconfig"),
-    );
+    let cluster = Cluster::for_suite("bk-api-verify", &work)?;
     cluster.create(None, "120s")?;
     status(&mut crate::kube::kind_load(PAUSE, cluster.name()))?;
     apply_crd(&cluster, &work)?;

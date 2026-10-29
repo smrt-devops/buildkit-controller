@@ -36,7 +36,7 @@ const OIDC_HOST: &str = "mock-oidc.bk-oidc.svc";
 /// The API URL clients use, through the Gateway.
 /// The loopback host ports kind publishes the Gateway's API and edge listeners
 /// on: 18443 and 18444 without `BK_KIND_SUFFIX` (CI), else a pair in 20000-21999.
-static PORTS: std::sync::LazyLock<HostPorts> = std::sync::LazyLock::new(|| {
+pub(crate) static PORTS: std::sync::LazyLock<HostPorts> = std::sync::LazyLock::new(|| {
     HostPorts::get(
         HostPorts {
             api: 18443,
@@ -47,8 +47,7 @@ static PORTS: std::sync::LazyLock<HostPorts> = std::sync::LazyLock::new(|| {
 });
 static API: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("https://localhost:{}", PORTS.api));
-const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
-const REGISTRY_IMAGE: &str = "registry:2";
+pub(crate) const REGISTRY_IMAGE: &str = "registry:2";
 const REG: &str = "registry.e2e-reg.svc.cluster.local:5000";
 /// The chart's cache registry, as workers reach it.
 const CACHE_HOST: &str = "buildkit-controller-registry.bk-system.svc:5000";
@@ -77,9 +76,10 @@ fn work_dir() -> PathBuf {
     root().join("target").join(name)
 }
 
-/// The e2e cluster: `bk-e2e`, plus `-$BK_KIND_SUFFIX` when that is set.
-fn cluster(work: &Path) -> Cluster {
-    Cluster::new(&super::kind_cluster("bk-e2e"), work.join("kubeconfig"))
+/// The e2e cluster: `bk-e2e`, plus `-$BK_KIND_SUFFIX` when that is set, or the
+/// cluster named by `BK_KIND_CLUSTER`.
+fn cluster(work: &Path) -> Result<Cluster> {
+    Cluster::for_suite("bk-e2e", work)
 }
 
 fn pool_yaml(name: &str, platforms: &str, rules: &str) -> String {
@@ -118,9 +118,11 @@ fn pool_yaml(name: &str, platforms: &str, rules: &str) -> String {
 fn install(env: &Cluster, work: &Path, mode: &Mode) -> Result<PathBuf> {
     let root = root();
     // A leftover cluster of this name holds the ports; delete it before checking them.
-    env.delete();
     let ports = *PORTS;
-    ports.check_free(env.name())?;
+    if !env.attached() {
+        env.delete();
+        ports.check_free(env.name())?;
+    }
     let kind_cfg = crate::fixture(
         "e2e/kind.yaml",
         work,
@@ -131,7 +133,7 @@ fn install(env: &Cluster, work: &Path, mode: &Mode) -> Result<PathBuf> {
     )?;
     env.create(Some(&kind_cfg), "120s")?;
 
-    crate::image::image(CONTROLLER_IMAGE, Some(env.name()))?;
+    crate::image::load_controller(env)?;
     crate::image::ensure_worker()?;
     let mut images = vec![WORKER_IMAGE];
     if matches!(mode, Mode::Mock(_)) {
@@ -143,7 +145,7 @@ fn install(env: &Cluster, work: &Path, mode: &Mode) -> Result<PathBuf> {
     for image in images {
         status(&mut crate::kube::kind_load(image, env.name()))?;
     }
-    let gateway_ca = crate::gateway::install(env, work)?;
+    let gateway_ca = crate::gateway::E2E.install(env, work)?;
 
     for ns in [NS, POOL_NS] {
         env.kubectl(&["create", "namespace", ns])?;
@@ -239,8 +241,8 @@ auth:
       audiences: [{AUD}]
 {oidc_ca}",
         edge_port = ports.edge,
-        gw = crate::gateway::NAME,
-        gw_ns = crate::gateway::NS,
+        gw = crate::gateway::E2E.name,
+        gw_ns = crate::gateway::E2E.ns,
     );
     let values_file = write(&work.join("values.yaml"), &values)?;
     let chart = root
@@ -339,7 +341,7 @@ auth:
 pub(crate) fn e2e_up(repo: &str) -> Result<()> {
     let work = work_dir();
     std::fs::create_dir_all(&work)?;
-    let env = cluster(&work);
+    let env = cluster(&work)?;
     // Left running for the Action job, whether or not the install succeeds.
     env.keep();
     let ca = install(&env, &work, &Mode::Github(repo))?;
@@ -349,14 +351,15 @@ pub(crate) fn e2e_up(repo: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn e2e() -> Result<()> {
+/// `long`: scenario l waits past five minutes, as the nightly job runs it.
+pub(crate) fn e2e(long: bool) -> Result<()> {
     let work = work_dir();
     std::fs::create_dir_all(&work)?;
-    let env = &cluster(&work);
+    let env = &cluster(&work)?;
     if std::env::var_os("E2E_KEEP").is_some() {
         env.keep();
     }
-    let result = run(env, &work);
+    let result = run(env, &work, long);
     if result.is_err() {
         for args in [
             vec!["get", "pods", "-A", "-o", "wide"],
@@ -473,7 +476,7 @@ fn prepare(work: &Path) -> Result<(PathBuf, PathBuf)> {
 }
 
 #[allow(clippy::too_many_lines, reason = "one linear scenario script")]
-fn run(env: &Cluster, work: &Path) -> Result<()> {
+fn run(env: &Cluster, work: &Path, long: bool) -> Result<()> {
     let issuer = Issuer::new(OIDC_HOST)?;
     let ca = install(env, work, &Mode::Mock(&issuer))?;
     let (ctx, mp) = prepare(work)?;
@@ -489,10 +492,11 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
     let foreign = if host == "arm64" { "amd64" } else { "arm64" };
 
     // l. A long wait through the Gateway, beside scenarios a to h. X holds the only
-    // worker of the foreign pool for 330 s, and Y queues behind it, past Envoy's
-    // default 5-minute stream idle timeout. No request stays open over 25 s: Y's
-    // claim waits on the server while the client polls.
-    let long = LongPoll::start(&c, &format!("{POOL_NS}/{foreign}"), &issuer)?;
+    // worker of the foreign pool for 60 s, and Y queues behind it through two or
+    // more polls; with --long, 330 s, past Envoy's default 5-minute stream idle
+    // timeout. No request stays open over 25 s: Y's claim waits on the server
+    // while the client polls.
+    let long = LongPoll::start(&c, &format!("{POOL_NS}/{foreign}"), &issuer, long)?;
 
     // a. A build with a RUN step succeeds through the edge (OIDC token).
     let out = c.build(&pool, &oidc, "")?;
@@ -502,11 +506,10 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
     );
     println!("PASS a: docker buildx build with RUN through the edge ({pool})");
 
-    // b. Mock-issuer OIDC (above) and ServiceAccount TokenReview both work,
-    // and a token from nobody is refused.
+    // b. Mock-issuer OIDC (above) and ServiceAccount TokenReview both allocate,
+    // and a token from nobody is refused. Scenario h builds with the account.
     let sa = c.sa_token()?;
-    let out = c.build(&pool, &sa, "")?;
-    ensure!(out.contains("built-through-edge"), "SA build:\n{out}");
+    output(&mut c.recipe(&pool, &sa, "true")).context("SA allocation")?;
     let bad = c.recipe(&pool, "not-a-token", "true").output()?;
     let why = String::from_utf8_lossy(&bad.stderr);
     ensure!(
@@ -514,7 +517,7 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
         "bogus token not refused with 401:\n{why}"
     );
     println!(
-        "PASS b: mock OIDC and ServiceAccount TokenReview allocate and build; a bogus token is refused with 401"
+        "PASS b: mock OIDC and ServiceAccount TokenReview allocate; a bogus token is refused with 401"
     );
 
     // c. Registry cache. The second build, on a fresh worker, hits it.
@@ -730,17 +733,27 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
 /// Scenario l: an allocation that stays queued for over five minutes behind the
 /// Gateway, which the client follows with polls of at most 25 s each.
 struct LongPoll {
+    /// The shortest wait that shows what the scenario tests.
+    min_wait: u64,
     holder: Spawned,
     waiter: Spawned,
     launched: u64,
     outd: PathBuf,
 }
 
-/// How long X holds the worker, so Y waits past Envoy's default 5-minute stream idle timeout.
+/// How long X holds the worker: Y waits through at least two 25 s polls.
+const HOLD_SECS: u64 = 60;
+/// With `--long` (nightly), so Y waits past Envoy's default 5-minute stream
+/// idle timeout.
 const LONG_HOLD_SECS: u64 = 330;
 
 impl LongPoll {
-    fn start(c: &Client, pool: &str, issuer: &Issuer) -> Result<Self> {
+    fn start(c: &Client, pool: &str, issuer: &Issuer, long: bool) -> Result<Self> {
+        let (hold, min_wait) = if long {
+            (LONG_HOLD_SECS, 300)
+        } else {
+            (HOLD_SECS, 50)
+        };
         let outd = c.work.clone();
         for stale in ["l.x", "l.y"] {
             let _ = std::fs::remove_file(outd.join(stale));
@@ -749,7 +762,7 @@ impl LongPoll {
             c.recipe(
                 pool,
                 &issuer.token(AUD, "e2e")?,
-                &format!(r#"date +%s > "$OUTD/l.x"; sleep {LONG_HOLD_SECS}"#),
+                &format!(r#"date +%s > "$OUTD/l.x"; sleep {hold}"#),
             )
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
@@ -769,6 +782,7 @@ impl LongPoll {
             .stderr(Stdio::piped()),
         )?;
         Ok(Self {
+            min_wait,
             holder,
             waiter,
             launched,
@@ -788,8 +802,9 @@ impl LongPoll {
         let started = read_secs(&self.outd.join("l.y"))?;
         let waited = started.saturating_sub(self.launched);
         ensure!(
-            waited >= 300,
-            "Y waited {waited}s, not past the 5-minute idle bound the scenario tests"
+            waited >= self.min_wait,
+            "Y waited {waited}s, less than the {}s the scenario tests",
+            self.min_wait
         );
         println!(
             "PASS l: an allocation queued {waited}s through the Gateway, polled with requests of at most 25s, and got the worker"
@@ -840,8 +855,8 @@ fn gateway_options(env: &Cluster, c: &Client, pool: &str, issuer: &Issuer) -> Re
             "gateway.api.mode=passthrough",
             &format!(
                 "gateway.api.parentRefs[0].sectionName=api-passthrough,gateway.api.parentRefs[0].name={},gateway.api.parentRefs[0].namespace={}",
-                crate::gateway::NAME,
-                crate::gateway::NS
+                crate::gateway::E2E.name,
+                crate::gateway::E2E.ns
             ),
         ],
     )?;
@@ -868,7 +883,7 @@ fn gateway_options(env: &Cluster, c: &Client, pool: &str, issuer: &Issuer) -> Re
     // kubectl port-forward exits when the pod refuses a connection, which it does
     // until Envoy has the listener, so each attempt opens its own.
     let code = until("API by passthrough", Duration::from_mins(2), || {
-        let port = crate::gateway::PortForward::envoy(env, 9443)?;
+        let port = crate::gateway::PortForward::envoy(env, &crate::gateway::E2E, 9443)?;
         let url = format!("https://localhost:{}/v1/pools", port.local);
         let probe = Command::new("curl")
             .args(["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--cacert"])

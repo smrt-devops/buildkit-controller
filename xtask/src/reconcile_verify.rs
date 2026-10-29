@@ -30,6 +30,9 @@ use crate::proc::Spawned;
 
 /// Namespace of the controller (Lease, CA Secret, Events).
 const NAMESPACE: &str = "bk-reconcile";
+/// The scenarios' namespace, the only one the controller watches, so it
+/// leaves pools of other suites on a shared cluster alone.
+const POOL_NAMESPACE: &str = "bk-rv";
 const SA: &str = "buildkit-controller";
 /// The worker image the scenarios' pools run. The task loads it into kind
 /// because Docker Hub DNS inside kind is unreliable on this host.
@@ -37,7 +40,7 @@ const IMAGE: &str = crate::image::WORKER_IMAGE;
 
 /// Logs every request of the controller's `ServiceAccount` at `Metadata`
 /// (verb, resource, name, response code) and nothing else.
-const AUDIT_POLICY: &str = "apiVersion: audit.k8s.io/v1
+pub(crate) const AUDIT_POLICY: &str = "apiVersion: audit.k8s.io/v1
 kind: Policy
 omitStages: [RequestReceived]
 rules:
@@ -128,10 +131,7 @@ pub fn reconcile_verify() -> Result<()> {
     crate::image::ensure_worker()?;
     let bin = crate::build_controller()?;
 
-    let c = Cluster::new(
-        &super::kind_cluster("bk-reconcile-verify"),
-        work.join("kubeconfig"),
-    );
+    let c = Cluster::for_suite("bk-reconcile-verify", &work)?;
     c.create(Some(&kind_config), "180s")?;
     crate::proc::status(&mut crate::kube::kind_load(IMAGE, c.name()))?;
     c.apply_crds()?;
@@ -142,7 +142,7 @@ pub fn reconcile_verify() -> Result<()> {
     std::fs::write(
         &config,
         format!(
-            "listen:\n  ops: 127.0.0.1:{ops}\n  api: 127.0.0.1:{api}\n  edge: 127.0.0.1:{edge}\nedge:\n  endpoint: tcp://bk.example.com:8444\n  serverName: bk.example.com\nworkerNetwork:\n  extraDeniedCIDRs: [203.0.113.0/24]\n  dns:\n    namespace: rv-dns\n    podLabels: {{rv-dns: \"yes\"}}\n    cidrs: [198.51.100.53/32]\nshutdown:\n  delay: 0s\n  drainTimeout: 5s\n",
+            "watchNamespaces: [{POOL_NAMESPACE}]\nlisten:\n  ops: 127.0.0.1:{ops}\n  api: 127.0.0.1:{api}\n  edge: 127.0.0.1:{edge}\nedge:\n  endpoint: tcp://bk.example.com:8444\n  serverName: bk.example.com\nworkerNetwork:\n  extraDeniedCIDRs: [203.0.113.0/24]\n  dns:\n    namespace: rv-dns\n    podLabels: {{rv-dns: \"yes\"}}\n    cidrs: [198.51.100.53/32]\nshutdown:\n  delay: 0s\n  drainTimeout: 5s\n",
         ),
     )?;
     let log = std::fs::File::create(work.join("controller.log"))?;
@@ -157,9 +157,18 @@ pub fn reconcile_verify() -> Result<()> {
         .stderr(Stdio::from(log));
     // Declared after the cluster, so it is killed before the cluster is deleted.
     let mut controller = Spawned::spawn(&mut controller).context("starting the controller")?;
-    std::thread::sleep(std::time::Duration::from_secs(5));
-    let early = controller.try_wait()?;
-    ensure!(early.is_none(), "controller exited at startup: {early:?}");
+    crate::proc::poll(
+        "the controller's /readyz",
+        std::time::Duration::from_mins(1),
+        std::time::Duration::from_millis(250),
+        || {
+            if let Some(s) = controller.try_wait()? {
+                anyhow::bail!("controller exited at startup: {s}");
+            }
+            let ready = crate::runtime_verify::http(ops, "/readyz").is_some_and(|(c, _)| c == 200);
+            Ok(ready.then_some(()))
+        },
+    )?;
     let mut tests = c.server_test("reconcile_verify");
     tests
         .env("RV_OPS", format!("127.0.0.1:{ops}"))

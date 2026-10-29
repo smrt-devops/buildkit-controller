@@ -33,17 +33,13 @@ const POOL_NS: &str = "bk-claim-pool";
 const OK_NS: &str = "claim-ok";
 const DENIED_NS: &str = "claim-denied";
 const UNLISTED_NS: &str = "claim-unlisted";
-const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const ANN_OWNER: &str = "buildkit.smrt-devops.net/owner";
 const ANN_ALLOC: &str = "buildkit.smrt-devops.net/alloc";
 
 pub(crate) fn claim_verify() -> Result<()> {
     let work = root().join("target/claim-verify");
     std::fs::create_dir_all(&work)?;
-    let env = &Cluster::new(
-        &super::kind_cluster("bk-claim-verify"),
-        work.join("kubeconfig"),
-    );
+    let env = &Cluster::for_suite("bk-claim-verify", &work)?;
     let result = verify(env);
     if result.is_err() {
         for args in [
@@ -128,7 +124,7 @@ fn verify(env: &Cluster) -> Result<()> {
     let root = root();
     let work = root.join("target/claim-verify");
     env.create(None, "120s")?;
-    crate::image::image(CONTROLLER_IMAGE, Some(env.name()))?;
+    crate::image::load_controller(env)?;
     crate::image::ensure_worker()?;
     crate::proc::status(&mut crate::kube::kind_load(WORKER_IMAGE, env.name()))?;
     for ns in [NS, POOL_NS, OK_NS, DENIED_NS, UNLISTED_NS] {

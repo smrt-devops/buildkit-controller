@@ -34,7 +34,7 @@ const NS: &str = "bk-registry";
 /// The pool the worker certs name; repositories live under `<NS>/<POOL>/`.
 const POOL: &str = "cache";
 const NONCE: &str = "0123456789abcdef";
-const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
+use crate::image::CONTROLLER_IMAGE;
 const HOST: &str = "buildkit-cache.bk-registry.svc:5000";
 const METRICS: &str = "http://buildkit-cache.bk-registry.svc:8080/metrics";
 const SOCKET: &str = "unix:///run/user/1000/buildkit/buildkitd.sock";
@@ -300,15 +300,12 @@ pub(crate) fn registry_verify() -> Result<()> {
     let work = root().join("target/registry-verify");
     std::fs::create_dir_all(&work)?;
     let cleanup = Cleanup(
-        Cluster::new(
-            &super::kind_cluster("bk-registry-verify"),
-            work.join("kubeconfig"),
-        ),
+        Cluster::for_suite("bk-registry-verify", &work)?,
         std::cell::Cell::new(false),
     );
     let env = &cleanup.0;
     env.create(None, "120s")?;
-    super::image::image(CONTROLLER_IMAGE, Some(env.name()))?;
+    crate::image::load_controller(env)?;
     crate::image::ensure_worker()?;
     status(&mut crate::kube::kind_load(WORKER_IMAGE, env.name()))?;
     deploy(env, &work)?;

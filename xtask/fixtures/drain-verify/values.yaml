@@ -6,10 +6,12 @@ replicaCount: 2
 logFormat: text
 service:
   type: NodePort
-  nodePorts: {api: 30443, edge: 30444}
+  nodePorts: {api: 30082, edge: 30083}
 # Straight to the controller's NodePorts, so the test sees each replica drain its own
 # connections. A gateway in between would hold the client side open.
 gateway: {enabled: false}
+# Only the pool namespace, so the controller leaves other suites on a shared cluster alone.
+watchNamespaces: [drain-ci]
 # Long enough that a Lease move inside it shows the Lease went before the listeners.
 shutdown: {delay: 10s}
 edge:

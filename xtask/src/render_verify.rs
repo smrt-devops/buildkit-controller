@@ -54,9 +54,7 @@ fn prepare(cluster: &Cluster) -> Result<()> {
     }
     cluster.apply_crds().context("CRD apply")?;
     for ns in [POOL_NAMESPACE, CONTROLLER_NAMESPACE] {
-        cluster
-            .kubectl(&["create", "namespace", ns])
-            .context("create namespace")?;
+        cluster.namespace(ns).context("create namespace")?;
     }
     cluster.apply(PREREQS).context("prereqs")
 }
@@ -77,7 +75,10 @@ fn check(cluster: &Cluster, file: &Path) -> Result<(bool, String)> {
             .join(" | ")
     };
     if out.status.success() && file.to_string_lossy().ends_with(".serviceaccount.yaml") {
-        let real = cluster.kubectl_raw(&["apply", "-f", &arg], None)?;
+        // Without its ownerReferences: their pool does not exist, so the garbage
+        // collector would delete the account before the pods are checked.
+        let yaml = std::fs::read_to_string(file)?;
+        let real = cluster.kubectl_raw(&["apply", "-f", "-"], Some(&without_owners(&yaml)))?;
         return Ok((real.status.success(), stderr(&real)));
     }
     Ok((out.status.success(), stderr(&out)))
@@ -90,10 +91,7 @@ pub fn render_verify() -> Result<()> {
 
     let work = root.join("target/render-verify");
     std::fs::create_dir_all(&work)?;
-    let cluster = Cluster::new(
-        &super::kind_cluster("bk-render-verify"),
-        work.join("kubeconfig"),
-    );
+    let cluster = Cluster::for_suite("bk-render-verify", &work)?;
     cluster.create(None, "120s")?;
     prepare(&cluster)?;
 
@@ -119,4 +117,42 @@ pub fn render_verify() -> Result<()> {
         bail!("{} fixtures rejected:\n{}", failed.len(), failed.join("\n"));
     }
     Ok(())
+}
+
+/// `yaml` without its `metadata.ownerReferences` block.
+fn without_owners(yaml: &str) -> String {
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in yaml.lines() {
+        if line == "  ownerReferences:" {
+            skipping = true;
+            continue;
+        }
+        if skipping && (line.starts_with("  - ") || line.starts_with("    ")) {
+            continue;
+        }
+        skipping = false;
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::without_owners;
+
+    #[test]
+    fn owner_references_are_dropped_and_the_rest_kept() {
+        let sa = "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: a\n  namespace: n\n  ownerReferences:\n  - apiVersion: x/v1\n    kind: BuildKitPool\n    uid: u\n";
+        assert_eq!(
+            without_owners(sa),
+            "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: a\n  namespace: n\n"
+        );
+        let later = "metadata:\n  ownerReferences:\n  - uid: u\n  name: a\nautomount: false\n";
+        assert_eq!(
+            without_owners(later),
+            "metadata:\n  name: a\nautomount: false\n"
+        );
+    }
 }
