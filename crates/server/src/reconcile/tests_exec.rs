@@ -35,6 +35,8 @@ struct Fake {
     fail: HashMap<String, OpError>,
     statuses: Mutex<Vec<BuildKitPoolStatus>>,
     deletes: Mutex<Vec<Delete>>,
+    /// Every Secret passed to `create_secret`.
+    secrets: Mutex<Vec<Secret>>,
     /// When set, every apply waits for a permit first.
     gate: Option<Arc<tokio::sync::Notify>>,
 }
@@ -125,6 +127,7 @@ impl KubeOps for Fake {
         self.call("status".into())
     }
     async fn create_secret(&self, s: &Secret) -> OpResult {
+        self.secrets.lock().unwrap().push(s.clone());
         let name = s.metadata.name.clone().unwrap_or_default();
         let labelled = s.metadata.labels.as_ref().is_some_and(|l| {
             l.get("app.kubernetes.io/component").map(String::as_str) == Some("ca-replaced")
@@ -503,6 +506,15 @@ async fn invalid_ca_is_backed_up_then_replaced() {
     let invalid = LoadOutcome::Missing; // the executor only reads the Secret object here
     let mut cur = Secret::default();
     cur.metadata.resource_version = Some("41".into());
+    let keys = CaBundle::generate(super::exec::odt(now()))
+        .unwrap()
+        .to_secret_data();
+    cur.data = Some(
+        keys.into_iter()
+            .map(|(k, v)| (k, k8s_openapi::ByteString(v)))
+            .collect(),
+    );
+    cur.string_data = Some([(crate::pki::CLIENT_CA_KEY.to_owned(), "k".to_owned())].into());
     let fake = Fake::default();
     let r = execute(
         &fake,
@@ -516,6 +528,16 @@ async fn invalid_ca_is_backed_up_then_replaced() {
         ["create_secret:backup", "replace_secret", "event:CAReplaced"]
     );
     assert_eq!(r.ca_replacements, ["invalid"]);
+    // The backup keeps the CA certificates and no private key.
+    let backup = fake.secrets.lock().unwrap()[0].clone();
+    let kept: Vec<&str> = backup
+        .data
+        .iter()
+        .flatten()
+        .map(|(k, _)| k.as_str())
+        .collect();
+    assert_eq!(kept, ["client-ca.crt", "generated-by", "internal-ca.crt"]);
+    assert!(backup.string_data.is_none_or(|s| s.is_empty()));
     // A failed backup stops the replace.
     let fake = Fake::failing(&[("create_secret:backup", OpError::Other("forbidden".into()))]);
     execute(

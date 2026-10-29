@@ -526,7 +526,8 @@ async fn replace_ca<O: KubeOps>(
         metadata: ObjectMeta {
             name: Some(CaBundle::backup_name(env.ca_secret_name, odt(env.now))),
             namespace: Some(env.render.controller_namespace.clone()),
-            // The CA Secret keeps backups for forensics. The controller never deletes them.
+            // Backups are for forensics and hold no CA keys: only the CA
+            // certificates and the marker. The controller never deletes them.
             labels: Some(BTreeMap::from([
                 (LABEL_MANAGED_BY.into(), CONTROLLER.into()),
                 ("app.kubernetes.io/component".into(), "ca-replaced".into()),
@@ -534,8 +535,14 @@ async fn replace_ca<O: KubeOps>(
             ..ObjectMeta::default()
         },
         type_: cur.type_.clone(),
-        data: cur.data.clone(),
-        string_data: cur.string_data.clone(),
+        data: cur
+            .data
+            .as_ref()
+            .map(|d| CaBundle::backup_data(d, |v: &ByteString| v.0.as_slice())),
+        string_data: cur
+            .string_data
+            .as_ref()
+            .map(|d| CaBundle::backup_data(d, String::as_bytes)),
         ..Secret::default()
     };
     match ops.create_secret(&backup).await {
