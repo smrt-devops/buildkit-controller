@@ -8,6 +8,5 @@ pools:
     namespace: ci-b
     spec: {}
 claims:
-  enabled: true
   namespaces: [apps]
 gateway: {enabled: false}

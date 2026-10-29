@@ -28,7 +28,7 @@ pub fn alloc_verify() -> Result<()> {
         crate::image::WORKER_IMAGE,
         cluster.name(),
     ))?;
-    apply_crd(&cluster, &work)?;
+    cluster.apply_crds()?;
     status(
         cluster
             .server_test("alloc_verify")
@@ -38,19 +38,4 @@ pub fn alloc_verify() -> Result<()> {
     )?;
     println!("alloc-verify: all scenarios passed");
     Ok(())
-}
-
-/// Applies the generated CRDs (pool and claim) and waits until they are Established.
-pub(crate) fn apply_crd(cluster: &Cluster, work: &std::path::Path) -> Result<()> {
-    let crd = work.join("crd.yaml");
-    let claim = crate::claim_crd_yaml(false)?;
-    std::fs::write(&crd, format!("{}---\n{claim}", crate::render_crd()?))?;
-    cluster.kubectl(&["apply", "--wait", "-f", &crd.to_string_lossy()])?;
-    cluster.wait_crd_established()?;
-    cluster.wait_condition(
-        "crd/buildkitclaims.buildkit.smrt-devops.net",
-        None,
-        "Established",
-        std::time::Duration::from_mins(1),
-    )
 }

@@ -85,7 +85,7 @@ spec:
         - name: cache
           image: {CONTROLLER_IMAGE}
           imagePullPolicy: Never
-          args: [cache, --log-format=text, --tls-dir=/etc/tls, --data-dir=/data,
+          args: [registry, --log-format=text, --tls-dir=/etc/tls, --data-dir=/data,
                  --grants-file=/etc/grants/grants.yaml]
           env:
             - name: POD_NAME

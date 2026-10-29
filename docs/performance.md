@@ -6,12 +6,13 @@ and how to repeat the measurement.
 ## Results
 
 Two runs of `cargo xtask perf` on 2026-10-20, each on a fresh kind cluster. The
-measured column is the median of the two runs. With two runs the median is the
-mean.
+measured column is the median of the two runs, with the median of two being
+the mean. The allocation row is the exception: it is one later run, with the
+claim queue (see [Before the claim queue](#before-the-claim-queue)).
 
 | Target | Measured, median of 2 | Run 1 | Run 2 | Verdict |
 |---|---|---|---|---|
-| Allocation p50 with a warm pod under 150 ms | p50 8.5 ms, p95 15.1 ms, p99 21.6 ms | 8.5 / 15.2 / 26.5 ms | 8.5 / 15.0 / 16.6 ms | Pass |
+| Allocation p50 with a warm pod under 150 ms | p50 15.2 ms, p95 21.9 ms, p99 25.6 ms (one run, with the claim queue) | 15.2 / 21.9 / 25.6 ms | none | Pass |
 | Edge connect overhead p99 under 5 ms, 1 connection at a time | p99 +0.0 ms, p50 +0.3 ms | +0.3 / +0.3 ms | -0.3 / +0.2 ms | p99 not resolved on kind; p50 overhead +0.2 to +0.3 ms. Pass on loopback, see below |
 | Edge connect overhead p99 under 5 ms, 8 connections at a time | p99 -2.0 ms, p50 +0.5 ms | -2.6 / +0.5 ms | -1.4 / +0.5 ms | p99 not resolved on kind; p50 overhead +0.5 ms in both runs. Pass on loopback, see below |
 | Edge throughput at least 1 GiB/s on loopback-class links | edge 310 MB/s, direct 349 MB/s | 343 / 364 MB/s | 276 / 333 MB/s | Not testable on kind. Pass on loopback at 1.6 GiB/s with one stream, see below |
@@ -27,9 +28,9 @@ arm64 Mac with 10 CPUs and 12 GiB given to the Docker VM. The controller runs
 two replicas from the edge-verify fixture: restricted PodSecurity, read-only
 root filesystem, and the image from `cargo xtask image`.
 
-### After the claim queue
+### Before the claim queue
 
-The table above was measured before every allocation became a claim, when the API replica patched the pod itself. An allocation now costs about three API-server writes: the claim create, the pod patch and the claim status. One `cargo xtask perf` run on the same rig after the change measured a warm allocation p50 of 15.2 ms, p95 21.9 ms and p99 25.6 ms, still well inside the 150 ms target, and an idle replica at 12.4 and 15.0 MiB RSS. The edge is unchanged. Its throughput on kind was 129 MB/s in that run, below the 1 GiB/s target for the reason given above (kind is not a loopback-class link). One run is not a median, so treat the numbers as a check, not a new baseline.
+The allocation row comes from one run on the same rig after every allocation became a claim, which costs about three API-server writes (the claim create, the pod patch and the claim status). The other rows are from the two runs before that change, which left the edge and idle replicas alone. Before the change, when the API replica patched the pod itself, a warm allocation measured p50 8.5 ms, p95 15.1 ms and p99 21.6 ms. One run is not a median: rerun `cargo xtask perf` twice to restore one.
 
 ### Allocation latency
 

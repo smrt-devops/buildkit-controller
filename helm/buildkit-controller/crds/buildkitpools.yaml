@@ -2096,12 +2096,6 @@ spec:
                         - identity
                         - pool
                         type: string
-                      sizeLimit:
-                        description: |-
-                          Size limit of the buildkitd state `emptyDir`. When unset, the
-                          ephemeral-storage limit bounds it.
-                        nullable: true
-                        x-kubernetes-int-or-string: true
                       writers:
                         description: |-
                           Callers whose builds may write the cache, in the syntax of `access.rules`; the
@@ -2192,6 +2186,12 @@ spec:
                     x-kubernetes-validations:
                     - message: startTimeout must be between 10s and 30m
                       rule: duration(self) >= duration('10s') && duration(self) <= duration('30m')
+                  stateSizeLimit:
+                    description: |-
+                      Size limit of the buildkitd state `emptyDir`. When unset, the
+                      ephemeral-storage limit bounds it.
+                    nullable: true
+                    x-kubernetes-int-or-string: true
                 type: object
             type: object
           status:

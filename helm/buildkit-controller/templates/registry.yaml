@@ -3,7 +3,7 @@
 {{- $ns := .Release.Namespace -}}
 {{- $name := printf "%s-registry" $fn -}}
 {{- $watch := include "bkc.watchNamespaces" . | fromJsonArray -}}
-{{- $labels := printf "%s\napp.kubernetes.io/component: cache\napp.kubernetes.io/managed-by: %s\napp.kubernetes.io/version: %s\nhelm.sh/chart: %s" (include "bkc.registrySelectorLabels" .) .Release.Service (.Chart.AppVersion | quote) (printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-") -}}
+{{- $labels := printf "%s\napp.kubernetes.io/component: registry\napp.kubernetes.io/managed-by: %s\napp.kubernetes.io/version: %s\nhelm.sh/chart: %s" (include "bkc.registrySelectorLabels" .) .Release.Service (.Chart.AppVersion | quote) (printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-") -}}
 {{- $read := list
   (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitpools") "verbs" (list "get" "list" "watch"))
   (dict "apiGroups" (list "") "resources" (list "pods") "verbs" (list "get" "list" "watch")) -}}
@@ -120,7 +120,7 @@ spec:
         - name: registry
           image: {{ include "bkc.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: [cache]
+          args: [registry]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

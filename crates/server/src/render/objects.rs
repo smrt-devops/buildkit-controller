@@ -47,14 +47,14 @@ fn pool_meta(pool: &BuildKitPool) -> Result<ObjectMeta, RenderError> {
 /// The per-pod Secret `<pod>-<nonce>` of the pod [`super::worker_pod`] renders
 /// from the same `inputs`: `tls.crt`, `tls.key`, `ca.crt`, `client.crt`, `client.key`
 /// (the registry client leaf) and `buildkitd.toml`.
-/// `cache_host` adds the cache registry entry to `buildkitd.toml`.
+/// `registry_host` adds the cache registry entry to `buildkitd.toml`.
 /// It carries the pool's ownerReference as rendered; [`crate::reconcile::spawn`]
 /// replaces it with the pod's before the Secret is created.
 pub fn worker_secret(
     pool: &BuildKitPool,
     inputs: &PodInputs,
     tls: &WorkerTlsPem,
-    cache_host: Option<&str>,
+    registry_host: Option<&str>,
 ) -> Result<Secret, RenderError> {
     let bytes = |s: &str| ByteString(s.as_bytes().to_vec());
     let mut metadata = pool_meta(pool)?;
@@ -73,7 +73,7 @@ pub fn worker_secret(
                 "buildkitd.toml".to_owned(),
                 bytes(&super::buildkitd_config(
                     &pool.spec.workers.buildkitd_config,
-                    cache_host,
+                    registry_host,
                 )),
             ),
         ])),
@@ -144,7 +144,7 @@ fn dns_rule(net: &WorkerNetwork) -> Option<NetworkPolicyEgressRule> {
 /// The cache registry pods in the controller namespace, on the port of `cache.host`.
 fn cache_rule(cfg: &RenderConfig) -> Option<NetworkPolicyEgressRule> {
     let port_no = cfg
-        .cache_host
+        .registry_host
         .as_deref()?
         .rsplit_once(':')?
         .1

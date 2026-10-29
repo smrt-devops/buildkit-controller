@@ -66,7 +66,7 @@ pub fn default_config() -> RenderConfig {
     RenderConfig {
         controller_namespace: CONTROLLER_NAMESPACE.into(),
         worker_network: WorkerNetwork::default(),
-        cache_host: None,
+        registry_host: None,
     }
 }
 
@@ -142,7 +142,7 @@ fn full_template() -> Value {
         },
         "workers": {
             "buildkitdConfig": "[worker.oci]\n  max-parallelism = 4\n",
-            "cache": {"sizeLimit": "50Gi"}
+            "stateSizeLimit": "50Gi"
         }
     })
 }
@@ -157,7 +157,7 @@ pub fn scenarios() -> Result<Vec<Scenario>, FixtureError> {
         "cache-registry",
         json!({"workers": {"buildkitdConfig": "[registry.\"docker.io\"]\n  mirrors = [\"mirror.internal\"]\n"}}),
     )?;
-    cache.config.cache_host = Some(format!("buildkit-registry.{CONTROLLER_NAMESPACE}.svc:5000"));
+    cache.config.registry_host = Some(format!("buildkit-registry.{CONTROLLER_NAMESPACE}.svc:5000"));
     let mut nodelocal = scenario("nodelocal-dns", json!({}))?;
     nodelocal.config.worker_network.dns.cidrs = vec!["169.254.20.10/32".into()];
     nodelocal.config.worker_network.extra_denied_cidrs = vec!["203.0.113.7/32".into()];
@@ -232,7 +232,7 @@ pub fn render_scenario(s: &Scenario) -> Result<Vec<(&'static str, String)>, Fixt
                 &s.pool,
                 &s.inputs,
                 &fake_tls(),
-                s.config.cache_host.as_deref(),
+                s.config.registry_host.as_deref(),
             )?)?,
         ),
         ("serviceaccount", yaml(&service_account(&s.pool)?)?),

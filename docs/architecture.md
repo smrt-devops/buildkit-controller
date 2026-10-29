@@ -1,4 +1,4 @@
-# Architecture
+| Registry (`buildkit-controller registry`) | 5000 (mTLS), 8080 (ops) | Stores BuildKit cache for the workers | one StatefulSet pod |# Architecture
 
 This page is the short version of how the controller works. Day-two tasks are in [operations.md](operations.md) and a first install is in [quickstart.md](quickstart.md).
 
@@ -12,6 +12,8 @@ The `buildkit-controller` binary (`crates/server`) runs as one Deployment with t
 | Edge | 8444 (mTLS) | Proxies a build connection to its worker | every replica |
 | Reconciler and allocator | none | Keeps warm pods, binds queued claims to pods, signs allocation certificates, retires expired pods, manages CAs and worker certificates, writes status | the Lease holder only |
 | Cache (`buildkit-controller cache`) | 5000 (mTLS), 8080 (ops) | Stores BuildKit cache for the workers | one StatefulSet pod |
+
+Two names stay apart in this project. "Cache" is the user feature: the Helm values `cache.*`, the pool field `spec.workers.cache` and the `cache` field of an allocation. "Registry" is the component that stores it: the `registry` role, the `<fullname>-registry` objects and the `buildkit_registry_*` metrics.
 
 Clients reach the API and edge ports through a Gateway by default: the API through an HTTPRoute, where the gateway terminates TLS and re-encrypts to the controller, and the edge through a TLS passthrough TLSRoute, so that the edge itself checks the client certificate. A LoadBalancer Service is the alternative. See [Exposure](operations.md#exposure).
 
@@ -150,7 +152,7 @@ The tier says whether the caller may write. `spec.workers.cache.writers` lists t
 A claim is the record of one allocation. Two kinds exist.
 
 - CI claims. The API creates them in the controller's namespace, named after the allocation id, with the caller's `publicKey` and `owner`. Callers use the HTTP API, never the claim.
-- In-cluster claims. A pipeline such as Tekton or Argo creates one in its own namespace and reads the credentials from a Secret, with no HTTP API. This part is opt-in (`claims.enabled`, see [operations.md](operations.md#in-cluster-claims)).
+- In-cluster claims. A pipeline such as Tekton or Argo creates one in its own namespace and reads the credentials from a Secret, with no HTTP API. This part is opt-in: list the namespace in `claims.namespaces` (see [operations.md](operations.md#in-cluster-claims)).
 
 ```yaml
 apiVersion: buildkit.smrt-devops.net/v1alpha1

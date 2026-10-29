@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use buildkit_controller_api::claim::{BuildKitClaim, CacheTier, ClaimPhase, secret_name};
 use buildkit_controller_api::dto::CacheKey;
-use buildkit_controller_api::v1alpha1::{self as crd, BuildKitPool};
+use buildkit_controller_api::v1alpha1::BuildKitPool;
 use k8s_openapi::api::core::v1::Pod;
 use kube::runtime::reflector::{ObjectRef, Store};
 use time::OffsetDateTime;
@@ -24,18 +24,16 @@ use tracing::{error, info, warn};
 use super::backend::{Backend, PatchOutcome, Write};
 use super::cache::{self, Plan};
 use super::certs::CertSource;
+use super::claims::{self, Binding, Caller, PoolKey, reason};
 use super::metrics::AllocMetrics;
 use super::pods::{
     Bind, CERT_MARGIN, MAX_TRIES, Want, ann, claim_patch, fmt_ts, is_candidate, of_pool, parse_ts,
     retire_patch, shuffle, whole_seconds,
 };
-use crate::auth::{AccessRule, AccessRules};
-use crate::claim::logic::{self, Binding, Caller, PoolKey, reason};
+use super::pool::{MIN_TTL, access_rules, pool_ready, seconds};
 use crate::pki::{AllocId, AllocationId, CaBundle, ClientPublicKey, LeafKey};
 use crate::render::{self as rnd, ANN_ALLOC, ANN_EXPIRES_AT, template_hash};
 
-/// The shortest TTL a claim may ask for.
-pub const MIN_TTL: u64 = 60;
 /// How long the binder remembers a claim it bound or a pod it took, for
 /// stores that have not caught up yet.
 const RECENT: Duration = Duration::from_secs(30);
@@ -58,8 +56,8 @@ pub struct BindConfig {
     pub namespace: String,
     /// Namespaces whose claims are served.
     pub served: HashSet<String>,
-    /// `cache.host`, `None` when the controller runs no cache registry.
-    pub cache_host: Option<String>,
+    /// `registry.host`, `None` when the controller runs no cache registry.
+    pub registry_host: Option<String>,
 }
 
 impl BindConfig {
@@ -74,57 +72,6 @@ impl BindConfig {
             None => self.endpoint.clone(),
         }
     }
-}
-
-/// `spec.access.rules` into the auth rule type. Any malformed rule
-/// denies the whole pool (fails closed).
-#[must_use]
-pub fn access_rules(pool: &BuildKitPool) -> Option<AccessRules> {
-    rules(&pool.spec.access.rules)
-}
-
-/// Pool access rules into the auth rule type; `None` when one is malformed.
-#[must_use]
-pub fn rules(list: &[crd::AccessRule]) -> Option<AccessRules> {
-    let rules = list
-        .iter()
-        .map(|r| match (&r.oidc, &r.service_account, &r.claims) {
-            (None, None, Some(c)) => Some(AccessRule::Claims {
-                namespaces: c.namespaces.clone(),
-            }),
-            (Some(o), None, None) => Some(AccessRule::Oidc {
-                issuer: o.issuer.clone(),
-                claims: o
-                    .claims
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.0.clone()))
-                    .collect(),
-            }),
-            (None, Some(s), None) => Some(AccessRule::ServiceAccount {
-                namespace: s.namespace.clone(),
-                name: s.name.clone(),
-            }),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    AccessRules::new(rules).ok()
-}
-
-/// Whether allocation may go ahead on `pool`: `Ready` is True, or False only
-/// for the CA (the binder checks the CA itself).
-#[must_use]
-pub fn pool_ready(pool: &BuildKitPool) -> bool {
-    let ready = pool
-        .status
-        .iter()
-        .flat_map(|s| &s.conditions)
-        .find(|c| c.type_ == "Ready");
-    matches!(ready, Some(c) if c.status == "True" || c.reason == "CAUnavailable")
-}
-
-/// Whole seconds of a pool duration.
-pub(super) fn seconds(d: &crd::Duration) -> Result<u64, String> {
-    d.seconds().map_err(|e| e.to_string())
 }
 
 /// What one claim asks of its pool, checked.
@@ -233,7 +180,7 @@ impl Binder {
     /// The pools with waiting claims.
     #[must_use]
     pub fn pools_waiting(&self) -> Vec<PoolKey> {
-        logic::queues(&self.claims.state(), &self.cfg.served)
+        claims::queues(&self.claims.state(), &self.cfg.served)
             .into_keys()
             .collect()
     }
@@ -242,7 +189,7 @@ impl Binder {
     /// another pass without an event: at the next queue deadline, or soon
     /// after a contended patch.
     pub async fn pass(&self, key: &PoolKey) -> Option<Duration> {
-        let mut queue = logic::queues(&self.claims.state(), &self.cfg.served)
+        let mut queue = claims::queues(&self.claims.state(), &self.cfg.served)
             .remove(key)
             .unwrap_or_default();
         if queue.is_empty() {
@@ -288,9 +235,9 @@ impl Binder {
     ) {
         let own = self.cfg.namespace.as_str();
         let (Some(caller), Some(alloc_id), Some(claim_ref)) = (
-            logic::caller(c, own),
-            logic::alloc_id(c, own),
-            logic::claim_ref(c),
+            claims::caller(c, own),
+            claims::alloc_id(c, own),
+            claims::claim_ref(c),
         ) else {
             return;
         };
@@ -306,7 +253,7 @@ impl Binder {
             }
             return self.no_pool(c, now, pass).await;
         };
-        let host = self.cfg.cache_host.as_deref();
+        let host = self.cfg.registry_host.as_deref();
         let ask = match ask(c, pool, own, host, caller, alloc_id, claim_ref) {
             Ok(a) => a,
             Err(message) => {
@@ -365,8 +312,8 @@ impl Binder {
         self.pods.state().into_iter().find_map(|p| {
             let ok = of_pool(&p, ns, name, uid)
                 && ann(&p, ANN_ALLOC) == Some(ask.alloc_id.as_str())
-                && ann(&p, super::pods::ANN_CLAIM) == Some(ask.claim_ref.as_str())
-                && logic::serves(&p, ask.alloc_id.as_str());
+                && ann(&p, rnd::ANN_CLAIM) == Some(ask.claim_ref.as_str())
+                && claims::serves(&p, ask.alloc_id.as_str());
             let expires = ann(&p, ANN_EXPIRES_AT).and_then(parse_ts)?;
             ok.then(|| ((*p).clone(), expires))
         })
@@ -527,7 +474,7 @@ impl Binder {
                 }
             }
         };
-        let status = logic::bound_status(c, &binding, secret);
+        let status = claims::bound_status(c, &binding, secret);
         match self
             .backend
             .patch_claim_status(ns, name, rv(c), &status)
@@ -572,7 +519,7 @@ impl Binder {
         let uid = c.metadata.uid.as_deref().unwrap_or_default();
         let sname = secret_name(name);
         match self.backend.get_secret(ns, &sname).await {
-            Ok(Some(s)) if !logic::controlled_by(&s, uid) => {
+            Ok(Some(s)) if !claims::controlled_by(&s, uid) => {
                 return Err(Some((
                     reason::SECRET_CONFLICT,
                     format!("secret {sname} exists and this claim does not own it"),
@@ -593,7 +540,7 @@ impl Binder {
                 return Err(None);
             }
         }
-        let secret = logic::secret(c, b, key_pem, ca).ok_or(None)?;
+        let secret = claims::secret(c, b, key_pem, ca).ok_or(None)?;
         match self.backend.create_secret(secret).await {
             Write::Done => Ok(()),
             Write::Refused(m) => Err(Some((
@@ -637,7 +584,7 @@ impl Binder {
         // The reason is written at once; a changed place at most every
         // POSITION_EVERY, so a queue that moves does not cost a write per waiter per bind.
         let uid = c.metadata.uid.clone().unwrap_or_default();
-        let same_reason = c.status.is_some() && logic::reason(c) == Some(why);
+        let same_reason = c.status.is_some() && claims::reason(c) == Some(why);
         let at = c.status.as_ref().and_then(|s| s.queue_position);
         if same_reason && at == i32::try_from(position).ok() {
             return;
@@ -652,7 +599,7 @@ impl Binder {
         }
         self.memory().positions.insert(uid, Instant::now());
         let (ns, name) = claim_names(c);
-        let status = logic::unbound_status(c, ClaimPhase::Pending, why, message, Some(position));
+        let status = claims::unbound_status(c, ClaimPhase::Pending, why, message, Some(position));
         if !matches!(
             self.backend
                 .patch_claim_status(ns, name, rv(c), &status)
@@ -666,14 +613,14 @@ impl Binder {
     /// No pool, or no access rule admits the claim: `PoolNotFound`, after a
     /// grace for a pool applied with the claim.
     async fn no_pool(&self, c: &BuildKitClaim, now: OffsetDateTime, pass: &mut Pass) {
-        if logic::young(c, now) {
+        if claims::young(c, now) {
             if let Some(t) = c
                 .metadata
                 .creation_timestamp
                 .as_ref()
                 .and_then(|t| OffsetDateTime::from_unix_timestamp(t.0.as_second()).ok())
             {
-                pass.until(t + logic::POOL_GRACE);
+                pass.until(t + claims::POOL_GRACE);
             }
             return;
         }
@@ -689,7 +636,7 @@ impl Binder {
     /// The claim fails for good.
     async fn fail(&self, c: &BuildKitClaim, why: &'static str, message: &str, result: &str) {
         let (ns, name) = claim_names(c);
-        let status = logic::unbound_status(c, ClaimPhase::Failed, why, message, None);
+        let status = claims::unbound_status(c, ClaimPhase::Failed, why, message, None);
         if let Some(uid) = &c.metadata.uid {
             self.memory().bound.insert(uid.clone(), Instant::now());
         }
@@ -735,7 +682,7 @@ fn ask(
     c: &BuildKitClaim,
     pool: &BuildKitPool,
     own: &str,
-    cache_host: Option<&str>,
+    registry_host: Option<&str>,
     caller: Caller,
     alloc_id: AllocId,
     claim_ref: String,
@@ -786,10 +733,10 @@ fn ask(
         (None, _) => None,
     };
     let plan = who.and_then(|(scope, tier)| {
-        cache::plan(cache_host, pool, key.as_ref(), c.spec.cache, scope, tier)
+        cache::plan(registry_host, pool, key.as_ref(), c.spec.cache, scope, tier)
     });
     Ok(Ask {
-        deadline: logic::queue_deadline(c, qt),
+        deadline: claims::queue_deadline(c, qt),
         caller,
         alloc_id,
         claim_ref,
@@ -846,7 +793,7 @@ pub(super) async fn retire_pod(
     let (Some(name), Some(uid)) = (&pod.metadata.name, &pod.metadata.uid) else {
         return false;
     };
-    let patch = retire_patch(Some(uid), expected);
+    let patch = retire_patch(uid, expected);
     match backend.patch_pod(ns, name, patch).await {
         PatchOutcome::Applied(_) => {
             let grace = pod

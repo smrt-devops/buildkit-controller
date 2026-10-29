@@ -319,6 +319,7 @@ fn statuses_and_the_secret() {
 /// Pods bound for in-cluster claims before every allocation was a claim have
 /// no `P claim`: they are strays once their claim (by uid) is gone, has ended
 /// or names another allocation; API callers' pods are left to `DELETE`.
+/// v0.1.0 upgrade shim: remove in the release after v3.
 #[test]
 fn pre_claim_pods_of_ended_claims_are_strays() {
     let owned = |name: &str, owner: &str, alloc: &str| {

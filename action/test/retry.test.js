@@ -275,6 +275,7 @@ for (const [name, body] of [
   });
 }
 
+// start_timeout and shutting_down: v0.1.0 only (v0.1.0 upgrade shim: remove them in the release after v3).
 for (const code of ['pool_exhausted', 'start_timeout', 'shutting_down', 'upstream_error']) {
   test(`POST is retried on 503 with Retry-After and code ${code}`, async () => {
     const body = JSON.stringify({ error: { code, message: 'x' } });

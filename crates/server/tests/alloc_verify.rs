@@ -223,7 +223,7 @@ async fn ca_secret(client: &kube::Client, ns: &str, config: &Config) -> CaBundle
 
 fn config(ns: &str) -> String {
     format!(
-        "watchNamespace: {ns}\nedge:\n  endpoint: tcp://bk.example.com:8444\n  serverName: bk.example.com\n  allocationDomain: alloc.bk.example.com\n"
+        "watchNamespaces: [{ns}]\nedge:\n  endpoint: tcp://bk.example.com:8444\n  serverName: bk.example.com\n  allocationDomain: alloc.bk.example.com\n"
     )
 }
 
@@ -267,9 +267,11 @@ async fn replica(
         let (ctx, stop) = (ctx.clone(), stop.clone());
         tokio::spawn(async move { certs.run(ctx, stop).await });
     }
-    {
-        let (svc, ctx, stop) = (svc.clone(), ctx.clone(), stop.clone());
-        tokio::spawn(async move { svc.run(ctx, stop).await });
+    // The front door on every replica; the allocator acts only while leading.
+    let components: [Arc<dyn Component>; 2] = [Arc::new(svc.clone()), Arc::new(svc.allocator())];
+    for c in components {
+        let (ctx, stop) = (ctx.clone(), stop.clone());
+        tokio::spawn(async move { c.run(ctx, stop).await });
     }
     if reconcile {
         let work: Arc<dyn LeaderWork> = Arc::new(Reconciler::new(&ctx));
@@ -364,6 +366,12 @@ fn metric(m: &Metrics, needle: &str) -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "needs a kind cluster: cargo xtask alloc-verify"]
 async fn alloc_verify() {
+    // The controller log, so a failure shows what the replicas did.
+    let _ = buildkit_controller::telemetry::logs::init(
+        "info",
+        buildkit_controller::config::LogFormat::Text,
+        "alloc-verify",
+    );
     let stop = CancellationToken::new();
     let h = setup(&stop).await;
     let svc = h.leader.svc.clone();
@@ -740,6 +748,7 @@ async fn cold(stop: &CancellationToken) {
 /// Scenario 7, an upgrade: pods allocated before every allocation was a claim
 /// carry no `P claim`. An API caller's is released by its owner's DELETE, and
 /// an in-cluster claim's whose claim is gone is retired by the leader's sweep.
+/// v0.1.0 upgrade shim: remove in the release after v3.
 async fn upgrade(h: &H) {
     let names = h.warm("u", 2).await;
     let (api_id, claim_id) = (

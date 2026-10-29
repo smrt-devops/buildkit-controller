@@ -7,7 +7,7 @@
 - [Examples](examples/README.md)
 - [Architecture](docs/architecture.md)
 - [Operations](docs/operations.md)
-- [Helm chart](helm/README.md)
+- [Helm chart](helm/buildkit-controller/README.md)
 - [Performance](docs/performance.md)
 
 ---

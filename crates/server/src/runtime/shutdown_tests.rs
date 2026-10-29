@@ -86,7 +86,7 @@ async fn an_early_exit_is_reported_with_its_name() {
 }
 
 /// The Lease is released only after the reconciler and every leader-gated
-/// component (the claim controller) have stopped.
+/// component (the allocator) have stopped.
 #[tokio::test(start_paused = true)]
 async fn step_down_releases_the_lease_after_all_leader_work_stopped() {
     let log = Log::default();

@@ -6,6 +6,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::Shutdown;
+use crate::runtime::AppContext;
+use crate::runtime::hooks::{BoxResult, Component, Hooks};
 use crate::runtime::readiness::Readiness;
 use crate::runtime::shutdown::Stages;
 
@@ -169,4 +171,58 @@ async fn a_step_down_longer_than_the_delay_drains_at_once() {
     let t0 = Instant::now();
     plan(&log, t0, 7 * SEC, Duration::ZERO).run().await;
     assert_eq!(log.at("api stopping"), 7 * SEC);
+}
+
+/// Stands in for a real component; [`Hooks::start`] is given its own runner.
+struct Fake(&'static str);
+
+impl Component for Fake {
+    fn name(&self) -> &'static str {
+        self.0
+    }
+
+    fn run(&self, _: AppContext, _: CancellationToken) -> BoxResult {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_allocator_stops_before_the_lease_is_released() {
+    let log = Log::default();
+    let t0 = Instant::now();
+    let fake = |name| Arc::new(Fake(name)) as Arc<dyn Component>;
+    let hooks = Hooks {
+        reconcile: |_| unreachable!("the plan stands in for the reconciler"),
+        pki: fake("pki"),
+        alloc: fake("alloc"),
+        allocator: fake("allocator"),
+        http: fake("http"),
+        edge: fake("edge"),
+    };
+    let (leader, stages) = hooks.start(|c, stop| {
+        let log = log.clone();
+        Box::pin(async move {
+            stop.cancelled().await;
+            log.push(t0, &format!("{} stopped", c.name()));
+            Ok(())
+        })
+    });
+    let mut s = plan(&log, t0, SEC, Duration::ZERO);
+    s.leader = leader;
+    s.stages = stages;
+    s.run().await;
+    let events = log.events();
+    let at = |e: &str| events.iter().position(|x| x == e).unwrap();
+    assert!(at("allocator stopped") < at("lease released"), "{events:?}");
+    for c in ["alloc", "http", "edge", "pki"] {
+        assert!(
+            at("lease released") < at(&format!("{c} stopped")),
+            "{events:?}"
+        );
+    }
+    assert_eq!(
+        log.at("alloc stopped"),
+        5 * SEC,
+        "the API stops after the delay"
+    );
 }

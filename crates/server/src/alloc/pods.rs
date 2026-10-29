@@ -1,7 +1,5 @@
-//! Pure pod logic of allocation, covering candidate selection, free slots,
-//! the claim and retire patches, allocation ids and timestamps.
-
-use std::collections::BTreeSet;
+//! Pure pod logic of allocation: candidate selection, the claim and retire
+//! patches, allocation ids and timestamps.
 
 use k8s_openapi::api::core::v1::Pod;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -10,20 +8,14 @@ use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
 use crate::pki::AllocId;
 use crate::render::{
-    ANN_ALLOC, ANN_ALLOCATED_AT, ANN_EXPIRES_AT, ANN_INTERNAL_CA, ANN_OWNER,
-    ANN_WORKER_CERT_NOT_AFTER, LABEL_POOL, LABEL_STATE, LABEL_TEMPLATE_HASH,
+    ANN_ALLOC, ANN_ALLOCATED_AT, ANN_CLAIM, ANN_EXPIRES_AT, ANN_INTERNAL_CA, ANN_OWNER,
+    ANN_WORKER_CERT_NOT_AFTER, DRAINING, FREE, LABEL_POOL, LABEL_STATE, LABEL_TEMPLATE_HASH,
 };
 
-/// At most this many warm candidates or cold slots per attempt.
+/// At most this many warm candidates per claim.
 pub const MAX_TRIES: usize = 8;
 /// `worker-cert-not-after` must reach `expires-at` plus this.
 pub const CERT_MARGIN: time::Duration = time::Duration::minutes(5);
-/// `P alloc` of an unclaimed pod.
-pub const FREE: &str = "free";
-/// `P alloc` of a retired pod.
-pub const DRAINING: &str = "draining";
-/// `P claim`: `<namespace>/<name>` of the claim an allocated pod serves.
-pub const ANN_CLAIM: &str = "buildkit.smrt-devops.net/claim";
 
 /// An annotation value.
 #[must_use]
@@ -91,21 +83,6 @@ pub fn is_candidate(pod: &Pod, want: &Want<'_>) -> bool {
             .is_some_and(|t| t >= want.cert_not_after)
 }
 
-/// The slot of `<pool>-<slot>` (decimal, no leading zeros).
-#[must_use]
-pub fn slot_of(name: &str, pool: &str) -> Option<u32> {
-    let s = name.strip_prefix(pool)?.strip_prefix('-')?;
-    let ok = !s.is_empty() && (s == "0" || !s.starts_with('0'));
-    ok.then(|| s.parse().ok()).flatten()
-}
-
-/// `0..max-1` minus the slot of every pod name given (any state).
-#[must_use]
-pub fn free_slots<'a>(names: impl Iterator<Item = &'a str>, pool: &str, max: u32) -> Vec<u32> {
-    let used: BTreeSet<u32> = names.filter_map(|n| slot_of(n, pool)).collect();
-    (0..max).filter(|s| !used.contains(s)).collect()
-}
-
 /// JSON pointer for a metadata key (`/` becomes `~1`).
 pub(super) fn ptr(section: &str, key: &str) -> String {
     format!(
@@ -145,19 +122,15 @@ pub fn claim_patch(uid: &str, b: &Bind<'_>) -> Value {
     ])
 }
 
-/// The retire patch; `uid: None` only for the cold-create undo.
+/// The retire patch. The `test`s make it lose to any other writer.
 #[must_use]
-pub fn retire_patch(uid: Option<&str>, expected: &str) -> Value {
-    let mut ops = Vec::with_capacity(4);
-    if let Some(uid) = uid {
-        ops.push(json!({"op": "test", "path": "/metadata/uid", "value": uid}));
-    }
-    ops.extend([
-        json!({"op": "test", "path": ptr("annotations", ANN_ALLOC), "value": expected}),
-        json!({"op": "replace", "path": ptr("annotations", ANN_ALLOC), "value": DRAINING}),
-        json!({"op": "replace", "path": ptr("labels", LABEL_STATE), "value": DRAINING}),
-    ]);
-    Value::Array(ops)
+pub fn retire_patch(uid: &str, expected: &str) -> Value {
+    json!([
+        {"op": "test", "path": "/metadata/uid", "value": uid},
+        {"op": "test", "path": ptr("annotations", ANN_ALLOC), "value": expected},
+        {"op": "replace", "path": ptr("annotations", ANN_ALLOC), "value": DRAINING},
+        {"op": "replace", "path": ptr("labels", LABEL_STATE), "value": DRAINING},
+    ])
 }
 
 /// RFC 3339 UTC, seconds precision.

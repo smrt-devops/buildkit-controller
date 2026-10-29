@@ -1,5 +1,5 @@
 //! `cargo xtask claim-verify` installs the chart on a throwaway kind cluster
-//! with `claims.enabled` and one pool that admits claims from namespace
+//! with `claims.namespaces` set and one pool that admits claims from namespace
 //! `claim-ok`, then checks the claim lifecycle end to end:
 //!
 //! 1. A claim in `claim-ok` binds and its Secret appears.
@@ -160,8 +160,8 @@ fn verify(env: &Cluster) -> Result<()> {
         ])?;
         Ok(s.starts_with("True warm=1").then_some(()))
     })?;
-    // The build reaches the edge through the controller's Service: wait until a
-    // ready replica backs it, or the first connect may be refused.
+    // The build reaches the edge through the controller's Service; the build
+    // pod waits for the Service itself (see check 2).
     env.kubectl(&[
         "rollout",
         "status",
@@ -170,21 +170,7 @@ fn verify(env: &Cluster) -> Result<()> {
         NS,
         "--timeout=300s",
     ])?;
-    until("edge Service endpoints", Duration::from_mins(2), || {
-        let ips = env.kubectl(&[
-            "get",
-            "endpoints",
-            "bkc",
-            "-n",
-            NS,
-            "-o",
-            "jsonpath={.subsets[*].addresses[*].ip}",
-        ])?;
-        Ok((!ips.trim().is_empty()).then_some(()))
-    })?;
-    println!(
-        "installed chart with claims.enabled; pool Ready, controller in the Service endpoints"
-    );
+    println!("installed chart with claims.namespaces; pool Ready, controller rolled out");
 
     // 7. A cacheKey that starts with a hyphen is rejected at admission.
     let path = work.join("cache-key.yaml");
@@ -232,9 +218,19 @@ spec:
       mkdir -p /tmp/w && cd /tmp/w
       echo hello > hello.txt
       printf 'FROM scratch\nCOPY hello.txt /hello.txt\n' > Dockerfile
-      buildctl --addr "$BUILDKIT_HOST" --tlsservername "$BUILDKIT_SERVER_NAME" \
-        --tlscacert /certs/ca.crt --tlscert /certs/tls.crt --tlskey /certs/tls.key \
-        build --frontend dockerfile.v0 --local context=. --local dockerfile=. \
+      bk() {{
+        buildctl --addr "$BUILDKIT_HOST" --tlsservername "$BUILDKIT_SERVER_NAME" \
+          --tlscacert /certs/ca.crt --tlscert /certs/tls.crt --tlskey /certs/tls.key "$@"
+      }}
+      # kube-proxy can program a new Service seconds after its endpoints are
+      # Ready, longer on a cluster whose API server was just restarted (as
+      # runtime-verify does before this suite in kind-all). Until then a
+      # connect is refused, so wait for the edge to answer first.
+      i=0
+      until bk debug workers >/dev/null 2>&1; do
+        i=$((i + 1)); [ "$i" -lt 120 ] || exit 1; sleep 1
+      done
+      bk build --frontend dockerfile.v0 --local context=. --local dockerfile=. \
         --output type=local,dest=/tmp/out
       test "$(cat /tmp/out/hello.txt)" = hello && echo BUILD-OK
     env:

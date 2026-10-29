@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 
-use crate::alloc_verify::{PAUSE, apply_crd};
+use crate::alloc_verify::PAUSE;
 use crate::kube::Cluster;
 use crate::proc::status;
 
@@ -21,7 +21,7 @@ pub fn api_verify() -> Result<()> {
     let cluster = Cluster::for_suite("bk-api-verify", &work)?;
     cluster.create(None, "120s")?;
     status(&mut crate::kube::kind_load(PAUSE, cluster.name()))?;
-    apply_crd(&cluster, &work)?;
+    cluster.apply_crds()?;
     status(
         cluster
             .server_test("api_verify")

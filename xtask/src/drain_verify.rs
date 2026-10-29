@@ -11,7 +11,8 @@
 //!    carrier is seen draining for more than 300 s; 390 s leaves room for the
 //!    rollout to reach the carrier late.
 //! b. The Lease moves to a live replica within 15 s of SIGTERM to the leader,
-//!    while the old leader is still in its `shutdown.delay`.
+//!    while the old leader is still in its `shutdown.delay`, and the old
+//!    leader logs that its allocator stopped before it released the Lease.
 //! c. With the one worker held, a second allocation answers 202 pending. Its
 //!    claim survives a rollout of both replicas, stays counted once in the
 //!    pool's `status.waiting`, and binds (a long poll answers 200) once the
@@ -552,6 +553,17 @@ fn drain_budget(logs: &str) -> Option<u64> {
     })
 }
 
+/// Whether the controller's log shows its allocator stopped before the Lease
+/// was released, so no claim or pod write of the old leader can follow.
+fn allocator_stopped_first(logs: &str) -> bool {
+    let lines: Vec<String> = logs.lines().map(strip_ansi).collect();
+    let at = |msg: &str| lines.iter().position(|l| l.contains(msg));
+    matches!(
+        (at("allocator stopped"), at("leadership released")),
+        (Some(a), Some(r)) if a < r
+    )
+}
+
 /// `line` without ANSI escape sequences (`ESC [ ... <letter>`).
 fn strip_ansi(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
@@ -599,6 +611,9 @@ fn lease_moves_on_sigterm(env: &Cluster) -> Result<()> {
         std::thread::sleep(Duration::from_millis(250));
     };
     let moved = t0.elapsed();
+    let old_logs = env
+        .kubectl(&["logs", "-n", NS, &leader])
+        .unwrap_or_default();
     ensure!(
         moved <= LEASE_MOVE_MAX,
         "the Lease took {}ms to move",
@@ -608,8 +623,12 @@ fn lease_moves_on_sigterm(env: &Cluster) -> Result<()> {
         old_still_there,
         "the old leader had already exited, so the early release is not shown"
     );
+    ensure!(
+        allocator_stopped_first(&old_logs),
+        "{leader} did not log `allocator stopped` before `leadership released`"
+    );
     println!(
-        "PASS b: Lease moved from {leader} to {new} {}ms after SIGTERM, while {leader} was still shutting down",
+        "PASS b: Lease moved from {leader} to {new} {}ms after SIGTERM, while {leader} was still shutting down; its allocator stopped before it released the Lease",
         moved.as_millis()
     );
     until("two live replicas", Duration::from_mins(3), || {
@@ -724,7 +743,24 @@ fn watch_for_surplus(env: &Cluster) -> Result<(i32, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::drain_budget;
+    use super::{allocator_stopped_first, drain_budget};
+
+    #[test]
+    fn the_allocator_must_stop_before_the_lease_is_released() {
+        let first = "\
+2026-10-29T10:00:00.000Z  INFO buildkit_controller::alloc::leader: allocator stopped component=\"allocator\"
+2026-10-29T10:00:00.001Z  INFO buildkit_controller::runtime::stop: leadership released
+";
+        assert!(allocator_stopped_first(first));
+        let late = "\
+2026-10-29T10:00:00.001Z  INFO buildkit_controller::runtime::stop: leadership released
+2026-10-29T10:00:05.000Z  INFO buildkit_controller::alloc::leader: allocator stopped component=\"allocator\"
+";
+        assert!(!allocator_stopped_first(late));
+        assert!(!allocator_stopped_first(
+            "INFO buildkit_controller::runtime::stop: leadership released"
+        ));
+    }
 
     #[test]
     fn drain_budget_comes_from_the_draining_line_only() {

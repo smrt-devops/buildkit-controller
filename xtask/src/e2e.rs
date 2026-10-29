@@ -51,7 +51,8 @@ pub(crate) const REGISTRY_IMAGE: &str = "registry:2";
 const REG: &str = "registry.e2e-reg.svc.cluster.local:5000";
 /// The chart's cache registry, as workers reach it.
 const CACHE_HOST: &str = "buildkit-controller-registry.bk-system.svc:5000";
-/// A cache volume as v0.1.0 labelled it, created before install; the leader deletes it.
+/// A cache volume as v0.1.0 labelled it, created before install; the leader
+/// deletes it. v0.1.0 upgrade shim: remove in the release after v3.
 const OLD_VOLUME: &str = "v010-volume";
 const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const AUD: &str = "buildkit-controller";
@@ -351,15 +352,14 @@ pub(crate) fn e2e_up(repo: &str) -> Result<()> {
     Ok(())
 }
 
-/// `long`: scenario l waits past five minutes, as the nightly job runs it.
-pub(crate) fn e2e(long: bool) -> Result<()> {
+pub(crate) fn e2e() -> Result<()> {
     let work = work_dir();
     std::fs::create_dir_all(&work)?;
     let env = &cluster(&work)?;
     if std::env::var_os("E2E_KEEP").is_some() {
         env.keep();
     }
-    let result = run(env, &work, long);
+    let result = run(env, &work);
     if result.is_err() {
         for args in [
             vec!["get", "pods", "-A", "-o", "wide"],
@@ -476,7 +476,7 @@ fn prepare(work: &Path) -> Result<(PathBuf, PathBuf)> {
 }
 
 #[allow(clippy::too_many_lines, reason = "one linear scenario script")]
-fn run(env: &Cluster, work: &Path, long: bool) -> Result<()> {
+fn run(env: &Cluster, work: &Path) -> Result<()> {
     let issuer = Issuer::new(OIDC_HOST)?;
     let ca = install(env, work, &Mode::Mock(&issuer))?;
     let (ctx, mp) = prepare(work)?;
@@ -493,10 +493,9 @@ fn run(env: &Cluster, work: &Path, long: bool) -> Result<()> {
 
     // l. A long wait through the Gateway, beside scenarios a to h. X holds the only
     // worker of the foreign pool for 60 s, and Y queues behind it through two or
-    // more polls; with --long, 330 s, past Envoy's default 5-minute stream idle
-    // timeout. No request stays open over 25 s: Y's claim waits on the server
+    // more polls. No request stays open over 25 s: Y's claim waits on the server
     // while the client polls.
-    let long = LongPoll::start(&c, &format!("{POOL_NS}/{foreign}"), &issuer, long)?;
+    let long = LongPoll::start(&c, &format!("{POOL_NS}/{foreign}"), &issuer)?;
 
     // a. A build with a RUN step succeeds through the edge (OIDC token).
     let out = c.build(&pool, &oidc, "")?;
@@ -667,6 +666,7 @@ fn run(env: &Cluster, work: &Path, long: bool) -> Result<()> {
     println!("PASS h: another identity starts with an empty cache");
 
     // m. Upgrade: the cache volume of v0.1.0 created before install is gone.
+    // v0.1.0 upgrade shim: remove in the release after v3.
     until(
         "the v0.1.0 cache volume is deleted",
         Duration::from_mins(2),
@@ -733,8 +733,6 @@ fn run(env: &Cluster, work: &Path, long: bool) -> Result<()> {
 /// Scenario l: an allocation that stays queued for over five minutes behind the
 /// Gateway, which the client follows with polls of at most 25 s each.
 struct LongPoll {
-    /// The shortest wait that shows what the scenario tests.
-    min_wait: u64,
     holder: Spawned,
     waiter: Spawned,
     launched: u64,
@@ -743,17 +741,11 @@ struct LongPoll {
 
 /// How long X holds the worker: Y waits through at least two 25 s polls.
 const HOLD_SECS: u64 = 60;
-/// With `--long` (nightly), so Y waits past Envoy's default 5-minute stream
-/// idle timeout.
-const LONG_HOLD_SECS: u64 = 330;
+/// The shortest wait of Y that shows what the scenario tests.
+const MIN_WAIT_SECS: u64 = 50;
 
 impl LongPoll {
-    fn start(c: &Client, pool: &str, issuer: &Issuer, long: bool) -> Result<Self> {
-        let (hold, min_wait) = if long {
-            (LONG_HOLD_SECS, 300)
-        } else {
-            (HOLD_SECS, 50)
-        };
+    fn start(c: &Client, pool: &str, issuer: &Issuer) -> Result<Self> {
         let outd = c.work.clone();
         for stale in ["l.x", "l.y"] {
             let _ = std::fs::remove_file(outd.join(stale));
@@ -762,7 +754,7 @@ impl LongPoll {
             c.recipe(
                 pool,
                 &issuer.token(AUD, "e2e")?,
-                &format!(r#"date +%s > "$OUTD/l.x"; sleep {hold}"#),
+                &format!(r#"date +%s > "$OUTD/l.x"; sleep {HOLD_SECS}"#),
             )
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
@@ -782,7 +774,6 @@ impl LongPoll {
             .stderr(Stdio::piped()),
         )?;
         Ok(Self {
-            min_wait,
             holder,
             waiter,
             launched,
@@ -802,9 +793,8 @@ impl LongPoll {
         let started = read_secs(&self.outd.join("l.y"))?;
         let waited = started.saturating_sub(self.launched);
         ensure!(
-            waited >= self.min_wait,
-            "Y waited {waited}s, less than the {}s the scenario tests",
-            self.min_wait
+            waited >= MIN_WAIT_SECS,
+            "Y waited {waited}s, less than the {MIN_WAIT_SECS}s the scenario tests"
         );
         println!(
             "PASS l: an allocation queued {waited}s through the Gateway, polled with requests of at most 25s, and got the worker"

@@ -36,8 +36,6 @@ logFormat: json
 # namespace is ignored. [] = every namespace, through a ClusterRole that can create
 # pods and Secrets in any namespace, kube-system included.
 watchNamespaces: []
-# Deprecated single-namespace form of watchNamespaces. Setting both fails.
-watchNamespace: ""
 
 edge:
   endpoint: ""       # required, tcp://<host>:<port>, returned to clients
@@ -157,12 +155,11 @@ gateway:
     mode: terminate
     parentRefs: []         # e.g. [{name: shared, namespace: gateway-system, sectionName: https}]
     hostnames: []          # [] = [edge.serverName]
-    # HTTPRoute timeouts (terminate mode). A queued allocation request is silent until a
-    # worker is free: up to the pool's maxQueueTimeout + workers.startTimeout + 10s, which
-    # is 12m10s with default pool settings. Keep both above that.
+    # HTTPRoute timeouts (terminate mode). API requests last at most 25 s: a queued
+    # allocation answers 202 and the client polls. Keep both above that.
     timeouts:
-      request: 15m
-      backendRequest: 15m
+      request: 60s
+      backendRequest: 60s
     # How the gateway verifies the controller (terminate mode).
     backendTLS:
       hostname: ""                 # name checked in the controller's certificate; "" = edge.serverName
@@ -213,14 +210,11 @@ priorityClassName: ""
 
 # In-cluster BuildKitClaims, see docs/architecture.md (BuildKitClaim). Every allocation is a
 # claim: the claim CRD is always installed, and the API's claims live in the release namespace.
-# Enabled, the controller also serves claims that pipelines create in their own namespaces and
-# reads claims in every namespace. Secret get/create/delete is granted by a Role in each of
-# `namespaces` only, and the controller refuses claims from any other namespace. With
-# watchNamespaces set, claims are read in `namespaces` only and claims elsewhere are ignored.
-# `namespaces` is required when enabled. Pools still admit claims with an access rule
-# `claims: {namespaces: [...]}`.
+# List namespaces here to also serve the claims that pipelines create there. The controller then
+# reads claims in every namespace (with watchNamespaces set, in these only), gets a Role for
+# Secret get/create/delete in each of them, and refuses claims from any other namespace. Pools
+# still admit claims with an access rule `claims: {namespaces: [...]}`. [] = API claims only.
 claims:
-  enabled: false
   namespaces: []
 
 # One BuildKitPool per item: {name, namespace, spec}; the chart copies spec unchanged.

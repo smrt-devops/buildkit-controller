@@ -13,7 +13,6 @@ edge:
   endpoint: tcp://bkc.bk-claim.svc:8444
   serverName: bkc.bk-claim.svc
 claims:
-  enabled: true
   namespaces: [claim-ok, claim-denied]
 pools:
   - name: verify
