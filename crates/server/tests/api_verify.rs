@@ -6,9 +6,10 @@
 //! the kind API server, with OIDC discovery and JWKS served by an in-harness
 //! issuer over HTTPS on localhost (its keys generated here, trusted through
 //! the issuer's `caBundleFile` config option). Service-account tokens are real
-//! (`kubectl create token`) and go through `TokenReview`. The harness stands in
-//! for the reconciler. It creates warm pause pods with the labels, annotations
-//! and ownerReference the reconciler would render.
+//! (`kubectl create token`) and go through `TokenReview`. The replica leads, so
+//! it also binds the claims the API creates. The harness stands in for the
+//! reconciler: it creates warm pause pods with the labels, annotations and
+//! ownerReference the reconciler would render.
 
 #![allow(
     clippy::unwrap_used,
@@ -36,7 +37,7 @@ use buildkit_controller::config::{Cli, Config, Settings};
 use buildkit_controller::election::LeaderState;
 use buildkit_controller::http::{HttpComponent, Limits};
 use buildkit_controller::pki::CaBundle;
-use buildkit_controller::render::{ANN_ALLOC, PodInputs, worker_pod};
+use buildkit_controller::render::{PodInputs, worker_pod};
 use buildkit_controller::runtime::AppContext;
 use buildkit_controller::runtime::hooks::Component;
 use buildkit_controller::runtime::metrics::Metrics;
@@ -45,7 +46,6 @@ use buildkit_controller_api::v1alpha1::BuildKitPool;
 use clap::Parser;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::{Namespace, Pod, Secret};
-use kube::ResourceExt;
 use kube::api::{Api, Patch, PatchParams, PostParams};
 use reqwest::StatusCode;
 use ring::rand::SystemRandom;
@@ -159,36 +159,6 @@ struct H {
 }
 
 impl H {
-    /// Holds the pool's only slot with a draining pod `p-0`, as the reconciler
-    /// would while it retires one. The cold path then finds no free slot and
-    /// queues, which is what these scenarios exercise.
-    async fn hold_slot(&self) {
-        let mut pod = worker_pod(
-            &self.pool,
-            &PodInputs {
-                slot: 0,
-                internal_ca_fingerprint: self.fp.clone(),
-                worker_cert_not_after: "2099-01-01T00:00:00Z".into(),
-                nonce: "00000000000000aa".into(),
-                claim: None,
-            },
-        )
-        .unwrap();
-        pod.annotations_mut()
-            .insert(ANN_ALLOC.into(), "draining".into());
-        pod.spec = Some(
-            serde_json::from_value(json!({
-                "terminationGracePeriodSeconds": 0,
-                "containers": [{"name": "pause", "image": self.image, "imagePullPolicy": "Never"}]
-            }))
-            .unwrap(),
-        );
-        self.pods
-            .create(&PostParams::default(), &pod)
-            .await
-            .unwrap();
-    }
-
     /// One warm pause pod `p-w<tag>`, waited for in the controller's store.
     async fn warm(&self, tag: &str) -> String {
         let mut pod = worker_pod(
@@ -198,7 +168,6 @@ impl H {
                 internal_ca_fingerprint: self.fp.clone(),
                 worker_cert_not_after: "2099-01-01T00:00:00Z".into(),
                 nonce: "00000000000000aa".into(),
-                claim: None,
             },
         )
         .unwrap();
@@ -357,7 +326,8 @@ async fn setup(issuer: &Issuer, stop: &CancellationToken) -> (H, SocketAddr, Arc
     }
 
     let metrics = Arc::new(Metrics::new());
-    let (leader_tx, leader_rx) = watch::channel(LeaderState::Follower);
+    // The leader: its alloc component also binds the claims.
+    let (leader_tx, leader_rx) = watch::channel(LeaderState::Leader { term: 1 });
     std::mem::forget(leader_tx);
     let ctx = AppContext::build(
         client.clone(),
@@ -481,7 +451,6 @@ async fn api_verify() {
     let stop = CancellationToken::new();
     let issuer = Issuer::start(stop.clone()).await;
     let (h, api, metrics) = setup(&issuer, &stop).await;
-    h.hold_slot().await;
     let w1 = h.warm("1").await;
     let w2 = h.warm("2").await;
     let alice = issuer.token(AUD, "build");
@@ -542,7 +511,7 @@ async fn api_verify() {
     }
     println!("c. GET /v1/pools lists only accessible pools: PASS");
 
-    // f (start). The pool is exhausted, so the next POST queues.
+    // f (start). The pool is exhausted, so the next POST waits in the queue.
     let queued = {
         let (c, tok) = (c.clone(), alice.clone());
         tokio::spawn(async move { post(&c, api, Some(&tok), POOL).await })
@@ -575,15 +544,59 @@ async fn api_verify() {
     h.gone(&pa).await;
     println!("d. DELETE non-owner 403, owner 204, pod drained: PASS");
 
-    // f. The reconciler's replacement arrives; the queued POST completes.
-    let w3 = h.warm("3").await;
-    let (st, f) = tokio::time::timeout(Duration::from_mins(1), queued)
+    // f. With no worker for 20 s the POST answers 202 with the id and the
+    // place; the reconciler's replacement arrives; a long poll follows the
+    // allocation to 200.
+    let (st, p) = tokio::time::timeout(Duration::from_mins(1), queued)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(st, StatusCode::CREATED, "{f}");
-    assert_eq!(h.wait_claimed(f["id"].as_str().unwrap()).await, w3);
-    println!("f. queued allocation completed after a release: PASS");
+    assert_eq!(st, StatusCode::ACCEPTED, "{p}");
+    assert_eq!(
+        (p["state"].as_str(), p["position"].as_u64()),
+        (Some("pending"), Some(1)),
+        "{p}"
+    );
+    let f_id = p["id"].as_str().unwrap().to_owned();
+    let get = |tok: String, q: &'static str| {
+        let (c, id) = (c.clone(), f_id.clone());
+        async move {
+            let r = c
+                .get(format!("{}/v1/allocations/{id}{q}", base(api)))
+                .bearer_auth(tok)
+                .send()
+                .await
+                .unwrap();
+            let st = r.status();
+            (st, r.json::<Value>().await.unwrap_or(Value::Null))
+        }
+    };
+    let (st, v) = get(sa.clone(), "").await;
+    assert_eq!(
+        (st, v["error"]["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("forbidden")),
+        "{v}"
+    );
+    let (st, v) = get(alice.clone(), "").await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    let poll = tokio::spawn(get(alice.clone(), "?wait=25s"));
+    let w3 = h.warm("3").await;
+    let (st, f) = tokio::time::timeout(Duration::from_secs(30), poll)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(st, StatusCode::OK, "{f}");
+    check_grant(&f, &ca);
+    assert_eq!(f["id"], f_id.as_str());
+    assert_eq!(h.wait_claimed(&f_id).await, w3);
+    println!(
+        "f. POST 202 pending at place 1, GET 403 for others, long poll 200 once a worker is free: PASS"
+    );
+    assert_eq!(
+        del(alice.clone(), a_id.clone()).await,
+        StatusCode::NOT_FOUND,
+        "released"
+    );
 
     // e. The 401s and the 404 look the same as a missing pool.
     let forged = {

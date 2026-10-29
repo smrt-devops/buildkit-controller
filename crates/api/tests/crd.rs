@@ -303,8 +303,10 @@ fn template_schema_prunes_volume_sources_and_matches_spec_names() {
         assert!(spec["allocation"]["properties"].get(f).is_some(), "{f}");
     }
     let st = &v["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]["properties"];
-    assert_eq!(st["waiters"]["maxItems"], 64);
-    assert_eq!(st["waiters"]["x-kubernetes-list-map-keys"][0], "replica");
+    assert!(
+        st.get("waiters").is_none(),
+        "the per-replica waiters list is gone"
+    );
     for f in ["waiting", "platforms"] {
         assert!(st.get(f).is_some(), "status.{f}");
     }
@@ -312,14 +314,15 @@ fn template_schema_prunes_volume_sources_and_matches_spec_names() {
 }
 
 #[test]
-fn status_waiters_platforms_roundtrip() {
-    let wire = json!({
-        "waiting": 2, "platforms": ["linux/amd64"],
-        "waiters": [{"replica": "bk-0", "count": 2, "updatedAt": "2026-01-01T00:00:00Z"}]
-    });
+fn status_waiting_platforms_roundtrip() {
+    let wire = json!({"waiting": 2, "platforms": ["linux/amd64"]});
     let s: BuildKitPoolStatus = serde_json::from_value(wire.clone()).unwrap();
-    assert_eq!(s.waiters[0].replica, "bk-0");
+    assert_eq!(s.waiting, Some(2));
     assert_eq!(serde_json::to_value(&s).unwrap(), wire);
+    // The per-replica entries of older versions are dropped on read.
+    let old = json!({"waiting": 1, "waiters": [{"replica": "bk-0", "count": 1, "updatedAt": "2026-01-01T00:00:00Z"}]});
+    let s: BuildKitPoolStatus = serde_json::from_value(old).unwrap();
+    assert_eq!(serde_json::to_value(&s).unwrap(), json!({"waiting": 1}));
 }
 
 #[test]
@@ -367,78 +370,36 @@ fn canonical_cidrs_only() {
 }
 
 #[test]
-fn cache_local_is_off_by_default_and_its_defaults_match() {
-    use buildkit_controller_api::v1alpha1::LocalCache;
-    assert!(BuildKitPoolSpec::default().workers.cache.local.is_none());
+fn cache_defaults_to_identity_scope_and_default_writers() {
+    use buildkit_controller_api::v1alpha1::CacheScope;
+    let c = &BuildKitPoolSpec::default().workers.cache;
+    assert_eq!(c.scope, CacheScope::Identity);
+    assert!(c.writers.is_none() && c.max_size.is_none());
     let v = serde_json::to_value(crd()).unwrap();
     let cache = &v["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
-        ["workers"]["properties"]["cache"];
-    let local = &cache["properties"]["local"];
-    assert!(local.get("default").is_none(), "local must stay unset");
+        ["workers"]["properties"]["cache"]["properties"];
+    for gone in ["local", "registry"] {
+        assert!(cache.get(gone).is_none(), "{gone}");
+    }
     assert!(
-        local.get("nullable").is_none(),
-        "local must not be nullable"
+        cache["writers"].get("default").is_none(),
+        "writers must stay unset"
     );
-    check_defaults(
-        local,
-        &serde_json::to_value(LocalCache::default()).unwrap(),
-        "spec/workers/cache/local",
-    );
-    assert_eq!(local["properties"]["size"]["default"], "20Gi");
-    assert_eq!(local["properties"]["maxVolumes"]["default"], 10);
-    // An empty block turns the feature on with every default.
-    let p = pool(&json!({"workers": {"cache": {"local": {}}}}));
-    assert_eq!(p.spec.workers.cache.local, Some(LocalCache::default()));
-}
-
-#[test]
-fn cache_local_size_is_not_nullable() {
-    let v = serde_json::to_value(crd()).unwrap();
-    let size = &v["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
-        ["workers"]["properties"]["cache"]["properties"]["local"]["properties"]["size"];
-    assert_ne!(size.get("nullable"), Some(&json!(true)));
-    assert_eq!(size["x-kubernetes-int-or-string"], true);
-    assert!(size.get("x-kubernetes-validations").is_some());
-}
-
-#[test]
-#[allow(clippy::many_single_char_names)]
-fn cache_registry_defaults_resolve() {
-    use buildkit_controller_api::v1alpha1::{CacheAffinity, CacheMode};
-    let p = pool(&json!({"workers": {"cache": {
-        "registry": {"repository": "ghcr.io/org/cache", "importFrom": ["trunk", "ghcr.io/org/base:main", "trunk"]},
-        "local": {}
-    }}}));
+    assert_eq!(cache["writers"]["maxItems"], 64);
+    assert!(cache["maxSize"].get("x-kubernetes-validations").is_some());
+    let status = &v["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]["properties"];
+    assert!(status.get("cache").is_none());
+    let p =
+        pool(&json!({"workers": {"cache": {"scope": "pool", "writers": [], "maxSize": "5Gi"}}}));
     let c = &p.spec.workers.cache;
-    let r = c.registry_enabled().expect("enabled by default");
     assert_eq!(
-        (r.mode, r.ref_template.as_str()),
-        (CacheMode::Max, "{repository}:{cacheKey}")
+        (
+            c.scope,
+            c.writers.as_deref().map(<[_]>::len),
+            c.max_size.as_ref().map(|q| q.0.as_str())
+        ),
+        (CacheScope::Pool, Some(0), Some("5Gi"))
     );
-    let l = c.local.as_ref().unwrap();
-    assert_eq!(
-        (l.affinity, l.keys_per_volume, l.gc_keep_storage.as_ref()),
-        (CacheAffinity::Soft, 8, None)
-    );
-    assert_eq!(c.default_key("app"), "app");
-    let f = r.resolve("app", "app-main");
-    assert_eq!(
-        f.to,
-        "type=registry,ref=ghcr.io/org/cache:app-main,mode=max,image-manifest=true,oci-mediatypes=true"
-    );
-    assert_eq!(
-        f.from,
-        [
-            "type=registry,ref=ghcr.io/org/cache:app-main",
-            "type=registry,ref=ghcr.io/org/cache:trunk",
-            "type=registry,ref=ghcr.io/org/base:main",
-        ]
-    );
-    let p = pool(&json!({"workers": {"cache": {"registry": {
-        "repository": "localhost:5000/c", "ref": "{repository}:{pool}-{cacheKey}", "defaultKey": "dflt", "enabled": false
-    }}}}));
-    assert!(p.spec.workers.cache.registry_enabled().is_none());
-    assert_eq!(p.spec.workers.cache.default_key("app"), "dflt");
 }
 
 #[test]

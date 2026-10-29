@@ -33,7 +33,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use buildkit_controller_api::v1alpha1::{
-    BuildKitPool, BuildKitPoolSpec, BuildKitPoolStatus, Waiter, condition,
+    BuildKitPool, BuildKitPoolSpec, BuildKitPoolStatus, condition,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use k8s_openapi::jiff::tz::TimeZone;
@@ -66,13 +66,10 @@ const DEGRADED_ORDER: [&str; 6] = [
 /// Fixed timings of the spec, injectable for tests.
 #[derive(Clone, Debug)]
 pub struct PlanConfig {
-    /// A `status.waiters` entry older than this is stale (90 s).
-    pub waiter_stale_after: SignedDuration,
     /// How long a slot that answered 409 stays held before one retry (10 min).
     pub slot_hold: SignedDuration,
-    /// A new hold reports `SlotTaken` only once it is this old (2 s), so the
-    /// usual race with an API replica's cold create, whose pod reaches the
-    /// store a moment later, does not flap `Degraded`.
+    /// A new hold reports `SlotTaken` only once it is this old (2 s), so a
+    /// create whose pod reaches the store a moment later does not flap `Degraded`.
     pub slot_taken_grace: SignedDuration,
     /// A terminating pod (free, allocated or draining) is force-deleted this
     /// long after `deletionTimestamp + grace` (2 min).
@@ -88,7 +85,6 @@ pub struct PlanConfig {
 impl Default for PlanConfig {
     fn default() -> Self {
         Self {
-            waiter_stale_after: SignedDuration::from_secs(90),
             slot_hold: SignedDuration::from_mins(10),
             slot_taken_grace: SignedDuration::from_secs(2),
             force_delete_after: SignedDuration::from_mins(2),
@@ -126,9 +122,6 @@ pub enum CreateResult {
         /// Error text.
         message: String,
     },
-    /// The slot's cache volume is terminating or was just replaced.
-    /// No hold and no `Degraded`; the pass requeues under the error backoff to retry.
-    VolumePending,
 }
 
 /// A recent create of the leader for this pool.
@@ -142,7 +135,7 @@ pub struct CreateOutcome {
 
 /// Everything the planner reads for one pool.
 pub struct Observed<'a> {
-    /// The cached pool (name, uid, generation, spec, status incl. `waiters`).
+    /// The cached pool (name, uid, generation, spec, status).
     pub pool: &'a BuildKitPool,
     /// `spec.scaling.timeZone` resolved by the caller; `None` yields `InvalidSpec`.
     pub time_zone: Option<TimeZone>,
@@ -183,11 +176,8 @@ pub struct Observed<'a> {
     /// an IP) that are not up now, with when the leader first saw them down.
     /// `startTimeout` judges only pods never seen up; see [`RetireReason::Unready`].
     pub down_since: BTreeMap<String, Timestamp>,
-    /// When the leader first saw each `status.waiters` entry, keyed by
-    /// `(replica, updatedAt)`, on its own clock. Staleness is judged from this,
-    /// never from `updatedAt`, which another replica's clock wrote. An entry
-    /// missing here counts as seen now.
-    pub waiters_seen: BTreeMap<(String, Timestamp), Timestamp>,
+    /// Pending claims of the pool: the leader sizes the pool for them.
+    pub waiting: i32,
 }
 
 /// Why a pod is retired.
@@ -205,7 +195,7 @@ pub enum RetireReason {
     StartTimeout,
     /// Free, seen Ready earlier in this term, and not Ready again within
     /// `startTimeout` of the leader first seeing it unready. Not a start
-    /// failure: no `Degraded`, no create backoff, and the slot keeps its cache volume.
+    /// failure: no `Degraded`, no create backoff.
     Unready,
     /// `P internal-ca` differs from the loaded internal CA.
     CaRotated,
@@ -255,17 +245,6 @@ pub struct CaEvent {
     pub type_: &'static str,
     /// Human text.
     pub message: String,
-}
-
-/// A `status.waiters` entry to prune with `test replica, test updatedAt, remove`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WaiterRef {
-    /// Index in `status.waiters`.
-    pub index: usize,
-    /// `replica` (tested).
-    pub replica: String,
-    /// `updatedAt` (tested).
-    pub updated_at: Time,
 }
 
 /// One step of a pass, in execution order.
@@ -333,13 +312,8 @@ pub enum Action {
         /// `<pool>-<slot>`.
         name: String,
     },
-    /// SSA the status (leader-owned fields; `waiters` untouched).
+    /// SSA the status.
     PatchStatus(Box<BuildKitPoolStatus>),
-    /// Prune `status.waiters`, highest index first so removals do not shift later ones.
-    PruneWaiters {
-        /// Entries to remove.
-        entries: Vec<WaiterRef>,
-    },
 }
 
 impl Action {
@@ -405,12 +379,10 @@ impl Plan {
     /// A failure outranks a 409 so a failing create is never retried at once.
     #[must_use]
     pub fn requeue_after_outcomes(outcomes: &[CreateOutcome]) -> Requeue {
-        if outcomes.iter().any(|c| {
-            matches!(
-                c.result,
-                CreateResult::Failed { .. } | CreateResult::VolumePending
-            )
-        }) {
+        if outcomes
+            .iter()
+            .any(|c| matches!(c.result, CreateResult::Failed { .. }))
+        {
             Requeue::ErrorBackoff
         } else if outcomes.iter().any(|c| c.result == CreateResult::SlotTaken) {
             Requeue::Immediately
@@ -537,7 +509,7 @@ impl<'a> Planner<'_, 'a> {
         let spec_block = spec_block.or_else(|| egress.map(|m| ("InvalidSpec", m)));
         // Step 2.
         let ca = self.plan_ca();
-        let waiting = self.plan_waiters_deadlines();
+        let waiting = o.waiting.max(0);
         // Steps 4 and 9 and the `P internal-ca` rule need a valid CA. Steps 5 to 8 always run.
         let fp = ca.map(|c| c.internal_ca().fingerprint_hex());
         if fp.is_some() && apply_sandbox {
@@ -557,12 +529,9 @@ impl<'a> Planner<'_, 'a> {
         };
         let status = self.status(counts, &ready, ca);
         let cached = o.pool.status.clone().unwrap_or_default();
-        let mut cached_cmp = cached.clone();
-        cached_cmp.waiters.clear();
-        if *status != cached_cmp {
+        if *status != cached {
             self.actions.push(Action::PatchStatus(status));
         }
-        self.prune_waiters(&cached);
         let backoff = if self
             .degraded
             .iter()
@@ -601,24 +570,6 @@ impl<'a> Planner<'_, 'a> {
             LoadOutcome::Valid(b) => Some(b),
             LoadOutcome::Missing | LoadOutcome::Invalid(_) => None,
         }
-    }
-
-    /// Sum of fresh waiter counts, and their stale deadlines.
-    fn plan_waiters_deadlines(&mut self) -> i32 {
-        let waiters = self.o.pool.status.iter().flat_map(|s| &s.waiters);
-        let mut sum: i64 = 0;
-        let mut stale_at = Vec::new();
-        for w in waiters {
-            let t = add(self.waiter_seen(w), self.cfg.waiter_stale_after);
-            if t >= self.now {
-                sum += i64::from(w.count.max(0));
-                stale_at.push(t);
-            }
-        }
-        for t in stale_at {
-            self.at(add(t, SignedDuration::from_secs(1)));
-        }
-        i32::try_from(sum).unwrap_or(i32::MAX)
     }
 
     /// Sandbox objects (step 4).
@@ -900,7 +851,6 @@ impl<'a> Planner<'_, 'a> {
                 CreateResult::Created => {
                     holds.remove(&c.slot);
                 }
-                CreateResult::VolumePending => {}
                 CreateResult::Failed { message } => self.degraded.push((
                     "PodCreateFailed",
                     format!("create `{}`: {message}", slot_name(&pool, c.slot)),
@@ -1104,11 +1054,9 @@ impl<'a> Planner<'_, 'a> {
             allocated,
             desired_warm: desired,
             waiting,
-            waiters: Vec::new(),
             platforms: o.platforms.clone(),
             endpoint: Some(self.cfg.endpoint.clone()).filter(|s| !s.is_empty()),
             server_name: Some(self.cfg.server_name.clone()).filter(|s| !s.is_empty()),
-            cache: cache_status(o.pool),
             conditions,
         })
     }
@@ -1135,34 +1083,6 @@ impl<'a> Planner<'_, 'a> {
             reason: reason.to_owned(),
             status: status.to_owned(),
             type_: type_.to_owned(),
-        }
-    }
-
-    /// When the leader first saw `w` (see [`Observed::waiters_seen`]).
-    fn waiter_seen(&self, w: &Waiter) -> Timestamp {
-        self.o
-            .waiters_seen
-            .get(&(w.replica.clone(), w.updated_at.0))
-            .copied()
-            .unwrap_or(self.now)
-    }
-
-    /// Step 10 prunes entries older than 90 s (stale, including `count: 0`).
-    fn prune_waiters(&mut self, status: &BuildKitPoolStatus) {
-        let mut entries: Vec<WaiterRef> = status
-            .waiters
-            .iter()
-            .enumerate()
-            .filter(|(_, w)| add(self.waiter_seen(w), self.cfg.waiter_stale_after) < self.now)
-            .map(|(index, w)| WaiterRef {
-                index,
-                replica: w.replica.clone(),
-                updated_at: w.updated_at.clone(),
-            })
-            .collect();
-        if !entries.is_empty() {
-            entries.reverse();
-            self.actions.push(Action::PruneWaiters { entries });
         }
     }
 }
@@ -1193,14 +1113,4 @@ fn truncate(m: &str) -> String {
         end -= 1;
     }
     m[..end].to_owned()
-}
-
-/// `status.cache`: the registry flags for the pool's default key.
-fn cache_status(pool: &BuildKitPool) -> Option<buildkit_controller_api::v1alpha1::CacheStatus> {
-    let c = &pool.spec.workers.cache;
-    let name = pool.metadata.name.as_deref()?;
-    let r = c.registry_enabled()?;
-    Some(buildkit_controller_api::v1alpha1::CacheStatus {
-        registry: Some(r.resolve(name, c.default_key(name))),
-    })
 }

@@ -7,9 +7,9 @@ use std::future::Future;
 
 use buildkit_controller_api::v1alpha1::{BuildKitPool, BuildKitPoolStatus};
 use k8s_openapi::NamespaceResourceScope;
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret};
+use k8s_openapi::api::core::v1::{Pod, Secret};
 use k8s_openapi::api::events::v1::Event;
-use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions};
+use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::{Client, Resource};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -17,7 +17,6 @@ use serde_json::json;
 
 use futures::future::BoxFuture;
 
-use super::plan::WaiterRef;
 use super::spawn::{WorkerSecrets, bounded};
 use crate::render::{ANN_ALLOC, ANN_EXPIRES_AT, CONTROLLER, LABEL_STATE};
 
@@ -129,35 +128,12 @@ pub trait KubeOps: WorkerSecrets + Send + Sync {
         pool: &str,
         status: &BuildKitPoolStatus,
     ) -> impl Future<Output = OpResult> + Send;
-    /// `[test replica, test updatedAt, remove]` on one `status.waiters` entry.
-    fn prune_waiter(
-        &self,
-        ns: &str,
-        pool: &str,
-        entry: &WaiterRef,
-    ) -> impl Future<Output = OpResult> + Send;
     /// POST a Secret (CA create, CA backup).
     fn create_secret(&self, secret: &Secret) -> impl Future<Output = OpResult> + Send;
     /// PUT a Secret; `metadata.resourceVersion` is the precondition.
     fn replace_secret(&self, secret: &Secret) -> impl Future<Output = OpResult> + Send;
     /// POST an `events.k8s.io/v1` Event.
     fn create_event(&self, event: &Event) -> impl Future<Output = OpResult> + Send;
-    /// GET a PVC; `None` on 404.
-    fn get_pvc(
-        &self,
-        ns: &str,
-        name: &str,
-    ) -> impl Future<Output = OpResult<Option<PersistentVolumeClaim>>> + Send;
-    /// POST a PVC.
-    fn create_pvc(&self, pvc: &PersistentVolumeClaim) -> impl Future<Output = OpResult> + Send;
-    /// DELETE a PVC with a uid precondition.
-    fn delete_pvc(&self, ns: &str, name: &str, uid: &str) -> impl Future<Output = OpResult> + Send;
-    /// LIST the PVCs in `ns` that match `selector`.
-    fn list_pvcs(
-        &self,
-        ns: &str,
-        selector: &str,
-    ) -> impl Future<Output = OpResult<Vec<PersistentVolumeClaim>>> + Send;
 }
 
 /// [`KubeOps`] over a `kube::Client`.
@@ -201,17 +177,6 @@ pub fn retire_patch(uid: &str, expected: &str, expires_at: Option<&str>) -> serd
         json!({"op": "replace", "path": format!("/metadata/labels/{}", escape(LABEL_STATE)), "value": "draining"}),
     ]);
     serde_json::Value::Array(ops)
-}
-
-/// The waiter prune patch.
-#[must_use]
-pub fn prune_patch(entry: &WaiterRef) -> serde_json::Value {
-    let base = format!("/status/waiters/{}", entry.index);
-    json!([
-        {"op": "test", "path": format!("{base}/replica"), "value": entry.replica},
-        {"op": "test", "path": format!("{base}/updatedAt"), "value": entry.updated_at},
-        {"op": "remove", "path": base},
-    ])
 }
 
 fn json_patch(v: serde_json::Value) -> OpResult<json_patch::Patch> {
@@ -276,11 +241,7 @@ impl KubeOps for KubeClient {
     }
 
     async fn patch_status(&self, ns: &str, pool: &str, status: &BuildKitPoolStatus) -> OpResult {
-        let mut status = serde_json::to_value(status).map_err(|e| OpError::Other(e.to_string()))?;
-        // `waiters` belongs to the API replicas; never take ownership of it.
-        if let Some(m) = status.as_object_mut() {
-            m.remove("waiters");
-        }
+        let status = serde_json::to_value(status).map_err(|e| OpError::Other(e.to_string()))?;
         let body = json!({
             "apiVersion": BuildKitPool::api_version(&()),
             "kind": BuildKitPool::kind(&()),
@@ -289,14 +250,6 @@ impl KubeOps for KubeClient {
         let pp = PatchParams::apply(FIELD_MANAGER).force();
         Api::<BuildKitPool>::namespaced(self.0.clone(), ns)
             .patch_status(pool, &pp, &Patch::Apply(body))
-            .await?;
-        Ok(())
-    }
-
-    async fn prune_waiter(&self, ns: &str, pool: &str, entry: &WaiterRef) -> OpResult {
-        let patch = json_patch(prune_patch(entry))?;
-        Api::<BuildKitPool>::namespaced(self.0.clone(), ns)
-            .patch_status(pool, &PatchParams::default(), &Patch::<()>::Json(patch))
             .await?;
         Ok(())
     }
@@ -328,40 +281,6 @@ impl KubeOps for KubeClient {
             .create(&PostParams::default(), event)
             .await?;
         Ok(())
-    }
-
-    async fn get_pvc(&self, ns: &str, name: &str) -> OpResult<Option<PersistentVolumeClaim>> {
-        Ok(self.api::<PersistentVolumeClaim>(ns).get_opt(name).await?)
-    }
-
-    async fn create_pvc(&self, pvc: &PersistentVolumeClaim) -> OpResult {
-        let pp = PostParams {
-            field_manager: Some(FIELD_MANAGER.into()),
-            ..PostParams::default()
-        };
-        self.api::<PersistentVolumeClaim>(&ns_of(pvc))
-            .create(&pp, pvc)
-            .await?;
-        Ok(())
-    }
-
-    async fn delete_pvc(&self, ns: &str, name: &str, uid: &str) -> OpResult {
-        let dp = DeleteParams {
-            preconditions: Some(Preconditions {
-                uid: Some(uid.to_owned()),
-                resource_version: None,
-            }),
-            ..DeleteParams::default()
-        };
-        self.api::<PersistentVolumeClaim>(ns)
-            .delete(name, &dp)
-            .await?;
-        Ok(())
-    }
-
-    async fn list_pvcs(&self, ns: &str, selector: &str) -> OpResult<Vec<PersistentVolumeClaim>> {
-        let lp = ListParams::default().labels(selector);
-        Ok(self.api::<PersistentVolumeClaim>(ns).list(&lp).await?.items)
     }
 }
 
@@ -446,11 +365,6 @@ impl<O: KubeOps> KubeOps for Timed<O> {
             .await
     }
 
-    async fn prune_waiter(&self, ns: &str, pool: &str, entry: &WaiterRef) -> OpResult {
-        self.run("prune waiter", self.inner.prune_waiter(ns, pool, entry))
-            .await
-    }
-
     async fn create_secret(&self, secret: &Secret) -> OpResult {
         self.run("create secret", self.inner.create_secret(secret))
             .await
@@ -463,24 +377,6 @@ impl<O: KubeOps> KubeOps for Timed<O> {
 
     async fn create_event(&self, event: &Event) -> OpResult {
         self.run("create event", self.inner.create_event(event))
-            .await
-    }
-
-    async fn get_pvc(&self, ns: &str, name: &str) -> OpResult<Option<PersistentVolumeClaim>> {
-        self.run("get pvc", self.inner.get_pvc(ns, name)).await
-    }
-
-    async fn create_pvc(&self, pvc: &PersistentVolumeClaim) -> OpResult {
-        self.run("create pvc", self.inner.create_pvc(pvc)).await
-    }
-
-    async fn delete_pvc(&self, ns: &str, name: &str, uid: &str) -> OpResult {
-        self.run("delete pvc", self.inner.delete_pvc(ns, name, uid))
-            .await
-    }
-
-    async fn list_pvcs(&self, ns: &str, selector: &str) -> OpResult<Vec<PersistentVolumeClaim>> {
-        self.run("list pvcs", self.inner.list_pvcs(ns, selector))
             .await
     }
 }

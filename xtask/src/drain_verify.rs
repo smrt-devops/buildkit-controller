@@ -3,16 +3,19 @@
 //! replicas, `shutdown.drainTimeout` unset, and one pool with a single worker,
 //! then checks three things:
 //!
-//! a. A build whose RUN step takes 390 s runs through the edge while the
+//! a. A build whose RUN step takes 60 s runs through the edge while the
 //!    controller is rolled (`kubectl rollout restart`). The replica carrying the
-//!    connection drains for more than the old fixed 300 s budget, the build
-//!    succeeds, and the replica exits once the connection ends. 390 s leaves room
-//!    for the rollout to reach the carrier late.
+//!    connection starts draining while the build runs, with a budget above the
+//!    old fixed 300 s one, the build succeeds, and the replica exits once the
+//!    connection ends. With `--long` (nightly) the RUN step takes 390 s and the
+//!    carrier is seen draining for more than 300 s; 390 s leaves room for the
+//!    rollout to reach the carrier late.
 //! b. The Lease moves to a live replica within 15 s of SIGTERM to the leader,
 //!    while the old leader is still in its `shutdown.delay`.
-//! c. With the one worker held, a second allocation queued on a replica that is
-//!    then deleted gets HTTP 503 `shutting_down` with `Retry-After`, not a reset,
-//!    and a retry after the first allocation is released succeeds.
+//! c. With the one worker held, a second allocation answers 202 pending. Its
+//!    claim survives a rollout of both replicas, stays counted once in the
+//!    pool's `status.waiting`, and binds (a long poll answers 200) once the
+//!    first allocation is released.
 //!
 //! The client is the real curl recipe `docs/ci/buildkit-allocate.sh` and real
 //! `docker buildx` on the host, through the API and edge that kind publishes on
@@ -37,7 +40,7 @@ use crate::root;
 
 /// The loopback host ports of the chart's API and edge `NodePorts`: 28443 and
 /// 28444 without `BK_KIND_SUFFIX`, else a pair in 22000-23999 per suffix.
-static PORTS: std::sync::LazyLock<HostPorts> = std::sync::LazyLock::new(|| {
+pub(crate) static PORTS: std::sync::LazyLock<HostPorts> = std::sync::LazyLock::new(|| {
     HostPorts::get(
         HostPorts {
             api: 28443,
@@ -51,26 +54,28 @@ static API: std::sync::LazyLock<String> =
 const NS: &str = "bk-drain";
 const POOL_NS: &str = "drain-ci";
 const POOL: &str = "drain";
-const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const DEPLOY: &str = "deploy/buildkit-controller";
 const LEASE: &str = "buildkit-controller-leader";
 const SELECTOR: &str = "app.kubernetes.io/name=buildkit-controller";
 const AUD: &str = "buildkit-controller";
-/// Length of the build's RUN step, printed as one tick every 5 s.
-const BUILD_SECS: u64 = 390;
+/// Length of the build's RUN step, printed as one tick every 5 s. Long enough
+/// for the rollout to reach the carrier while the build runs.
+const BUILD_SECS: u64 = 60;
+/// The RUN step with `--long`: past [`OLD_BUDGET`], with room for the rollout
+/// to reach the carrier late.
+const LONG_BUILD_SECS: u64 = 390;
 /// The fixed drain budget the controller used to have.
 const OLD_BUDGET: Duration = Duration::from_mins(5);
 /// The longest a Lease may take to move after SIGTERM to the leader.
 const LEASE_MOVE_MAX: Duration = Duration::from_secs(15);
 
-pub(crate) fn drain_verify() -> Result<()> {
+/// `long`: the build outlasts [`OLD_BUDGET`], so check a shows the drain going
+/// past it; otherwise the carrier's logged drain budget shows it.
+pub(crate) fn drain_verify(long: bool) -> Result<()> {
     let work = root().join("target/drain-verify");
     std::fs::create_dir_all(&work)?;
-    let env = &Cluster::new(
-        &super::kind_cluster("bk-drain-verify"),
-        work.join("kubeconfig"),
-    );
-    let result = run(env, &work);
+    let env = &Cluster::for_suite("bk-drain-verify", &work)?;
+    let result = run(env, &work, long);
     if result.is_err() {
         diagnose(env);
     }
@@ -96,7 +101,8 @@ fn diagnose(env: &Cluster) {
     }
 }
 
-fn run(env: &Cluster, work: &Path) -> Result<()> {
+fn run(env: &Cluster, work: &Path, long: bool) -> Result<()> {
+    let build_secs = if long { LONG_BUILD_SECS } else { BUILD_SECS };
     let ca = install(env, work)?;
     let token = env
         .kubectl(&[
@@ -112,16 +118,18 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
         ])?
         .trim()
         .to_owned();
-    let ctx = prepare(work)?;
+    let ctx = prepare(work, build_secs)?;
     let c = Client {
         env,
         ca,
         token,
         work: work.to_path_buf(),
+        build_secs,
+        long,
     };
     build_survives_rollout(&c, &ctx)?;
     lease_moves_on_sigterm(env)?;
-    queued_request_gets_503(&c)?;
+    pending_claim_survives_rollout(&c)?;
     println!("drain-verify: all checks passed");
     Ok(())
 }
@@ -129,15 +137,17 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
 fn install(env: &Cluster, work: &Path) -> Result<PathBuf> {
     let root = root();
     // A leftover cluster of this name holds the ports; delete it before checking them.
-    env.delete();
-    PORTS.check_free(env.name())?;
+    if !env.attached() {
+        env.delete();
+        PORTS.check_free(env.name())?;
+    }
     let ports = [
         ("API_PORT", PORTS.api.to_string()),
         ("EDGE_PORT", PORTS.edge.to_string()),
     ];
     let kind_cfg = crate::fixture("drain-verify/kind.yaml", work, &ports)?;
     env.create(Some(&kind_cfg), "120s")?;
-    crate::image::image(CONTROLLER_IMAGE, Some(env.name()))?;
+    crate::image::load_controller(env)?;
     crate::image::ensure_worker()?;
     status(&mut crate::kube::kind_load(
         crate::image::WORKER_IMAGE,
@@ -279,13 +289,13 @@ fn lease_holder(env: &Cluster) -> Result<String> {
         .to_owned())
 }
 
-/// A build context whose RUN step prints `tick N` every 5 s for [`BUILD_SECS`].
-fn prepare(work: &Path) -> Result<PathBuf> {
+/// A build context whose RUN step prints `tick N` every 5 s for `secs`.
+fn prepare(work: &Path, secs: u64) -> Result<PathBuf> {
     let ctx = work.join("ctx");
     let _ = std::fs::remove_dir_all(&ctx);
     std::fs::create_dir_all(&ctx)?;
     copy_busybox(&ctx)?;
-    let ticks = BUILD_SECS / 5;
+    let ticks = secs / 5;
     std::fs::write(
         ctx.join("Dockerfile"),
         format!(
@@ -300,6 +310,10 @@ struct Client<'a> {
     ca: PathBuf,
     token: String,
     work: PathBuf,
+    /// Length of check a's RUN step.
+    build_secs: u64,
+    /// Whether check a must see the drain outlast [`OLD_BUDGET`].
+    long: bool,
 }
 
 impl Client<'_> {
@@ -349,6 +363,19 @@ impl Client<'_> {
         ensure!(code == "201", "allocation {tag}: HTTP {code} {body}");
         let v: serde_json::Value = serde_json::from_str(&body)?;
         v["id"].as_str().map(str::to_owned).context("allocation id")
+    }
+
+    /// `GET /v1/allocations/{id}?wait=25s`: the status code and body.
+    fn get(&self, id: &str) -> Result<(String, String)> {
+        let out = self.work.join("get.body");
+        let code = output(
+            self.curl()?
+                .arg("-o")
+                .arg(&out)
+                .args(["-w", "%{http_code}", "--max-time", "40"])
+                .arg(format!("{}/v1/allocations/{id}?wait=25s", *API)),
+        )?;
+        Ok((code, std::fs::read_to_string(&out).unwrap_or_default()))
     }
 
     fn release(&self, id: &str) -> Result<()> {
@@ -408,6 +435,7 @@ fn has_tick(log: &Path, n: u64) -> bool {
 
 fn watch_build(c: &Client<'_>, build: &mut Spawned, log: &Path) -> Result<()> {
     let env = c.env;
+    let last_tick = c.build_secs / 5;
     until(
         "the build's RUN step to start",
         Duration::from_mins(5),
@@ -436,12 +464,14 @@ fn watch_build(c: &Client<'_>, build: &mut Spawned, log: &Path) -> Result<()> {
     let restarted = Instant::now();
 
     let mut stopped: BTreeMap<String, Instant> = BTreeMap::new();
+    // The drain budget each carrier logged, seen while the build still ran.
+    let mut budgets: BTreeMap<String, u64> = BTreeMap::new();
     let exit = loop {
         if let Some(s) = build.try_wait()? {
             break s;
         }
         ensure!(
-            restarted.elapsed() < Duration::from_secs(BUILD_SECS + 300),
+            restarted.elapsed() < Duration::from_secs(c.build_secs + 300),
             "the build did not finish"
         );
         let pods = controller_pods(env)?;
@@ -449,20 +479,26 @@ fn watch_build(c: &Client<'_>, build: &mut Spawned, log: &Path) -> Result<()> {
             match pods.get(p) {
                 Some((_, true)) => {
                     stopped.entry(p.clone()).or_insert_with(Instant::now);
+                    if !budgets.contains_key(p) && !has_tick(log, last_tick) {
+                        let logs = env.kubectl(&["logs", "-n", NS, p]).unwrap_or_default();
+                        if let Some(b) = drain_budget(&logs) {
+                            budgets.insert(p.clone(), b);
+                        }
+                    }
                 }
                 Some((_, false)) => {}
                 // Once buildx is done the connection closes and the carrier
                 // may exit while the recipe is still releasing.
-                None if has_tick(log, BUILD_SECS / 5) => {}
+                None if has_tick(log, last_tick) => {}
                 None => bail!("carrier {p} exited while the build was still running"),
             }
         }
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(Duration::from_secs(1));
     };
     let finished = Instant::now();
     ensure!(exit.success(), "the build failed: {exit}");
     ensure!(
-        has_tick(log, BUILD_SECS / 5),
+        has_tick(log, last_tick),
         "the RUN step did not finish all its ticks"
     );
     for p in &carriers {
@@ -470,25 +506,68 @@ fn watch_build(c: &Client<'_>, build: &mut Spawned, log: &Path) -> Result<()> {
             .get(p)
             .with_context(|| format!("the rollout never stopped carrier {p}"))?;
         let drained = finished.duration_since(*at);
+        // The carrier was draining, with its open connection, before the build ended.
+        let budget = budgets.get(p).copied().with_context(|| {
+            format!("carrier {p} logged no drain while the build was still running")
+        })?;
         ensure!(
-            drained > OLD_BUDGET,
-            "carrier {p} drained only {}s; the build must outlast the old {}s budget",
-            drained.as_secs(),
+            budget > OLD_BUDGET.as_secs(),
+            "carrier {p} drains for at most {budget}s; with drainTimeout unset it must outlast the old {}s budget",
             OLD_BUDGET.as_secs()
         );
+        if c.long {
+            ensure!(
+                drained > OLD_BUDGET,
+                "carrier {p} drained only {}s; the build must outlast the old {}s budget",
+                drained.as_secs(),
+                OLD_BUDGET.as_secs()
+            );
+        }
         until(
             &format!("carrier {p} to exit after the build"),
             Duration::from_mins(1),
             || Ok((!controller_pods(env)?.contains_key(p)).then_some(())),
         )?;
         println!(
-            "PASS a: {BUILD_SECS}s build succeeded through {p} across rollout restart; {p} drained {}s after SIGTERM (old budget {}s) and exited {}s after the build ended",
+            "PASS a: {}s build succeeded through {p} across rollout restart; {p} drained {}s after SIGTERM with a {budget}s budget (old budget {}s) and exited {}s after the build ended",
+            c.build_secs,
             drained.as_secs(),
             OLD_BUDGET.as_secs(),
             finished.elapsed().as_secs()
         );
     }
     Ok(())
+}
+
+/// `drain_budget_s` of the controller's `draining` log line, if it has one.
+/// Text logs may carry ANSI colour codes, which are dropped first.
+fn drain_budget(logs: &str) -> Option<u64> {
+    logs.lines().map(strip_ansi).find_map(|l| {
+        let fields = l.split_once(" draining ")?.1;
+        fields
+            .split_whitespace()
+            .find_map(|f| f.strip_prefix("drain_budget_s="))?
+            .parse()
+            .ok()
+    })
+}
+
+/// `line` without ANSI escape sequences (`ESC [ ... <letter>`).
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// b. SIGTERM to the leader moves the Lease to a live replica within seconds.
@@ -539,148 +618,78 @@ fn lease_moves_on_sigterm(env: &Cluster) -> Result<()> {
     Ok(())
 }
 
-/// c. A request queued on a stopping replica gets 503 `shutting_down`.
-fn queued_request_gets_503(c: &Client<'_>) -> Result<()> {
+/// c. A pending allocation is a claim, so it survives a rollout of every
+/// replica, is counted once in the pool's `status.waiting` throughout, and
+/// binds once the held worker is released.
+fn pending_claim_survives_rollout(c: &Client<'_>) -> Result<()> {
     let env = c.env;
     wait_pool_warm(env)?;
     let held = c.allocate_ok("a", 0)?;
     println!("holding the only worker with allocation {held}");
-    let mut queued = Spawned::spawn(&mut c.allocate("b", 300)?)?;
-    let replica = until(
-        "the second request to queue",
-        Duration::from_mins(1),
-        || {
-            if let Some(s) = queued.try_wait()? {
-                bail!(
-                    "request b ended before it queued: {s} {}",
-                    c.read("b", "code")
-                );
-            }
-            let w = env.kubectl(&[
-                "get",
-                "buildkitpool",
-                POOL,
-                "-n",
-                POOL_NS,
-                "-o",
-                "jsonpath={range .status.waiters[*]}{.replica} {.count}{\"\\n\"}{end}",
-            ])?;
-            Ok(w.lines().find_map(|l| {
-                let (r, n) = l.split_once(' ')?;
-                (n.trim().parse::<i32>().ok()? > 0).then(|| r.to_owned())
-            }))
-        },
-    )?;
-    env.kubectl(&["delete", "pod", &replica, "-n", NS, "--wait=false"])?;
-    let t0 = Instant::now();
-    let exit = loop {
-        if let Some(s) = queued.try_wait()? {
-            break s;
-        }
-        if t0.elapsed() > Duration::from_mins(1) {
-            queued.kill();
-            bail!("the queued request got no answer within 60s of SIGTERM");
-        }
-        std::thread::sleep(Duration::from_millis(200));
+    status(&mut c.allocate("b", 300)?)?;
+    let (code, body) = (c.read("b", "code"), c.read("b", "body"));
+    ensure!(code == "202", "request b: HTTP {code} {body}");
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    ensure!(
+        v["state"] == "pending" && v["position"] == 1,
+        "request b: {body}"
+    );
+    let id = v["id"].as_str().context("allocation id")?.to_owned();
+    let claim = |field: &str| {
+        env.kubectl(&[
+            "get",
+            "bkc",
+            &id,
+            "-n",
+            NS,
+            "-o",
+            &format!("jsonpath={field}"),
+        ])
     };
-    let answered = t0.elapsed();
-    let (code, hdr, body) = (c.read("b", "code"), c.read("b", "hdr"), c.read("b", "body"));
-    ensure!(
-        exit.success(),
-        "curl failed ({exit}): the connection was cut, not answered"
-    );
-    ensure!(code == "503", "queued request got HTTP {code}: {body}");
-    let retry_after = hdr
-        .lines()
-        .find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            k.trim()
-                .eq_ignore_ascii_case("retry-after")
-                .then(|| v.trim().to_owned())
-        })
-        .context("no Retry-After header")?;
-    ensure!(body.contains("\"shutting_down\""), "body: {body}");
-    println!(
-        "PASS c: request queued on {replica} answered 503 shutting_down, Retry-After {retry_after}, {}ms after SIGTERM",
-        answered.as_millis()
-    );
-    retry_is_counted_once(c, &replica, t0, &held)
-}
-
-/// c, continued: the retry of the refused request queues on a live replica and is
-/// counted once, and it gets 201 once the held worker is released.
-fn retry_is_counted_once(c: &Client<'_>, replica: &str, t0: Instant, held: &str) -> Result<()> {
-    let env = c.env;
-    // The client retries at once, while the worker is still held, so it queues
-    // on a live replica. The stopping replica's entry must already read 0, or
-    // the leader counts the request twice and plans surplus workers.
-    let mut retry = Spawned::spawn(&mut c.allocate("b2", 120)?)?;
-    let cleared = until(
-        "the stopping replica's waiters entry to clear and the retry to queue",
-        Duration::from_secs(30),
-        || {
-            if let Some(s) = retry.try_wait()? {
-                bail!(
-                    "the retry ended before it queued: {s} {}",
-                    c.read("b2", "code")
-                );
-            }
-            let w = waiters(env)?;
-            let old = w.get(replica).copied().unwrap_or(0);
-            let queued_elsewhere = w.iter().any(|(r, n)| r != replica && *n > 0);
-            Ok((old == 0 && queued_elsewhere).then_some(w))
-        },
-    )?;
-    let cleared_after = t0.elapsed();
+    let uid = claim("{.metadata.uid}")?;
+    println!("PASS c: request b answered 202 pending at place 1 after the POST's wait ({id})");
+    env.kubectl(&["rollout", "restart", DEPLOY, "-n", NS])?;
+    let t0 = Instant::now();
     let (max_waiting, max_pods) = watch_for_surplus(env)?;
+    env.kubectl(&["rollout", "status", DEPLOY, "-n", NS, "--timeout=300s"])?;
+    let rolled = t0.elapsed();
+    let now = claim("{.metadata.uid} {.status.phase} {.status.queuePosition}")?;
     ensure!(
-        max_waiting <= 1,
-        "status.waiting reached {max_waiting} with one queued request"
+        now == format!("{uid} Pending 1"),
+        "the pending claim did not survive the rollout: {now}"
+    );
+    ensure!(
+        max_waiting == 1,
+        "status.waiting reached {max_waiting} with one pending claim"
     );
     ensure!(max_pods <= 1, "{max_pods} worker pods with scaling.max 1");
     println!(
-        "PASS c: {replica}'s status.waiters entry read 0 {}ms after SIGTERM ({cleared:?}); over 20s with the retry queued, status.waiting max {max_waiting}, worker pods max {max_pods}",
-        cleared_after.as_millis()
+        "PASS c: after a rollout of {}s the claim is still Pending at place 1 (uid unchanged); status.waiting stayed 1, worker pods max {max_pods}",
+        rolled.as_secs()
     );
-    c.release(held)?;
+    c.release(&held)?;
     let started = Instant::now();
     loop {
-        if let Some(s) = retry.try_wait()? {
-            ensure!(s.success(), "the retry failed: {s}");
-            break;
+        let (code, body) = c.get(&id)?;
+        match code.as_str() {
+            "200" => {
+                let v: serde_json::Value = serde_json::from_str(&body)?;
+                ensure!(v["id"] == id.as_str(), "bound: {body}");
+                break;
+            }
+            "202" => {}
+            _ => bail!("poll of {id}: HTTP {code} {body}"),
         }
         ensure!(
             started.elapsed() < Duration::from_mins(3),
-            "the retry was not served after the release"
+            "the pending claim was not bound after the release"
         );
-        std::thread::sleep(Duration::from_millis(500));
     }
-    let (code, body) = (c.read("b2", "code"), c.read("b2", "body"));
-    ensure!(code == "201", "retry: HTTP {code} {body}");
-    let v: serde_json::Value = serde_json::from_str(&body)?;
-    let retried = v["id"].as_str().context("allocation id")?.to_owned();
-    c.release(&retried)?;
-    println!("PASS c: the queued retry got 201 after the release ({retried})");
-    Ok(())
-}
-
-/// `status.waiters` of the pool, by replica.
-fn waiters(env: &Cluster) -> Result<BTreeMap<String, i32>> {
-    let w = env.kubectl(&[
-        "get",
-        "buildkitpool",
-        POOL,
-        "-n",
-        POOL_NS,
-        "-o",
-        "jsonpath={range .status.waiters[*]}{.replica} {.count}{\"\\n\"}{end}",
-    ])?;
-    Ok(w.lines()
-        .filter_map(|l| {
-            let (r, n) = l.split_once(' ')?;
-            Some((r.to_owned(), n.trim().parse().ok()?))
-        })
-        .collect())
+    println!(
+        "PASS c: the claim bound {}ms after the held worker was released",
+        started.elapsed().as_millis()
+    );
+    c.release(&id)
 }
 
 /// Highest `status.waiting` and live worker pod count seen over 20 s.
@@ -711,4 +720,25 @@ fn watch_for_surplus(env: &Cluster) -> Result<(i32, usize)> {
         std::thread::sleep(Duration::from_secs(2));
     }
     Ok((max_waiting, max_pods))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drain_budget;
+
+    #[test]
+    fn drain_budget_comes_from_the_draining_line_only() {
+        let logs = "\
+2026-10-29T10:00:00.000Z  INFO buildkit_controller::edge::listener: edge listener closed, draining open=1
+2026-10-29T10:00:00.001Z  INFO buildkit_controller::runtime::stop: draining drain_budget_s=86700
+";
+        assert_eq!(drain_budget(logs), Some(86700));
+        assert_eq!(
+            drain_budget("INFO x: edge listener closed, draining open=1"),
+            None
+        );
+        assert_eq!(drain_budget(""), None);
+        let colour = "\u{1b}[32m INFO\u{1b}[0m stop: draining \u{1b}[3mdrain_budget_s\u{1b}[0m\u{1b}[2m=\u{1b}[0m86700";
+        assert_eq!(drain_budget(colour), Some(86700));
+    }
 }

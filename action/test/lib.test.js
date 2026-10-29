@@ -100,10 +100,10 @@ test('request round-trips JSON', async () => {
   } finally { srv.close(); }
 });
 
-test('postTimeoutMs covers queue timeout + startTimeout ceiling + 10 s', () => {
-  assert.equal(L.postTimeoutMs(300), (300 + 1800 + 10) * 1000);
-  assert.equal(L.postTimeoutMs(0), 1810000);
-  assert.equal(L.postTimeoutMs(undefined), (3600 + 1800 + 10) * 1000);
+test('a poll times out at 40 s, a POST gets the whole remaining budget', () => {
+  assert.equal(L.REQUEST_TIMEOUT_MS, 40000);
+  assert.equal(L.postTimeoutMs(L.retryBudgetMs(300)), 360000);
+  assert.equal(L.postTimeoutMs(0), 1000);
 });
 
 test('checkAllocationId rejects path traversal and odd shapes', () => {
@@ -126,9 +126,9 @@ test('createBuilder records the builder only after the first create succeeds', (
 
 test('parseCacheInputs: defaults, validation, one cache-from per line', () => {
   assert.deepEqual(L.parseCacheInputs({}), { cache: 'auto', cacheKey: undefined, mode: undefined, from: [] });
-  assert.deepEqual(L.parseCacheInputs({ cache: 'registry', cacheKey: 'app-main', cacheMode: 'min', cacheFrom: 'type=registry,ref=r/x:a\n\n type=gha \n' }),
-    { cache: 'registry', cacheKey: 'app-main', mode: 'min', from: ['type=registry,ref=r/x:a', 'type=gha'] });
-  assert.throws(() => L.parseCacheInputs({ cache: 'all' }), /invalid cache/);
+  assert.deepEqual(L.parseCacheInputs({ cache: 'none', cacheKey: 'app-main', cacheMode: 'min', cacheFrom: 'type=registry,ref=r/x:a\n\n type=gha \n' }),
+    { cache: 'none', cacheKey: 'app-main', mode: 'min', from: ['type=registry,ref=r/x:a', 'type=gha'] });
+  for (const gone of ['all', 'registry', 'local']) assert.throws(() => L.parseCacheInputs({ cache: gone }), /invalid cache/);
   for (const bad of ['-a', 'a/b', 'a-', 'x'.repeat(64)]) assert.throws(() => L.parseCacheInputs({ cacheKey: bad }), /invalid cache-key/);
   assert.equal(L.parseCacheInputs({ cacheKey: 'x'.repeat(63) }).cacheKey.length, 63);
   assert.throws(() => L.parseCacheInputs({ cacheMode: 'all' }), /invalid cache-mode/);
@@ -145,15 +145,16 @@ test('allocationBody sends cache and cacheKey, leaving out the auto default', ()
 
 test('cacheFlags: registry flags from responses, mode override, extra refs, dedup', () => {
   const to = 'type=registry,ref=r/c:app,mode=max,image-manifest=true,oci-mediatypes=true';
-  const a = { cache: { key: 'app', registry: { to, from: ['type=registry,ref=r/c:app', 'type=registry,ref=r/c:trunk'] }, local: { result: 'hit' } } };
+  const a = { cache: { key: 'app', registry: { to, from: ['type=registry,ref=r/c:app', 'type=registry,ref=r/c:trunk'] }} };
   const f = L.cacheFlags([a, a], { from: ['type=registry,ref=r/c:extra', 'type=registry,ref=r/c:app'] });
   assert.deepEqual(f.to, [to]);
   assert.deepEqual(f.from, ['type=registry,ref=r/c:app', 'type=registry,ref=r/c:trunk', 'type=registry,ref=r/c:extra']);
   assert.deepEqual(f.args, ['--cache-from=type=registry,ref=r/c:app', '--cache-from=type=registry,ref=r/c:trunk',
     '--cache-from=type=registry,ref=r/c:extra', `--cache-to=${to}`]);
   assert.deepEqual(L.cacheFlags([a], { mode: 'min' }).to, ['type=registry,ref=r/c:app,image-manifest=true,oci-mediatypes=true,mode=min']);
-  // Local-only or no cache object: no registry flags, but extra refs still apply.
-  const local = { cache: { key: 'app', local: { result: 'miss' } } };
-  assert.deepEqual(L.cacheFlags([local, {}], {}), { to: [], from: [], args: [] });
+  // A read-only allocation gets --cache-from only; no cache object, no flags, but extra refs still apply.
+  const ro = { cache: { key: 'app', registry: { from: ['type=registry,ref=r/c:app'] } } };
+  assert.deepEqual(L.cacheFlags([ro], {}), { to: [], from: ['type=registry,ref=r/c:app'], args: ['--cache-from=type=registry,ref=r/c:app'] });
+  assert.deepEqual(L.cacheFlags([{}], {}), { to: [], from: [], args: [] });
   assert.deepEqual(L.cacheFlags([{}], { from: ['type=gha'] }).args, ['--cache-from=type=gha']);
 });

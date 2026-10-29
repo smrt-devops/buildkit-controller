@@ -1,4 +1,36 @@
 ---
+# Source: buildkit-controller/templates/cache.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: buildkit-controller-registry
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-registry
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: buildkit-registry
+      app.kubernetes.io/instance: bk
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/managed-by: buildkit-controller
+              app.kubernetes.io/name: buildkitd
+      ports:
+        - {protocol: TCP, port: 5000}
+    - ports:
+        - {protocol: TCP, port: 8080}
+
+---
 # Source: buildkit-controller/templates/extras.yaml
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -17,6 +49,21 @@ spec:
     matchLabels:
       app.kubernetes.io/name: buildkit-controller
       app.kubernetes.io/instance: bk
+
+---
+# Source: buildkit-controller/templates/cache.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: buildkit-controller-registry
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-registry
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
 
 ---
 # Source: buildkit-controller/templates/serviceaccount.yaml
@@ -60,6 +107,9 @@ data:
         maxReviewsPerIp: 4
         recentSubjectTtl: 10m
         reservedReviews: 8
+    cache:
+      host: buildkit-controller-registry.buildkit-system.svc:5000
+      tlsSecretName: buildkit-controller-registry-tls
     claims:
       enabled: true
       namespaces:
@@ -139,6 +189,9 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
+    - jsonPath: .status.queuePosition
+      name: Position
+      type: integer
     - jsonPath: .status.secretName
       name: Secret
       type: string
@@ -160,19 +213,38 @@ spec:
                 description: "`cache` of `POST /v1/allocations`."
                 enum:
                 - auto
-                - registry
-                - local
                 - none
                 nullable: true
                 type: string
               cacheKey:
-                description: >-
-                  Cache key of both cache layers, as `cacheKey` of `POST /v1/allocations`. Unset
-                  uses the pool's default key.
+                description: Cache tag, as `cacheKey` of `POST /v1/allocations`. Unset uses the pool name.
                 maxLength: 63
                 minLength: 1
                 nullable: true
                 pattern: ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$
+                type: string
+              cacheScope:
+                description: |-
+                  The caller's cache scope id, written by the API with `owner`. Honoured only in
+                  the controller's namespace.
+                maxLength: 128
+                minLength: 1
+                nullable: true
+                type: string
+              cacheTier:
+                description: Whether an allocation may write the cache or only read it.
+                enum:
+                - trusted
+                - untrusted
+                nullable: true
+                type: string
+              owner:
+                description: |-
+                  The allocation owner the API authenticated. Honoured only in the controller's
+                  namespace; elsewhere the owner is `claim:<namespace>/<name>#<uid>`.
+                maxLength: 1024
+                minLength: 1
+                nullable: true
                 type: string
               poolRef:
                 description: The pool to allocate from.
@@ -193,6 +265,23 @@ spec:
                 - name
                 - namespace
                 type: object
+              publicKey:
+                description: |-
+                  PEM SPKI ECDSA P-256 public key. The leader signs the allocation certificate
+                  for it and writes the certificate into status. Without it the leader generates
+                  the key and writes the Secret `<name>-buildkit`.
+                maxLength: 1024
+                nullable: true
+                type: string
+              queueTimeout:
+                description: |-
+                  How long the claim may stay `Pending` before it fails with `QueueTimeout`.
+                  Defaults to the pool's `allocation.queueTimeout`; its `maxQueueTimeout` caps it.
+                maxLength: 32
+                minLength: 1
+                nullable: true
+                pattern: ^([0-9]+h)?([0-9]+m)?([0-9]+s)?$
+                type: string
               ttl:
                 description: |-
                   Lifetime of the allocation. Defaults to the pool's `allocation.defaultTTL`;
@@ -217,6 +306,36 @@ spec:
             properties:
               allocationId:
                 description: Allocation id (set once bound).
+                nullable: true
+                type: string
+              cache:
+                description: Cache flags of the allocation, as in the `201` response.
+                nullable: true
+                properties:
+                  key:
+                    description: The effective cache key.
+                    type: string
+                  registry:
+                    description: buildx flags for the built-in cache registry.
+                    nullable: true
+                    properties:
+                      from:
+                        description: "`--cache-from` values, in order."
+                        items:
+                          type: string
+                        type: array
+                      to:
+                        description: "`--cache-to` value. Absent when the caller may only read the cache."
+                        nullable: true
+                        type: string
+                    required:
+                    - from
+                    type: object
+                required:
+                - key
+                type: object
+              certificate:
+                description: The allocation client certificate (PEM; public).
                 nullable: true
                 type: string
               conditions:
@@ -294,10 +413,19 @@ spec:
                 - Failed
                 nullable: true
                 type: string
+              pod:
+                description: The worker pod the claim is bound to.
+                nullable: true
+                type: string
+              queuePosition:
+                description: 1-based place in the pool's queue while `Pending`. Refreshed every few seconds.
+                format: int32
+                nullable: true
+                type: integer
               secretName:
-                description: >-
-                  Secret in the claim's namespace holding `tls.crt`, `tls.key`, `ca.crt` and
-                  `endpoint`.
+                description: |-
+                  Secret in the claim's namespace holding `tls.crt`, `tls.key`, `ca.crt` and `endpoint`.
+                  Unset for a claim with `spec.publicKey`.
                 nullable: true
                 type: string
               serverName:
@@ -351,6 +479,70 @@ subjects:
   - kind: ServiceAccount
     name: buildkit-controller
     namespace: buildkit-system
+
+---
+# Source: buildkit-controller/templates/cache.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: buildkit-controller-registry-buildkit-system
+  namespace: ci-a
+  labels:
+    app.kubernetes.io/name: buildkit-registry
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+rules:
+  - apiGroups:
+    - buildkit.smrt-devops.net
+    resources:
+    - buildkitpools
+    verbs:
+    - get
+    - list
+    - watch
+  - apiGroups:
+    - ""
+    resources:
+    - pods
+    verbs:
+    - get
+    - list
+    - watch
+
+---
+# Source: buildkit-controller/templates/cache.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: buildkit-controller-registry-buildkit-system
+  namespace: ci-b
+  labels:
+    app.kubernetes.io/name: buildkit-registry
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+rules:
+  - apiGroups:
+    - buildkit.smrt-devops.net
+    resources:
+    - buildkitpools
+    verbs:
+    - get
+    - list
+    - watch
+  - apiGroups:
+    - ""
+    resources:
+    - pods
+    verbs:
+    - get
+    - list
+    - watch
 
 ---
 # Source: buildkit-controller/templates/rbac.yaml
@@ -409,10 +601,7 @@ rules:
     resources:
     - persistentvolumeclaims
     verbs:
-    - get
     - list
-    - create
-    - patch
     - delete
   - apiGroups:
     - networking.k8s.io
@@ -479,10 +668,7 @@ rules:
     resources:
     - persistentvolumeclaims
     verbs:
-    - get
     - list
-    - create
-    - patch
     - delete
   - apiGroups:
     - networking.k8s.io
@@ -520,6 +706,10 @@ rules:
     resources: [secrets]
     resourceNames: [buildkit-controller-ca]
     verbs: [get, list, watch, update]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [buildkit-controller-registry-tls]
+    verbs: [get, update]
   - apiGroups: [events.k8s.io]
     resources: [events]
     verbs: [create]
@@ -530,6 +720,12 @@ rules:
     resources: [configmaps]
     resourceNames: [buildkit-controller-ca-bundle]
     verbs: [patch]
+  - apiGroups: [buildkit.smrt-devops.net]
+    resources: [buildkitclaims]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [buildkit.smrt-devops.net]
+    resources: [buildkitclaims/status]
+    verbs: [get, patch, update]
 
 ---
 # Source: buildkit-controller/templates/rbac.yaml
@@ -564,6 +760,46 @@ rules:
   - apiGroups: [""]
     resources: [secrets]
     verbs: [get, create, delete]
+
+---
+# Source: buildkit-controller/templates/cache.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: buildkit-controller-registry-buildkit-system
+  namespace: ci-a
+  labels:
+    app.kubernetes.io/name: buildkit-registry
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: buildkit-controller-registry-buildkit-system}
+subjects:
+  - kind: ServiceAccount
+    name: buildkit-controller-registry
+    namespace: buildkit-system
+
+---
+# Source: buildkit-controller/templates/cache.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: buildkit-controller-registry-buildkit-system
+  namespace: ci-b
+  labels:
+    app.kubernetes.io/name: buildkit-registry
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: buildkit-controller-registry-buildkit-system}
+subjects:
+  - kind: ServiceAccount
+    name: buildkit-controller-registry
+    namespace: buildkit-system
 
 ---
 # Source: buildkit-controller/templates/rbac.yaml
@@ -642,6 +878,29 @@ subjects:
     namespace: buildkit-system
 
 ---
+# Source: buildkit-controller/templates/cache.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildkit-controller-registry
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-registry
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: buildkit-registry
+    app.kubernetes.io/instance: bk
+  ports:
+    - {name: registry, port: 5000, targetPort: registry}
+    - {name: metrics, port: 8080, targetPort: ops}
+
+---
 # Source: buildkit-controller/templates/service.yaml
 apiVersion: v1
 kind: Service
@@ -717,7 +976,7 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: buildkit-controller-0.1.0
       annotations:
-        checksum/config: 9e57360d393363d0de7509ca6870f35581f5610032e0e689ca839ed63b4e981b
+        checksum/config: 43beb354184a6518b18805580f8db1aa799acfb05499cb2cff36cc58d4cbdf4b
     spec:
       serviceAccountName: buildkit-controller
       terminationGracePeriodSeconds: 86715
@@ -777,6 +1036,96 @@ spec:
                   matchLabels:
                     app.kubernetes.io/name: buildkit-controller
                     app.kubernetes.io/instance: bk
+
+---
+# Source: buildkit-controller/templates/cache.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: buildkit-controller-registry
+  namespace: buildkit-system
+  labels:
+    app.kubernetes.io/name: buildkit-registry
+    app.kubernetes.io/instance: bk
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: buildkit-controller-0.1.0
+spec:
+  replicas: 1
+  serviceName: buildkit-controller-registry
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: buildkit-registry
+      app.kubernetes.io/instance: bk
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: buildkit-registry
+        app.kubernetes.io/instance: bk
+        app.kubernetes.io/component: cache
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/version: "0.1.0"
+        helm.sh/chart: buildkit-controller-0.1.0
+    spec:
+      serviceAccountName: buildkit-controller-registry
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: registry
+          image: "ghcr.io/smrt-devops/buildkit-controller:0.1.0"
+          imagePullPolicy: IfNotPresent
+          args: [cache]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: [ALL]}
+          env:
+            - {name: LOG_LEVEL, value: "info"}
+            - {name: LOG_FORMAT, value: "json"}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: BUILDKIT_CACHE_OPS_LISTEN, value: "0.0.0.0:8080"}
+            - {name: BUILDKIT_CACHE_MAX_SIZE, value: "40Gi"}
+            - {name: BUILDKIT_CACHE_POOL_MAX_SIZE, value: "10Gi"}
+            - {name: BUILDKIT_CACHE_MAX_BLOB_SIZE, value: "5Gi"}
+            - {name: BUILDKIT_CACHE_MAX_UPLOAD_SIZE, value: "10Gi"}
+            - {name: BUILDKIT_CACHE_GC_INTERVAL, value: "10m"}
+            - {name: BUILDKIT_CACHE_WATCH_NAMESPACES, value: "ci-a,ci-b"}
+          ports:
+            - {name: registry, containerPort: 5000}
+            - {name: ops, containerPort: 8080}
+          livenessProbe:
+            httpGet: {path: /healthz, port: ops}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: ops}
+            periodSeconds: 5
+          resources:
+            limits:
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/buildkit-cache}
+            - {name: tls, mountPath: /etc/buildkit-cache/tls, readOnly: true}
+      volumes:
+        - name: tls
+          secret: {secretName: buildkit-controller-registry-tls, defaultMode: 0440}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: "60Gi"}
 
 ---
 # Source: buildkit-controller/templates/extras.yaml

@@ -34,31 +34,27 @@ use anyhow::{Context, Result, ensure};
 
 use buildkit_controller::net::ProxyError;
 
-use crate::gateway::SOCAT;
+use crate::gateway::{PROXY as GATEWAY, SOCAT};
 use crate::image::WORKER_IMAGE;
 use crate::kube::Cluster;
 use crate::proc::{Spawned, host_platform, output, until, write};
 use crate::root;
 
-const NS: &str = "bk-system";
-const POOL_NS: &str = "ci";
+const NS: &str = "bk-proxy";
+const POOL_NS: &str = "proxy-ci";
 const CLIENT_NS: &str = "bk-clients";
-const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const SOCAT_IMAGE: &str = SOCAT.0;
 const SERVER_NAME: &str = "bk.proxy.test";
 /// SNI of the extra passthrough `TLSRoute` to the API (scenario e).
 const PASSTHROUGH_HOST: &str = "pt.proxy.test";
 const AUD: &str = "buildkit-controller";
 const FORGED: [u8; 4] = [203, 0, 113, 9];
-const CONTROLLER: &str = "buildkit-controller.bk-system.svc";
+const CONTROLLER: &str = "buildkit-controller.bk-proxy.svc";
 
 pub(crate) fn proxy_verify() -> Result<()> {
     let work = root().join("target/proxy-verify");
     std::fs::create_dir_all(&work)?;
-    let env = &Cluster::new(
-        &super::kind_cluster("bk-proxy-verify"),
-        work.join("kubeconfig"),
-    );
+    let env = &Cluster::for_suite("bk-proxy-verify", &work)?;
     if std::env::var_os("PROXY_VERIFY_KEEP").is_some() {
         env.keep();
     }
@@ -100,8 +96,8 @@ fn values(trusted: &[String], edge_port: u16, host: &str) -> String {
         .map(|ip| format!("{ip}/32"))
         .collect::<Vec<_>>()
         .join(", ");
-    let gw = crate::gateway::NAME;
-    let gw_ns = crate::gateway::NS;
+    let gw = GATEWAY.name;
+    let gw_ns = GATEWAY.ns;
     format!(
         "\
 fullnameOverride: buildkit-controller
@@ -312,18 +308,18 @@ impl Rig<'_> {
 #[allow(clippy::too_many_lines, reason = "one linear scenario script")]
 fn run(env: &Cluster, work: &Path) -> Result<()> {
     env.create(None, "120s")?;
-    crate::image::image(CONTROLLER_IMAGE, Some(env.name()))?;
+    crate::image::load_controller(env)?;
     crate::image::ensure_worker()?;
     crate::gateway::ensure_image(SOCAT.0, SOCAT.1)?;
     for image in [WORKER_IMAGE, SOCAT_IMAGE] {
         output(&mut crate::kube::kind_load(image, env.name()))?;
     }
-    let gateway_ca = crate::gateway::install(env, work)?;
-    let envoy_ips = crate::gateway::envoy_pod_ips(env)?;
+    let gateway_ca = GATEWAY.install(env, work)?;
+    let envoy_ips = GATEWAY.envoy_pod_ips(env)?;
     println!("Envoy pod addresses (trusted): {envoy_ips:?}");
     let rig = Rig {
         env,
-        envoy: crate::gateway::envoy_host(env)?,
+        envoy: GATEWAY.envoy_host(env)?,
     };
 
     for ns in [NS, POOL_NS, CLIENT_NS] {
@@ -337,8 +333,8 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
 
     // The host reaches the Gateway's API and edge listeners through port-forwards,
     // so edge.endpoint can name the local edge port.
-    let api_pf = crate::gateway::PortForward::envoy(env, 8443)?;
-    let edge_pf = crate::gateway::PortForward::envoy(env, 8444)?;
+    let api_pf = crate::gateway::PortForward::envoy(env, &GATEWAY, 8443)?;
+    let edge_pf = crate::gateway::PortForward::envoy(env, &GATEWAY, 8444)?;
     let values_file = write(
         &work.join("values.yaml"),
         &values(&envoy_ips, edge_pf.local, host_platform()?),

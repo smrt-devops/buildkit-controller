@@ -2,7 +2,7 @@
 //!
 //! The task installs the controller from the Helm chart. A mock OIDC issuer
 //! runs in this process (trusted through the issuer's `caBundleConfigMap`) and
-//! a `registry:2` runs in the cluster. The clients are the real recipe
+//! a `registry:2` runs in the cluster beside the chart's built-in cache registry. The clients are the real recipe
 //! `docs/ci/buildkit-allocate.sh` and real `docker buildx` on the host. They go
 //! through the real API and mTLS edge behind Envoy Gateway (see `gateway.rs`),
 //! installed with the chart's default Gateway API exposure: an `HTTPRoute` with a
@@ -36,7 +36,7 @@ const OIDC_HOST: &str = "mock-oidc.bk-oidc.svc";
 /// The API URL clients use, through the Gateway.
 /// The loopback host ports kind publishes the Gateway's API and edge listeners
 /// on: 18443 and 18444 without `BK_KIND_SUFFIX` (CI), else a pair in 20000-21999.
-static PORTS: std::sync::LazyLock<HostPorts> = std::sync::LazyLock::new(|| {
+pub(crate) static PORTS: std::sync::LazyLock<HostPorts> = std::sync::LazyLock::new(|| {
     HostPorts::get(
         HostPorts {
             api: 18443,
@@ -47,9 +47,12 @@ static PORTS: std::sync::LazyLock<HostPorts> = std::sync::LazyLock::new(|| {
 });
 static API: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("https://localhost:{}", PORTS.api));
-const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
-const REGISTRY_IMAGE: &str = "registry:2";
+pub(crate) const REGISTRY_IMAGE: &str = "registry:2";
 const REG: &str = "registry.e2e-reg.svc.cluster.local:5000";
+/// The chart's cache registry, as workers reach it.
+const CACHE_HOST: &str = "buildkit-controller-registry.bk-system.svc:5000";
+/// A cache volume as v0.1.0 labelled it, created before install; the leader deletes it.
+const OLD_VOLUME: &str = "v010-volume";
 const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const AUD: &str = "buildkit-controller";
 
@@ -73,9 +76,10 @@ fn work_dir() -> PathBuf {
     root().join("target").join(name)
 }
 
-/// The e2e cluster: `bk-e2e`, plus `-$BK_KIND_SUFFIX` when that is set.
-fn cluster(work: &Path) -> Cluster {
-    Cluster::new(&super::kind_cluster("bk-e2e"), work.join("kubeconfig"))
+/// The e2e cluster: `bk-e2e`, plus `-$BK_KIND_SUFFIX` when that is set, or the
+/// cluster named by `BK_KIND_CLUSTER`.
+fn cluster(work: &Path) -> Result<Cluster> {
+    Cluster::for_suite("bk-e2e", work)
 }
 
 fn pool_yaml(name: &str, platforms: &str, rules: &str) -> String {
@@ -108,53 +112,17 @@ fn pool_yaml(name: &str, platforms: &str, rules: &str) -> String {
     )
 }
 
-/// Cache pools of scenarios f to h: `(name, scaling, chart cache value)`. Their
-/// `cache` goes through the chart's per-pool value.
-const CACHE_POOLS: [(&str, &str, &str); 3] = [
-    (
-        "cache-reg",
-        "{min: 1, max: 1}",
-        "{registry: {repository: \"REG/bkcache\"}}",
-    ),
-    (
-        "cache-local",
-        "{min: 1, max: 1}",
-        "{local: {size: 1Gi, maxVolumes: 1}}",
-    ),
-    (
-        "cache-spill",
-        "{min: 2, max: 2}",
-        "{local: {size: 1Gi, maxVolumes: 2}}",
-    ),
-];
-
-/// [`pool_yaml`] with other scaling and a chart `cache` value.
-fn cache_pool_yaml(name: &str, platform: &str, rules: &str, scaling: &str, cache: &str) -> String {
-    pool_yaml(name, platform, rules)
-        .replacen(
-            "scaling: {min: 1, max: 1}",
-            &format!("scaling: {scaling}"),
-            1,
-        )
-        .replacen(
-            &format!("    namespace: {POOL_NS}\n"),
-            &format!(
-                "    namespace: {POOL_NS}\n    cache: {}\n",
-                cache.replace("REG", REG)
-            ),
-            1,
-        )
-}
-
 #[allow(clippy::too_many_lines, reason = "one linear install script")]
 /// Create the cluster and install the chart with its pools. Returns the API CA
 /// file (the client CA, which signs the API serving certificate).
 fn install(env: &Cluster, work: &Path, mode: &Mode) -> Result<PathBuf> {
     let root = root();
     // A leftover cluster of this name holds the ports; delete it before checking them.
-    env.delete();
     let ports = *PORTS;
-    ports.check_free(env.name())?;
+    if !env.attached() {
+        env.delete();
+        ports.check_free(env.name())?;
+    }
     let kind_cfg = crate::fixture(
         "e2e/kind.yaml",
         work,
@@ -165,7 +133,7 @@ fn install(env: &Cluster, work: &Path, mode: &Mode) -> Result<PathBuf> {
     )?;
     env.create(Some(&kind_cfg), "120s")?;
 
-    crate::image::image(CONTROLLER_IMAGE, Some(env.name()))?;
+    crate::image::load_controller(env)?;
     crate::image::ensure_worker()?;
     let mut images = vec![WORKER_IMAGE];
     if matches!(mode, Mode::Mock(_)) {
@@ -177,12 +145,15 @@ fn install(env: &Cluster, work: &Path, mode: &Mode) -> Result<PathBuf> {
     for image in images {
         status(&mut crate::kube::kind_load(image, env.name()))?;
     }
-    let gateway_ca = crate::gateway::install(env, work)?;
+    let gateway_ca = crate::gateway::E2E.install(env, work)?;
 
     for ns in [NS, POOL_NS] {
         env.kubectl(&["create", "namespace", ns])?;
     }
     env.kubectl(&["create", "serviceaccount", "builder", "-n", POOL_NS])?;
+    env.apply(&format!(
+        "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: {OLD_VOLUME}\n  namespace: {POOL_NS}\n  labels: {{app.kubernetes.io/managed-by: buildkit-controller, app.kubernetes.io/name: buildkit-cache}}\nspec:\n  accessModes: [ReadWriteOnce]\n  resources: {{requests: {{storage: 1Mi}}}}\n"
+    ))?;
 
     let (issuer_url, oidc_ca, rules) = match mode {
         Mode::Mock(i) => {
@@ -270,8 +241,8 @@ auth:
       audiences: [{AUD}]
 {oidc_ca}",
         edge_port = ports.edge,
-        gw = crate::gateway::NAME,
-        gw_ns = crate::gateway::NS,
+        gw = crate::gateway::E2E.name,
+        gw_ns = crate::gateway::E2E.ns,
     );
     let values_file = write(&work.join("values.yaml"), &values)?;
     let chart = root
@@ -297,14 +268,7 @@ auth:
     for (p, plats) in &platforms {
         pools.push_str(&pool_yaml(p, plats, &rules));
     }
-    let mut ready: Vec<String> = platforms.iter().map(|(p, _)| p.clone()).collect();
-    if matches!(mode, Mode::Mock(_)) {
-        for (name, scaling, cache) in CACHE_POOLS {
-            let plat = format!("linux/{host}");
-            pools.push_str(&cache_pool_yaml(name, &plat, &rules, scaling, cache));
-            ready.push(name.to_owned());
-        }
-    }
+    let ready: Vec<String> = platforms.iter().map(|(p, _)| p.clone()).collect();
     let pools_file = write(&work.join("pools.yaml"), &pools)?;
     env.helm(&[
         "upgrade",
@@ -322,6 +286,14 @@ auth:
         "rollout",
         "status",
         "deploy/buildkit-controller",
+        "-n",
+        NS,
+        "--timeout=300s",
+    ])?;
+    env.kubectl(&[
+        "rollout",
+        "status",
+        "statefulset/buildkit-controller-registry",
         "-n",
         NS,
         "--timeout=300s",
@@ -369,7 +341,7 @@ auth:
 pub(crate) fn e2e_up(repo: &str) -> Result<()> {
     let work = work_dir();
     std::fs::create_dir_all(&work)?;
-    let env = cluster(&work);
+    let env = cluster(&work)?;
     // Left running for the Action job, whether or not the install succeeds.
     env.keep();
     let ca = install(&env, &work, &Mode::Github(repo))?;
@@ -379,14 +351,15 @@ pub(crate) fn e2e_up(repo: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn e2e() -> Result<()> {
+/// `long`: scenario l waits past five minutes, as the nightly job runs it.
+pub(crate) fn e2e(long: bool) -> Result<()> {
     let work = work_dir();
     std::fs::create_dir_all(&work)?;
-    let env = &cluster(&work);
+    let env = &cluster(&work)?;
     if std::env::var_os("E2E_KEEP").is_some() {
         env.keep();
     }
-    let result = run(env, &work);
+    let result = run(env, &work, long);
     if result.is_err() {
         for args in [
             vec!["get", "pods", "-A", "-o", "wide"],
@@ -439,17 +412,6 @@ impl Client<'_> {
         output(&mut self.recipe(pool, token, &script))
     }
 
-    /// `kubectl exec -n ci <args[0]> -- <args[1..]>`.
-    fn exec(&self, args: &[&str]) -> Result<String> {
-        let (pod, cmd) = args.split_first().context("exec needs a pod")?;
-        output(
-            self.env
-                .kubectl_cmd()
-                .args(["exec", "-n", POOL_NS, pod, "--"])
-                .args(cmd),
-        )
-    }
-
     /// The curl recipe with `CACHE_KEY` (and `CACHE` unless empty), building with `$CACHE_ARGS`.
     fn cached_build(&self, pool: &str, token: &str, key: &str, cache: &str) -> Result<String> {
         let script = "docker buildx build --builder \"$BUILDER\" --progress=plain -o type=cacheonly $CACHE_ARGS .";
@@ -459,34 +421,6 @@ impl Client<'_> {
             c.env("CACHE", cache);
         }
         output(&mut c)
-    }
-
-    /// `(alloc == free && Ready, cache-keys)` of a pool pod, or `None` when it does not exist.
-    fn pod_state(&self, pod: &str) -> Option<(bool, String)> {
-        let Ok(out) = self.env.kubectl(&["get", "pod", "-n", POOL_NS, pod, "-o",
-            "jsonpath={.metadata.annotations.buildkit\\.smrt-devops\\.net/alloc} {.status.conditions[?(@.type==\"Ready\")].status} {.metadata.deletionTimestamp} |{.metadata.annotations.buildkit\\.smrt-devops\\.net/cache-keys}"])
-        else {
-            return None;
-        };
-        let (state, keys) = out.split_once('|').unwrap_or((&out, ""));
-        let f: Vec<&str> = state.split_whitespace().collect();
-        Some((f == ["free", "True"], keys.trim().to_owned()))
-    }
-
-    /// Waits until `pod` is a free Ready pod whose cache keys contain `key` (any keys when empty).
-    fn wait_warm(&self, pod: &str, key: &str) -> Result<()> {
-        until(
-            &format!("{pod} warm with key {key:?}"),
-            Duration::from_mins(3),
-            || {
-                Ok(self
-                    .pod_state(pod)
-                    .is_some_and(|(free, keys)| {
-                        free && (key.is_empty() || keys.split(',').any(|k| k == key))
-                    })
-                    .then_some(()))
-            },
-        )
     }
 
     fn sa_token(&self) -> Result<String> {
@@ -541,110 +475,8 @@ fn prepare(work: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok((ctx, mp))
 }
 
-/// How many build records `docker buildx history ls` listed between the
-/// markers. The listing runs after the build, in the same allocation.
-fn history_records(out: &str) -> Result<usize> {
-    let start = out
-        .find("HISTORY-START")
-        .context("history listing did not run")?;
-    let end = out.find("HISTORY-END").context("history listing failed")?;
-    Ok(out[start..end]
-        .lines()
-        .skip(1)
-        .filter(|l| l.trim_start().starts_with('{'))
-        .count())
-}
-
-/// Scenario k: cache scopes and build history on `cache-local` (one slot).
-fn scopes(c: &Client, host_pool: &str, oidc: &str) -> Result<()> {
-    let sa = &c.sa_token()?;
-    let local_pool = format!("{POOL_NS}/cache-local");
-    let build = "docker buildx build --builder \"$BUILDER\" --progress=plain -o type=cacheonly $CACHE_ARGS .";
-    let script = format!(
-        "{build} && echo HISTORY-START && docker buildx history ls --builder \"$BUILDER\" --format json && echo HISTORY-END"
-    );
-    let go = |pool: &str, token: &str| {
-        let mut cmd = c.recipe(pool, token, &script);
-        if pool == local_pool {
-            cmd.env("CACHE_KEY", "e2e-local").env("CACHE", "local");
-        }
-        output(&mut cmd)
-    };
-    let binding = || {
-        c.env.kubectl(&[
-            "get",
-            "pvc",
-            "-n",
-            POOL_NS,
-            "cache-local-cache-0",
-            "-o",
-            "jsonpath={.metadata.annotations.buildkit\\.smrt-devops\\.net/cache-scope}",
-        ])
-    };
-    c.wait_warm("cache-local-0", "e2e-local")?;
-    let owner = binding()?;
-    ensure!(
-        owner.contains('@'),
-        "the volume has no owner after g: {owner:?}"
-    );
-
-    // History works through the edge on a pool without cache.local.
-    let control = go(host_pool, sa)?;
-    let n = history_records(&control)?;
-    ensure!(n >= 1, "no build record on {host_pool}:\n{control}");
-
-    // Another identity: a fresh volume, no cache, no history.
-    let other = go(&local_pool, sa)?;
-    ensure!(
-        !other.contains("local hit"),
-        "the ServiceAccount hit the OIDC caller's volume:\n{other}"
-    );
-    let cached = other.matches("CACHED").count();
-    ensure!(
-        cached == 0,
-        "the ServiceAccount got {cached} CACHED steps from another identity's volume:\n{other}"
-    );
-    let records = history_records(&other)?;
-    ensure!(
-        records == 0,
-        "{records} build records readable on a cache pool:\n{other}"
-    );
-    let result = other
-        .lines()
-        .find_map(|l| l.strip_prefix("cache: key e2e-local, local "))
-        .unwrap_or("?")
-        .to_owned();
-    let now = binding()?;
-    ensure!(now != owner, "the volume binding did not change: {now:?}");
-
-    // The same identity hits its own cache on the next pod.
-    c.wait_warm("cache-local-0", "e2e-local")?;
-    let again = go(&local_pool, sa)?;
-    let hits = again.matches("CACHED").count();
-    ensure!(
-        again.contains("cache: key e2e-local, local hit") && hits >= 3,
-        "the ServiceAccount did not hit its own cache ({hits} CACHED):\n{again}"
-    );
-    ensure!(
-        history_records(&again)? == 0,
-        "build records readable on a cache pool:\n{again}"
-    );
-
-    // The OIDC caller's volume was taken over, so it starts empty too.
-    c.wait_warm("cache-local-0", "e2e-local")?;
-    let back = go(&local_pool, oidc)?;
-    ensure!(
-        !back.contains("local hit") && back.matches("CACHED").count() == 0,
-        "the OIDC caller got the ServiceAccount's cache:\n{back}"
-    );
-    println!(
-        "PASS k: another identity gets an empty volume (local {result}, 0 CACHED, 0 build records; {n} on {host_pool}); the same identity then hits ({hits} CACHED); the first identity starts empty again"
-    );
-    Ok(())
-}
-
 #[allow(clippy::too_many_lines, reason = "one linear scenario script")]
-fn run(env: &Cluster, work: &Path) -> Result<()> {
+fn run(env: &Cluster, work: &Path, long: bool) -> Result<()> {
     let issuer = Issuer::new(OIDC_HOST)?;
     let ca = install(env, work, &Mode::Mock(&issuer))?;
     let (ctx, mp) = prepare(work)?;
@@ -659,10 +491,12 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
     let oidc = issuer.token(AUD, "e2e")?;
     let foreign = if host == "arm64" { "amd64" } else { "arm64" };
 
-    // l. A long poll through the Gateway, beside scenarios a to h. X holds the only
-    // worker of the foreign pool for 330 s, and Y queues behind it. The API sends
-    // nothing while Y waits, past Envoy's default 5-minute stream idle timeout.
-    let long = LongPoll::start(&c, &format!("{POOL_NS}/{foreign}"), &issuer)?;
+    // l. A long wait through the Gateway, beside scenarios a to h. X holds the only
+    // worker of the foreign pool for 60 s, and Y queues behind it through two or
+    // more polls; with --long, 330 s, past Envoy's default 5-minute stream idle
+    // timeout. No request stays open over 25 s: Y's claim waits on the server
+    // while the client polls.
+    let long = LongPoll::start(&c, &format!("{POOL_NS}/{foreign}"), &issuer, long)?;
 
     // a. A build with a RUN step succeeds through the edge (OIDC token).
     let out = c.build(&pool, &oidc, "")?;
@@ -672,11 +506,10 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
     );
     println!("PASS a: docker buildx build with RUN through the edge ({pool})");
 
-    // b. Mock-issuer OIDC (above) and ServiceAccount TokenReview both work,
-    // and a token from nobody is refused.
+    // b. Mock-issuer OIDC (above) and ServiceAccount TokenReview both allocate,
+    // and a token from nobody is refused. Scenario h builds with the account.
     let sa = c.sa_token()?;
-    let out = c.build(&pool, &sa, "")?;
-    ensure!(out.contains("built-through-edge"), "SA build:\n{out}");
+    output(&mut c.recipe(&pool, &sa, "true")).context("SA allocation")?;
     let bad = c.recipe(&pool, "not-a-token", "true").output()?;
     let why = String::from_utf8_lossy(&bad.stderr);
     ensure!(
@@ -684,7 +517,7 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
         "bogus token not refused with 401:\n{why}"
     );
     println!(
-        "PASS b: mock OIDC and ServiceAccount TokenReview allocate and build; a bogus token is refused with 401"
+        "PASS b: mock OIDC and ServiceAccount TokenReview allocate; a bogus token is refused with 401"
     );
 
     // c. Registry cache. The second build, on a fresh worker, hits it.
@@ -722,6 +555,15 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
     )?;
+    // B waits as a claim in the controller's namespace, at the head of the queue.
+    let pending = until("B pending as a claim", Duration::from_mins(1), || {
+        let s = c.env.kubectl(&[
+            "get", "bkc", "-n", NS, "-o",
+            "jsonpath={range .items[?(@.status.phase==\"Pending\")]}{.metadata.name} {.spec.poolRef.name} {.status.queuePosition}{\"\\n\"}{end}",
+        ])?;
+        let head = format!(" {host} 1");
+        Ok(s.lines().find(|l| l.ends_with(&head)).map(str::to_owned))
+    })?;
     ensure!(a.wait()?.success(), "allocation A failed");
     ensure!(b.wait()?.success(), "allocation B failed");
     let (a_end, b_start) = (
@@ -737,149 +579,103 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
         "B did not wait (launched {b_launched}, started {b_start})"
     );
     println!(
-        "PASS d: second allocation queued {}s and ran after the first was released",
+        "PASS d: second allocation queued {}s as claim {pending} (place 1) and ran after the first was released",
         b_start - b_launched
     );
 
-    // f. Registry layer. Two builds of one cacheKey on fresh workers, each with the
-    // flags from its allocation response; the second imports what the first exported.
-    let reg_pool = format!("{POOL_NS}/cache-reg");
-    let first = c.cached_build(&reg_pool, &oidc, "e2e-reg", "")?;
-    let want = format!(
-        "cache flags: --cache-from=type=registry,ref={REG}/bkcache:e2e-reg --cache-to=type=registry,ref={REG}/bkcache:e2e-reg,mode=max"
-    );
-    ensure!(first.contains(&want), "registry flags missing:\n{first}");
-    ensure!(
-        !first.contains("CACHED"),
-        "first build was cached:\n{first}"
-    );
-    let second = c.cached_build(&reg_pool, &oidc, "e2e-reg", "")?;
-    let hits = second.matches("CACHED").count();
-    ensure!(
-        hits >= 3,
-        "expected CACHED steps from the registry ref, got {hits}:\n{second}"
-    );
-    println!(
-        "PASS f: registry layer from the response flags (second build on a fresh worker: {hits} CACHED steps)"
-    );
-
-    // g. Local layer on a pool with no registry config. Slot 0 keeps its volume, so
-    // the second build on a new pod in that slot reuses the first build's state.
-    let local_pool = format!("{POOL_NS}/cache-local");
-    let first = c.cached_build(&local_pool, &oidc, "e2e-local", "local")?;
-    ensure!(
-        !first.contains("cache flags:"),
-        "a local-only pool returned registry flags:\n{first}"
-    );
-    ensure!(
-        !first.contains("CACHED"),
-        "first build was cached:\n{first}"
-    );
-    c.wait_warm("cache-local-0", "e2e-local")?;
-    let second = c.cached_build(&local_pool, &oidc, "e2e-local", "local")?;
-    let hits = second.matches("CACHED").count();
-    ensure!(
-        second.contains("cache: key e2e-local, local hit"),
-        "expected local hit:\n{second}"
-    );
-    ensure!(
-        hits >= 3,
-        "expected CACHED steps from the volume, got {hits}:\n{second}"
-    );
-    let config = c.exec(&["cache-local-0", "cat", "/etc/buildkit/buildkitd.toml"])?;
-    ensure!(
-        config.contains("maxUsedSpace = \"858993456\""),
-        "gcKeepStorage (1Gi / 5 * 4) not in buildkitd.toml:\n{config}"
-    );
-    let workers = c.exec(&[
-        "cache-local-0",
-        "buildctl",
-        "--addr",
-        "unix:///run/user/1000/buildkit/buildkitd.sock",
-        "debug",
-        "workers",
-        "-v",
-    ])?;
-    let gc: Vec<&str> = workers
+    // f. The built-in cache registry. Two builds of one key on fresh workers, each
+    // with the flags from its allocation response (a push event: trusted). The
+    // second imports what the first exported.
+    let repo = format!("{CACHE_HOST}/{POOL_NS}/{host}/");
+    let first = c.cached_build(&pool, &oidc, "e2e", "")?;
+    let flags = first
         .lines()
-        .filter(|l| l.contains("Maximum used space") && l.contains("858.993456MB"))
-        .collect();
+        .find_map(|l| l.strip_prefix("cache flags: "))
+        .with_context(|| format!("no cache flags:\n{first}"))?
+        .to_owned();
     ensure!(
-        !gc.is_empty(),
-        "buildctl debug workers shows no 858.993456MB GC bound:\n{workers}"
+        flags.contains(&format!("--cache-from=type=registry,ref={repo}"))
+            && flags.contains(&format!("--cache-to=type=registry,ref={repo}"))
+            && flags.contains("mode=max,ignore-error=true,oci-mediatypes=true"),
+        "built-in registry flags missing: {flags}"
+    );
+    ensure!(
+        !first.contains("CACHED"),
+        "first build was cached:\n{first}"
+    );
+    let second = c.cached_build(&pool, &oidc, "e2e", "")?;
+    let hits = second.matches("CACHED").count();
+    ensure!(
+        hits >= 3,
+        "expected CACHED steps from the built-in registry, got {hits}:\n{second}"
     );
     println!(
-        "PASS g: local layer (result hit, {hits} CACHED steps); buildkitd maxUsedSpace=858993456; buildctl: {}",
-        gc.join(" | ").trim()
+        "PASS f: built-in cache registry (second build on a fresh worker: {hits} CACHED steps)"
     );
 
-    // h. Concurrency. Two overlapping builds of one key on a pool with two cached
-    // slots, one of which holds the key: both succeed, the first is a hit, and the
-    // second, on the other slot, reports spill.
-    let spill_pool = format!("{POOL_NS}/cache-spill");
-    c.cached_build(&spill_pool, &oidc, "e2e-spill", "")?;
-    let holder = until(
-        "a cache-spill pod holding e2e-spill",
-        Duration::from_mins(3),
+    // g. A pull_request build of the same caller reads the cache and gets no
+    // --cache-to. A push it adds itself is refused by the registry.
+    let pr = issuer.token_for_event(AUD, "e2e", "pull_request")?;
+    let read = c.cached_build(&pool, &pr, "e2e", "")?;
+    let pr_flags = read
+        .lines()
+        .find_map(|l| l.strip_prefix("cache flags: "))
+        .with_context(|| format!("no cache flags:\n{read}"))?;
+    ensure!(
+        pr_flags.contains("--cache-from=") && !pr_flags.contains("--cache-to="),
+        "an untrusted build got: {pr_flags}"
+    );
+    let pr_hits = read.matches("CACHED").count();
+    ensure!(
+        pr_hits >= 3,
+        "the untrusted build did not read the cache ({pr_hits} CACHED):\n{read}"
+    );
+    let denied_before = registry_metric(env, "buildkit_registry_denied_total{action=\"push\"}")?;
+    let target = flags
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix("--cache-from="))
+        .context("no cache ref")?
+        .to_owned();
+    let push = c
+        .recipe(
+            &pool,
+            &pr,
+            &format!(
+                "docker buildx build --builder \"$BUILDER\" --progress=plain -o type=cacheonly --no-cache --cache-to {target},mode=max ."
+            ),
+        )
+        .output()?;
+    let denied = registry_metric(env, "buildkit_registry_denied_total{action=\"push\"}")?;
+    ensure!(
+        !push.status.success() && denied > denied_before,
+        "the untrusted push was not refused (exit {:?}, push denials {denied_before} -> {denied}):\n{}",
+        push.status.code(),
+        String::from_utf8_lossy(&push.stderr)
+    );
+    println!(
+        "PASS g: an untrusted (pull_request) build reads the cache ({pr_hits} CACHED) and its own push is refused ({denied} push denials)"
+    );
+
+    // h. Another identity has another scope: the ServiceAccount does not read the
+    // OIDC caller's cache.
+    let sa = c.sa_token()?;
+    let other = c.cached_build(&pool, &sa, "e2e", "")?;
+    ensure!(
+        other.matches("CACHED").count() == 0,
+        "the ServiceAccount read another identity's cache:\n{other}"
+    );
+    println!("PASS h: another identity starts with an empty cache");
+
+    // m. Upgrade: the cache volume of v0.1.0 created before install is gone.
+    until(
+        "the v0.1.0 cache volume is deleted",
+        Duration::from_mins(2),
         || {
-            for pod in ["cache-spill-0", "cache-spill-1"] {
-                if c.pod_state(pod)
-                    .is_some_and(|(free, keys)| free && keys.split(',').any(|k| k == "e2e-spill"))
-                {
-                    return Ok(Some(pod));
-                }
-            }
-            Ok(None)
+            let left = env.kubectl(&["get", "pvc", "-n", POOL_NS, "-o", "name"])?;
+            Ok((!left.contains(OLD_VOLUME)).then_some(()))
         },
     )?;
-    let other = if holder == "cache-spill-0" {
-        "cache-spill-1"
-    } else {
-        "cache-spill-0"
-    };
-    c.wait_warm(other, "")?;
-    let _ = std::fs::remove_file(work.join("h.a"));
-    let build = "docker buildx build --builder \"$BUILDER\" --progress=plain -o type=cacheonly $CACHE_ARGS .";
-    let a = Spawned::spawn(
-        c.recipe(
-            &spill_pool,
-            &oidc,
-            &format!("touch \"$OUTD/h.a\"; {build} && sleep 15"),
-        )
-        .env("CACHE_KEY", "e2e-spill")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped()),
-    )?;
-    until("A holds the cached slot", Duration::from_mins(3), || {
-        Ok(
-            (work.join("h.a").exists() && c.pod_state(holder).is_some_and(|(free, _)| !free))
-                .then_some(()),
-        )
-    })?;
-    let b = c.cached_build(&spill_pool, &oidc, "e2e-spill", "")?;
-    let a = a.wait_with_output()?;
-    let a_out = format!(
-        "{}{}",
-        String::from_utf8_lossy(&a.stdout),
-        String::from_utf8_lossy(&a.stderr)
-    );
-    ensure!(a.status.success(), "build A failed:\n{a_out}");
-    ensure!(
-        a_out.contains("cache: key e2e-spill, local hit"),
-        "A was not a hit:\n{a_out}"
-    );
-    ensure!(
-        b.contains("cache: key e2e-spill, local spill"),
-        "B did not spill:\n{b}"
-    );
-    println!(
-        "PASS h: two overlapping e2e-spill builds both succeed; A local hit on {holder}, B local spill on {other}"
-    );
-
-    // k. Cache scopes. After g, the only volume of cache-local belongs to the OIDC
-    // caller. A caller of another identity (the ServiceAccount) neither gets its
-    // cache nor reads any build history through the edge, then hits its own cache.
-    scopes(&c, &pool, &oidc)?;
+    println!("PASS m: the leader deleted the v0.1.0 cache volume {OLD_VOLUME}");
 
     long.finish()?;
 
@@ -934,20 +730,30 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Scenario l: an allocation request that stays queued, and silent, for over
-/// five minutes behind the Gateway.
+/// Scenario l: an allocation that stays queued for over five minutes behind the
+/// Gateway, which the client follows with polls of at most 25 s each.
 struct LongPoll {
+    /// The shortest wait that shows what the scenario tests.
+    min_wait: u64,
     holder: Spawned,
     waiter: Spawned,
     launched: u64,
     outd: PathBuf,
 }
 
-/// How long X holds the worker, so Y waits past Envoy's default 5-minute stream idle timeout.
+/// How long X holds the worker: Y waits through at least two 25 s polls.
+const HOLD_SECS: u64 = 60;
+/// With `--long` (nightly), so Y waits past Envoy's default 5-minute stream
+/// idle timeout.
 const LONG_HOLD_SECS: u64 = 330;
 
 impl LongPoll {
-    fn start(c: &Client, pool: &str, issuer: &Issuer) -> Result<Self> {
+    fn start(c: &Client, pool: &str, issuer: &Issuer, long: bool) -> Result<Self> {
+        let (hold, min_wait) = if long {
+            (LONG_HOLD_SECS, 300)
+        } else {
+            (HOLD_SECS, 50)
+        };
         let outd = c.work.clone();
         for stale in ["l.x", "l.y"] {
             let _ = std::fs::remove_file(outd.join(stale));
@@ -956,7 +762,7 @@ impl LongPoll {
             c.recipe(
                 pool,
                 &issuer.token(AUD, "e2e")?,
-                &format!(r#"date +%s > "$OUTD/l.x"; sleep {LONG_HOLD_SECS}"#),
+                &format!(r#"date +%s > "$OUTD/l.x"; sleep {hold}"#),
             )
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
@@ -976,6 +782,7 @@ impl LongPoll {
             .stderr(Stdio::piped()),
         )?;
         Ok(Self {
+            min_wait,
             holder,
             waiter,
             launched,
@@ -995,11 +802,12 @@ impl LongPoll {
         let started = read_secs(&self.outd.join("l.y"))?;
         let waited = started.saturating_sub(self.launched);
         ensure!(
-            waited >= 300,
-            "Y waited {waited}s, not past the 5-minute idle bound the scenario tests"
+            waited >= self.min_wait,
+            "Y waited {waited}s, less than the {}s the scenario tests",
+            self.min_wait
         );
         println!(
-            "PASS l: an allocation request queued silently for {waited}s through the Gateway and got the worker"
+            "PASS l: an allocation queued {waited}s through the Gateway, polled with requests of at most 25s, and got the worker"
         );
         Ok(())
     }
@@ -1047,8 +855,8 @@ fn gateway_options(env: &Cluster, c: &Client, pool: &str, issuer: &Issuer) -> Re
             "gateway.api.mode=passthrough",
             &format!(
                 "gateway.api.parentRefs[0].sectionName=api-passthrough,gateway.api.parentRefs[0].name={},gateway.api.parentRefs[0].namespace={}",
-                crate::gateway::NAME,
-                crate::gateway::NS
+                crate::gateway::E2E.name,
+                crate::gateway::E2E.ns
             ),
         ],
     )?;
@@ -1075,7 +883,7 @@ fn gateway_options(env: &Cluster, c: &Client, pool: &str, issuer: &Issuer) -> Re
     // kubectl port-forward exits when the pod refuses a connection, which it does
     // until Envoy has the listener, so each attempt opens its own.
     let code = until("API by passthrough", Duration::from_mins(2), || {
-        let port = crate::gateway::PortForward::envoy(env, 9443)?;
+        let port = crate::gateway::PortForward::envoy(env, &crate::gateway::E2E, 9443)?;
         let url = format!("https://localhost:{}/v1/pools", port.local);
         let probe = Command::new("curl")
             .args(["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--cacert"])
@@ -1094,4 +902,18 @@ fn gateway_options(env: &Cluster, c: &Client, pool: &str, issuer: &Issuer) -> Re
         "PASS j: gateway.api.mode=passthrough: TLSRoute Accepted; the API answers {code} with the controller's own certificate"
     );
     Ok(())
+}
+
+/// The value of `sample` (name and labels, as exposed) on the cache registry's
+/// `/metrics`, read through the API server's Service proxy; 0 when absent.
+fn registry_metric(env: &Cluster, sample: &str) -> Result<f64> {
+    let text = env.kubectl(&[
+        "get",
+        "--raw",
+        &format!("/api/v1/namespaces/{NS}/services/http:buildkit-controller-registry:metrics/proxy/metrics"),
+    ])?;
+    Ok(text
+        .lines()
+        .find_map(|l| l.strip_prefix(sample)?.trim().parse().ok())
+        .unwrap_or(0.0))
 }

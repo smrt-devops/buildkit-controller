@@ -20,10 +20,38 @@ use crate::kube::Cluster;
 use crate::proc::stdout as run;
 use crate::root;
 
-/// Namespace of the Gateway the controller's routes attach to.
-pub(crate) const NS: &str = "bk-gateway";
-/// The Gateway's name.
-pub(crate) const NAME: &str = "bk";
+/// A Gateway that a suite's routes attach to, with its own `GatewayClass` and
+/// Envoy deployment, so suites on one cluster never share listeners.
+pub(crate) struct Gateway {
+    /// Namespace of the Gateway (and its API listener's certificate).
+    pub(crate) ns: &'static str,
+    /// The Gateway's name.
+    pub(crate) name: &'static str,
+    /// The `GatewayClass`, and the `EnvoyProxy` it points to.
+    class: &'static str,
+    /// The `NodePorts` of the API and edge listeners, which the kind config
+    /// publishes on loopback. `None`: a `ClusterIP` Service, reached through
+    /// [`PortForward`].
+    node_ports: Option<(u16, u16)>,
+}
+
+/// e2e's Gateway. Its `NodePorts` are below 30086, in the band the API server
+/// hands out only when asked by number, so no other Service can take them first.
+pub(crate) const E2E: Gateway = Gateway {
+    ns: "bk-gateway",
+    name: "bk",
+    class: "bk-e2e",
+    node_ports: Some((30080, 30081)),
+};
+
+/// proxy-verify's Gateway.
+pub(crate) const PROXY: Gateway = Gateway {
+    ns: "bk-proxy-gateway",
+    name: "bk",
+    class: "bk-proxy",
+    node_ports: None,
+};
+
 const EG_NS: &str = "envoy-gateway-system";
 /// Gateway API v1.6.1, standard channel: `HTTPRoute`, `BackendTLSPolicy` and `TLSRoute` at v1.
 const GATEWAY_API: (&str, &str) = (
@@ -58,13 +86,15 @@ pub(crate) const SOCAT: (&str, &str) = (
 );
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    ring::digest::digest(&ring::digest::SHA256, bytes)
-        .as_ref()
-        .iter()
-        .fold(String::new(), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
+    hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
+}
+
+/// Lowercase hex of `bytes`.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 /// Whether `path` exists and hashes to `sha256`.
@@ -128,13 +158,15 @@ fn fetch() -> Result<(PathBuf, PathBuf)> {
     Ok((crds, chart))
 }
 
-/// Installs Envoy Gateway and the Gateway `bk-gateway/bk` in `cluster`. The
-/// Gateway's HTTPS listener serves a self-signed certificate for `localhost`;
-/// returns the PEM file of that certificate, which API clients trust.
-pub(crate) fn install(env: &Cluster, work: &Path) -> Result<PathBuf> {
+/// Installs the pinned Envoy Gateway and the Gateway API CRDs, unless the
+/// release `eg` is there already (a shared cluster installs it once).
+pub(crate) fn install_envoy_gateway(env: &Cluster, work: &Path) -> Result<()> {
     for (tag, digest) in IMAGES {
         ensure_image(tag, digest)?;
         run(&mut crate::kube::kind_load(tag, env.name()))?;
+    }
+    if env.helm(&["status", "eg", "-n", EG_NS]).is_ok() {
+        return Ok(());
     }
     let (crds, chart) = fetch()?;
     let unpacked = work.join("gateway-chart");
@@ -166,37 +198,118 @@ pub(crate) fn install(env: &Cluster, work: &Path) -> Result<PathBuf> {
         "5m",
     ])?;
     println!("installed Envoy Gateway {EG_VERSION} and the Gateway API standard channel");
+    Ok(())
+}
 
-    env.kubectl(&["create", "namespace", NS])?;
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-        .context("gateway certificate")?;
-    let ca = work.join("gateway-ca.pem");
-    let key = work.join("gateway-key.pem");
-    std::fs::write(&ca, cert.cert.pem())?;
-    std::fs::write(&key, cert.signing_key.serialize_pem())?;
-    env.kubectl(&[
-        "create",
-        "secret",
-        "tls",
-        API_SECRET,
-        "-n",
-        NS,
-        &format!("--cert={}", ca.display()),
-        &format!("--key={}", key.display()),
-    ])?;
-    env.kubectl(&[
-        "apply",
-        "-f",
-        &fixtures.join("gateway.yaml").to_string_lossy(),
-    ])?;
-    env.wait_condition(
-        &format!("gateway/{NAME}"),
-        Some(NS),
-        "Programmed",
-        std::time::Duration::from_mins(5),
-    )?;
-    println!("Gateway {NS}/{NAME} Programmed");
-    Ok(ca)
+impl Gateway {
+    /// Installs Envoy Gateway if needed, then this Gateway. Its HTTPS listener
+    /// serves a self-signed certificate for `localhost`; returns the PEM file
+    /// of that certificate, which API clients trust.
+    pub(crate) fn install(&self, env: &Cluster, work: &Path) -> Result<PathBuf> {
+        install_envoy_gateway(env, work)?;
+        let ns = self.ns;
+        env.kubectl(&["create", "namespace", ns])?;
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .context("gateway certificate")?;
+        let ca = work.join("gateway-ca.pem");
+        let key = work.join("gateway-key.pem");
+        std::fs::write(&ca, cert.cert.pem())?;
+        std::fs::write(&key, cert.signing_key.serialize_pem())?;
+        env.kubectl(&[
+            "create",
+            "secret",
+            "tls",
+            API_SECRET,
+            "-n",
+            ns,
+            &format!("--cert={}", ca.display()),
+            &format!("--key={}", key.display()),
+        ])?;
+        let service = match self.node_ports {
+            Some((api, edge)) => format!(
+                "        type: NodePort\n        patch:\n          type: StrategicMerge\n          value:\n            spec:\n              ports:\n                - {{port: 8443, nodePort: {api}}}\n                - {{port: 8444, nodePort: {edge}}}"
+            ),
+            None => "        type: ClusterIP".to_owned(),
+        };
+        let manifest = crate::fixture(
+            "gateway/gateway.yaml",
+            work,
+            &[
+                ("ENVOY_SERVICE", service),
+                ("GW_CLASS", self.class.to_owned()),
+                ("GW_NAME", self.name.to_owned()),
+                ("GW_NS", ns.to_owned()),
+            ],
+        )?;
+        env.kubectl(&["apply", "-f", &manifest.to_string_lossy()])?;
+        env.wait_condition(
+            &format!("gateway/{}", self.name),
+            Some(ns),
+            "Programmed",
+            std::time::Duration::from_mins(5),
+        )?;
+        println!("Gateway {ns}/{} Programmed", self.name);
+        Ok(ca)
+    }
+
+    /// Label selector of the Gateway's Envoy Service and pods.
+    fn envoy_selector(&self) -> String {
+        format!(
+            "gateway.envoyproxy.io/owning-gateway-name={},gateway.envoyproxy.io/owning-gateway-namespace={}",
+            self.name, self.ns
+        )
+    }
+
+    /// The name of the Gateway's Envoy Service in `envoy-gateway-system`.
+    pub(crate) fn envoy_service(&self, env: &Cluster) -> Result<String> {
+        let svc = env.kubectl(&[
+            "get",
+            "svc",
+            "-n",
+            EG_NS,
+            "-l",
+            &self.envoy_selector(),
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ])?;
+        let svc = svc.trim();
+        ensure!(
+            !svc.is_empty(),
+            "no Envoy Service for {}/{}",
+            self.ns,
+            self.name
+        );
+        Ok(svc.to_owned())
+    }
+
+    /// In-cluster DNS name of the Gateway's Envoy Service.
+    pub(crate) fn envoy_host(&self, env: &Cluster) -> Result<String> {
+        Ok(format!("{}.{EG_NS}.svc", self.envoy_service(env)?))
+    }
+
+    /// Pod IPs of the Gateway's Envoy pods: the source addresses of every
+    /// connection Envoy opens to a backend.
+    pub(crate) fn envoy_pod_ips(&self, env: &Cluster) -> Result<Vec<String>> {
+        let ips = env.kubectl(&[
+            "get",
+            "pods",
+            "-n",
+            EG_NS,
+            "-l",
+            &self.envoy_selector(),
+            "--field-selector=status.phase=Running",
+            "-o",
+            "jsonpath={.items[*].status.podIP}",
+        ])?;
+        let ips: Vec<String> = ips.split_whitespace().map(str::to_owned).collect();
+        ensure!(
+            !ips.is_empty(),
+            "no running Envoy pod for {}/{}",
+            self.ns,
+            self.name
+        );
+        Ok(ips)
+    }
 }
 
 /// `status.ancestors[*].conditions[type=Accepted].status` of a route or policy.
@@ -232,54 +345,6 @@ pub(crate) fn dump(env: &Cluster) {
     }
 }
 
-/// Label selector of the Gateway's Envoy Service and pods.
-fn envoy_selector() -> String {
-    format!(
-        "gateway.envoyproxy.io/owning-gateway-name={NAME},gateway.envoyproxy.io/owning-gateway-namespace={NS}"
-    )
-}
-
-/// The name of the Gateway's Envoy Service in `envoy-gateway-system`.
-pub(crate) fn envoy_service(env: &Cluster) -> Result<String> {
-    let svc = env.kubectl(&[
-        "get",
-        "svc",
-        "-n",
-        EG_NS,
-        "-l",
-        &envoy_selector(),
-        "-o",
-        "jsonpath={.items[0].metadata.name}",
-    ])?;
-    let svc = svc.trim();
-    ensure!(!svc.is_empty(), "no Envoy Service for {NS}/{NAME}");
-    Ok(svc.to_owned())
-}
-
-/// In-cluster DNS name of the Gateway's Envoy Service.
-pub(crate) fn envoy_host(env: &Cluster) -> Result<String> {
-    Ok(format!("{}.{EG_NS}.svc", envoy_service(env)?))
-}
-
-/// Pod IPs of the Gateway's Envoy pods: the source addresses of every
-/// connection Envoy opens to a backend.
-pub(crate) fn envoy_pod_ips(env: &Cluster) -> Result<Vec<String>> {
-    let ips = env.kubectl(&[
-        "get",
-        "pods",
-        "-n",
-        EG_NS,
-        "-l",
-        &envoy_selector(),
-        "--field-selector=status.phase=Running",
-        "-o",
-        "jsonpath={.items[*].status.podIP}",
-    ])?;
-    let ips: Vec<String> = ips.split_whitespace().map(str::to_owned).collect();
-    ensure!(!ips.is_empty(), "no running Envoy pod for {NS}/{NAME}");
-    Ok(ips)
-}
-
 /// `kubectl port-forward` to a port of the Gateway's Envoy Service, on a free
 /// local port. Stopped when dropped.
 pub(crate) struct PortForward {
@@ -289,8 +354,8 @@ pub(crate) struct PortForward {
 }
 
 impl PortForward {
-    pub(crate) fn envoy(env: &Cluster, port: u16) -> Result<Self> {
-        let svc = envoy_service(env)?;
+    pub(crate) fn envoy(env: &Cluster, gw: &Gateway, port: u16) -> Result<Self> {
+        let svc = gw.envoy_service(env)?;
         let mut child = crate::proc::Spawned::spawn(
             env.kubectl_cmd()
                 .args(["port-forward", "-n", EG_NS])

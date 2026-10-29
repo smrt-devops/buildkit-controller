@@ -1,16 +1,15 @@
-//! The Kubernetes writes of allocation, behind a trait so the engine is
-//! testable without an API server. Every call is bounded by `kube.requestTimeout`.
+//! The Kubernetes calls of allocation, behind a trait so the front door and
+//! the binder are testable without an API server. Every call is bounded by
+//! `kube.requestTimeout`.
 
 use std::time::Duration;
 
-use buildkit_controller_api::v1alpha1::BuildKitPool;
+use buildkit_controller_api::claim::{BuildKitClaim, BuildKitClaimStatus};
 use futures::future::BoxFuture;
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret};
+use k8s_openapi::api::core::v1::{Pod, Secret};
 use kube::api::{DeleteParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::{Api, Client};
 use serde_json::{Value, json};
-
-use crate::reconcile::spawn::{PodCreated, PodOutcome, WorkerSecrets, bounded};
 
 /// Outcome of a JSON patch (claim or retire).
 #[derive(Debug, Clone)]
@@ -25,27 +24,25 @@ pub enum PatchOutcome {
     Failed(String),
 }
 
-/// Outcome of a cold-path create.
-#[derive(Debug, Clone)]
-pub enum CreateOutcome {
-    /// HTTP 201, the created pod.
-    Created(Box<Pod>),
-    /// 409 `AlreadyExists`.
+/// Outcome of a create, delete or status write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Write {
+    /// 2xx.
+    Done,
+    /// 409 `AlreadyExists` on a create.
     Exists,
-    /// 403 `exceeded quota`.
-    Quota,
-    /// Timeout, 5xx, 408 or 429.
+    /// 404, or a 409 from a failed uid precondition: the object is gone or replaced.
+    Gone,
+    /// Timeout, transport error, 5xx, 408 or 429: the write may or may not have landed.
     Unknown,
-    /// Admission, invalid, other.
-    Failed(String),
+    /// Refused for good (another 4xx), with the server's reason.
+    Refused(String),
 }
 
-/// The writes allocation makes.
-pub trait Backend: WorkerSecrets + Send + Sync + 'static {
+/// The calls allocation makes.
+pub trait Backend: Send + Sync + 'static {
     /// `application/json-patch+json` on a pod.
     fn patch_pod(&self, ns: &str, name: &str, patch: Value) -> BoxFuture<'static, PatchOutcome>;
-    /// `POST` a pod.
-    fn create_pod(&self, ns: &str, pod: Pod) -> BoxFuture<'static, CreateOutcome>;
     /// `DELETE` with a uid precondition; 404/409 count as done (`Ok`).
     fn delete_pod(
         &self,
@@ -54,47 +51,32 @@ pub trait Backend: WorkerSecrets + Send + Sync + 'static {
         uid: &str,
         grace: Option<u32>,
     ) -> BoxFuture<'static, Result<(), String>>;
-    /// Server-side apply of this replica's `status.waiters` entry.
-    fn apply_waiters(
-        &self,
-        ns: &str,
-        pool: &str,
-        replica: &str,
-        count: i32,
-        updated_at: &str,
-    ) -> BoxFuture<'static, Result<(), String>>;
-    /// `GET` a PVC; `Ok(None)` on 404.
-    fn get_pvc(
+    /// `POST` a claim.
+    fn create_claim(&self, claim: BuildKitClaim) -> BoxFuture<'static, Write>;
+    /// `GET` a claim; `Ok(None)` on 404.
+    fn get_claim(
         &self,
         ns: &str,
         name: &str,
-    ) -> BoxFuture<'static, Result<Option<PersistentVolumeClaim>, String>>;
-    /// `POST` a PVC; 409 counts as created.
-    fn create_pvc(&self, ns: &str, pvc: PersistentVolumeClaim) -> BoxFuture<'static, PvcCreate>;
-    /// `DELETE` a PVC with a uid precondition; 404/409 count as done.
-    fn delete_pvc(&self, ns: &str, name: &str, uid: &str)
-    -> BoxFuture<'static, Result<(), String>>;
-    /// JSON merge patch setting one annotation on a PVC.
-    fn annotate_pvc(
+    ) -> BoxFuture<'static, Result<Option<BuildKitClaim>, Write>>;
+    /// `DELETE` a claim with a uid precondition.
+    fn delete_claim(&self, ns: &str, name: &str, uid: &str) -> BoxFuture<'static, Write>;
+    /// Merge-patch a claim's status, if the claim is still at `resource_version`
+    /// (a 409 otherwise, which is [`Write::Gone`]).
+    fn patch_claim_status(
         &self,
         ns: &str,
         name: &str,
-        key: &str,
-        value: &str,
-    ) -> BoxFuture<'static, Result<(), String>>;
-}
-
-/// Outcome of a cold-path volume create.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PvcCreate {
-    /// HTTP 201 or 409.
-    Created,
-    /// 403 `exceeded quota`.
-    Quota,
-    /// Timeout, 5xx, 408 or 429: the volume may or may not exist.
-    Unknown(String),
-    /// Anything else.
-    Failed(String),
+        resource_version: &str,
+        status: &BuildKitClaimStatus,
+    ) -> BoxFuture<'static, Write>;
+    /// `GET` a Secret; `Ok(None)` on 404.
+    fn get_secret(&self, ns: &str, name: &str)
+    -> BoxFuture<'static, Result<Option<Secret>, Write>>;
+    /// `POST` a Secret.
+    fn create_secret(&self, secret: Secret) -> BoxFuture<'static, Write>;
+    /// `DELETE` a Secret with a uid precondition.
+    fn delete_secret(&self, ns: &str, name: &str, uid: &str) -> BoxFuture<'static, Write>;
 }
 
 /// [`Backend`] on a real API server.
@@ -109,53 +91,75 @@ impl KubeBackend {
     pub fn new(client: Client, timeout: Duration) -> Self {
         Self { client, timeout }
     }
-}
 
-/// What a failed call means for its caller.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum Class {
-    /// 422, 404, or a 409 other than `AlreadyExists`, with the server's reason.
-    Lost(String),
-    Exists,
-    Quota,
-    Unknown,
-    Failed(String),
+    fn api<K>(&self, ns: &str) -> Api<K>
+    where
+        K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>,
+        K::DynamicType: Default,
+    {
+        Api::namespaced(self.client.clone(), ns)
+    }
 }
 
 /// Sorts a failed call. Throttling (429) and request timeouts (408) count as
 /// unknown, like a 5xx: the client has no retry layer, so treating them as
 /// final would abandon a write that a later try would make.
-pub(super) fn classify(r: Result<kube::Error, tokio::time::error::Elapsed>) -> Class {
+pub(super) fn write_of(r: Result<kube::Error, tokio::time::error::Elapsed>) -> Write {
     match r {
-        Err(_) => Class::Unknown,
-        Ok(kube::Error::Api(s)) => {
-            let detail = || format!("http {} {}: {}", s.code, s.reason, s.message);
-            match s.code {
-                409 if s.reason == "AlreadyExists" => Class::Exists,
-                422 | 409 | 404 => Class::Lost(detail()),
-                403 if s.message.contains("exceeded quota") => Class::Quota,
-                408 | 429 => Class::Unknown,
-                c if c >= 500 => Class::Unknown,
-                _ => Class::Failed(detail()),
-            }
-        }
-        // Transport failures after the request may have been sent.
-        Ok(e) => Class::Unknown.or_failed(e),
+        Ok(kube::Error::Api(s)) => match s.code {
+            409 if s.reason == "AlreadyExists" => Write::Exists,
+            404 | 409 => Write::Gone,
+            408 | 429 => Write::Unknown,
+            c if c >= 500 => Write::Unknown,
+            _ => Write::Refused(format!("http {} {}: {}", s.code, s.reason, s.message)),
+        },
+        // A timeout, or a transport failure after the request may have been sent.
+        Err(_) | Ok(kube::Error::HyperError(_) | kube::Error::Service(_)) => Write::Unknown,
+        Ok(e) => Write::Refused(e.to_string()),
     }
 }
 
-impl Class {
-    fn or_failed(self, e: kube::Error) -> Self {
-        match e {
-            kube::Error::HyperError(_) | kube::Error::Service(_) => self,
-            other => Self::Failed(other.to_string()),
-        }
+/// A failed JSON patch: a failed `test` is a 422.
+fn patch_of(r: Result<kube::Error, tokio::time::error::Elapsed>) -> PatchOutcome {
+    if let Ok(kube::Error::Api(s)) = &r
+        && s.code == 422
+    {
+        return PatchOutcome::Lost;
     }
+    match write_of(r) {
+        Write::Done | Write::Exists | Write::Gone => PatchOutcome::Lost,
+        Write::Unknown => PatchOutcome::Unknown,
+        Write::Refused(m) => PatchOutcome::Failed(m),
+    }
+}
+
+/// The outcome of a bounded call.
+async fn done<T>(t: Duration, f: impl Future<Output = Result<T, kube::Error>>) -> Result<T, Write> {
+    match tokio::time::timeout(t, f).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(write_of(Ok(e))),
+        Err(e) => Err(write_of(Err(e))),
+    }
+}
+
+fn delete_params(uid: &str, grace: Option<u32>) -> DeleteParams {
+    DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: Some(uid.to_owned()),
+            resource_version: None,
+        }),
+        grace_period_seconds: grace,
+        ..DeleteParams::default()
+    }
+}
+
+fn written<T>(r: Result<T, Write>) -> Write {
+    r.map_or_else(|w| w, |_| Write::Done)
 }
 
 impl Backend for KubeBackend {
     fn patch_pod(&self, ns: &str, name: &str, patch: Value) -> BoxFuture<'static, PatchOutcome> {
-        let (api, name, t) = (self.pods(ns), name.to_owned(), self.timeout);
+        let (api, name, t) = (self.api::<Pod>(ns), name.to_owned(), self.timeout);
         Box::pin(async move {
             let patch: json_patch::Patch = match serde_json::from_value(patch) {
                 Ok(p) => p,
@@ -164,20 +168,8 @@ impl Backend for KubeBackend {
             let (pp, patch) = (PatchParams::default(), Patch::Json::<()>(patch));
             match tokio::time::timeout(t, api.patch(&name, &pp, &patch)).await {
                 Ok(Ok(pod)) => PatchOutcome::Applied(Box::new(pod)),
-                Ok(Err(e)) => from_class(classify(Ok(e))),
-                Err(e) => from_class(classify(Err(e))),
-            }
-        })
-    }
-
-    fn create_pod(&self, ns: &str, pod: Pod) -> BoxFuture<'static, CreateOutcome> {
-        let (api, t) = (self.pods(ns), self.timeout);
-        Box::pin(async move {
-            let r = tokio::time::timeout(t, api.create(&PostParams::default(), &pod)).await;
-            match r {
-                Ok(Ok(pod)) => CreateOutcome::Created(Box::new(pod)),
-                Ok(Err(e)) => created(classify(Ok(e))),
-                Err(e) => created(classify(Err(e))),
+                Ok(Err(e)) => patch_of(Ok(e)),
+                Err(e) => patch_of(Err(e)),
             }
         })
     }
@@ -189,194 +181,111 @@ impl Backend for KubeBackend {
         uid: &str,
         grace: Option<u32>,
     ) -> BoxFuture<'static, Result<(), String>> {
-        let (api, name, t) = (self.pods(ns), name.to_owned(), self.timeout);
-        let dp = DeleteParams {
-            preconditions: Some(Preconditions {
-                uid: Some(uid.to_owned()),
-                resource_version: None,
-            }),
-            grace_period_seconds: grace,
-            ..DeleteParams::default()
+        let (api, name, t) = (self.api::<Pod>(ns), name.to_owned(), self.timeout);
+        let dp = delete_params(uid, grace);
+        Box::pin(async move {
+            match written(done(t, api.delete(&name, &dp)).await) {
+                Write::Done | Write::Gone => Ok(()),
+                w => Err(format!("{w:?}")),
+            }
+        })
+    }
+
+    fn create_claim(&self, claim: BuildKitClaim) -> BoxFuture<'static, Write> {
+        let ns = claim.metadata.namespace.clone().unwrap_or_default();
+        let (api, t) = (self.api::<BuildKitClaim>(&ns), self.timeout);
+        Box::pin(async move { written(done(t, api.create(&PostParams::default(), &claim)).await) })
+    }
+
+    fn get_claim(
+        &self,
+        ns: &str,
+        name: &str,
+    ) -> BoxFuture<'static, Result<Option<BuildKitClaim>, Write>> {
+        let (api, name, t) = (self.api::<BuildKitClaim>(ns), name.to_owned(), self.timeout);
+        Box::pin(async move { done(t, api.get_opt(&name)).await })
+    }
+
+    fn delete_claim(&self, ns: &str, name: &str, uid: &str) -> BoxFuture<'static, Write> {
+        let (api, name, t) = (self.api::<BuildKitClaim>(ns), name.to_owned(), self.timeout);
+        let dp = delete_params(uid, None);
+        Box::pin(async move { written(done(t, api.delete(&name, &dp)).await) })
+    }
+
+    fn patch_claim_status(
+        &self,
+        ns: &str,
+        name: &str,
+        resource_version: &str,
+        status: &BuildKitClaimStatus,
+    ) -> BoxFuture<'static, Write> {
+        let (api, name, t) = (self.api::<BuildKitClaim>(ns), name.to_owned(), self.timeout);
+        let body = Patch::Merge(status_patch(resource_version, status));
+        Box::pin(async move {
+            written(done(t, api.patch_status(&name, &PatchParams::default(), &body)).await)
+        })
+    }
+
+    fn get_secret(
+        &self,
+        ns: &str,
+        name: &str,
+    ) -> BoxFuture<'static, Result<Option<Secret>, Write>> {
+        let (api, name, t) = (self.api::<Secret>(ns), name.to_owned(), self.timeout);
+        Box::pin(async move { done(t, api.get_opt(&name)).await })
+    }
+
+    fn create_secret(&self, secret: Secret) -> BoxFuture<'static, Write> {
+        let ns = secret.metadata.namespace.clone().unwrap_or_default();
+        let (api, t) = (self.api::<Secret>(&ns), self.timeout);
+        Box::pin(async move { written(done(t, api.create(&PostParams::default(), &secret)).await) })
+    }
+
+    fn delete_secret(&self, ns: &str, name: &str, uid: &str) -> BoxFuture<'static, Write> {
+        let (api, name, t) = (self.api::<Secret>(ns), name.to_owned(), self.timeout);
+        let dp = delete_params(uid, None);
+        Box::pin(async move { written(done(t, api.delete(&name, &dp)).await) })
+    }
+}
+
+/// The merge patch of a claim status write, preconditioned on
+/// `resource_version`. A status without a queue place sends `queuePosition:
+/// null`, so a claim that leaves `Pending` loses its place; the other fields are
+/// always written in full.
+pub(super) fn status_patch(resource_version: &str, status: &BuildKitClaimStatus) -> Value {
+    let mut s = json!(status);
+    if let Some(m) = s.as_object_mut() {
+        m.entry("queuePosition").or_insert(Value::Null);
+    }
+    json!({"metadata": {"resourceVersion": resource_version}, "status": s})
+}
+
+#[cfg(test)]
+mod tests {
+    use buildkit_controller_api::claim::{BuildKitClaimStatus, ClaimPhase};
+    use serde_json::json;
+
+    use super::status_patch;
+
+    #[test]
+    fn leaving_pending_clears_the_queue_position() {
+        let bound = BuildKitClaimStatus {
+            phase: Some(ClaimPhase::Bound),
+            ..BuildKitClaimStatus::default()
         };
-        Box::pin(async move {
-            match tokio::time::timeout(t, api.delete(&name, &dp)).await {
-                Ok(Ok(_)) => Ok(()),
-                Ok(Err(kube::Error::Api(s))) if s.code == 404 || s.code == 409 => Ok(()),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(_) => Err("timeout".into()),
-            }
-        })
-    }
-
-    fn apply_waiters(
-        &self,
-        ns: &str,
-        pool: &str,
-        replica: &str,
-        count: i32,
-        updated_at: &str,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        let api: Api<BuildKitPool> = Api::namespaced(self.client.clone(), ns);
-        let (pool, t) = (pool.to_owned(), self.timeout);
-        let pp = PatchParams::apply(&format!("buildkit-controller/{replica}")).force();
-        let body = json!({
-            "apiVersion": "buildkit.smrt-devops.net/v1alpha1",
-            "kind": "BuildKitPool",
-            "metadata": {"name": pool},
-            "status": {"waiters": [{"replica": replica, "count": count, "updatedAt": updated_at}]},
-        });
-        Box::pin(async move {
-            match tokio::time::timeout(t, api.patch_status(&pool, &pp, &Patch::Apply(body))).await {
-                Ok(Ok(_)) => Ok(()),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(_) => Err("timeout".into()),
-            }
-        })
-    }
-
-    fn get_pvc(
-        &self,
-        ns: &str,
-        name: &str,
-    ) -> BoxFuture<'static, Result<Option<PersistentVolumeClaim>, String>> {
-        let (api, name, t) = (self.pvcs(ns), name.to_owned(), self.timeout);
-        Box::pin(async move {
-            match tokio::time::timeout(t, api.get_opt(&name)).await {
-                Ok(r) => r.map_err(|e| e.to_string()),
-                Err(_) => Err("timeout".into()),
-            }
-        })
-    }
-
-    fn create_pvc(&self, ns: &str, pvc: PersistentVolumeClaim) -> BoxFuture<'static, PvcCreate> {
-        let (api, t) = (self.pvcs(ns), self.timeout);
-        Box::pin(async move {
-            match tokio::time::timeout(t, api.create(&PostParams::default(), &pvc)).await {
-                Ok(Ok(_)) => PvcCreate::Created,
-                Ok(Err(kube::Error::Api(s))) if s.code == 409 => PvcCreate::Created,
-                Ok(Err(e)) => {
-                    let detail = e.to_string();
-                    pvc_created(&classify(Ok(e)), detail)
-                }
-                Err(e) => pvc_created(&classify(Err(e)), "timeout".into()),
-            }
-        })
-    }
-
-    fn delete_pvc(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        let (api, name, t) = (self.pvcs(ns), name.to_owned(), self.timeout);
-        let dp = DeleteParams {
-            preconditions: Some(Preconditions {
-                uid: Some(uid.to_owned()),
-                resource_version: None,
-            }),
-            ..DeleteParams::default()
+        let p = status_patch("7", &bound);
+        assert_eq!(p["metadata"]["resourceVersion"], "7");
+        assert_eq!(p["status"]["queuePosition"], json!(null));
+        assert!(
+            p["status"]
+                .as_object()
+                .is_some_and(|m| m.contains_key("queuePosition"))
+        );
+        let pending = BuildKitClaimStatus {
+            phase: Some(ClaimPhase::Pending),
+            queue_position: Some(3),
+            ..BuildKitClaimStatus::default()
         };
-        Box::pin(async move {
-            match tokio::time::timeout(t, api.delete(&name, &dp)).await {
-                Ok(Ok(_)) => Ok(()),
-                Ok(Err(kube::Error::Api(s))) if s.code == 404 || s.code == 409 => Ok(()),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(_) => Err("timeout".into()),
-            }
-        })
-    }
-
-    fn annotate_pvc(
-        &self,
-        ns: &str,
-        name: &str,
-        key: &str,
-        value: &str,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        let (api, name, t) = (self.pvcs(ns), name.to_owned(), self.timeout);
-        let patch = json!({"metadata": {"annotations": {key: value}}});
-        Box::pin(async move {
-            let pp = PatchParams::default();
-            match tokio::time::timeout(t, api.patch(&name, &pp, &Patch::Merge(patch))).await {
-                Ok(Ok(_)) => Ok(()),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(_) => Err("timeout".into()),
-            }
-        })
-    }
-}
-
-impl KubeBackend {
-    fn pods(&self, ns: &str) -> Api<Pod> {
-        Api::namespaced(self.client.clone(), ns)
-    }
-
-    fn pvcs(&self, ns: &str) -> Api<PersistentVolumeClaim> {
-        Api::namespaced(self.client.clone(), ns)
-    }
-}
-
-/// A create's outcome. A refusal keeps the server's reason, so an admission
-/// or validation error is logged as the API server gave it.
-pub(super) fn created(c: Class) -> CreateOutcome {
-    match c {
-        Class::Exists => CreateOutcome::Exists,
-        Class::Quota => CreateOutcome::Quota,
-        Class::Unknown => CreateOutcome::Unknown,
-        Class::Lost(m) | Class::Failed(m) => CreateOutcome::Failed(m),
-    }
-}
-
-/// A volume create's outcome (a 409 never gets here: it counts as created).
-pub(super) fn pvc_created(c: &Class, detail: String) -> PvcCreate {
-    match c {
-        Class::Quota => PvcCreate::Quota,
-        Class::Unknown => PvcCreate::Unknown(detail),
-        Class::Lost(_) | Class::Exists | Class::Failed(_) => PvcCreate::Failed(detail),
-    }
-}
-
-pub(super) fn from_class(c: Class) -> PatchOutcome {
-    match c {
-        Class::Lost(_) | Class::Exists => PatchOutcome::Lost,
-        Class::Unknown => PatchOutcome::Unknown,
-        Class::Quota => PatchOutcome::Failed("forbidden: exceeded quota".into()),
-        Class::Failed(m) => PatchOutcome::Failed(m),
-    }
-}
-
-impl PodOutcome for CreateOutcome {
-    fn pod_created(&self) -> PodCreated {
-        match self {
-            Self::Created(p) => match (&p.metadata.name, &p.metadata.uid) {
-                (Some(name), Some(uid)) => PodCreated::Yes {
-                    name: name.clone(),
-                    uid: uid.clone(),
-                },
-                _ => PodCreated::Unknown,
-            },
-            Self::Exists | Self::Quota | Self::Failed(_) => PodCreated::No,
-            Self::Unknown => PodCreated::Unknown,
-        }
-    }
-}
-
-impl WorkerSecrets for KubeBackend {
-    fn create_worker_secret(&self, secret: &Secret) -> BoxFuture<'static, Result<(), String>> {
-        bounded(self.timeout, self.client.create_worker_secret(secret))
-    }
-
-    fn get_worker_pod(
-        &self,
-        ns: &str,
-        name: &str,
-    ) -> BoxFuture<'static, Result<Option<Pod>, String>> {
-        let (f, t) = (self.client.get_worker_pod(ns, name), self.timeout);
-        Box::pin(async move {
-            tokio::time::timeout(t, f)
-                .await
-                .unwrap_or_else(|_| Err("timeout".to_owned()))
-        })
+        assert_eq!(status_patch("7", &pending)["status"]["queuePosition"], 3);
     }
 }

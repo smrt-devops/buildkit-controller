@@ -18,11 +18,13 @@ mod gateway;
 mod helm_test;
 mod helm_verify;
 mod image;
+mod kind_all;
 mod kube;
 mod perf;
 mod proc;
 mod proxy_verify;
 mod reconcile_verify;
+mod registry_verify;
 mod render_verify;
 mod runtime_verify;
 mod soak;
@@ -39,13 +41,14 @@ use image::{image, prune};
 use perf::{perf, perf_loopback};
 use proxy_verify::proxy_verify;
 use reconcile_verify::reconcile_verify;
+use registry_verify::registry_verify;
 use render_verify::render_verify;
 use runtime_verify::runtime_verify;
 use soak::soak;
 
 /// Repository-relative path of the generated CRD.
 const CRD_PATH: &str = "helm/buildkit-controller/crds/buildkitpools.yaml";
-/// The claim CRD is a chart template so `claims.enabled` can gate it (Helm never templates `crds/`).
+/// The claim CRD is a chart template so `helm upgrade` updates it (Helm never upgrades `crds/`).
 const CLAIM_CRD_PATH: &str = "helm/buildkit-controller/templates/crd-buildkitclaims.yaml";
 
 /// Repository automation tasks.
@@ -93,6 +96,8 @@ enum Task {
     ApiVerify,
     /// Run the reconciler against a throwaway kind cluster. Covers warm pods, the pool maximum, idle and expiry handling, CA repair and replacement, the sandbox, slot holds and the absence of idle polling.
     ReconcileVerify,
+    /// Run the cache registry role on a throwaway kind cluster with two real buildkitd pods. Checks a `mode=max` registry cache export, a cache hit from a fresh daemon over mTLS, and that a read-only grant cannot push.
+    RegistryVerify,
     /// Run `helm lint` and golden `helm template` tests of the chart. Needs no cluster.
     HelmTest {
         /// Rewrite the golden files.
@@ -102,7 +107,11 @@ enum Task {
     /// Install the chart on a throwaway kind cluster with one pool and check the replicas, the leader, the pool and readiness.
     HelmVerify,
     /// Install the chart with two replicas on a throwaway kind cluster and check that stopping a replica never cuts a live build: a long build survives a rollout, the Lease moves within seconds, and a queued request gets 503 `shutting_down`.
-    DrainVerify,
+    DrainVerify {
+        /// Run the build past the old 300 s drain budget (390 s), as the nightly job does.
+        #[arg(long)]
+        long: bool,
+    },
     /// Install the chart with claims on a throwaway kind cluster and check the claim lifecycle, a real build through a claim Secret, refusal, expiry and a lost worker.
     ClaimVerify,
     /// Soak the certificate lifecycle on a throwaway kind cluster. Runs continuous builds through leaf renewals, a serving certificate swap, a leader failover, and deletion and corruption of the CA Secret.
@@ -111,8 +120,30 @@ enum Task {
     Docs,
     /// Install the chart behind Envoy Gateway with PROXY protocol on, on a throwaway kind cluster, and check that the logs and the per-address caps see client addresses, that a build through the edge works, and that an untrusted pod cannot forge its address.
     ProxyVerify,
-    /// Run the end-to-end suite on a kind cluster, exposed through Envoy Gateway. Covers chart install, the Gateway API routes, OIDC and `TokenReview`, builds, the registry cache, queueing, a long poll, multi-platform builds and the Envoy extras.
-    E2e,
+    /// Run the end-to-end suite on a kind cluster, exposed through Envoy Gateway. Covers chart install, the Gateway API routes, OIDC and `TokenReview`, builds, an external registry cache, the built-in cache registry for trusted and untrusted callers, the v0.1.0 volume sweep, queueing, a long poll, multi-platform builds and the Envoy extras.
+    E2e {
+        /// Hold scenario l's queue past five minutes (330 s), as the nightly job does.
+        #[arg(long)]
+        long: bool,
+    },
+    /// Run every kind suite but soak and perf in one go: build once, two shared clusters, suites side by side. Logs go to target/kind-all/<suite>.log.
+    KindAll {
+        /// Run only these suites (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+        /// Leave the clusters running; run a suite on one with `BK_KIND_CLUSTER=<name> cargo xtask <suite>`.
+        #[arg(long)]
+        keep: bool,
+        /// Delete the clusters a `--keep` run left, and run nothing.
+        #[arg(long)]
+        down: bool,
+        /// How many suites run at once on the shared cluster; 0 runs all of them.
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
+        /// Also run soak and perf, each on its own cluster, once the others are done.
+        #[arg(long)]
+        nightly: bool,
+    },
     /// Install the chart on kind behind Envoy Gateway, trust GitHub OIDC for REPO (owner/name) and leave the cluster running. Used by the CI Action job.
     E2eUp {
         /// Repository whose workflow tokens may allocate.
@@ -202,19 +233,27 @@ fn render_crd() -> Result<String> {
     ))
 }
 
-/// Render the claim CRD template, gated on `claims.enabled`.
+/// Render the claim CRD template. Every allocation is a claim, so the chart
+/// always installs it. It is a template rather than a `crds/` file so that
+/// `helm upgrade` updates it.
 fn render_claim_crd() -> Result<String> {
-    let mut crd = buildkit_controller_api::claim::crd();
-    // Keep the CRD, and so every claim, when the feature is turned off or the
-    // release is uninstalled.
-    crd.metadata.annotations = Some(std::collections::BTreeMap::from([(
-        "helm.sh/resource-policy".to_owned(),
-        "keep".to_owned(),
-    )]));
-    let yaml = serde_saphyr::to_string(&crd).context("serialising claim CRD")?;
     Ok(format!(
-        "{{{{- if .Values.claims.enabled }}}}\n# Generated by `cargo xtask crdgen`; do not edit.\n{yaml}{{{{- end }}}}\n"
+        "# Generated by `cargo xtask crdgen`; do not edit.\n{}",
+        claim_crd_yaml(true)?
     ))
+}
+
+/// The claim CRD as YAML; `keep` adds the annotation that keeps it, and so
+/// every claim, when the release is uninstalled.
+pub(crate) fn claim_crd_yaml(keep: bool) -> Result<String> {
+    let mut crd = buildkit_controller_api::claim::crd();
+    if keep {
+        crd.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            "helm.sh/resource-policy".to_owned(),
+            "keep".to_owned(),
+        )]));
+    }
+    serde_saphyr::to_string(&crd).context("serialising claim CRD")
 }
 
 fn crdgen(check: bool) -> Result<()> {
@@ -256,7 +295,7 @@ fn crd_verify() -> Result<()> {
     let root = root();
     let work = root.join("target/crd-verify");
     std::fs::create_dir_all(&work)?;
-    let cluster = kube::Cluster::new(&kind_cluster("bk-crd-verify"), work.join("kubeconfig"));
+    let cluster = kube::Cluster::for_suite("bk-crd-verify", &work)?;
     cluster.create(None, "120s")?;
     let version = cluster.kubectl(&["version", "-o", "json"])?;
     println!(
@@ -267,14 +306,9 @@ fn crd_verify() -> Result<()> {
             .collect::<Vec<_>>()
             .join("\n")
     );
-    let crd_file = root.join(CRD_PATH);
-    let crd_arg = crd_file.to_string_lossy().into_owned();
     cluster
-        .kubectl(&["apply", "--server-side", "-f", &crd_arg])
-        .context("CRD rejected")?;
-    cluster
-        .wait_crd_established()
-        .context("CRD not established")?;
+        .apply_crds()
+        .context("CRDs rejected or not established")?;
     let (mut passed, mut failed) = (0usize, Vec::new());
     for (dir, want_ok) in [("accept", true), ("reject", false)] {
         for file in yaml_files(&root.join(FIXTURES).join(dir))? {
@@ -333,15 +367,29 @@ fn main() -> Result<()> {
         Task::AllocVerify => alloc_verify(),
         Task::ApiVerify => api_verify(),
         Task::ReconcileVerify => reconcile_verify(),
+        Task::RegistryVerify => registry_verify(),
         Task::HelmTest { update } => helm_test(update),
         Task::HelmVerify => helm_verify(),
-        Task::DrainVerify => drain_verify(),
+        Task::DrainVerify { long } => drain_verify(long),
         Task::ClaimVerify => claim_verify(),
         Task::Soak => soak(),
         Task::Docs => docs(),
         Task::ProxyVerify => proxy_verify(),
-        Task::E2e => e2e(),
+        Task::E2e { long } => e2e(long),
         Task::E2eUp { repo } => e2e_up(&repo),
+        Task::KindAll {
+            only,
+            keep,
+            down,
+            jobs,
+            nightly,
+        } => kind_all::kind_all(&kind_all::Opts {
+            only,
+            keep,
+            down,
+            jobs,
+            nightly,
+        }),
         Task::Perf { loopback: true, .. } => perf_loopback(),
         Task::Perf {
             batches, idle_secs, ..

@@ -9,6 +9,7 @@
 //! controller's own requests are counted from the audit log.
 
 #![allow(
+    clippy::many_single_char_names,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::too_many_lines,
@@ -29,6 +30,7 @@ use buildkit_controller::render::{
     self, ANN_ALLOC, ANN_ALLOCATED_AT, ANN_EXPIRES_AT, ANN_INTERNAL_CA, ANN_WORKER_NONCE,
     LABEL_POOL,
 };
+use buildkit_controller_api::claim::BuildKitClaim;
 use buildkit_controller_api::v1alpha1::BuildKitPool;
 use futures::StreamExt;
 use k8s_openapi::api::authentication::v1::TokenRequest;
@@ -279,21 +281,32 @@ impl H {
         Ok(names)
     }
 
-    async fn set_waiters(&self, pool: &str, count: i32) {
-        let waiters = if count > 0 {
-            json!([{"replica": "rv-test", "count": count,
-                    "updatedAt": jiff::Timestamp::now().round(jiff::Unit::Second).unwrap().to_string()}])
-        } else {
-            Value::Null
-        };
-        self.pools
-            .patch_status(
-                pool,
-                &PatchParams::default(),
-                &Patch::Merge(json!({"status": {"waiters": waiters}})),
-            )
-            .await
+    /// Create `n` claims for `pool` in the controller's namespace, as the API
+    /// does for CI callers. They wait in the pool's queue, and the pool is sized
+    /// for them.
+    async fn demand(&self, pool: &str, n: usize) {
+        let claims: Api<BuildKitClaim> = Api::namespaced(self.client.clone(), &self.ctrl_ns);
+        let key = rcgen::KeyPair::generate().unwrap().public_key_pem();
+        for i in 0..n {
+            let c: BuildKitClaim = serde_json::from_value(json!({
+                "apiVersion": "buildkit.smrt-devops.net/v1alpha1", "kind": "BuildKitClaim",
+                "metadata": {"name": format!("demand-{pool}-{i}"), "namespace": self.ctrl_ns},
+                "spec": {"poolRef": {"namespace": NS, "name": pool}, "ttl": "1h",
+                    "queueTimeout": "10m", "owner": "sa:bk-rv/demand", "publicKey": key}
+            }))
             .unwrap();
+            claims.create(&PostParams::default(), &c).await.unwrap();
+        }
+    }
+
+    /// Delete every claim of `pool` that [`H::demand`] made.
+    async fn no_demand(&self, pool: &str) {
+        let claims: Api<BuildKitClaim> = Api::namespaced(self.client.clone(), &self.ctrl_ns);
+        for c in claims.list(&ListParams::default()).await.unwrap().items {
+            if c.name_any().starts_with(&format!("demand-{pool}-")) {
+                let _ = claims.delete(&c.name_any(), &DeleteParams::default()).await;
+            }
+        }
     }
 
     fn deletes_since(&self, mark: usize, pool: &str) -> Vec<String> {
@@ -490,7 +503,7 @@ impl Replica {
         Self { child, api }
     }
 
-    /// SIGKILL: no orphan guard runs, nothing is cleaned up.
+    /// SIGKILL: nothing is cleaned up.
     fn kill(&mut self) {
         self.child.kill().unwrap();
         self.child.wait().unwrap();
@@ -522,10 +535,6 @@ async fn sa_token(client: &Client, name: &str) -> String {
         .status
         .unwrap()
         .token
-}
-
-fn ts(p: &Pod, key: &str) -> jiff::Timestamp {
-    p.annotations()[key].parse().unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -742,16 +751,21 @@ async fn reconcile_verify() {
         blocks(&before)
     ));
 
-    // 2. A demand burst never exceeds max.
+    // 2. A demand burst never exceeds max. Ten claims wait; the pool grows to
+    // max 4 for them, the four oldest bind and six stay counted in `waiting`.
     let mark = h.mark();
-    h.set_waiters("p", 10).await;
-    let took = until("4 Ready free pods in p", 300, || async {
-        h.counts("p").await == (4, 4)
+    h.demand("p", 10).await;
+    let allocated = |pods: &[Pod]| {
+        pods.iter()
+            .filter(|p| ready(p) && !matches!(alloc(p), "" | "free" | "draining"))
+            .count()
+    };
+    let took = until("4 Ready pods bound in p", 300, || async {
+        let pods = h.list("p").await;
+        pods.len() == 4 && allocated(&pods) == 4
     })
     .await;
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    let p = h.pool("p").await;
-    let st = p.status.clone().unwrap();
+    let st = until_status(&h, "p", 60, |s| s.waiting == Some(6)).await;
     let (peak, names) = {
         let r = rec.lock().unwrap();
         let names: BTreeSet<String> = r.pods[mark..]
@@ -767,19 +781,26 @@ async fn reconcile_verify() {
             .iter()
             .all(|n| ["p-0", "p-1", "p-2", "p-3"].contains(&n.as_str()))
     );
-    assert_eq!(
-        (st.waiting, st.desired_warm),
-        (Some(10), Some(4)),
-        "desiredWarm is capped by free slots"
-    );
     summary.push(format!(
-        "S2 PASS: waiters=10, max=4: 4 Ready in {}s, peak {peak} pods, names {names:?}, status waiting 10, desiredWarm 4 (capped by slots)",
-        took.as_secs()
+        "S2 PASS: 10 pending claims, max=4: 4 pods Ready and bound in {}s, peak {peak} pods, names {names:?}, status waiting 6, desiredWarm {:?}",
+        took.as_secs(),
+        st.desired_warm
     ));
+    // The claims go: the sweep retires their pods, and min 2 warm pods come back.
+    h.no_demand("p").await;
+    until("p back to 2 Ready free pods", 300, || async {
+        h.counts("p").await == (2, 2)
+    })
+    .await;
 
-    // 3. Idle reaping. Once demand is gone, free pods above min retire after idleTimeout (1m).
+    // 3. Idle reaping. Free pods above min retire after idleTimeout (1m).
+    scale(&h, "p", 4).await;
+    until("4 Ready free pods in p", 300, || async {
+        h.counts("p").await == (4, 4)
+    })
+    .await;
     let mark = h.mark();
-    h.set_waiters("p", 0).await;
+    scale(&h, "p", 2).await;
     let took = until("p back to 2 pods", 180, || async {
         h.counts("p").await == (2, 2)
     })
@@ -1018,8 +1039,13 @@ async fn reconcile_verify() {
         cond(&h.pool("q").await, "Degraded") == Some(("True".into(), "SlotTaken".into()))
     })
     .await;
-    tokio::time::sleep(Duration::from_secs(70)).await;
-    let conflicts = completed(&audit())
+    // 9 shares this window. With q-0 held for 10 minutes after its one 409 the
+    // controller has nothing to do, so the same minute shows it does not poll.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let before = audit().len();
+    tokio::time::sleep(Duration::from_mins(1)).await;
+    let all = audit();
+    let conflicts = completed(&all)
         .filter(|e| {
             e["verb"] == "create"
                 && e["objectRef"]["resource"] == "pods"
@@ -1034,11 +1060,7 @@ async fn reconcile_verify() {
         "S8 PASS: Degraded=SlotTaken; creates of q-0 over 70s+: {conflicts:?} (one 409 per 10 min hold); pod_operations_total sum {metric_409}"
     ));
 
-    // 9. The controller does not poll the API while idle.
-    tokio::time::sleep(Duration::from_secs(10)).await;
-    let before = audit().len();
-    tokio::time::sleep(Duration::from_mins(1)).await;
-    let all = audit();
+    // 9. The controller does not poll the API while idle (the minute above).
     let mut idle: BTreeMap<String, usize> = BTreeMap::new();
     for e in completed(&all[before..]) {
         *idle.entry(key(e)).or_default() += 1;
@@ -1072,8 +1094,9 @@ async fn reconcile_verify() {
         "S9 PASS: 60s idle: {renewals} lease renewals (<= 35), {watches} watch completions (<= 8), no other request; all: {idle:?}"
     ));
 
-    // 10 and 11 run a second replica, which serves the API, against pool `r`.
-    // The pool keeps no warm pods, so each allocation creates its pod.
+    // 10, 11 and 12 run a second replica, which serves the API, against pool `r`.
+    // The pool keeps no warm pods, so each allocation waits as a claim while the
+    // leader creates a pod for it.
     let start_timeout = 20;
     let mut pool_r = pool_json("r", &h.image, 0, 1, "Allow");
     pool_r.spec.workers.start_timeout =
@@ -1087,20 +1110,57 @@ async fn reconcile_verify() {
     })
     .await;
     let mut replica = Replica::start("rv-1").await;
+    let leader_api = std::fs::read_to_string(env("RV_CONFIG"))
+        .unwrap()
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("api: ").map(str::to_owned))
+        .unwrap();
     let token = sa_token(&client, "builder").await;
     let http = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .unwrap();
-    let allocate = || {
+    let allocate = |api: &str| {
         let req = http
-            .post(format!("https://{}/v1/allocations", replica.api))
+            .post(format!("https://{api}/v1/allocations"))
             .bearer_auth(&token)
             .json(
-                &json!({"namespace": NS, "pool": "r", "ttlSeconds": 3600, "queueTimeoutSeconds": 0,
+                &json!({"namespace": NS, "pool": "r", "ttlSeconds": 3600, "queueTimeoutSeconds": 120,
                 "publicKey": rcgen::KeyPair::generate().unwrap().public_key_pem()}),
             );
         tokio::spawn(req.send())
+    };
+    // Follow a 201 or 202 to the bound allocation, as a client does.
+    let bound = |api: String, resp: reqwest::Response| {
+        let (http, token) = (http.clone(), token.clone());
+        async move {
+            let mut st = resp.status();
+            let mut body: Value = resp.json().await.unwrap();
+            while st == reqwest::StatusCode::ACCEPTED {
+                let id = body["id"].as_str().unwrap().to_owned();
+                let r = http
+                    .get(format!("https://{api}/v1/allocations/{id}?wait=25s"))
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .unwrap();
+                st = r.status();
+                body = r.json().await.unwrap();
+            }
+            assert!(st.is_success(), "{st} {body}");
+            body
+        }
+    };
+    let release = |api: String, id: String| {
+        let (http, token) = (http.clone(), token.clone());
+        async move {
+            http.delete(format!("https://{api}/v1/allocations/{id}"))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
     };
     let r_secrets = || async {
         Api::<Secret>::namespaced(client.clone(), NS)
@@ -1112,18 +1172,34 @@ async fn reconcile_verify() {
             .map(|s| s.name_any())
             .collect::<Vec<_>>()
     };
-    let claimed = |p: &Pod| !matches!(alloc(p), "" | "free" | "draining");
+    let claims: Api<BuildKitClaim> = Api::namespaced(client.clone(), &ctrl_ns);
+    let live_claims_of_r = || async {
+        claims
+            .list(&ListParams::default())
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .filter(|c| c.spec.pool_ref.name == "r")
+            .filter(|c| {
+                !c.status
+                    .as_ref()
+                    .and_then(|s| s.phase)
+                    .is_some_and(buildkit_controller_api::claim::ClaimPhase::is_terminal)
+            })
+            .map(|c| c.name_any())
+            .collect::<Vec<_>>()
+    };
 
     // 12. Cold-start latency, printed for comparison across changes: each of
-    // five allocations creates its pod. Pod times are watch receipt times.
+    // five allocations waits for its pod. Pod times are watch receipt times.
     let (mut answered, mut started) = (Vec::new(), Vec::new());
     for _ in 0..5 {
         let mark = h.mark();
         let sent = Instant::now();
-        let resp = allocate().await.unwrap().unwrap();
-        assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+        let resp = allocate(&replica.api).await.unwrap().unwrap();
+        let body = bound(replica.api.clone(), resp).await;
         answered.push(sent.elapsed().as_millis());
-        let body: Value = resp.json().await.unwrap();
         let uid = h.pods.get("r-0").await.unwrap().metadata.uid.unwrap();
         {
             let log = rec.lock().unwrap();
@@ -1132,17 +1208,11 @@ async fn reconcile_verify() {
                 .as_millis();
             started.push(u128::try_from(ms).unwrap());
         }
-        let released = http
-            .delete(format!(
-                "https://{}/v1/allocations/{}",
-                replica.api,
-                body["id"].as_str().unwrap()
-            ))
-            .bearer_auth(&token)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(released.status(), reqwest::StatusCode::NO_CONTENT);
+        let id = body["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            release(replica.api.clone(), id).await,
+            reqwest::StatusCode::NO_CONTENT
+        );
         until("r-0 released and gone", 60, || async {
             h.deletes_since(mark, "r").contains(&"r-0".to_owned()) && h.list("r").await.is_empty()
         })
@@ -1157,30 +1227,30 @@ async fn reconcile_verify() {
         )
     };
     summary.push(format!(
-        "S12 latency (n=5): POST to 201 {}; pod seen to Ready {}",
+        "S12 latency (n=5): POST to bound {}; pod seen to Ready {}",
         stats(&mut answered),
         stats(&mut started)
     ));
     println!("{}", summary.last().unwrap());
 
-    // 10. A client that gives up mid cold start (a cancelled CI job) leaves
-    // neither the pod nor its worker Secret behind.
+    // 10. A client that gives up while its claim waits (a cancelled CI job)
+    // leaves no claim behind; the pod made for it retires (idle or released)
+    // with its worker Secret.
     let mark = h.mark();
-    let inflight = allocate();
+    let inflight = allocate(&replica.api);
     soon("r-0 created", 60, || async {
         h.pods.get_opt("r-0").await.unwrap().is_some()
     })
     .await;
     inflight.abort();
-    let pre = h.pods.get("r-0").await.unwrap();
-    assert!(
-        claimed(&pre) && !ready(&pre),
-        "r-0 not mid cold start: {pre:?}"
-    );
     let took = until(
-        "r-0 retired and its worker Secret collected",
-        120,
-        || async { h.list("r").await.is_empty() && r_secrets().await.is_empty() },
+        "the claim gone, r-0 retired and its worker Secret collected",
+        150,
+        || async {
+            live_claims_of_r().await.is_empty()
+                && h.list("r").await.is_empty()
+                && r_secrets().await.is_empty()
+        },
     )
     .await;
     let seq: Vec<String> = rec.lock().unwrap().pods[mark..]
@@ -1190,84 +1260,54 @@ async fn reconcile_verify() {
         .collect();
     assert!(seq.contains(&"apply:draining".to_owned()), "{seq:?}");
     summary.push(format!(
-        "S10 PASS: client cancelled mid cold start; r-0 retired and no worker Secret of r left after {}s; sequence {seq:?}",
+        "S10 PASS: client cancelled while its claim waited; claim deleted, r-0 retired and no worker Secret of r left after {}s; sequence {seq:?}",
         took.as_secs()
     ));
 
-    // 11. A replica killed (SIGKILL) between the claim and the response
-    // holds the pod only until the claim's short expiry, at most
-    // startTimeout + 60 s, and the leader then retires it.
-    let mark = h.mark();
-    let inflight = allocate();
-    soon("r-0 created pre-claimed", 60, || async {
-        h.pods
-            .get_opt("r-0")
-            .await
-            .unwrap()
-            .is_some_and(|p| claimed(&p))
-    })
-    .await;
+    // 11. The claim outlives the replica that took the POST: rv-1 is SIGKILLed
+    // while the POST waits on it. The leader binds the claim anyway, and the
+    // leader's own API answers for it and releases it.
+    let inflight = allocate(&replica.api);
+    let id = {
+        let end = Instant::now() + Duration::from_mins(1);
+        loop {
+            if let Some(n) = live_claims_of_r().await.pop() {
+                break n;
+            }
+            assert!(Instant::now() < end, "no claim for the POST");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
     replica.kill();
     inflight.abort();
-    let pre = h.pods.get("r-0").await.unwrap();
-    assert!(
-        !ready(&pre),
-        "r-0 was Ready before the kill, so it may have committed"
-    );
-    let id = alloc(&pre).to_owned();
-    let (allocated, expires) = (ts(&pre, ANN_ALLOCATED_AT), ts(&pre, ANN_EXPIRES_AT));
-    let bound = jiff::SignedDuration::from_secs(start_timeout + 60);
-    let window = expires.duration_since(allocated);
-    assert!(
-        window >= bound && window <= bound + jiff::SignedDuration::from_secs(1),
-        "claim window {window:?}, want startTimeout + 60 s"
-    );
-    // The pod starts, so no start timeout applies: only the expiry can free it.
-    until("r-0 Running with an IP", 60, || async {
-        h.pods
-            .get("r-0")
-            .await
-            .unwrap()
-            .status
-            .is_some_and(|s| s.phase.as_deref() == Some("Running") && s.pod_ip.is_some())
+    let took = until("the orphaned claim bound", 120, || async {
+        claims.get(&id).await.unwrap().status.and_then(|s| s.phase)
+            == Some(buildkit_controller_api::claim::ClaimPhase::Bound)
     })
     .await;
-    let check_at = expires - jiff::SignedDuration::from_secs(2);
-    tokio::time::sleep(
-        check_at
-            .duration_since(jiff::Timestamp::now())
-            .unsigned_abs(),
-    )
-    .await;
-    assert!(jiff::Timestamp::now() < expires);
+    let r = http
+        .get(format!("https://{leader_api}/v1/allocations/{id}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::OK);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["id"], id.as_str());
+    let mark = h.mark();
     assert_eq!(
-        alloc(&h.pods.get("r-0").await.unwrap()),
-        id,
-        "r-0 retired early"
+        release(leader_api.clone(), id.clone()).await,
+        reqwest::StatusCode::NO_CONTENT
     );
-    until("r-0 deleted", 90, || async {
+    until("r-0 released and its Secret collected", 120, || async {
         h.deletes_since(mark, "r").contains(&"r-0".to_owned())
-    })
-    .await;
-    let first_drain = rec.lock().unwrap().pods[mark..]
-        .iter()
-        .find(|e| e.1 == "r-0" && e.3 == "draining")
-        .map(|e| e.4)
-        .expect("draining seen");
-    let late = first_drain.duration_since(expires);
-    assert!(
-        late >= jiff::SignedDuration::ZERO && late <= jiff::SignedDuration::from_secs(5),
-        "first draining {late:?} after the claim's expires-at (want 0..=5 s)"
-    );
-    until("r's worker Secret collected", 60, || async {
-        r_secrets().await.is_empty()
+            && h.list("r").await.is_empty()
+            && r_secrets().await.is_empty()
     })
     .await;
     summary.push(format!(
-        "S11 PASS: replica SIGKILLed mid cold start; claim expires-at = allocated-at + {}s; leader retired r-0 {:.1}s after it ({:.0}s after the claim), Secret collected",
-        window.as_secs(),
-        late.as_secs_f64(),
-        first_drain.duration_since(allocated).as_secs_f64()
+        "S11 PASS: rv-1 SIGKILLed while a POST waited on it; its claim bound {}s later, the leader's API answered 200 for {id} and released it",
+        took.as_secs()
     ));
 
     // Every controller request the API server rejected over the whole run.
@@ -1305,4 +1345,34 @@ async fn reconcile_verify() {
     let conds = rec.lock().unwrap().conds.clone();
     summary.push(format!("conditions seen: {conds:?}"));
     println!("\n==== reconcile-verify ====\n{}", summary.join("\n"));
+}
+
+/// Set `scaling.min` of `pool`.
+async fn scale(h: &H, pool: &str, min: i32) {
+    h.pools
+        .patch(
+            pool,
+            &PatchParams::default(),
+            &Patch::Merge(json!({"spec": {"scaling": {"min": min}}})),
+        )
+        .await
+        .unwrap();
+}
+
+/// The status of `pool` once `f` holds for it.
+async fn until_status(
+    h: &H,
+    pool: &str,
+    secs: u64,
+    f: impl Fn(&buildkit_controller_api::v1alpha1::BuildKitPoolStatus) -> bool,
+) -> buildkit_controller_api::v1alpha1::BuildKitPoolStatus {
+    let end = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let st = h.pool(pool).await.status.unwrap_or_default();
+        if f(&st) {
+            return st;
+        }
+        assert!(Instant::now() < end, "{pool} status never matched: {st:?}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }

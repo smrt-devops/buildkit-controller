@@ -25,10 +25,10 @@ pub struct CreateAllocationRequest {
     /// server then generates the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
-    /// Cache key of both cache layers. Defaults to the pool's `registry.defaultKey`, else its name.
+    /// Tag of the cache in the caller's scope, so one caller can keep several caches. Defaults to the pool name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_key: Option<CacheKey>,
-    /// Which cache layers to use. Defaults to `auto`.
+    /// Whether to use the cache. Defaults to `auto`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheChoice>,
 }
@@ -39,43 +39,37 @@ pub struct CreateAllocationRequest {
 )]
 #[serde(rename_all = "lowercase")]
 pub enum CacheChoice {
-    /// Every layer the pool enables.
+    /// The built-in cache registry, when the controller runs one.
     #[default]
     Auto,
-    /// Only the registry cache; 400 when the pool has none.
-    Registry,
-    /// Only local volumes; 400 when the pool has none.
-    Local,
-    /// No cache layer.
+    /// No cache.
     None,
 }
 
 /// `cache` of the `201` response.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheResponse {
     /// The effective cache key.
     pub key: String,
-    /// buildx flags of the registry cache.
+    /// buildx flags for the built-in cache registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub registry: Option<crate::v1alpha1::RegistryCacheFlags>,
-    /// Local volume outcome.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local: Option<LocalCacheResult>,
+    pub registry: Option<RegistryCacheFlags>,
 }
 
-/// `cache.local` of the `201` response.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// buildx flags for the built-in cache registry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct LocalCacheResult {
-    /// `hit`, `miss`, `spill`, `cold` or `uncached`, or
-    /// `reused` when the request left out the local layer.
-    pub result: String,
+pub struct RegistryCacheFlags {
+    /// `--cache-to` value. Absent when the caller may only read the cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// `--cache-from` values, in order.
+    pub from: Vec<String>,
 }
 
 /// `cacheKey` of `POST /v1/allocations`: a Kubernetes label value of 1 to 63
-/// characters (`^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$`). The allocator
-/// uses it for the registry ref and the local volume preference.
+/// characters (`^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$`), used as the cache tag.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct CacheKey(String);
@@ -136,9 +130,31 @@ pub struct AllocationResponse {
     pub client_key: Option<String>,
     /// RFC 3339 UTC expiry.
     pub expires_at: String,
-    /// Cache flags and outcome; absent when no cache layer applies.
+    /// Cache flags; absent when the controller runs no cache or the request asked for none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheResponse>,
+}
+
+/// The `202 Accepted` body of `POST /v1/allocations` and `GET /v1/allocations/{id}`
+/// while the allocation waits in the pool's queue.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingAllocation {
+    /// Allocation id. Poll `GET /v1/allocations/{id}?wait=25s` until it is bound.
+    pub id: String,
+    /// Always `pending`.
+    pub state: AllocationState,
+    /// 1-based place in the pool's queue, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<u32>,
+}
+
+/// `state` of [`PendingAllocation`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AllocationState {
+    /// Waiting for a worker.
+    Pending,
 }
 
 /// One entry of `GET /v1/pools`.
@@ -157,7 +173,7 @@ pub struct PoolSummary {
     pub starting: i32,
     /// Number of allocated pods.
     pub allocated: i32,
-    /// Number of requests queued across replicas.
+    /// Number of allocations waiting in the pool's queue.
     pub waiting: i32,
     /// Value of `scaling.min`.
     pub min: i32,
@@ -215,20 +231,22 @@ pub enum ErrorCode {
     UnsupportedMediaType,
     /// HTTP 500 for an unexpected error.
     Internal,
-    /// HTTP 503 when the queue timeout expires, the queue timeout is `0s`, or the replica queue is full.
+    /// HTTP 503 when the allocation waited its whole queue timeout (at once with `0s`)
+    /// without a worker.
     PoolExhausted,
-    /// HTTP 503 when a cold pod is not Ready within `startTimeout`.
+    /// HTTP 503 when a worker pod is not Ready within `startTimeout`. Not sent since
+    /// allocations queue as claims; kept so older clients still parse it.
     StartTimeout,
-    /// HTTP 503 when a cold pod is deleted or changed while the request waits.
+    /// HTTP 503 when the worker pod of a bound allocation is gone.
     PodLost,
     /// HTTP 503 when pool `Ready` is not True for a reason other than the CA.
     NotReady,
     /// HTTP 503 when the CA never loaded or is invalid.
     CaUnavailable,
-    /// HTTP 503 when a Kubernetes API call times out or returns 5xx and the outcome is unknown.
+    /// HTTP 503 when a Kubernetes API call times out or returns 5xx. Retry after `Retry-After`.
     UpstreamError,
-    /// HTTP 503 when the replica is shutting down and took no pod for the request. Retry
-    /// at once: the replica has already left the Service endpoints.
+    /// HTTP 503 when the replica is shutting down. Not sent since allocations queue as
+    /// claims, which outlive a replica; kept so older clients still parse it.
     ShuttingDown,
 }
 
@@ -260,6 +278,7 @@ impl ErrorCode {
         match self {
             Self::PoolExhausted | Self::StartTimeout => Some(5),
             Self::ShuttingDown => Some(1),
+            Self::UpstreamError => Some(2),
             _ => None,
         }
     }

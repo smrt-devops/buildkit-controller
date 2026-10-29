@@ -12,6 +12,9 @@
 //! d. Deleting the pod cuts a live session, and the task measures the latency.
 //! e. A 512 MiB COPY through the edge, compared with one direct to buildkitd,
 //!    in MB/s.
+//! f. No certificate a worker holds (its serving cert, its registry client
+//!    cert, another worker's) is accepted by buildkitd, dialled from a pod the
+//!    worker `NetworkPolicy` admits; the edge client cert is.
 //!
 //! The controller's RBAC is the chart's (`templates/rbac.yaml`, rendered with
 //! `helm template`), so the "no 403s" check covers the RBAC that ships. Every
@@ -27,12 +30,13 @@ use anyhow::{Context, Result, bail, ensure};
 use buildkit_controller::pki::{AllocationId, CaBundle, LeafKey, WorkerIdentity};
 use buildkit_controller::render::fixtures::pool;
 use buildkit_controller::render::{
-    BUILDKIT_PORT, Claim, PodInputs, WorkerTlsPem, service_account, worker_pod, worker_secret,
+    ANN_ALLOC, ANN_ALLOCATED_AT, ANN_EXPIRES_AT, ANN_OWNER, BUILDKIT_PORT, LABEL_STATE, PodInputs,
+    WorkerTlsPem, service_account, worker_pod, worker_secret,
 };
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::{CRD_PATH, root};
+use super::root;
 use crate::image::WORKER_IMAGE;
 use crate::kube::Cluster;
 use crate::proc::{Spawned, status};
@@ -41,7 +45,6 @@ const NS: &str = "bk-edge";
 const POOL: &str = "edge";
 /// The worker pod's nonce; the edge dials `<NONCE>.<pod>.<pool>.<ns>`.
 const NONCE: &str = "0123456789abcdef";
-const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const ALLOC: &str = "mfrggzdfmztwq2lknnwg23tpoa";
 const OTHER_ALLOC: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbb";
 /// 512 MiB.
@@ -108,12 +111,15 @@ done
 
 /// The controller's `ServiceAccount` and RBAC, rendered from the chart for the
 /// release `bk` in [`SYSTEM_NS`]. `tls_secret` is the chart's
-/// `edge.tls.secretName`, which the RBAC lets the controller read.
-pub(crate) fn chart_rbac(tls_secret: &str) -> Result<String> {
+/// `edge.tls.secretName`, which the RBAC lets the controller read. `watch` is
+/// `watchNamespaces`; empty means cluster-wide.
+pub(crate) fn chart_rbac(tls_secret: &str, watch: &[&str]) -> Result<String> {
     let chart = root().join("helm/buildkit-controller");
+    let mut helm = crate::kube::helm(&crate::kube::sandbox());
+    // `{}` would be one empty name, so cluster-wide sets nothing.
+    let watch_set = (!watch.is_empty()).then(|| format!("watchNamespaces={{{}}}", watch.join(",")));
     let rbac = crate::proc::stdout(
-        crate::kube::helm(&crate::kube::sandbox())
-            .args(["template", "bk"])
+        helm.args(["template", "bk"])
             .arg(&chart)
             .args(["-n", SYSTEM_NS])
             .args(["--show-only", "templates/serviceaccount.yaml"])
@@ -122,7 +128,8 @@ pub(crate) fn chart_rbac(tls_secret: &str) -> Result<String> {
             .args(["--set", "gateway.enabled=false"])
             .args(["--set", "edge.endpoint=tcp://bk.example.com:8444"])
             .args(["--set", "edge.serverName=bk.example.com"])
-            .args(["--set-string", &format!("edge.tls.secretName={tls_secret}")]),
+            .args(["--set-string", &format!("edge.tls.secretName={tls_secret}")])
+            .args(watch_set.iter().flat_map(|s| ["--set", s.as_str()])),
     )
     .context("rendering the chart's RBAC")?;
     Ok(rbac + "\n---\n")
@@ -251,23 +258,18 @@ pub(crate) fn edge_verify() -> Result<()> {
     let work = root.join("target/edge-verify");
     std::fs::create_dir_all(&work)?;
     let cleanup = Cleanup(
-        Cluster::new(
-            &super::kind_cluster("bk-edge-verify"),
-            work.join("kubeconfig"),
-        ),
+        Cluster::for_suite("bk-edge-verify", &work)?,
         std::cell::Cell::new(false),
     );
     let env = &cleanup.0;
     env.create(None, "120s")?;
 
-    super::image::image(CONTROLLER_IMAGE, Some(env.name()))?;
+    crate::image::load_controller(env)?;
     crate::image::ensure_worker()?;
     status(&mut crate::kube::kind_load(WORKER_IMAGE, env.name()))?;
 
-    let crd = root.join(CRD_PATH).to_string_lossy().into_owned();
-    env.kubectl(&["apply", "--server-side", "-f", &crd])?;
-    env.wait_crd_established()?;
-    env.kubectl(&["create", "namespace", SYSTEM_NS])?;
+    env.apply_crds()?;
+    env.namespace(SYSTEM_NS)?;
     // The controller pod must pass PodSecurity "restricted".
     env.kubectl(&[
         "label",
@@ -286,7 +288,17 @@ pub(crate) fn edge_verify() -> Result<()> {
         &work.join("ca"),
         ca.to_secret_data(),
     )?;
-    env.apply(&(chart_rbac("")? + &controller_fixture()?))?;
+    // Scoped to the pool namespace, so it leaves other suites on a shared cluster alone.
+    let controller = controller_fixture()?.replacen(
+        "\n    edge:\n",
+        &format!("\n    watchNamespaces: [{NS}]\n    edge:\n"),
+        1,
+    );
+    ensure!(
+        controller.contains("watchNamespaces"),
+        "no edge: key in the controller fixture config"
+    );
+    env.apply(&(chart_rbac("", &[NS])? + &controller))?;
 
     let pod_ip = deploy(env, &work, &ca, now)?;
 
@@ -343,23 +355,35 @@ fn deploy(env: &Cluster, work: &Path, ca: &CaBundle, now: OffsetDateTime) -> Res
     p.metadata.uid = Some(uid);
 
     let serving = ca.issue_worker_serving(&worker_identity()?, now)?;
-    let tls = WorkerTlsPem::from_pki(&serving, ca.internal_ca())?;
+    let client = ca.issue_worker_client_for(&worker_identity()?, now, time::Duration::days(30))?;
+    let tls = WorkerTlsPem::from_pki(&serving, &client, ca.internal_ca())?;
     let expires = now + Duration::from_hours(2);
     let inputs = PodInputs {
         slot: 0,
         internal_ca_fingerprint: ca.internal_ca().fingerprint_hex(),
         worker_cert_not_after: rfc3339(serving_not_after(now))?,
         nonce: NONCE.into(),
-        claim: Some(Claim {
-            alloc_id: ALLOC.into(),
-            owner: "sa:bk-edge/edge-verify".into(),
-            allocated_at: rfc3339(now)?,
-            expires_at: rfc3339(expires)?,
-        }),
     };
+    // Created already allocated, as a bind would leave it.
+    let mut worker_obj = worker_pod(&p, &inputs)?;
+    worker_obj
+        .metadata
+        .labels
+        .get_or_insert_default()
+        .insert(LABEL_STATE.into(), "allocated".into());
+    worker_obj
+        .metadata
+        .annotations
+        .get_or_insert_default()
+        .extend([
+            (ANN_ALLOC.to_owned(), ALLOC.to_owned()),
+            (ANN_OWNER.to_owned(), "sa:bk-edge/edge-verify".to_owned()),
+            (ANN_ALLOCATED_AT.to_owned(), rfc3339(now)?),
+            (ANN_EXPIRES_AT.to_owned(), rfc3339(expires)?),
+        ]);
     env.apply(&yaml(&service_account(&p)?)?)?;
-    env.apply(&yaml(&worker_secret(&p, &inputs, &tls)?)?)?;
-    env.apply(&yaml(&worker_pod(&p, &inputs)?)?)?;
+    env.apply(&yaml(&worker_secret(&p, &inputs, &tls, None)?)?)?;
+    env.apply(&yaml(&worker_obj)?)?;
     let worker = format!("{POOL}-0");
     env.kubectl(&[
         "-n",
@@ -499,6 +523,8 @@ fn scenarios(env: &Cluster, pod_ip: &str, r: &mut Report) -> Result<Vec<f64>> {
             last_line(&out)
         ),
     );
+
+    worker_certs_refused(env, &direct, r)?;
 
     // e. Runs before d, which deletes the worker.
     let mut rates = Vec::new();
@@ -645,6 +671,7 @@ fn client_certs(
         })
     };
     let hour = Duration::from_hours(1);
+    let month = time::Duration::days(30);
     let certs = [
         (
             "alloc",
@@ -659,6 +686,16 @@ fn client_certs(
             ca.issue_allocation(&id(OTHER_ALLOC)?, LeafKey::Generate, now, expires)?,
         ),
         ("direct", ca.issue_edge_client(now)?),
+        // What a worker holds: its serving cert and its registry client cert.
+        (
+            "w1client",
+            ca.issue_worker_client_for(&worker_identity()?, now, month)?,
+        ),
+        ("w2serve", ca.issue_worker_serving(&other_worker()?, now)?),
+        (
+            "w2client",
+            ca.issue_worker_client_for(&other_worker()?, now, month)?,
+        ),
     ];
     let mut files = std::collections::BTreeMap::new();
     files.insert(
@@ -721,9 +758,70 @@ fn worker_identity() -> Result<WorkerIdentity> {
     })
 }
 
+/// Scenario f. No certificate a worker holds opens a buildkitd: the client pod in
+/// the controller namespace passes the worker `NetworkPolicy`, so only TLS decides.
+/// The edge client cert is the control that the path is open.
+fn worker_certs_refused(
+    env: &Cluster,
+    direct: &dyn Fn(&str) -> String,
+    r: &mut Report,
+) -> Result<()> {
+    let (ok, out) = client_in(
+        env,
+        SYSTEM_NS,
+        &format!("timeout 30 {} debug workers", direct("direct")),
+    )?;
+    r.check(
+        "f/edge client cert direct to worker accepted",
+        ok,
+        last_line(&out),
+    );
+    for (cert, what) in [
+        ("w2serve", "another worker's serving cert"),
+        ("w2client", "another worker's registry client cert"),
+        ("w1client", "the worker's own registry client cert"),
+    ] {
+        let (ok, out) = client_in(
+            env,
+            SYSTEM_NS,
+            &format!(
+                "timeout 30 {} debug workers; rc=$?; echo rc=$rc; exit $rc",
+                direct(cert)
+            ),
+        )?;
+        r.check(
+            &format!("f/{what} refused by buildkitd"),
+            !ok && out.contains("rc=1") && !out.contains("connection refused"),
+            last_line(&out),
+        );
+    }
+
+    Ok(())
+}
+
+/// Another worker of the pool: credentials of the same CA the target worker
+/// must refuse.
+fn other_worker() -> Result<WorkerIdentity> {
+    Ok(WorkerIdentity {
+        pod: format!("{POOL}-1"),
+        nonce: "00000000000000bb".into(),
+        ..worker_identity()?
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (soak, perf): cluster-wide RBAC once rendered with
+    /// `watchNamespaces={}`, which the chart schema rejects as one empty name.
+    #[test]
+    fn chart_rbac_renders_cluster_wide_and_scoped() {
+        let wide = chart_rbac("", &[]).unwrap();
+        assert!(wide.contains("kind: ClusterRole"), "{wide}");
+        let scoped = chart_rbac("", &[NS]).unwrap();
+        assert!(scoped.contains(&format!("namespace: {NS}")), "{scoped}");
+    }
 
     /// The controller's RBAC comes from the chart only; a hand-written copy
     /// here would be what edge-verify, soak and perf test instead.

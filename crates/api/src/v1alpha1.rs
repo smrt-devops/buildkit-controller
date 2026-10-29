@@ -11,7 +11,7 @@ use k8s_openapi::api::core::v1::{
     TopologySpreadConstraint, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube_derive::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -454,7 +454,7 @@ pub struct Workers {
     /// How long a pod may take to become Ready, from 10s to 30m.
     #[schemars(extend("x-kubernetes-validations" = [{"rule": "duration(self) >= duration('10s') && duration(self) <= duration('30m')", "message": "startTimeout must be between 10s and 30m"}]))]
     pub start_timeout: Duration,
-    /// Cache volume settings.
+    /// Build cache settings.
     pub cache: Cache,
 }
 
@@ -472,153 +472,45 @@ impl Default for Workers {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Cache {
-    /// Size limit of the `emptyDir`. When unset, the ephemeral-storage limit bounds it.
+    /// Size limit of the buildkitd state `emptyDir`. When unset, the
+    /// ephemeral-storage limit bounds it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_limit: Option<Quantity>,
-    /// Persistent state volumes for cache affinity. Unset turns the
-    /// feature off. A volume is shared only by callers of one cache scope, see `local.scope`,
-    /// and is emptied before a pod of another scope starts on it. With it set, buildkitd runs
-    /// with build history off (`[history] maxEntries = 0`) and `history.db` is deleted at
-    /// every start, so no build logs or build arguments reach a later allocation and
-    /// `buildx history` shows nothing on this pool.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "non_null::<LocalCache>")]
-    pub local: Option<LocalCache>,
-    /// Shared registry cache that clients import and export. Every caller
-    /// this pool admits, and anyone who can push to the repository, can write cache that
-    /// later callers read.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "non_null::<RegistryCache>")]
-    pub registry: Option<RegistryCache>,
-}
-
-/// `spec.workers.cache.local`: one PVC per cached slot, mounted at the buildkitd state dir.
-///
-/// A volume holds the whole buildkitd state: the content store, the cache records and
-/// any image built on it. Each volume belongs to one cache scope (`scope`). A pod whose
-/// caller is in another scope never gets the volume as it is: the volume is emptied
-/// before buildkitd starts. buildkitd runs with build history off
-/// (`[history] maxEntries = 0`) and `history.db` is deleted at every start, so no
-/// build logs or build arguments reach a later allocation and `buildx history`
-/// shows nothing on these pools.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", default)]
-#[schemars(extend("x-kubernetes-validations" = [{"rule": "!has(self.gcKeepStorage) || quantity(string(self.gcKeepStorage)).compareTo(quantity(string(self.size))) <= 0", "message": "gcKeepStorage must not exceed size"}]))]
-pub struct LocalCache {
-    /// Storage request of each volume, from 1Gi to 10Ti.
-    #[schemars(schema_with = "plain_quantity", extend("x-kubernetes-validations" = [{"rule": "quantity(string(self)).compareTo(quantity('1Gi')) >= 0 && quantity(string(self)).compareTo(quantity('10Ti')) <= 0", "message": "size must be between 1Gi and 10Ti"}]))]
-    pub size: Quantity,
-    /// Storage class of the volumes; unset uses the cluster default. Use one with
-    /// `volumeBindingMode: WaitForFirstConsumer`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(length(min = 1, max = 253), extend("pattern" = r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"))]
-    pub storage_class: Option<String>,
-    /// Slots `0..min(maxVolumes, scaling.max)` get a volume; other slots use an `emptyDir`.
-    #[schemars(range(min = 1, max = 500))]
-    pub max_volumes: i32,
-    /// `soft` prefers a free pod whose volume served the request's key; `off` ignores keys.
-    pub affinity: CacheAffinity,
-    /// Recent keys tracked per volume in the `cache-keys` annotation.
-    #[schemars(range(min = 1, max = 32))]
-    pub keys_per_volume: i32,
-    /// buildkitd GC bound (`[worker.oci] maxUsedSpace`). Unset uses 80% of `size`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "opt_quantity")]
-    pub gc_keep_storage: Option<Quantity>,
-    /// Who shares a volume. `identity` (the default) gives each caller its own cache. An
-    /// OIDC token is scoped to its issuer and its `repository_id` claim (GitHub Actions),
-    /// else its `repository` claim, else its `sub`. A `ServiceAccount` is scoped to its
-    /// namespace and name, and a `BuildKitClaim` to its namespace. `pool` lets every caller
-    /// the pool admits read and write the same volumes, so use it only when they are one
-    /// trust domain.
+    /// Who shares a cache in the built-in registry. `identity` (the default) gives each
+    /// caller its own cache. An OIDC token is scoped to its issuer and its `repository_id`
+    /// claim (GitHub Actions), else its `repository` claim, else its `sub`. A
+    /// `ServiceAccount` is scoped to its namespace and name, and a `BuildKitClaim` to its
+    /// namespace. `pool` gives every caller the pool admits one cache, so use it only
+    /// when they are one trust domain.
     pub scope: CacheScope,
+    /// Callers whose builds may write the cache, in the syntax of `access.rules`; the
+    /// rest only read it. Unset trusts OIDC tokens whose `event_name` claim is `push`,
+    /// `schedule`, `workflow_dispatch` or `merge_group`, and every `ServiceAccount` and
+    /// `BuildKitClaim` caller. `[]` trusts nobody. A token whose `event_name` is
+    /// `pull_request`, `pull_request_target`, `workflow_run`, `issue_comment`,
+    /// `pull_request_review` or `pull_request_review_comment` only reads, whatever these
+    /// rules say, since those jobs can run fork code. Pin `event_name` in OIDC rules here
+    /// (for example `push`) rather than matching on the repository alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 64))]
+    pub writers: Option<Vec<AccessRule>>,
+    /// Bytes the pool's caches may hold in the built-in registry together. Over it, the
+    /// least recently used caches go first. Unset uses the registry's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "max_size")]
+    pub max_size: Option<Quantity>,
 }
 
-impl Default for LocalCache {
-    fn default() -> Self {
-        Self {
-            size: Quantity("20Gi".to_owned()),
-            storage_class: None,
-            max_volumes: 10,
-            affinity: CacheAffinity::Soft,
-            keys_per_volume: 8,
-            gc_keep_storage: None,
-            scope: CacheScope::Identity,
-        }
-    }
-}
-
-/// `spec.workers.cache.registry`: a shared registry cache that clients import and export
-///. Every caller this pool admits can write cache that later callers read.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct RegistryCache {
-    /// Image name of the cache, without tag or digest, for example `ghcr.io/org/cache`.
-    #[schemars(length(min = 1, max = 255), extend("x-kubernetes-validations" = [{"rule": "self.matches(r'^[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]{1,5})?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*$')", "message": "repository must be an image name without tag or digest"}]))]
-    pub repository: String,
-    /// Whether allocations return the registry cache flags.
-    #[serde(default = "yes")]
-    pub enabled: bool,
-    /// Export mode of `--cache-to`.
-    #[serde(default)]
-    pub mode: CacheMode,
-    /// Ref template. Placeholders: `{repository}`, `{cacheKey}`, `{pool}`.
-    #[serde(default = "default_ref", rename = "ref")]
-    #[schemars(length(min = 1, max = 255), extend("x-kubernetes-validations" = [{"rule": "self.replace('{repository}', 'r.example/x').replace('{cacheKey}', 'k').replace('{pool}', 'p').matches(r'^[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]{1,5})?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$')", "message": "ref may use only {repository}, {cacheKey} and {pool} and must render to an image reference"}]))]
-    pub ref_template: String,
-    /// Key for requests that name no `cacheKey`. Unset uses the pool name.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(min = 1, max = 63), extend("pattern" = r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$"))]
-    pub default_key: Option<String>,
-    /// Read-only fallbacks after the request's own ref: a cache key, rendered through `ref`,
-    /// or an image reference (an entry with `/` or `:`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 8), schema_with = "import_from")]
-    pub import_from: Vec<String>,
-}
-
-fn yes() -> bool {
-    true
-}
-
-fn default_ref() -> String {
-    "{repository}:{cacheKey}".to_owned()
-}
-
-fn import_from(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+fn max_size(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
-        "type": "array",
-        "maxItems": 8,
-        "items": {"type": "string", "minLength": 1, "maxLength": 255},
+        "x-kubernetes-int-or-string": true,
         "x-kubernetes-validations": [
-            {"rule": "self.all(e, (size(e) <= 63 && e.matches(r'^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$')) || ((e.contains('/') || e.contains(':')) && e.matches(r'^[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]{1,5})?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(@sha256:[a-f0-9]{64})?$')))", "message": "importFrom entries must be cache keys or image references"}
+            {"rule": "quantity(string(self)).compareTo(quantity('1Mi')) >= 0", "message": "maxSize must be at least 1Mi"}
         ]
     })
 }
 
-/// `cache.registry.mode`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum CacheMode {
-    /// Export every intermediate layer.
-    #[default]
-    Max,
-    /// Export only the final image's layers.
-    Min,
-}
-
-impl CacheMode {
-    /// The buildx `mode=` value.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Max => "max",
-            Self::Min => "min",
-        }
-    }
-}
-
-/// `cache.local.scope`.
+/// `cache.scope`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheScope {
@@ -627,91 +519,6 @@ pub enum CacheScope {
     Identity,
     /// One cache for every caller the pool admits.
     Pool,
-}
-
-/// `cache.local.affinity`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum CacheAffinity {
-    /// Prefer a free pod whose volume served the key; spill to any free pod.
-    #[default]
-    Soft,
-    /// Ignore keys; prefer any cached slot.
-    Off,
-}
-
-/// Resolved buildx flags of the registry cache.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct RegistryCacheFlags {
-    /// `--cache-to` value.
-    pub to: String,
-    /// `--cache-from` values, in order.
-    pub from: Vec<String>,
-}
-
-/// `status.cache`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct CacheStatus {
-    /// Registry flags for `registry.defaultKey`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub registry: Option<RegistryCacheFlags>,
-}
-
-impl RegistryCache {
-    /// `ref` with its placeholders filled in.
-    #[must_use]
-    pub fn render_ref(&self, pool: &str, key: &str) -> String {
-        self.ref_template
-            .replace("{repository}", &self.repository)
-            .replace("{cacheKey}", key)
-            .replace("{pool}", pool)
-    }
-
-    /// `--cache-to` and `--cache-from` values for `key`.
-    #[must_use]
-    pub fn resolve(&self, pool: &str, key: &str) -> RegistryCacheFlags {
-        let own = self.render_ref(pool, key);
-        let mut refs = vec![own.clone()];
-        for e in &self.import_from {
-            let r = if e.contains(['/', ':']) {
-                e.clone()
-            } else {
-                self.render_ref(pool, e)
-            };
-            if !refs.contains(&r) {
-                refs.push(r);
-            }
-        }
-        RegistryCacheFlags {
-            to: format!(
-                "type=registry,ref={own},mode={},image-manifest=true,oci-mediatypes=true",
-                self.mode.as_str()
-            ),
-            from: refs
-                .iter()
-                .map(|r| format!("type=registry,ref={r}"))
-                .collect(),
-        }
-    }
-}
-
-impl Cache {
-    /// The registry layer when it is set and enabled.
-    #[must_use]
-    pub fn registry_enabled(&self) -> Option<&RegistryCache> {
-        self.registry.as_ref().filter(|r| r.enabled)
-    }
-
-    /// Key of a request without `cacheKey`: `registry.defaultKey`, else the pool name.
-    #[must_use]
-    pub fn default_key<'a>(&'a self, pool: &'a str) -> &'a str {
-        self.registry
-            .as_ref()
-            .and_then(|r| r.default_key.as_deref())
-            .unwrap_or(pool)
-    }
 }
 
 /// A cache key: a label value of 1 to 63 characters.
@@ -830,17 +637,6 @@ pub struct Access {
 }
 
 /// Schema of `T` without the `null` alternative, so the apiserver prunes explicit nulls.
-/// A Quantity that may not be null (kube-core marks optional int-or-string fields nullable
-/// unless `nullable` is already set), so a `null` cannot skip
-/// the default and the CEL rule.
-fn plain_quantity(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    schemars::json_schema!({"x-kubernetes-int-or-string": true, "nullable": false})
-}
-
-fn opt_quantity(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    schemars::json_schema!({"x-kubernetes-int-or-string": true})
-}
-
 fn non_null<T: JsonSchema>(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
     T::json_schema(generator)
 }
@@ -949,8 +745,7 @@ impl Default for AllocationSpec {
     }
 }
 
-/// `BuildKitPool` status. The leader owns every field except `waiters`, which
-/// each API replica owns for its own entry.
+/// `BuildKitPool` status, written by the leader.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildKitPoolStatus {
@@ -969,13 +764,9 @@ pub struct BuildKitPoolStatus {
     /// Minimum number of warm pods in effect now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desired_warm: Option<i32>,
-    /// Sum of the non-stale `waiters[].count` values.
+    /// Number of pending claims of this pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting: Option<i32>,
-    /// Queued allocation requests per API replica.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 64), extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["replica"]))]
-    pub waiters: Vec<Waiter>,
     /// Platforms from `spec.platforms`, or derived from the template's arch selector.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub platforms: Vec<String>,
@@ -985,25 +776,10 @@ pub struct BuildKitPoolStatus {
     /// TLS server name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_name: Option<String>,
-    /// Resolved cache flags for the pool's default key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache: Option<CacheStatus>,
     /// Conditions (`Ready`, `Degraded`, `CAExpiringSoon`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["type"]))]
     pub conditions: Vec<Condition>,
-}
-
-/// One API replica's queue length (`status.waiters`).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct Waiter {
-    /// Replica (pod) name. It is the list key.
-    pub replica: String,
-    /// Queued POSTs on that replica.
-    pub count: i32,
-    /// When the replica last wrote the entry. Entries older than 90 s are stale.
-    pub updated_at: Time,
 }
 
 /// Condition types.

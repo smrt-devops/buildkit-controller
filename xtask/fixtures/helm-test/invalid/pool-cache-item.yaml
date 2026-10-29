@@ -1,0 +1,7 @@
+# expect: at '/pools/0': additional properties 'cache' not allowed
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+pools:
+  - name: a
+    namespace: ci
+    cache: {scope: pool}
+gateway: {enabled: false}

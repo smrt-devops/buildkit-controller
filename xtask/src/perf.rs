@@ -31,7 +31,7 @@ use time::OffsetDateTime;
 
 use super::edge_verify::{chart_rbac, controller_fixture, secret_from_files};
 use super::reconcile_verify::KIND_CONFIG;
-use super::{CRD_PATH, root};
+use super::root;
 use crate::image::WORKER_IMAGE;
 use crate::kube::Cluster;
 use crate::proc::{status, stdout as run_out};
@@ -40,7 +40,6 @@ const SYSTEM_NS: &str = "buildkit-system";
 const NS: &str = "bk-perf";
 const POOL: &str = "perf";
 const CURL_IMAGE: &str = "curlimages/curl:8.11.1";
-const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const SERVER_NAME: &str = "bk.example.com";
 const API: &str = "https://buildkit-controller.buildkit-system.svc:8443";
 /// Warm pods the pool keeps (`scaling.min`).
@@ -392,15 +391,13 @@ impl Perf {
 
 #[allow(clippy::too_many_lines, reason = "one linear setup script")]
 fn setup(p: &Perf, work: &std::path::Path) -> Result<CaBundle> {
-    super::image::image(CONTROLLER_IMAGE, Some(p.env.name()))?;
+    crate::image::load_controller(&p.env)?;
     crate::image::ensure_worker()?;
     crate::image::ensure(CURL_IMAGE)?;
     for img in [WORKER_IMAGE, CURL_IMAGE] {
         status(&mut crate::kube::kind_load(img, p.env.name()))?;
     }
-    let crd = root().join(CRD_PATH).to_string_lossy().into_owned();
-    p.k(&["apply", "--server-side", "-f", &crd])?;
-    p.env.wait_crd_established()?;
+    p.env.apply_crds()?;
     p.k(&["create", "namespace", SYSTEM_NS])?;
     p.k(&[
         "label",
@@ -445,7 +442,8 @@ fn setup(p: &Perf, work: &std::path::Path) -> Result<CaBundle> {
         files,
     )?;
 
-    p.env.apply(&(chart_rbac("")? + &controller_manifest()?))?;
+    p.env
+        .apply(&(chart_rbac("", &[])? + &controller_manifest()?))?;
     p.k(&[
         "-n",
         SYSTEM_NS,

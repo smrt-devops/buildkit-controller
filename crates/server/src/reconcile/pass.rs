@@ -40,16 +40,12 @@ pub struct PoolMemory {
     recent_creates: Vec<CreateOutcome>,
     /// Generation and time of the last successful sandbox apply.
     sandbox_applied: Option<(i64, Timestamp)>,
-    /// Generation whose above-limit volume reap completed in this term.
-    volume_generation: Option<i64>,
     create_backoff: Option<(Timestamp, SignedDuration)>,
     ready: BTreeSet<String>,
     /// Uids seen up (see [`WorkerPod::up`]) in this term.
     seen_up: BTreeSet<String>,
     /// [`Observed::down_since`].
     down_since: BTreeMap<String, Timestamp>,
-    /// [`Observed::waiters_seen`], kept for the entries still in the status.
-    waiters_seen: BTreeMap<(String, Timestamp), Timestamp>,
     /// 201 responses not yet in the store, with their create time.
     pending: Vec<(Pod, Timestamp)>,
     error_backoff: Option<Duration>,
@@ -174,7 +170,7 @@ pub async fn ca_pass<O: KubeOps>(
     execute(ops, guard, &env, &plan).await
 }
 
-/// Runs one pass of `pool`.
+/// Runs one pass of `pool`, which has `waiting` pending claims.
 #[allow(clippy::too_many_arguments, reason = "the pass's whole input")]
 pub async fn run<O: KubeOps>(
     ops: &O,
@@ -184,6 +180,7 @@ pub async fn run<O: KubeOps>(
     store_pods: &[Arc<Pod>],
     ca: &CaView,
     mem: &mut PoolMemory,
+    waiting: i32,
     now: Timestamp,
 ) -> Outcome {
     let loaded = load_ca(ca, now);
@@ -220,17 +217,6 @@ pub async fn run<O: KubeOps>(
         .map(|p| p.uid.clone())
         .collect();
     mem.observe_up(&pods, now);
-    // A changed `(replica, updatedAt)` is a new observation, as for the Lease.
-    let waiters_seen: BTreeMap<(String, Timestamp), Timestamp> = pool
-        .status
-        .iter()
-        .flat_map(|s| &s.waiters)
-        .map(|w| {
-            let key = (w.replica.clone(), w.updated_at.0);
-            let seen = mem.waiters_seen.get(&key).copied().unwrap_or(now);
-            (key, seen)
-        })
-        .collect();
     let observed = Observed {
         pool,
         time_zone: TimeZone::get(&pool.spec.scaling.time_zone).ok(),
@@ -250,10 +236,9 @@ pub async fn run<O: KubeOps>(
             .collect(),
         slot_holds: std::mem::take(&mut mem.slot_holds),
         became_ready: ready_now.difference(&mem.ready).cloned().collect(),
-        waiters_seen,
+        waiting,
         down_since: mem.down_since.clone(),
     };
-    mem.waiters_seen = observed.waiters_seen.clone();
     let plan = plan(&observed, now, &settings.plan);
     let env = Env {
         pool,
@@ -266,40 +251,9 @@ pub async fn run<O: KubeOps>(
         replica: &settings.replica,
         now,
     };
-    let mut report = execute(ops, guard, &env, &plan).await;
-    reap_volumes(ops, mem, pool, &observed.pods, &mut report).await;
+    let report = execute(ops, guard, &env, &plan).await;
     let requeue = remember(mem, pool, &plan, &report, ready_now, now);
     Outcome { report, requeue }
-}
-
-/// The above-limit volume reap: on the first pass of a
-/// term and on each new generation, until one completes. A volume whose slot a
-/// pod still holds keeps the generation unreaped, so a later pod event retries.
-async fn reap_volumes<O: KubeOps>(
-    ops: &O,
-    mem: &mut PoolMemory,
-    pool: &BuildKitPool,
-    pods: &[WorkerPod],
-    report: &mut Report,
-) {
-    let generation = pool.metadata.generation.unwrap_or_default();
-    if mem.volume_generation == Some(generation) {
-        return;
-    }
-    let name = pool.name_any();
-    let held: BTreeSet<u32> = pods
-        .iter()
-        .filter_map(|p| p.slot)
-        .chain(
-            report
-                .created
-                .iter()
-                .filter_map(|p| super::pods::parse_slot(&p.name_any(), &name)),
-        )
-        .collect();
-    if super::cache::reap_above_limit(ops, pool, &held, report).await {
-        mem.volume_generation = Some(generation);
-    }
 }
 
 /// Stores the term memory and returns the requeue.

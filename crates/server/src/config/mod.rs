@@ -138,6 +138,8 @@ pub struct Config {
     pub shutdown: Shutdown,
     /// The `BuildKitClaim` controller.
     pub claims: Claims,
+    /// The built-in cache registry.
+    pub cache: Cache,
 }
 
 /// `listen`.
@@ -564,6 +566,29 @@ pub struct Claims {
     pub namespaces: Vec<String>,
 }
 
+/// `cache`: where workers reach the built-in cache registry. Unset, allocations
+/// carry no cache flags and workers get no registry entry.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct Cache {
+    /// `<host>:<port>` of the registry Service, for example
+    /// `bk-cache.buildkit-system.svc:5000`. `""` = no cache.
+    pub host: String,
+    /// Secret in the controller's namespace where the leader keeps the registry's
+    /// serving certificate (`tls.crt`, `tls.key`) and the internal CA (`ca.crt`).
+    pub tls_secret_name: String,
+}
+
+impl Cache {
+    /// The host without its port, the name in the serving certificate.
+    #[must_use]
+    pub fn server_name(&self) -> &str {
+        self.host
+            .rsplit_once(':')
+            .map_or(self.host.as_str(), |(h, _)| h)
+    }
+}
+
 /// Leader election timing, validated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ElectionTiming {
@@ -765,6 +790,7 @@ impl Config {
             ));
         }
         self.validate_watch(&mut p);
+        self.validate_cache(&mut p);
         self.validate_edge(&mut p);
         self.validate_auth(&mut p);
         self.validate_network(&mut p);
@@ -792,6 +818,37 @@ impl Config {
         }
     }
 
+    /// The namespaces whose claims are watched, `[]` = all. The controller's own
+    /// namespace `own` (claims of CI callers) always; with `claims.enabled`, every
+    /// namespace when pools are watched cluster-wide (claims outside
+    /// `claims.namespaces` are refused), else `claims.namespaces` too.
+    #[must_use]
+    pub fn claim_namespaces(&self, own: &str) -> Vec<String> {
+        if !self.claims.enabled {
+            return vec![own.to_owned()];
+        }
+        if self.watched_namespaces().is_empty() {
+            return Vec::new();
+        }
+        let mut v: Vec<String> = std::iter::once(own.to_owned())
+            .chain(self.claims.namespaces.iter().cloned())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// The namespaces whose in-cluster claims are served: the controller's own
+    /// and, with `claims.enabled`, `claims.namespaces`.
+    #[must_use]
+    pub fn served_claim_namespaces(&self, own: &str) -> std::collections::HashSet<String> {
+        let mut s: std::collections::HashSet<String> = std::iter::once(own.to_owned()).collect();
+        if self.claims.enabled {
+            s.extend(self.claims.namespaces.iter().cloned());
+        }
+        s
+    }
+
     fn validate_watch(&self, p: &mut Vec<String>) {
         if !self.watch_namespace.is_empty() && !self.watch_namespaces.is_empty() {
             p.push(
@@ -801,6 +858,20 @@ impl Config {
         }
         namespace_list("watchNamespaces", self.watched_namespaces(), p);
         namespace_list("claims.namespaces", &self.claims.namespaces, p);
+    }
+
+    fn validate_cache(&self, p: &mut Vec<String>) {
+        let c = &self.cache;
+        if c.host.is_empty() {
+            return;
+        }
+        let port = c.host.rsplit_once(':').map(|(_, port)| port.parse::<u16>());
+        if !matches!(port, Some(Ok(n)) if n > 0) || !is_dns_name(c.server_name()) {
+            p.push(format!("cache.host `{}` must be <dns-name>:<port>", c.host));
+        }
+        if c.tls_secret_name.is_empty() {
+            p.push("cache.tlsSecretName is required when cache.host is set".into());
+        }
     }
 
     fn validate_edge(&self, p: &mut Vec<String>) {
@@ -1023,6 +1094,7 @@ impl Config {
                     cidrs: n.dns.cidrs.clone(),
                 },
             },
+            cache_host: (!self.cache.host.is_empty()).then(|| self.cache.host.clone()),
         }
     }
 }

@@ -32,13 +32,11 @@ function parseDuration(s) {
 }
 
 /**
- * Socket timeout for POST /v1/allocations: queue timeout + startTimeout ceiling
- * (30 m) + 10 s. An unset queue timeout is bounded by maxQueueTimeout (1 h).
+ * Socket timeout for each long poll. The server caps a poll's `wait` at 25 s; 40 s leaves room for the
+ * network. A POST gets the whole remaining budget instead (see `postTimeoutMs`).
  */
-function postTimeoutMs(queueTimeoutSeconds) {
-  const q = queueTimeoutSeconds === undefined ? 3600 : queueTimeoutSeconds;
-  return (q + 1800 + 10) * 1000;
-}
+const REQUEST_TIMEOUT_MS = 40000;
+const POLL_WAIT = '25s';
 
 /** Fresh ECDSA P-256 key as PEM strings (PKCS#8 private, SPKI public). */
 function generateKey() {
@@ -65,7 +63,7 @@ function allocationBody({ namespace, pool }, publicKey, ttl, queueTimeout, cache
   return b;
 }
 
-const CACHE_CHOICES = ['auto', 'registry', 'local', 'none'];
+const CACHE_CHOICES = ['auto', 'none'];
 const CACHE_KEY = /^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 
 /**
@@ -74,7 +72,7 @@ const CACHE_KEY = /^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/;
  */
 function parseCacheInputs({ cache, cacheKey, cacheMode, cacheFrom }) {
   const c = String(cache || '').trim() || 'auto';
-  if (!CACHE_CHOICES.includes(c)) throw new Error(`invalid cache "${c}": use auto, registry, local or none`);
+  if (!CACHE_CHOICES.includes(c)) throw new Error(`invalid cache "${c}": use auto or none`);
   const k = String(cacheKey || '').trim();
   if (k && (k.length > 63 || !CACHE_KEY.test(k))) {
     throw new Error(`invalid cache-key "${k}": 1 to 63 of [A-Za-z0-9._-], starting and ending alphanumeric`);
@@ -231,7 +229,16 @@ function effectiveQueueTimeout(queueTimeoutSeconds, pool) {
   return Number.isInteger(d) && d >= 0 ? d : undefined;
 }
 
-/** Bound on the whole retry loop: the request's queue timeout (1 h, the largest allowed, if unknown) + 60 s. */
+/**
+ * Socket timeout of a POST: the whole budget left. A v3 controller answers within about 20 s, but a
+ * v0.1.0 controller holds the POST open through the queue wait and the pod start, so a short timeout
+ * would fail an allocation whose id the client never saw.
+ */
+function postTimeoutMs(remainingMs) {
+  return Math.max(1000, remainingMs);
+}
+
+/** Bound on the whole retry loop: the request's queue timeout (1 h, the largest allowed, if unknown) + 60 s. It covers the POST, every poll and any fresh POST after a queue timeout. */
 function retryBudgetMs(queueTimeoutSeconds) {
   const q = queueTimeoutSeconds === undefined ? 3600 : queueTimeoutSeconds;
   return (q + 60) * 1000;
@@ -253,6 +260,8 @@ const SHORT_BUDGET_MS = 60000;
 
 // Error codes the controller answers 503 with Retry-After before it claims anything.
 const CLAIM_FREE_CODES = new Set(['pool_exhausted', 'start_timeout', 'shutting_down', 'upstream_error']);
+// Error codes that end a queued allocation's id for good: GET /v1/allocations/{id} will not change its answer.
+const TERMINAL_POLL_CODES = new Set(['pool_exhausted', 'pod_lost', 'not_found', 'forbidden']);
 
 /** True when a 503 body carries one of the controller's claim-free error codes. */
 function isClaimFree503(res) {
@@ -322,6 +331,74 @@ async function requestWithRetry(url, opts, { what, getToken, budgetMs, idempoten
   }
 }
 
+/** The `error.code` of a response body, or undefined. */
+function errorCode(res) {
+  try {
+    const j = JSON.parse(res.body);
+    return (j && j.error && j.error.code) || undefined;
+  } catch { return undefined; }
+}
+
+/**
+ * Long-poll GET /v1/allocations/{id} until the allocation is bound or fails for good. Resolves the
+ * last response: 200 (bound) or a terminal answer (a 4xx, or a 503 pool_exhausted or pod_lost).
+ * Everything else is transient and polls the same id again after Retry-After (else 2 s): 202, any
+ * other 5xx, a 503 upstream_error, and transport failures. Throws once `budgetMs` (from the call)
+ * is spent, so it never polls forever. `getToken` runs for every request.
+ */
+async function pollAllocation(api, id, { ca, getToken, budgetMs, log = () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now } = {}) {
+  const start = now();
+  for (;;) {
+    const left = budgetMs - (now() - start);
+    if (left <= 0) throw new Error(`allocation ${id} was not bound within the queue budget`);
+    let wait = 0;
+    try {
+      const headers = getToken ? { Authorization: `Bearer ${await getToken()}` } : {};
+      const res = await request(`${api}/v1/allocations/${id}?wait=${POLL_WAIT}`,
+        { ca, headers, timeoutMs: Math.min(REQUEST_TIMEOUT_MS, left + 5000) });
+      if (res.status === 200) return res;
+      if (res.status === 202) continue;
+      if (res.status < 500 || (res.status === 503 && TERMINAL_POLL_CODES.has(errorCode(res)))) return res;
+      wait = retryAfterMs(res.headers, now()) ?? 2000;
+      log(`poll ${id}: HTTP ${res.status}, polling again in ${Math.round(wait / 1000)}s`);
+    } catch (e) {
+      wait = 2000;
+      log(`poll ${id}: ${e.message}, polling again in 2s`);
+    }
+    await sleep(wait);
+  }
+}
+
+/**
+ * Allocate one worker. POST /v1/allocations answers 201 (bound) or 202 (queued, with an id); a 202
+ * is polled until bound. The queue timeout can run out on a poll (terminal for that id): that starts
+ * a fresh POST while the overall budget (`budgetMs`, from the call) allows, as a 503 pool_exhausted
+ * from the POST itself does. `attemptOpts({remainingMs})` builds each POST's request options.
+ * `onId(id)` fires as soon as an id is known and `onGone(id)` when that id ended for good, so the
+ * caller can release exactly the ids that may still hold a worker. Resolves the AllocationResponse.
+ */
+async function allocate(api, { what, ca, getToken, attemptOpts, budgetMs, onId = () => {}, onGone = () => {}, log = () => {}, sleep, now = Date.now }) {
+  const start = now();
+  for (;;) {
+    const remaining = budgetMs - (now() - start);
+    const res = await requestWithRetry(`${api}/v1/allocations`, attemptOpts,
+      { what, getToken, budgetMs: remaining, log, sleep, now });
+    if (res.status === 201) return JSON.parse(res.body);
+    if (res.status !== 202) throw apiError(what, res);
+    let id;
+    try { id = checkAllocationId(JSON.parse(res.body).id); } catch { throw new Error(`${what} failed: controller returned an invalid allocation id`); }
+    onId(id);
+    log(`${what}: queued as ${id}`);
+    const pr = await pollAllocation(api, id, { ca, getToken, budgetMs: budgetMs - (now() - start), log, sleep, now });
+    if (pr.status === 200) return JSON.parse(pr.body);
+    onGone(id);
+    const wait = retryAfterMs(pr.headers, now()) ?? 5000;
+    if (errorCode(pr) !== 'pool_exhausted' || now() - start + wait > budgetMs) throw apiError(what, pr);
+    log(`${what}: queue timeout ran out for ${id}, allocating again in ${Math.round(wait / 1000)}s`);
+    await (sleep || ((ms) => new Promise((r) => setTimeout(r, ms))))(wait);
+  }
+}
+
 /** Release allocation `id`. 404 counts as released. Own short retry budget: a down API must not hold the job. */
 async function releaseAllocation({ api, ca, getToken, id, log, ...inject }) {
   const res = await requestWithRetry(`${api}/v1/allocations/${id}`, { method: 'DELETE', ca, timeoutMs: 30000 },
@@ -345,7 +422,7 @@ async function fetchOidcToken(audience, setSecret) {
 }
 
 module.exports = {
-  parseList, parsePool, postTimeoutMs, parseDuration, generateKey, allocationBody,
+  parseList, parsePool, REQUEST_TIMEOUT_MS, postTimeoutMs, pollAllocation, allocate, errorCode, parseDuration, generateKey, allocationBody,
   validatePools, buildxCommands, parseCacheInputs, cacheFlags, checkAllocationId, createBuilder, writeMaterial, request, apiError,
   effectiveQueueTimeout, retryBudgetMs, SHORT_BUDGET_MS, isClaimFree503, releaseAllocation, queueTimeoutFor, retryAfterMs, isPreSendError, requestWithRetry, fetchOidcToken,
 };

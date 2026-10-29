@@ -105,7 +105,7 @@ fn worker() -> Worker {
     let pool = fixtures::pool("p", json!({})).unwrap();
     let now = OffsetDateTime::now_utc();
     let ca = CaBundle::generate(now).unwrap();
-    spawn::prepare(&pool, &ca, 0, None, now, time::Duration::days(30)).unwrap()
+    spawn::prepare(&pool, &ca, 0, now, time::Duration::days(30), None).unwrap()
 }
 
 fn nonce(w: &Worker) -> String {

@@ -15,9 +15,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The Rust harness: mock OIDC issuer, curl recipe, buildx, registry cache,
-  # queueing and multi-platform on a kind cluster (cargo xtask e2e).
-  e2e:
+  # Every kind suite but soak and perf in one run (cargo xtask kind-all): the controller
+  # image is built once, the suites share two kind clusters and run side by side. The
+  # suites' logs are kept as an artifact.
+  kind-all:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -26,25 +27,14 @@ jobs:
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-      - run: cargo xtask e2e
-
-  # The cheap kind suites, on every pull request: the CRD against its fixtures, the rendered
-  # objects server-side, and the chart installed on a cluster. Each leg has its own runner,
-  # so none needs a BK_KIND_SUFFIX.
-  kind:
-    if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        suite: [crd-verify, render-verify, helm-verify]
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: cargo xtask kind-all --jobs 4
+      - name: Keep the suite logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          persist-credentials: false
-      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-      - run: cargo xtask ${{ matrix.suite }}
+          name: kind-all-logs
+          path: target/kind-all/*.log
+          if-no-files-found: ignore
 
   # examples/*.yaml against the CRDs in a real API server, so a field rename that breaks the files
   # the README tells users to apply fails here.
@@ -128,45 +118,21 @@ jobs:
           kubectl --kubeconfig target/e2e/kubeconfig get gateway,httproute,tlsroute,backendtlspolicy -A -o yaml
           kubectl --kubeconfig target/e2e/kubeconfig -n envoy-gateway-system logs deploy/envoy-gateway --tail=100
 
-  # The remaining kind suites, nightly and on demand only. Each leg has its own runner, so none
-  # needs a BK_KIND_SUFFIX.
+  # The long runs, nightly and on demand only: the certificate soak, the performance
+  # rig, a drain that outlasts the old 300 s budget, and an allocation queued past
+  # Envoy's 5-minute stream idle timeout. Each leg has its own runner, so none needs
+  # a BK_KIND_SUFFIX.
   nightly:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        suite: [alloc-verify, api-verify, runtime-verify, reconcile-verify, edge-verify, claim-verify, proxy-verify]
+        suite: [soak, perf, drain-verify --long, e2e --long]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
       - run: cargo xtask ${{ matrix.suite }}
-
-  # Cert-lifecycle soak (cargo xtask soak). Long: nightly and on demand only.
-  soak:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-      - run: cargo xtask soak
-
-  # Controller shutdown never cuts a live build: a 390 s build survives a rollout,
-  # the Lease moves within seconds, and a queued request on a stopping replica
-  # gets 503 shutting_down (cargo xtask drain-verify). Slow: nightly and on demand only.
-  drain:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-      - run: cargo xtask drain-verify

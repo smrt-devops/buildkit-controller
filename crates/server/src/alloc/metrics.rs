@@ -2,7 +2,6 @@
 
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
-use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 
@@ -17,13 +16,10 @@ fn new_hist() -> Histogram {
 pub struct AllocMetrics {
     allocations: Family<Labels, Counter>,
     duration: Family<Labels, Histogram, fn() -> Histogram>,
-    queue_depth: Family<Labels, Gauge>,
     queue_wait: Family<Labels, Histogram, fn() -> Histogram>,
     conflicts: Family<Labels, Counter>,
     releases: Family<Labels, Counter>,
-    cache_affinity: Family<Labels, Counter>,
-    registry_served: Family<Labels, Counter>,
-    volume_ops: Family<Labels, Counter>,
+    cache: Family<Labels, Counter>,
 }
 
 impl Default for AllocMetrics {
@@ -31,13 +27,10 @@ impl Default for AllocMetrics {
         Self {
             allocations: Family::default(),
             duration: Family::new_with_constructor(new_hist),
-            queue_depth: Family::default(),
             queue_wait: Family::new_with_constructor(new_hist),
             conflicts: Family::default(),
             releases: Family::default(),
-            cache_affinity: Family::default(),
-            registry_served: Family::default(),
-            volume_ops: Family::default(),
+            cache: Family::default(),
         }
     }
 }
@@ -67,22 +60,17 @@ impl AllocMetrics {
     pub fn register(&self, r: &mut Registry) {
         r.register(
             "allocations",
-            "POST /v1/allocations outcomes",
+            "Allocation outcomes: refusals by the API, and how each claim ended",
             self.allocations.clone(),
         );
         r.register(
             "allocation_duration_seconds",
-            "Successful allocation, receipt to response",
+            "Successful allocation, claim creation to bind",
             self.duration.clone(),
         );
         r.register(
-            "queue_depth",
-            "Waiters queued on this replica",
-            self.queue_depth.clone(),
-        );
-        r.register(
             "queue_wait_seconds",
-            "Time spent queued",
+            "Time claims spent queued, by how the wait ended",
             self.queue_wait.clone(),
         );
         r.register(
@@ -91,19 +79,9 @@ impl AllocMetrics {
             self.conflicts.clone(),
         );
         r.register(
-            "cache_affinity",
-            "Allocations that used local cache volumes, by result",
-            self.cache_affinity.clone(),
-        );
-        r.register(
-            "cache_registry_served",
-            "Allocations whose response carried registry cache flags",
-            self.registry_served.clone(),
-        );
-        r.register(
-            "cache_volume_api_operations",
-            "Cache volume writes by API replicas",
-            self.volume_ops.clone(),
+            "cache_allocations",
+            "Allocations whose response carried cache flags, by tier",
+            self.cache.clone(),
         );
     }
 
@@ -121,14 +99,7 @@ impl AllocMetrics {
             .observe(secs);
     }
 
-    /// Current queue length.
-    pub fn depth(&self, ns: &str, p: &str, n: usize) {
-        self.queue_depth
-            .get_or_create(&pool(ns, p))
-            .set(i64::try_from(n).unwrap_or(i64::MAX));
-    }
-
-    /// `result` = `ok`, `timeout`, `cancelled`, `full`, `shutting_down`.
+    /// `result` = `ok` or `timeout`.
     pub fn queue_wait(&self, ns: &str, p: &str, result: &str, secs: f64) {
         self.queue_wait
             .get_or_create(&with(pool(ns, p), "result", result))
@@ -140,42 +111,18 @@ impl AllocMetrics {
         self.conflicts.get_or_create(&pool(ns, p)).inc();
     }
 
-    /// `reason` = `released`, `abandoned`, `start_timeout`, or `cache_scope` (a warm pod
-    /// bound to another cache scope was retired so a request could take its slot).
+    /// `reason` = `released` (the claim was deleted or ended) or `pod_lost` (the claimed pod was
+    /// terminating).
     pub fn release(&self, ns: &str, p: &str, reason: &str) {
         self.releases
             .get_or_create(&with(pool(ns, p), "reason", reason))
             .inc();
     }
 
-    /// `result` = `hit`, `miss`, `spill`, `cold`, `wiped` (a pod created on a volume that
-    /// another cache scope owned) or `uncached`.
-    pub fn affinity(&self, ns: &str, p: &str, result: &str) {
-        self.cache_affinity
-            .get_or_create(&with(pool(ns, p), "result", result))
-            .inc();
-    }
-
-    /// Cache metrics of one `201`: `registry` when it carried registry flags,
-    /// `local` the cache result when the local layer applied.
-    pub fn cache(&self, ns: &str, p: &str, registry: bool, local: Option<&str>) {
-        if let Some(result) = local {
-            self.affinity(ns, p, result);
-        }
-        if registry {
-            self.registry_served(ns, p);
-        }
-    }
-
-    /// One response that carried `cache.registry`.
-    pub fn registry_served(&self, ns: &str, p: &str) {
-        self.registry_served.get_or_create(&pool(ns, p)).inc();
-    }
-
-    /// `op` = `create`, `delete` or `label`; `result` = `ok` or `error`.
-    pub fn volume_op(&self, op: &str, result: &str) {
-        self.volume_ops
-            .get_or_create(&vec![("op", op.to_owned()), ("result", result.to_owned())])
+    /// One `201` that carried cache flags; `tier` = `trusted` or `untrusted`.
+    pub fn cache(&self, ns: &str, p: &str, tier: &str) {
+        self.cache
+            .get_or_create(&with(pool(ns, p), "tier", tier))
             .inc();
     }
 }

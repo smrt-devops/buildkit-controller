@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitClaim
+metadata: {name: claim-minimal, namespace: default}
+spec:
+  poolRef: {namespace: ci, name: default}

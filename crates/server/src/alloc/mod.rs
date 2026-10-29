@@ -1,28 +1,29 @@
-//! Allocation service: warm claim,
-//! cold pre-claimed create, the per-replica FIFO queue, owner-only release.
+//! Allocation. Every allocation is a `BuildKitClaim`: the claim is the
+//! queue entry, and once bound it holds the result.
 //!
-//! Runs on every replica (not leader-gated) as the runtime's `alloc`
-//! [`Component`]. The HTTP layer holds a clone of the same [`AllocService`]
-//! and calls [`AllocService::allocate`] after authenticating the caller, and
-//! [`AllocService::release`]. This module does the pool lookup **and the
-//! access check**,
-//! so a caller of `allocate` cannot skip it. HTTP counts in
-//! `buildkit_allocations_total` only the rejections it makes itself
-//! (`unauthenticated`, `payload_too_large`, `unsupported_media_type`, bad JSON);
-//! every outcome of `allocate` is counted here.
+//! - [`front`]: every replica's stateless front door. The HTTP layer calls
+//!   [`AllocService::allocate`], [`AllocService::get`] and
+//!   [`AllocService::release`] after authenticating the caller. The front door
+//!   does the pool lookup **and the access check**, so a caller cannot skip
+//!   it, then creates, reads or deletes the caller's claim in the controller's
+//!   namespace.
+//! - [`bind`]: the leader's allocator. One pass per pool binds pending claims,
+//!   oldest first, to free warm pods and signs their certificates. The claim
+//!   controller ([`crate::claim`]) schedules the passes.
 //!
-//! A successful [`Allocation`] still owns its pod through the orphan guard:
-//! the handler calls [`Allocation::commit`] while writing the 201. Dropping it
-//! (handler error, panic, client disconnect) retires the pod.
+//! HTTP counts in `buildkit_allocations_total` only the rejections it makes
+//! itself (`unauthenticated`, `payload_too_large`, `unsupported_media_type`,
+//! bad JSON). The front door counts the requests it refuses; the leader counts
+//! how each claim ends.
 
 pub mod backend;
+pub mod bind;
 mod cache;
 pub mod certs;
-pub mod engine;
 pub mod error;
+pub mod front;
 pub mod metrics;
 pub mod pods;
-pub mod queue;
 
 #[cfg(test)]
 mod tests;
@@ -36,25 +37,22 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 pub use backend::{Backend, KubeBackend};
+pub use bind::{BindConfig, Binder};
 pub use certs::{CertSource, MaterialSource};
-pub use engine::{Allocation, Engine, EngineConfig};
 pub use error::AllocError;
+pub use front::{Front, Outcome};
 
 use crate::auth::Identity;
 use crate::certs::CertMaterial;
-use crate::render::{ANN_ALLOC, LABEL_POOL};
 use crate::runtime::AppContext;
 use crate::runtime::hooks::{BoxResult, Component};
-use crate::runtime::stores::PodEvent;
 use metrics::AllocMetrics;
-use pods::{FREE, ann, is_ready};
-use queue::{MAX_WAITERS, PoolKey, Queues, WaitersWriter};
 
-/// Handle to the allocation service; clone it into the HTTP layer.
+/// Handle to allocation; clone it into the HTTP layer.
 #[derive(Clone)]
 pub struct AllocService {
     material: watch::Receiver<CertMaterial>,
-    engine: Arc<OnceLock<Arc<Engine>>>,
+    front: Arc<OnceLock<Arc<Front>>>,
     metrics: Arc<OnceLock<AllocMetrics>>,
 }
 
@@ -65,7 +63,7 @@ impl AllocService {
     pub fn new(material: watch::Receiver<CertMaterial>) -> Self {
         Self {
             material,
-            engine: Arc::default(),
+            front: Arc::default(),
             metrics: Arc::default(),
         }
     }
@@ -93,17 +91,17 @@ impl AllocService {
     /// True once the service accepts calls.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        self.engine.get().is_some()
+        self.front.get().is_some()
     }
 
-    fn engine(&self) -> Result<&Arc<Engine>, AllocError> {
-        self.engine.get().ok_or_else(|| {
+    fn front(&self) -> Result<&Arc<Front>, AllocError> {
+        self.front.get().ok_or_else(|| {
             error!("allocation service called before it started");
             AllocError::Internal
         })
     }
 
-    /// POST /v1/allocations for an authenticated caller.
+    /// `POST /v1/allocations` for an authenticated caller.
     ///
     /// # Errors
     /// [`AllocError`], one variant per the API error code.
@@ -111,16 +109,29 @@ impl AllocService {
         &self,
         who: &Identity,
         req: &CreateAllocationRequest,
-    ) -> Result<Allocation, AllocError> {
-        self.engine()?.allocate(who, req).await
+    ) -> Result<Outcome, AllocError> {
+        self.front()?.allocate(who, req).await
     }
 
-    /// DELETE /v1/allocations/{id}: owner-only.
+    /// `GET /v1/allocations/{id}`: owner-only.
+    ///
+    /// # Errors
+    /// `not_found`, `forbidden`, the error of a failed allocation, `upstream_error`, `internal`.
+    pub async fn get(
+        &self,
+        who: &Identity,
+        id: &str,
+        wait: Duration,
+    ) -> Result<Outcome, AllocError> {
+        self.front()?.get(who, id, wait).await
+    }
+
+    /// `DELETE /v1/allocations/{id}`: owner-only.
     ///
     /// # Errors
     /// `not_found`, `forbidden`, `upstream_error`, `internal`.
     pub async fn release(&self, who: &Identity, alloc_id: &str) -> Result<(), AllocError> {
-        self.engine()?.release(who, alloc_id).await
+        self.front()?.release(who, alloc_id).await
     }
 }
 
@@ -129,8 +140,10 @@ impl Component for AllocService {
         "alloc"
     }
 
+    /// The front door on every replica, and the claim controller (the
+    /// allocator among it) while this replica leads.
     fn run(&self, ctx: AppContext, shutdown: CancellationToken) -> BoxResult {
-        let cell = Arc::clone(&self.engine);
+        let cell = Arc::clone(&self.front);
         let material = self.material.clone();
         let metrics_cell = Arc::clone(&self.metrics);
         Box::pin(async move {
@@ -139,269 +152,49 @@ impl Component for AllocService {
                 .clone();
             ctx.metrics().with_registry(|r| metrics.register(r));
             let c = ctx.config();
-            let cfg = EngineConfig {
-                endpoint: c.edge.endpoint.clone(),
-                server_name: c.edge.server_name.clone(),
-                allocation_domain: Some(c.edge.allocation_domain.clone()).filter(|d| !d.is_empty()),
-            };
             let timeout = c
                 .kube
                 .request_timeout
                 .seconds()
                 .map(Duration::from_secs)
                 .map_err(|e| anyhow::anyhow!("kube.requestTimeout: {e}"))?;
+            let backend: Arc<dyn Backend> = Arc::new(KubeBackend::new(ctx.client(), timeout));
+            let certs: Arc<dyn CertSource> = Arc::new(MaterialSource::new(material));
+            let own = ctx.namespace().to_owned();
+            let served = c.served_claim_namespaces(&own);
             let sub_ctx = ctx.clone();
-            let engine = Arc::new(
-                Engine::new(
-                    Arc::new(KubeBackend::new(ctx.client(), timeout)),
-                    ctx.pools(),
-                    ctx.pods(),
-                    Box::new(move || sub_ctx.pod_events()),
-                    Arc::new(MaterialSource::new(material)),
-                    cfg,
-                    metrics.clone(),
-                    Arc::new(Queues::new(MAX_WAITERS, metrics)),
-                )
-                .with_stopping(shutdown.clone()),
-            );
+            let front = Front::new(
+                Arc::clone(&backend),
+                ctx.pools(),
+                ctx.claims(),
+                Box::new(move || sub_ctx.claim_events()),
+                Arc::clone(&certs),
+                own.clone(),
+                served.clone(),
+                metrics.clone(),
+            )
+            .with_stopping(shutdown.clone())
+            .with_pods(ctx.pods());
+            let binder = Arc::new(Binder::new(
+                backend,
+                (ctx.pools(), ctx.pods(), ctx.claims()),
+                certs,
+                BindConfig {
+                    endpoint: c.edge.endpoint.clone(),
+                    server_name: c.edge.server_name.clone(),
+                    allocation_domain: Some(c.edge.allocation_domain.clone())
+                        .filter(|d| !d.is_empty()),
+                    namespace: own,
+                    served,
+                    cache_host: (!c.cache.host.is_empty()).then(|| c.cache.host.clone()),
+                },
+                metrics,
+            ));
             ctx.wait_synced().await;
-            let _ = cell.set(Arc::clone(&engine));
+            let _ = cell.set(Arc::new(front));
             info!(component = "alloc", "allocation service running");
-            drive(&engine, ctx.replica().to_owned(), shutdown).await;
+            crate::claim::run(ctx, binder, shutdown).await?;
             Ok(())
         })
-    }
-}
-
-fn key_of(p: &k8s_openapi::api::core::v1::Pod) -> Option<PoolKey> {
-    let pool = p.metadata.labels.as_ref()?.get(LABEL_POOL)?;
-    Some((p.metadata.namespace.clone()?, pool.clone()))
-}
-
-/// Keeps this replica's `status.waiters` entries current until `stop`, then
-/// sets every entry it wrote back to 0. The requests it counted have been
-/// refused by then and retry on another replica, which counts them again; a
-/// stale count here would make the leader start surplus workers until the entry
-/// ages out.
-///
-/// `stop` is checked only between ticks. A tick that has started runs to the
-/// end, each apply bounded by `kube.requestTimeout`. The writer records an
-/// entry before its non-zero apply is sent, so `clear` also zeroes one whose
-/// apply timed out and may still have landed.
-async fn write_waiters(
-    mut writer: WaitersWriter,
-    queues: Arc<Queues>,
-    backend: Arc<dyn Backend>,
-    stop: CancellationToken,
-) {
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            biased;
-            () = stop.cancelled() => break,
-            _ = tick.tick() => {}
-        }
-        writer.tick(&queues, &*backend).await;
-    }
-    writer.clear(&*backend).await;
-}
-
-/// Wakes queue heads on pod events and keeps `status.waiters` current, until
-/// `shutdown`.
-pub async fn drive(engine: &Engine, replica: String, shutdown: CancellationToken) {
-    let mut sub = (engine.subscribe)();
-    // Status applies wait on the API server; in their own task they cannot
-    // hold back pod events and queue wakes.
-    let writer_stop = shutdown.child_token();
-    let _writer_guard = writer_stop.clone().drop_guard();
-    let writer = tokio::spawn(write_waiters(
-        WaitersWriter::new(replica, engine.pools.clone()),
-        Arc::clone(&engine.queues),
-        Arc::clone(&engine.backend),
-        writer_stop,
-    ));
-    loop {
-        tokio::select! {
-            () = shutdown.cancelled() => {
-                // The final zero write must land before the replica exits.
-                let _ = writer.await;
-                return;
-            }
-            ev = sub.recv() => match ev {
-                None => return,
-                Some(PodEvent::Resync) => engine.queues.wake_all(),
-                Some(PodEvent::Apply(p)) => {
-                    let free = ann(&p, ANN_ALLOC) == Some(FREE)
-                        && is_ready(&p)
-                        && p.metadata.deletion_timestamp.is_none();
-                    if let (true, Some(k)) = (free, key_of(&p)) {
-                        engine.queues.wake(&k);
-                    }
-                }
-                Some(PodEvent::Delete(p)) => {
-                    if let Some(k) = key_of(&p) {
-                        engine.queues.wake(&k);
-                    }
-                }
-            },
-        }
-    }
-}
-
-#[cfg(test)]
-mod waiters_tests {
-    #![allow(clippy::unwrap_used)]
-
-    use std::sync::Mutex;
-
-    use buildkit_controller_api::v1alpha1::BuildKitPool;
-    use futures::future::BoxFuture;
-    use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret};
-    use kube::runtime::reflector::store::Writer;
-    use kube::runtime::watcher;
-    use serde_json::{Value, json};
-
-    use super::backend::{CreateOutcome, PatchOutcome, PvcCreate};
-    use super::*;
-    use crate::reconcile::spawn::WorkerSecrets;
-    use crate::render::fixtures;
-
-    /// Records each `status.waiters` count when the apply is sent; the apply
-    /// then takes 2 s and fails with `timeout` while its flag is set. Nothing
-    /// else is called.
-    #[derive(Default)]
-    struct SlowWaiters(Mutex<Vec<i32>>, std::sync::atomic::AtomicBool);
-
-    fn unused<T: Send + 'static>(out: T) -> BoxFuture<'static, T> {
-        Box::pin(async move { out })
-    }
-
-    impl Backend for SlowWaiters {
-        fn patch_pod(&self, _: &str, _: &str, _: Value) -> BoxFuture<'static, PatchOutcome> {
-            unused(PatchOutcome::Failed("unused".into()))
-        }
-        fn create_pod(&self, _: &str, _: Pod) -> BoxFuture<'static, CreateOutcome> {
-            unused(CreateOutcome::Failed("unused".into()))
-        }
-        fn delete_pod(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: Option<u32>,
-        ) -> BoxFuture<'static, Result<(), String>> {
-            unused(Err("unused".into()))
-        }
-        fn apply_waiters(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            count: i32,
-            _: &str,
-        ) -> BoxFuture<'static, Result<(), String>> {
-            self.0.lock().unwrap().push(count);
-            let fail = self.1.load(std::sync::atomic::Ordering::SeqCst);
-            Box::pin(async move {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                if fail { Err("timeout".into()) } else { Ok(()) }
-            })
-        }
-        fn get_pvc(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> BoxFuture<'static, Result<Option<PersistentVolumeClaim>, String>> {
-            unused(Err("unused".into()))
-        }
-        fn create_pvc(&self, _: &str, _: PersistentVolumeClaim) -> BoxFuture<'static, PvcCreate> {
-            unused(PvcCreate::Failed("unused".into()))
-        }
-        fn delete_pvc(&self, _: &str, _: &str, _: &str) -> BoxFuture<'static, Result<(), String>> {
-            unused(Err("unused".into()))
-        }
-        fn annotate_pvc(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> BoxFuture<'static, Result<(), String>> {
-            unused(Err("unused".into()))
-        }
-    }
-
-    impl WorkerSecrets for SlowWaiters {
-        fn create_worker_secret(&self, _: &Secret) -> BoxFuture<'static, Result<(), String>> {
-            unused(Err("unused".into()))
-        }
-        fn get_worker_pod(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> BoxFuture<'static, Result<Option<Pod>, String>> {
-            unused(Err("unused".into()))
-        }
-    }
-
-    /// A stop that lands while the first non-zero apply is in flight must
-    /// not lose it: the PATCH may land, and an entry `clear` does not know
-    /// about stays above 0 until the leader prunes it.
-    #[tokio::test(start_paused = true)]
-    async fn stop_during_the_first_apply_still_sets_the_entry_back_to_zero() {
-        let spec = json!({
-            "template": {"spec": {"containers": [{"name": "buildkitd", "image": "moby/buildkit:v0.26.3"}]}},
-            "scaling": {"min": 0, "max": 1},
-            "access": {"rules": [{"serviceAccount": {}}]},
-        });
-        let mut pools = Writer::<BuildKitPool>::default();
-        pools.apply_watcher_event(&watcher::Event::Apply(fixtures::pool("p", spec).unwrap()));
-        let queues = Arc::new(Queues::new(MAX_WAITERS, AllocMetrics::default()));
-        let _queued = queues
-            .enqueue(&(fixtures::POOL_NAMESPACE.into(), "p".into()), None)
-            .unwrap();
-        let backend = Arc::new(SlowWaiters::default());
-        let stop = CancellationToken::new();
-        let writer = tokio::spawn(write_waiters(
-            WaitersWriter::new("r1".into(), pools.as_reader()),
-            Arc::clone(&queues),
-            Arc::clone(&backend) as Arc<dyn Backend>,
-            stop.clone(),
-        ));
-        // The first tick is due at once and its apply is now in flight.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(*backend.0.lock().unwrap(), [1]);
-        stop.cancel();
-        writer.await.unwrap();
-        assert_eq!(*backend.0.lock().unwrap(), [1, 0]);
-    }
-
-    /// A non-zero apply that times out may still land, so `clear` must zero
-    /// its entry too.
-    #[tokio::test(start_paused = true)]
-    async fn clear_zeroes_an_entry_whose_apply_timed_out() {
-        let spec = json!({
-            "template": {"spec": {"containers": [{"name": "buildkitd", "image": "moby/buildkit:v0.26.3"}]}},
-            "scaling": {"min": 0, "max": 1},
-            "access": {"rules": [{"serviceAccount": {}}]},
-        });
-        let mut pools = Writer::<BuildKitPool>::default();
-        pools.apply_watcher_event(&watcher::Event::Apply(fixtures::pool("p", spec).unwrap()));
-        let queues = Queues::new(MAX_WAITERS, AllocMetrics::default());
-        let queues = Arc::new(queues);
-        let _queued = queues
-            .enqueue(&(fixtures::POOL_NAMESPACE.into(), "p".into()), None)
-            .unwrap();
-        let backend = SlowWaiters::default();
-        backend.1.store(true, std::sync::atomic::Ordering::SeqCst);
-        let mut writer = WaitersWriter::new("r1".into(), pools.as_reader());
-        writer.tick(&queues, &backend).await;
-        backend.1.store(false, std::sync::atomic::Ordering::SeqCst);
-        writer.clear(&backend).await;
-        assert_eq!(*backend.0.lock().unwrap(), [1, 0]);
-        // Settled: a second clear sends nothing.
-        writer.clear(&backend).await;
-        assert_eq!(*backend.0.lock().unwrap(), [1, 0]);
     }
 }

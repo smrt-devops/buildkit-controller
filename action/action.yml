@@ -12,7 +12,7 @@ inputs:
     description: Allocation TTL, e.g. 3600, 90m or 1h (default is the pool default).
     required: false
   queue-timeout:
-    description: How long to wait in the queue, e.g. 300 or 5m (default is the pool default). Also bounds retries of a 503 with Retry-After. The Action keeps retrying for at most this long (the pool default when unset) plus 60 seconds.
+    description: How long to wait in the queue, e.g. 300 or 5m (default is the pool default). Also bounds the whole allocation: the Action keeps polling a queued allocation and retrying a 503 with Retry-After, or a queue timeout that ran out, for at most this long (the pool default when unset) plus 60 seconds.
     required: false
   audience:
     description: OIDC token audience.
@@ -25,14 +25,14 @@ inputs:
     description: PEM CA certificate to trust for the API listener (default is system roots).
     required: false
   cache:
-    description: Cache layers to use, auto, registry, local or none (default auto, every layer the pool enables).
+    description: Whether to use the built-in build cache, auto or none (default auto).
     required: false
     default: auto
   cache-key:
-    description: Cache key for both layers, 1 to 63 of [A-Za-z0-9._-] (default the pool registry defaultKey, else the pool name).
+    description: Cache tag, so one repository can keep several caches, 1 to 63 of [A-Za-z0-9._-] (default the pool name).
     required: false
   cache-mode:
-    description: Overrides the pool mode in cache-to, max or min.
+    description: Overrides the mode in cache-to, max or min.
     required: false
   cache-from:
     description: Extra --cache-from values, one per line, added after the ones the controller returns.

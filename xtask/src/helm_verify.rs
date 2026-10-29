@@ -6,7 +6,8 @@
 //! pool in each watched namespace is Ready with its warm pod and binds a claim,
 //! that a pool in a third namespace is ignored, that the controller cannot
 //! create pods or Secrets in that namespace or in kube-system, and that its logs
-//! show no RBAC denial. The controller namespace enforces `PodSecurity`
+//! show no RBAC denial; then that the cache registry becomes Ready with the
+//! certificate the leader writes, and its logs show no RBAC denial either. The controller namespace enforces `PodSecurity`
 //! "restricted".
 //!
 //! The cluster name is `bk-helm-verify`, plus `-$BK_KIND_SUFFIX` when that is set.
@@ -32,16 +33,12 @@ const STRAY_NS: &str = "bk-helm-stray";
 /// The namespace in `claims.namespaces`.
 const APPS_NS: &str = "bk-helm-apps";
 const CONTROLLER_SA: &str = "system:serviceaccount:bk-helm:buildkit-controller";
-const CONTROLLER_IMAGE: &str = "buildkit-controller:dev";
 const LEASE: &str = "buildkit-controller-leader";
 
 pub(crate) fn helm_verify() -> Result<()> {
     let work = root().join("target/helm-verify");
     std::fs::create_dir_all(&work)?;
-    let env = &Cluster::new(
-        &super::kind_cluster("bk-helm-verify"),
-        work.join("kubeconfig"),
-    );
+    let env = &Cluster::for_suite("bk-helm-verify", &work)?;
     let result = verify(env);
     if result.is_err() {
         for args in [
@@ -71,7 +68,7 @@ pub(crate) fn helm_verify() -> Result<()> {
 fn verify(env: &Cluster) -> Result<()> {
     let root = root();
     env.create(None, "120s")?;
-    crate::image::image(CONTROLLER_IMAGE, Some(env.name()))?;
+    crate::image::load_controller(env)?;
     crate::image::ensure_worker()?;
     crate::proc::status(&mut crate::kube::kind_load(WORKER_IMAGE, env.name()))?;
 
@@ -306,6 +303,30 @@ fn verify(env: &Cluster) -> Result<()> {
         "controller logs show an RBAC denial"
     );
     println!("PASS no RBAC denial (Forbidden / is forbidden / \"code\":403) in controller logs");
+
+    // The cache registry starts once the leader has written its certificate, and
+    // reads pods and pools in the watched namespaces without a denial.
+    env.kubectl(&[
+        "rollout",
+        "status",
+        "statefulset/buildkit-controller-registry",
+        "-n",
+        NS,
+        "--timeout=180s",
+    ])?;
+    let logs = env.kubectl(&[
+        "logs",
+        "-n",
+        NS,
+        "-l",
+        "app.kubernetes.io/name=buildkit-registry",
+        "--tail=-1",
+    ])?;
+    ensure!(
+        !shows_rbac_denial(&logs),
+        "cache registry logs show an RBAC denial"
+    );
+    println!("PASS cache registry Ready, no RBAC denial in its logs");
     println!("helm-verify: all checks passed");
     Ok(())
 }

@@ -1,4 +1,4 @@
-//! Creating one worker, shared by the reconciler and the API's cold path:
+//! Creating one worker for the reconciler:
 //! issue the pod's serving cert, create the pod, then create the pod's Secret
 //! owned by the pod.
 //!
@@ -21,9 +21,7 @@ use kube::{Client, ResourceExt};
 use time::{Duration, OffsetDateTime};
 
 use crate::pki::{CaBundle, Namespace, PoolName, WorkerIdentity};
-use crate::render::{
-    self, ANN_WORKER_NONCE, CONTROLLER, Claim, PodInputs, WorkerTlsPem, worker_pod_name,
-};
+use crate::render::{self, ANN_WORKER_NONCE, CONTROLLER, PodInputs, WorkerTlsPem, worker_pod_name};
 
 /// The calls [`spawn`] needs beyond the pod create: create the pod's Secret
 /// and read the pod back after a create whose outcome is unknown. RBAC grants
@@ -64,19 +62,21 @@ pub struct Worker {
     pub pod: Pod,
     /// `<pod>-<nonce>`; [`spawn`] makes the pod its owner.
     pub secret: Secret,
-    /// The serving cert's notAfter.
+    /// The earlier notAfter of its serving and registry client certs.
     pub not_after: OffsetDateTime,
 }
 
-/// Picks a nonce, issues the serving cert for `<nonce>.<pod>.<pool>.<ns>` valid
-/// for `validity`, and renders the pod and its Secret.
+/// Picks a nonce, issues the serving cert (internal CA) and the registry client
+/// cert (client CA, its own key) for `<nonce>.<pod>.<pool>.<ns>` valid for
+/// `validity`, and renders the pod and its Secret, whose `buildkitd.toml`
+/// names the cache registry at `cache_host`.
 pub fn prepare(
     pool: &BuildKitPool,
     ca: &CaBundle,
     slot: u32,
-    claim: Option<Claim>,
     now: OffsetDateTime,
     validity: Duration,
+    cache_host: Option<&str>,
 ) -> Result<Worker, String> {
     let ns =
         Namespace::try_from(pool.namespace().unwrap_or_default()).map_err(|e| e.to_string())?;
@@ -86,21 +86,26 @@ pub fn prepare(
     let cert = ca
         .issue_worker_serving_for(&id, now, validity)
         .map_err(|e| e.to_string())?;
-    let pem = WorkerTlsPem::from_pki(&cert, ca.internal_ca()).map_err(|e| e.to_string())?;
+    let client = ca
+        .issue_worker_client_for(&id, now, validity)
+        .map_err(|e| e.to_string())?;
+    let pem =
+        WorkerTlsPem::from_pki(&cert, &client, ca.internal_ca()).map_err(|e| e.to_string())?;
+    // Either CA can end first; the pod is good until the earlier leaf ends.
+    let not_after = cert.not_after().min(client.not_after());
     let inputs = PodInputs {
         slot,
         internal_ca_fingerprint: ca.internal_ca().fingerprint_hex(),
-        worker_cert_not_after: cert
-            .not_after()
+        worker_cert_not_after: not_after
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| e.to_string())?,
         nonce: id.nonce,
-        claim,
     };
     Ok(Worker {
         pod: render::worker_pod(pool, &inputs).map_err(|e| e.to_string())?,
-        secret: render::worker_secret(pool, &inputs, &pem).map_err(|e| e.to_string())?,
-        not_after: cert.not_after(),
+        secret: render::worker_secret(pool, &inputs, &pem, cache_host)
+            .map_err(|e| e.to_string())?,
+        not_after,
     })
 }
 

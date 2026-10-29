@@ -36,34 +36,42 @@ async function run() {
   gha.saveState('audience', aud);
   gha.saveState('ca', ca || '');
   const root = process.env.RUNNER_TEMP || require('node:os').tmpdir();
-  const okIds = [];
+  // Every id that may still hold a worker, bound or queued. State is rewritten on each change, so a
+  // cancel while an allocation is still queued releases it in the post step.
+  const live = new Set();
+  const saveIds = () => {
+    const ids = [...live];
+    gha.saveState('ids', ids.join(','));
+    gha.saveState('dirs', ids.map((id) => path.join(root, `buildkit-${id}`)).join(','));
+  };
   const results = await Promise.allSettled(pools.map(async (p, i) => {
     // Only a 503 with Retry-After or a failure before the request was sent is retried: anything
-    // else may have claimed a worker whose id we would never learn.
+    // else may have claimed a worker whose id we would never learn. A 202 hands out the id, which
+    // is polled until bound; a queue timeout that runs out on the poll starts a fresh POST.
     // A retry queues only for what is left of the budget, so the total stays near the queue timeout
     // + 60 s. Without queue-timeout, the pool default from GET /v1/pools sets the budget.
     const pqt = L.effectiveQueueTimeout(qt, found[i]);
     const attemptOpts = ({ remainingMs }) => {
       const q = L.queueTimeoutFor(pqt, remainingMs);
       return {
-        method: 'POST', ca, timeoutMs: L.postTimeoutMs(q), headers: { 'Content-Type': 'application/json' },
+        method: 'POST', ca, timeoutMs: L.postTimeoutMs(remainingMs), headers: { 'Content-Type': 'application/json' },
         body: L.allocationBody(p, keys[i].publicKey, ttl, q, cache),
       };
     };
-    const res = await L.requestWithRetry(`${api}/v1/allocations`, attemptOpts,
-      { what: `allocate ${p.namespace}/${p.pool}`, getToken, budgetMs: L.retryBudgetMs(pqt), log: gha.info });
-    if (res.status !== 201) throw L.apiError(`allocate ${p.namespace}/${p.pool}`, res);
-    const a = JSON.parse(res.body);
+    const a = await L.allocate(api, {
+      what: `allocate ${p.namespace}/${p.pool}`, ca, getToken, attemptOpts, budgetMs: L.retryBudgetMs(pqt), log: gha.info,
+      onId: (id) => { live.add(id); saveIds(); },
+      onGone: (id) => { live.delete(id); saveIds(); },
+    });
     L.checkAllocationId(a.id);
-    okIds.push(a.id);
-    gha.saveState('ids', okIds.join(','));
-    gha.saveState('dirs', okIds.map((id) => path.join(root, `buildkit-${id}`)).join(','));
+    live.add(a.id);
+    saveIds();
     return a;
   }));
   const allocs = results.map((r) => (r.status === 'fulfilled' ? r.value : undefined));
   const failed = results.find((r) => r.status === 'rejected');
   if (failed) {
-    await Promise.all(allocs.filter(Boolean).map((a) => L.releaseAllocation({ api, ca, getToken, id: a.id, log: gha.info })
+    await Promise.all([...live].map((id) => L.releaseAllocation({ api, ca, getToken, id, log: gha.info })
       .catch((e) => gha.warning(e.message))));
     throw failed.reason;
   }
@@ -84,7 +92,7 @@ async function run() {
   gha.setOutput('cache-to', flags.to.join('\n'));
   gha.setOutput('cache-from', flags.from.join('\n'));
   gha.setOutput('cache-args', flags.args.join(' '));
-  for (const a of allocs) if (a.cache && a.cache.local) gha.info(`${a.namespace}/${a.pool}: cache key ${a.cache.key}, local ${a.cache.local.result}`);
+  for (const a of allocs) if (a.cache && a.cache.registry && !a.cache.registry.to) gha.info(`${a.namespace}/${a.pool}: cache key ${a.cache.key}, read only for this build`);
   gha.setOutput('platforms', [...new Set(nodes.flatMap((n) => n.platforms))].join(','));
   gha.info(`builder ${builder} ready with ${ids.length} node(s)`);
 }
