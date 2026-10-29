@@ -71,6 +71,7 @@ pub enum CertKind {
     InternalCa,
     Allocation,
     WorkerServing,
+    CacheServing,
     EdgeServing,
     EdgeClient,
 }
@@ -84,6 +85,7 @@ impl CertKind {
             Self::InternalCa => "internal_ca",
             Self::Allocation => "allocation",
             Self::WorkerServing => "worker_serving",
+            Self::CacheServing => "cache_serving",
             Self::EdgeServing => "edge_serving",
             Self::EdgeClient => "edge_client",
         }
@@ -95,6 +97,7 @@ impl From<Profile> for CertKind {
         match p {
             Profile::Allocation => Self::Allocation,
             Profile::WorkerServing => Self::WorkerServing,
+            Profile::CacheServing => Self::CacheServing,
             Profile::EdgeServing => Self::EdgeServing,
             Profile::EdgeClient => Self::EdgeClient,
         }

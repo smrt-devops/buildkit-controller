@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -25,8 +26,10 @@ use super::ops::{KubeClient, Timed};
 use super::pass::{self, CaView, PoolMemory, Settings};
 use super::plan::{PlanConfig, REAPPLY_AFTER};
 use super::pods::WorkerPod;
+use super::registry_tls;
 use crate::claim::logic as claims;
 use crate::config::ElectionTiming;
+use crate::pki::LoadOutcome;
 use crate::render::LABEL_POOL;
 use crate::runtime::AppContext;
 use crate::runtime::hooks::LeaderWork;
@@ -111,6 +114,8 @@ async fn sleep_until(t: Option<Instant>) {
 pub struct Reconciler {
     ctx: AppContext,
     metrics: ReconcileMetrics,
+    /// The v0.1.0 cache volumes are gone ([`super::sweep`]).
+    swept: Arc<AtomicBool>,
 }
 
 impl Reconciler {
@@ -120,6 +125,7 @@ impl Reconciler {
         Self {
             metrics: ReconcileMetrics::register(ctx.metrics()),
             ctx: ctx.clone(),
+            swept: Arc::default(),
         }
     }
 }
@@ -127,7 +133,8 @@ impl Reconciler {
 impl LeaderWork for Reconciler {
     fn run(&self, term: u64) -> BoxFut {
         let (ctx, metrics) = (self.ctx.clone(), self.metrics.clone());
-        Box::pin(run_term(ctx, metrics).instrument(info_span!("reconcile", term)))
+        let side = side_work(ctx.clone(), Arc::clone(&self.swept));
+        Box::pin(run_term(ctx, metrics, side).instrument(info_span!("reconcile", term)))
     }
 }
 
@@ -169,7 +176,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-async fn run_term(ctx: AppContext, metrics: ReconcileMetrics) {
+async fn run_term(ctx: AppContext, metrics: ReconcileMetrics, side: impl Future<Output = ()>) {
     info!("reconciler started");
     let _gauges = TermGauges(metrics.clone());
     let client: Client = ctx.client();
@@ -263,15 +270,52 @@ async fn run_term(ctx: AppContext, metrics: ReconcileMetrics) {
         let term = Arc::clone(&term);
         move || all_keys(&term.pools.state(), lock(&term.memory).keys())
     };
-    schedule(triggers, all, |key| {
+    let passes = schedule(triggers, all, |key| {
         let term = Arc::clone(&term);
         async move {
             let requeue = pass_once(&term, &key).await;
             (key, requeue)
         }
+    });
+    // The side work never ends on its own; the passes end with the watches.
+    tokio::select! {
+        () = passes => {}
+        () = side => {}
+    }
+    info!("reconciler stopped: watches ended");
+}
+
+/// Leader work beside the passes: the one-time sweep of v0.1.0 cache
+/// volumes, then the cache registry certificate. Never returns.
+async fn side_work(ctx: AppContext, swept: Arc<AtomicBool>) {
+    let client = ctx.client();
+    if !swept.load(Ordering::Relaxed)
+        && super::sweep::old_cache_volumes(&client, ctx.config().watched_namespaces()).await
+    {
+        swept.store(true, Ordering::Relaxed);
+    }
+    let c = &ctx.config().cache;
+    if c.host.is_empty() {
+        return std::future::pending().await;
+    }
+    let target = registry_tls::Target {
+        namespace: ctx.namespace().to_owned(),
+        secret_name: c.tls_secret_name.clone(),
+        server_name: c.server_name().to_owned(),
+        validity: ctx.config().leaf_validity().edge_serving,
+    };
+    let ca = ctx.ca_secret();
+    registry_tls::keep(client, target, move || {
+        let view = CaView {
+            epoch: 0,
+            secret: ca.borrow().secret.clone(),
+        };
+        match pass::load_ca(&view, Timestamp::now()) {
+            LoadOutcome::Valid(b) => Some(*b),
+            _ => None,
+        }
     })
     .await;
-    info!("reconciler stopped: watches ended");
 }
 
 async fn pass_once(term: &Term, key: &PoolKey) -> Option<Duration> {
@@ -316,7 +360,7 @@ async fn pass_once(term: &Term, key: &PoolKey) -> Option<Duration> {
             .iter()
             .filter_map(|p| WorkerPod::from_pod(p, &key.0, &key.1, &pool.uid().unwrap_or_default()))
             .collect();
-        let counts = PodCounts::of(&pool, &workers);
+        let counts = PodCounts::of(&workers);
         let elapsed = started.elapsed();
         term.metrics.pass(
             &key.0,

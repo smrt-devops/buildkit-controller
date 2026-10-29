@@ -157,8 +157,6 @@ pub struct Report {
     pub errors: Vec<String>,
     /// `(op, result)` for `buildkit_pod_operations_total`.
     pub pod_ops: Vec<(&'static str, &'static str)>,
-    /// `(op, result)` for `buildkit_cache_volume_operations_total`.
-    pub volume_ops: Vec<(&'static str, &'static str)>,
     /// `buildkit_ca_replacements_total{reason}`.
     pub ca_replacements: Vec<&'static str>,
     /// `buildkit_releases_total{reason}` (allocated pods retired).
@@ -231,11 +229,9 @@ pub async fn execute<O: KubeOps>(ops: &O, guard: &CaGuard, env: &Env<'_>, plan: 
                 let res = ops.delete_pod(&ns, pod, uid, None, Some(0)).await;
                 pod_op(&mut r, "force_delete", pod, res);
             }
-            Action::RetireFree { pod, uid, reason } => {
+            Action::RetireFree { pod, uid, .. } => {
                 r.trace.push(format!("retire:{pod}"));
-                if retire(ops, &ns, pod, uid, "free", None, &mut r).await {
-                    super::cache::reap_after_failure(ops, env.pool, pod, *reason, &mut r).await;
-                }
+                retire(ops, &ns, pod, uid, "free", None, &mut r).await;
             }
             Action::RetireAllocated {
                 pod,
@@ -247,7 +243,6 @@ pub async fn execute<O: KubeOps>(ops: &O, guard: &CaGuard, env: &Env<'_>, plan: 
                 r.trace.push(format!("retire:{pod}"));
                 let exp = expires_at.as_deref();
                 if retire(ops, &ns, pod, uid, alloc_id, exp, &mut r).await {
-                    super::cache::reap_after_failure(ops, env.pool, pod, *reason, &mut r).await;
                     r.releases.push(match reason.label() {
                         "ca_rotated" => "ca_replaced",
                         other => other,
@@ -395,20 +390,17 @@ async fn create_pod<O: KubeOps>(ops: &O, env: &Env<'_>, slot: u32, r: &mut Repor
     let LoadOutcome::Valid(ca) = env.ca else {
         return failed("no valid CA".into());
     };
-    let mut worker = match spawn::prepare(
+    let worker = match spawn::prepare(
         env.pool,
         ca,
         slot,
-        None,
         odt(env.now),
         env.worker_cert_validity,
+        env.render.cache_host.as_deref(),
     ) {
         Ok(w) => w,
         Err(e) => return failed(e),
     };
-    if let Some(skip) = super::cache::ensure_volume(ops, env.pool, slot, &mut worker.pod, r).await {
-        return skip;
-    }
     let ns = env.pool.namespace().unwrap_or_default();
     // Boxed: the create and its read back would bloat every pass future.
     let res = Box::pin(spawn::spawn(ops, worker, |pod| async move {

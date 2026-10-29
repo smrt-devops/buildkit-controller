@@ -185,6 +185,7 @@ impl Component for AllocService {
                         .filter(|d| !d.is_empty()),
                     namespace: own,
                     served,
+                    cache_host: (!c.cache.host.is_empty()).then(|| c.cache.host.clone()),
                 },
                 metrics,
             ));

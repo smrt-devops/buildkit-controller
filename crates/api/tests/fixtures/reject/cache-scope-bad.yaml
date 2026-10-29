@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: cache-scope-bad, namespace: default}
+spec:
+  workers: {cache: {scope: repository}}

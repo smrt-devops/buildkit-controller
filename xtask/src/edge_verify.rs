@@ -27,7 +27,8 @@ use anyhow::{Context, Result, bail, ensure};
 use buildkit_controller::pki::{AllocationId, CaBundle, LeafKey, WorkerIdentity};
 use buildkit_controller::render::fixtures::pool;
 use buildkit_controller::render::{
-    BUILDKIT_PORT, Claim, PodInputs, WorkerTlsPem, service_account, worker_pod, worker_secret,
+    ANN_ALLOC, ANN_ALLOCATED_AT, ANN_EXPIRES_AT, ANN_OWNER, BUILDKIT_PORT, LABEL_STATE, PodInputs,
+    WorkerTlsPem, service_account, worker_pod, worker_secret,
 };
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -348,16 +349,27 @@ fn deploy(env: &Cluster, work: &Path, ca: &CaBundle, now: OffsetDateTime) -> Res
         internal_ca_fingerprint: ca.internal_ca().fingerprint_hex(),
         worker_cert_not_after: rfc3339(serving_not_after(now))?,
         nonce: NONCE.into(),
-        claim: Some(Claim {
-            alloc_id: ALLOC.into(),
-            owner: "sa:bk-edge/edge-verify".into(),
-            allocated_at: rfc3339(now)?,
-            expires_at: rfc3339(expires)?,
-        }),
     };
+    // Created already allocated, as a bind would leave it.
+    let mut worker_obj = worker_pod(&p, &inputs)?;
+    worker_obj
+        .metadata
+        .labels
+        .get_or_insert_default()
+        .insert(LABEL_STATE.into(), "allocated".into());
+    worker_obj
+        .metadata
+        .annotations
+        .get_or_insert_default()
+        .extend([
+            (ANN_ALLOC.to_owned(), ALLOC.to_owned()),
+            (ANN_OWNER.to_owned(), "sa:bk-edge/edge-verify".to_owned()),
+            (ANN_ALLOCATED_AT.to_owned(), rfc3339(now)?),
+            (ANN_EXPIRES_AT.to_owned(), rfc3339(expires)?),
+        ]);
     env.apply(&yaml(&service_account(&p)?)?)?;
-    env.apply(&yaml(&worker_secret(&p, &inputs, &tls)?)?)?;
-    env.apply(&yaml(&worker_pod(&p, &inputs)?)?)?;
+    env.apply(&yaml(&worker_secret(&p, &inputs, &tls, None)?)?)?;
+    env.apply(&yaml(&worker_obj)?)?;
     let worker = format!("{POOL}-0");
     env.kubectl(&[
         "-n",

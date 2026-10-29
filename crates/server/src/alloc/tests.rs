@@ -32,6 +32,8 @@ const POOL_NS: &str = fixtures::POOL_NAMESPACE;
 const POOL: &str = "p";
 /// The controller's namespace.
 const OWN: &str = "bk-system";
+/// `cache.host` of the harness.
+const CACHE_HOST: &str = "bk-registry.bk.svc:5000";
 /// A tenant namespace the pool admits claims from.
 const CI: &str = "ci";
 /// A client public key, PEM.
@@ -172,17 +174,6 @@ impl Backend for Fake {
                 .unwrap()
                 .apply_watcher_event(&watcher::Event::Delete(p));
         }
-        ready(Ok(()))
-    }
-
-    fn annotate_pvc(
-        &self,
-        _: &str,
-        name: &str,
-        _: &str,
-        value: &str,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        self.call(format!("annotate_pvc {name} {value}"));
         ready(Ok(()))
     }
 
@@ -361,6 +352,7 @@ fn env() -> Env {
             allocation_domain: Some("alloc.bk.example.com".into()),
             namespace: OWN.into(),
             served: served.clone(),
+            cache_host: Some(CACHE_HOST.into()),
         },
         metrics.clone(),
     );
@@ -409,7 +401,6 @@ impl Env {
                 internal_ca_fingerprint: self.ca.internal_ca().fingerprint_hex(),
                 worker_cert_not_after: "2099-01-01T00:00:00Z".into(),
                 nonce: "00000000000000aa".into(),
-                claim: None,
             },
         )
         .unwrap();
@@ -1016,3 +1007,6 @@ async fn tidy_ends_claims_and_retires_strays() {
     let mut reg = prometheus_client::registry::Registry::default();
     e.metrics.register(&mut reg);
 }
+
+#[path = "tests_cache.rs"]
+mod cache_tests;

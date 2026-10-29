@@ -25,10 +25,10 @@ pub struct CreateAllocationRequest {
     /// server then generates the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
-    /// Cache key of both cache layers. Defaults to the pool's `registry.defaultKey`, else its name.
+    /// Tag of the cache in the caller's scope, so one caller can keep several caches. Defaults to the pool name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_key: Option<CacheKey>,
-    /// Which cache layers to use. Defaults to `auto`.
+    /// Whether to use the cache. Defaults to `auto`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheChoice>,
 }
@@ -39,14 +39,10 @@ pub struct CreateAllocationRequest {
 )]
 #[serde(rename_all = "lowercase")]
 pub enum CacheChoice {
-    /// Every layer the pool enables.
+    /// The built-in cache registry, when the controller runs one.
     #[default]
     Auto,
-    /// Only the registry cache; 400 when the pool has none.
-    Registry,
-    /// Only local volumes; 400 when the pool has none.
-    Local,
-    /// No cache layer.
+    /// No cache.
     None,
 }
 
@@ -56,26 +52,24 @@ pub enum CacheChoice {
 pub struct CacheResponse {
     /// The effective cache key.
     pub key: String,
-    /// buildx flags of the registry cache.
+    /// buildx flags for the built-in cache registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub registry: Option<crate::v1alpha1::RegistryCacheFlags>,
-    /// Local volume outcome.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local: Option<LocalCacheResult>,
+    pub registry: Option<RegistryCacheFlags>,
 }
 
-/// `cache.local` of the `201` response.
+/// buildx flags for the built-in cache registry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct LocalCacheResult {
-    /// `hit`, `miss`, `spill`, `cold` or `uncached`, or
-    /// `reused` when the request left out the local layer.
-    pub result: String,
+pub struct RegistryCacheFlags {
+    /// `--cache-to` value. Absent when the caller may only read the cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// `--cache-from` values, in order.
+    pub from: Vec<String>,
 }
 
 /// `cacheKey` of `POST /v1/allocations`: a Kubernetes label value of 1 to 63
-/// characters (`^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$`). The allocator
-/// uses it for the registry ref and the local volume preference.
+/// characters (`^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$`), used as the cache tag.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct CacheKey(String);
@@ -136,7 +130,7 @@ pub struct AllocationResponse {
     pub client_key: Option<String>,
     /// RFC 3339 UTC expiry.
     pub expires_at: String,
-    /// Cache flags and outcome; absent when no cache layer applies.
+    /// Cache flags; absent when the controller runs no cache or the request asked for none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheResponse>,
 }

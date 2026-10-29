@@ -476,15 +476,6 @@ impl Backend for NoBackend {
     ) -> BoxFuture<'static, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
-    fn annotate_pvc(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: &str,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
     fn create_claim(&self, _: BuildKitClaim) -> BoxFuture<'static, Write> {
         Box::pin(async { Write::Unknown })
     }

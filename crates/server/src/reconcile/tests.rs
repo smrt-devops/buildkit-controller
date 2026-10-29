@@ -1189,11 +1189,8 @@ fn held_slot_heals_after_foreign_pod_is_deleted() {
 }
 
 #[test]
-fn volumes_in_use_counts_pods_below_the_cache_limit() {
+fn pod_counts_count_draining_pods() {
     use super::metrics::PodCounts;
-    use buildkit_controller_api::v1alpha1::LocalCache;
-    let mut pool = fx().pool;
-    pool.spec.scaling.max = 4;
     let draining = WorkerPod {
         alloc: Alloc::Draining,
         ..pod(3)
@@ -1203,24 +1200,12 @@ fn volumes_in_use_counts_pods_below_the_cache_limit() {
         ..pod(0)
     };
     let workers = [pod(0), allocated(1), pod(2), draining, foreign];
-    let c = PodCounts::of(&pool, &workers);
-    assert_eq!((c.draining, c.volumes_in_use), (1, None));
-    // limit = min(maxVolumes 2, max 4): slots 0 and 1.
-    pool.spec.workers.cache.local = Some(LocalCache {
-        max_volumes: 2,
-        ..LocalCache::default()
-    });
-    assert_eq!(PodCounts::of(&pool, &workers).volumes_in_use, Some(2));
-    // limit = min(maxVolumes 10, max 3): slots 0 to 2.
-    pool.spec.scaling.max = 3;
-    pool.spec.workers.cache.local = Some(LocalCache::default());
-    assert_eq!(PodCounts::of(&pool, &workers).volumes_in_use, Some(3));
+    assert_eq!(PodCounts::of(&workers).draining, 1);
 }
 
 /// Regression (RECON-1): a warm pod that was Ready and failed its readiness
 /// probe after `startTimeout` was retired as `StartTimeout`, which set
-/// `Degraded=PodStartTimeout`, bumped the create backoff and, in a cached
-/// slot, deleted the cache volume. A pod seen up earlier in the term gets
+/// `Degraded=PodStartTimeout` and bumped the create backoff. A pod seen up earlier in the term gets
 /// `startTimeout` from when it went down, then retires as `Unready` with no
 /// `Degraded` and no backoff.
 #[test]

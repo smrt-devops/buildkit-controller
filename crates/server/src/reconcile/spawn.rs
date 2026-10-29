@@ -21,9 +21,7 @@ use kube::{Client, ResourceExt};
 use time::{Duration, OffsetDateTime};
 
 use crate::pki::{CaBundle, Namespace, PoolName, WorkerIdentity};
-use crate::render::{
-    self, ANN_WORKER_NONCE, CONTROLLER, Claim, PodInputs, WorkerTlsPem, worker_pod_name,
-};
+use crate::render::{self, ANN_WORKER_NONCE, CONTROLLER, PodInputs, WorkerTlsPem, worker_pod_name};
 
 /// The calls [`spawn`] needs beyond the pod create: create the pod's Secret
 /// and read the pod back after a create whose outcome is unknown. RBAC grants
@@ -69,14 +67,15 @@ pub struct Worker {
 }
 
 /// Picks a nonce, issues the serving cert for `<nonce>.<pod>.<pool>.<ns>` valid
-/// for `validity`, and renders the pod and its Secret.
+/// for `validity`, and renders the pod and its Secret, whose `buildkitd.toml`
+/// names the cache registry at `cache_host`.
 pub fn prepare(
     pool: &BuildKitPool,
     ca: &CaBundle,
     slot: u32,
-    claim: Option<Claim>,
     now: OffsetDateTime,
     validity: Duration,
+    cache_host: Option<&str>,
 ) -> Result<Worker, String> {
     let ns =
         Namespace::try_from(pool.namespace().unwrap_or_default()).map_err(|e| e.to_string())?;
@@ -95,11 +94,11 @@ pub fn prepare(
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| e.to_string())?,
         nonce: id.nonce,
-        claim,
     };
     Ok(Worker {
         pod: render::worker_pod(pool, &inputs).map_err(|e| e.to_string())?,
-        secret: render::worker_secret(pool, &inputs, &pem).map_err(|e| e.to_string())?,
+        secret: render::worker_secret(pool, &inputs, &pem, cache_host)
+            .map_err(|e| e.to_string())?,
         not_after: cert.not_after(),
     })
 }

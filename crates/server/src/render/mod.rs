@@ -5,7 +5,7 @@
 //! controller-owned field is a typed [`RenderError::TemplateConflict`] naming the
 //! field, never a silent override.
 
-mod cache;
+mod config;
 mod hash;
 mod objects;
 mod pod;
@@ -23,16 +23,10 @@ use std::fmt;
 use buildkit_controller_api::v1alpha1::{BuildKitPool, GROUP, VERSION};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 
-pub use cache::{
-    Binding, Bound, CACHE_VOLUME_NAME, GENERATION_FILE, KEY_CACHE_GENERATION, KEY_CACHE_KEYS,
-    KEY_CACHE_SCOPE, LABEL_VOLUME_HASH, bind_pod, buildkitd_config, cache_limit, cache_volume,
-    cache_volume_name, cache_volume_slot, gc_keep_bytes, is_cached_slot, keys_contain,
-    pod_cache_keys, pod_serves, push_key, quantity_bytes, scope_id, set_pod_cache_keys,
-    volume_hash, won_binding,
-};
+pub use config::{buildkitd_config, is_scope_id, quantity_bytes, scope_id};
 pub use hash::{config_hash, template_hash};
 pub use objects::{ca_bundle_config_map, network_policy, service_account, worker_secret};
-pub use pod::{CACHE_INIT_NAME, pod_spec, worker_pod};
+pub use pod::{pod_spec, worker_pod};
 pub use validate::{
     Conflict, PROTECTED_CIDRS, refused_allow_cidr, refused_allow_cidrs, validate_template,
 };
@@ -70,6 +64,13 @@ pub const ANN_WORKER_CERT_NOT_AFTER: &str = "buildkit.smrt-devops.net/worker-cer
 pub const ANN_INTERNAL_CA: &str = "buildkit.smrt-devops.net/internal-ca";
 /// `P worker-nonce`: the nonce in the worker serving cert's SAN.
 pub const ANN_WORKER_NONCE: &str = "buildkit.smrt-devops.net/worker-nonce";
+
+/// `P scope`: the cache scope id of the allocation a pod serves.
+pub const ANN_SCOPE: &str = "buildkit.smrt-devops.net/scope";
+/// `P tier`: `trusted` or `untrusted`, whether that allocation may write the cache.
+pub const ANN_TIER: &str = "buildkit.smrt-devops.net/tier";
+/// Value of [`LABEL_NAME`] on the built-in cache registry pod; workers may reach it.
+pub const REGISTRY_NAME: &str = "buildkit-registry";
 
 /// Port buildkitd listens on (mTLS).
 pub const BUILDKIT_PORT: i32 = 1234;
@@ -136,6 +137,9 @@ pub struct RenderConfig {
     pub controller_namespace: String,
     /// `workerNetwork`.
     pub worker_network: WorkerNetwork,
+    /// `cache.host`: where workers reach the built-in cache registry, in the
+    /// controller namespace. `None` = no cache.
+    pub cache_host: Option<String>,
 }
 
 /// The `workerNetwork` settings.
@@ -198,20 +202,6 @@ impl Default for WorkerNetwork {
     }
 }
 
-/// An allocation a pod is created with.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Claim {
-    /// 26-char allocation id.
-    pub alloc_id: String,
-    /// The caller, as [`crate::auth::Identity::owner`] builds it: `sa:<namespace>/<name>`,
-    /// `claim:<namespace>/<name>#<uid>`, or `oidc:<iss>#<sub>` followed by any run claims.
-    pub owner: String,
-    /// RFC 3339 UTC, seconds precision.
-    pub allocated_at: String,
-    /// RFC 3339 UTC, seconds precision.
-    pub expires_at: String,
-}
-
 /// Per-pod inputs of [`worker_pod`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PodInputs {
@@ -225,8 +215,6 @@ pub struct PodInputs {
     /// Worker nonce ([`crate::pki::WorkerIdentity::nonce`]): names the per-pod
     /// Secret `<pod>-<nonce>` and is rendered as `P worker-nonce`.
     pub nonce: String,
-    /// `Some` for a pre-claimed cold-path pod; `None` creates it `free`.
-    pub claim: Option<Claim>,
 }
 
 /// Contents of the worker Secret that come from the PKI.

@@ -14,6 +14,7 @@ use super::*;
 
 const EDGE_NAME: &str = "buildkit.example.com";
 const WORKER_NAME: &str = "00000000000000aa.default-0.default.ci.worker.buildkit.internal";
+const CACHE_NAME: &str = "bk-registry.buildkit-system.svc";
 
 type Live = Vec<(Profile, CertificateDer<'static>, OffsetDateTime)>;
 
@@ -68,6 +69,13 @@ fn trusted(b: &CaBundle, p: Profile, der: &CertificateDer<'_>, now: OffsetDateTi
             now,
         ),
         Profile::EdgeClient => chains(der, internal, KeyUsage::client_auth(), None, now),
+        Profile::CacheServing => chains(
+            der,
+            internal,
+            KeyUsage::server_auth(),
+            Some(CACHE_NAME),
+            now,
+        ),
     }
 }
 
@@ -86,7 +94,7 @@ fn edge_names() -> EdgeNames {
 fn min_left_at_renewal(p: Profile) -> Duration {
     match p {
         // With 30 days, renewal leaves at least 10 days.
-        Profile::WorkerServing | Profile::EdgeServing => Duration::days(10),
+        Profile::WorkerServing | Profile::CacheServing | Profile::EdgeServing => Duration::days(10),
         // With 24 hours, renewal leaves at least 8 hours.
         Profile::EdgeClient => Duration::hours(8),
         Profile::Allocation => Duration::ZERO,

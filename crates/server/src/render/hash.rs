@@ -63,29 +63,17 @@ pub fn config_hash(buildkitd_config: &str) -> String {
 /// `P template-hash`: first 10 hex chars of SHA-256 over the
 /// merged pod spec, the user's pod labels and annotations, and the
 /// `buildkitdConfig` hash. The CA fingerprint, the slot and per-pod state are
-/// not inputs, so a CA rotation does not retire free pods by this hash.
+/// not inputs, so a CA rotation does not retire free pods by this hash. Nor is the
+/// cache registry entry: a worker made before `cache.host` changed exports to the
+/// old host, which fails without failing the build, until it is replaced.
 pub fn template_hash(pool: &BuildKitPool) -> Result<String, RenderError> {
     let spec = pod_spec(pool)?;
-    let mut doc = json!({
+    let doc = json!({
         "spec": serde_json::to_value(&spec).map_err(|e| RenderError::Serialize(e.to_string()))?,
         "labels": pool.spec.template.metadata.labels,
         "annotations": pool.spec.template.metadata.annotations,
-        "configHash": config_hash(&super::buildkitd_config(pool)),
+        "configHash": config_hash(&pool.spec.workers.buildkitd_config),
     });
-    // Only when set, so pools without cache.local keep their hash. Only the
-    // fields that shape the pod or its volume: `affinity` and `keysPerVolume`
-    // steer the allocator alone, and `gcKeepStorage` is in `configHash`.
-    if let (Some(lc), Some(m)) = (&pool.spec.workers.cache.local, doc.as_object_mut()) {
-        m.insert(
-            "cacheLocal".to_owned(),
-            json!({
-                "size": lc.size,
-                "storageClass": lc.storage_class,
-                "maxVolumes": lc.max_volumes,
-                "scope": lc.scope,
-            }),
-        );
-    }
     let mut s = String::new();
     canonical(&doc, &mut s);
     Ok(sha256_hex(s.as_bytes())[..10].to_owned())

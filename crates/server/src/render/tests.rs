@@ -249,12 +249,12 @@ fn conflict_cases() -> Vec<(&'static str, Value, &'static str)> {
         ),
         (
             "config-not-toml",
-            json!({"workers": {"buildkitdConfig": "[worker.oci\n", "cache": {"local": {}}}}),
+            json!({"workers": {"buildkitdConfig": "[worker.oci\n"}}),
             "spec.workers.buildkitdConfig",
         ),
         (
-            "config-worker-not-table",
-            json!({"workers": {"buildkitdConfig": "worker = 1\n", "cache": {"local": {}}}}),
+            "config-registry-not-table",
+            json!({"workers": {"buildkitdConfig": "registry = 1\n"}}),
             "spec.workers.buildkitdConfig",
         ),
     ]
@@ -342,7 +342,7 @@ fn hash_excludes_ca_fingerprint_slot_and_claim() {
 fn hash_covers_template_and_buildkitd_config() {
     let base = template_hash(&pool("p", json!({}))).unwrap();
     for spec in [
-        json!({"workers": {"buildkitdConfig": "x"}}),
+        json!({"workers": {"buildkitdConfig": "debug = true\n"}}),
         json!({"template": {"metadata": {"labels": {"a": "b"}}}}),
         json!({"template": {"spec": {"containers": [{"name": "buildkitd", "image": "other", "resources": {"limits": {"memory": "1Gi", "ephemeral-storage": "1Gi"}}}]}}}),
         json!({"platforms": ["linux/arm64"]}),
@@ -368,7 +368,7 @@ fn worker_secret_keys() {
         "p",
         json!({"workers": {"buildkitdConfig": "debug = true\n"}}),
     );
-    let s = worker_secret(&p, &default_inputs(), &fake_tls()).unwrap();
+    let s = worker_secret(&p, &default_inputs(), &fake_tls(), None).unwrap();
     let data = s.data.unwrap();
     assert_eq!(
         data.keys().map(String::as_str).collect::<Vec<_>>(),
@@ -559,7 +559,7 @@ fn pod_mounts_its_own_secret_and_names_its_nonce() {
             .and_then(|v| v.secret.as_ref())
             .and_then(|s| s.secret_name.clone())
     };
-    let secret = worker_secret(&p, &a, &fake_tls()).unwrap();
+    let secret = worker_secret(&p, &a, &fake_tls(), None).unwrap();
     assert_eq!(mounted(&pa), secret.metadata.name);
     assert_eq!(mounted(&pb).as_deref(), Some("p-0-00000000000000bb"));
     let ann = |pod: &k8s_openapi::api::core::v1::Pod| {
@@ -574,396 +574,158 @@ fn pod_mounts_its_own_secret_and_names_its_nonce() {
     assert_eq!(hash(&pa), hash(&pb));
 }
 
-fn state_volume(p: &k8s_openapi::api::core::v1::Pod) -> k8s_openapi::api::core::v1::Volume {
-    let vs = p.spec.as_ref().unwrap().volumes.as_ref().unwrap();
-    vs.iter().find(|v| v.name == "state").unwrap().clone()
-}
+const HOST: &str = "bk-registry.bk.svc:5000";
 
-fn cached_pool(max_volumes: i32, max: i32) -> BuildKitPool {
-    pool(
-        "c",
-        json!({"scaling": {"max": max}, "workers": {"cache": {"local": {"maxVolumes": max_volumes}}}}),
-    )
-}
-
-#[test]
-fn cached_slots_mount_their_volume_and_others_keep_the_empty_dir() {
-    let p = cached_pool(2, 5);
-    assert_eq!(cache_limit(&p), 2);
-    for (slot, want) in [(0, Some("c-cache-0")), (1, Some("c-cache-1")), (2, None)] {
-        let mut i = default_inputs();
-        i.slot = slot;
-        let v = state_volume(&worker_pod(&p, &i).unwrap());
-        let claim = v
-            .persistent_volume_claim
-            .as_ref()
-            .map(|c| c.claim_name.as_str());
-        assert_eq!(claim, want, "slot {slot}");
-        assert_eq!(v.empty_dir.is_none(), want.is_some(), "slot {slot}");
-        assert_eq!(cache_volume(&p, slot).unwrap().is_some(), want.is_some());
-    }
-    let off = pool("c", json!({}));
-    assert_eq!(cache_limit(&off), 0);
-    assert!(
-        state_volume(&worker_pod(&off, &default_inputs()).unwrap())
-            .empty_dir
-            .is_some()
-    );
-    assert!(cache_volume(&off, 0).unwrap().is_none());
-}
-
-#[test]
-fn cache_limit_is_capped_by_scaling_max() {
-    assert_eq!(cache_limit(&cached_pool(10, 3)), 3);
-    assert_eq!(cache_limit(&cached_pool(1, 3)), 1);
-}
-
-#[test]
-fn cache_local_changes_the_hash_only_when_set() {
-    let off = pool("c", json!({}));
-    let on = cached_pool(2, 5);
-    let bigger = pool(
-        "c",
-        json!({"scaling": {"max": 5}, "workers": {"cache": {"local": {"maxVolumes": 3}}}}),
-    );
-    assert_ne!(template_hash(&off).unwrap(), template_hash(&on).unwrap());
-    assert_ne!(template_hash(&on).unwrap(), template_hash(&bigger).unwrap());
-    // The slot's volume source is not a hash input: every slot shares one hash.
-    let mut i = default_inputs();
-    i.slot = 4;
-    let a = worker_pod(&on, &default_inputs()).unwrap();
-    let b = worker_pod(&on, &i).unwrap();
-    assert_eq!(
-        a.metadata.labels.as_ref().unwrap()[LABEL_TEMPLATE_HASH],
-        b.metadata.labels.as_ref().unwrap()[LABEL_TEMPLATE_HASH]
-    );
-}
-
-#[test]
-fn volume_hash_tracks_size_and_class_only() {
-    let base = buildkit_controller_api::v1alpha1::LocalCache::default();
-    let mut more = base.clone();
-    more.max_volumes = 99;
-    assert_eq!(volume_hash(&base), volume_hash(&more));
-    more.size = k8s_openapi::apimachinery::pkg::api::resource::Quantity("30Gi".into());
-    assert_ne!(volume_hash(&base), volume_hash(&more));
-    let mut class = base.clone();
-    class.storage_class = Some("fast".into());
-    assert_ne!(volume_hash(&base), volume_hash(&class));
-}
-
-#[test]
-fn cache_volume_slot_parses_only_this_pools_names() {
-    assert_eq!(cache_volume_slot("p", "p-cache-0"), Some(0));
-    assert_eq!(cache_volume_slot("p", "p-cache-12"), Some(12));
-    for bad in [
-        "p-cache-",
-        "p-cache-01",
-        "p-cache-x",
-        "pp-cache-1",
-        "q-cache-1",
-        "p-cache--1",
-    ] {
-        assert_eq!(cache_volume_slot("p", bad), None, "{bad}");
-    }
-}
-
-#[test]
-fn pod_cache_keys_round_trip_and_push_keeps_the_newest() {
-    let mut pod = worker_pod(&cached_pool(2, 5), &default_inputs()).unwrap();
-    assert_eq!(pod_cache_keys(&pod), None);
-    set_pod_cache_keys(&mut pod, "a,b");
-    assert_eq!(pod_cache_keys(&pod), Some("a,b"));
-    assert!(
-        keys_contain(Some("a,b"), "b")
-            && !keys_contain(Some("ab"), "a")
-            && !keys_contain(None, "a")
-    );
-    assert_eq!(push_key(None, "k", 3), "k");
-    assert_eq!(push_key(Some("a,b,c"), "b", 3), "b,a,c");
-    assert_eq!(push_key(Some("a,b,c"), "d", 3), "d,a,b");
-    assert_eq!(push_key(Some("a,b"), "c", 1), "c");
-}
-
-#[test]
-fn local_cache_bounds_buildkitd_gc() {
-    assert_eq!(quantity_bytes("20Gi"), Some(20 << 30));
-    assert_eq!(quantity_bytes("1.5Gi"), Some(3 << 29));
-    assert_eq!(quantity_bytes("2G"), Some(2_000_000_000));
-    assert_eq!(quantity_bytes("1e9"), None);
-    let mut p = cached_pool(2, 5);
-    // 80% of the 20Gi default size.
-    assert_eq!(
-        buildkitd_config(&p),
-        "[worker.oci]\nmaxUsedSpace = \"17179869184\"\ngc = true\n\n[history]\nmaxEntries = 0\n"
-    );
-    // A `gc = false` in the section is replaced; `gc` elsewhere and `gckeepstorage` stay.
-    p.spec.workers.buildkitd_config =
-        "debug = true\n[worker.oci]\n  gc = false\n  gckeepstorage = 1\n[worker.containerd]\n  gc = false\n"
-            .into();
-    p.spec.workers.cache.local.as_mut().unwrap().gc_keep_storage = Some(
-        k8s_openapi::apimachinery::pkg::api::resource::Quantity("1Gi".into()),
-    );
-    assert_eq!(
-        buildkitd_config(&p),
-        "debug = true\n[worker.oci]\n  gc = true\n  gckeepstorage = 1\nmaxUsedSpace = \"1073741824\"\n[worker.containerd]\n  gc = false\n\n[history]\nmaxEntries = 0\n"
-    );
-    // A pool that sets maxUsedSpace keeps it and its own gc; history is turned off all the same.
-    p.spec.workers.buildkitd_config = "[worker.oci]\nmaxUsedSpace = \"5GB\"\ngc = false".into();
-    assert_eq!(
-        buildkitd_config(&p),
-        "[worker.oci]\nmaxUsedSpace = \"5GB\"\ngc = false\n\n[history]\nmaxEntries = 0\n"
-    );
-    // A [history] of the pool's own gets maxEntries = 0 and keeps the rest.
-    p.spec.workers.buildkitd_config =
-        "[history]\n  maxAge = 3600\n  maxEntries = 50\n[worker.oci]\nmaxUsedSpace = \"5GB\"\n"
-            .into();
-    assert_eq!(
-        buildkitd_config(&p),
-        "[history]\n  maxAge = 3600\n  maxEntries = 0\n[worker.oci]\nmaxUsedSpace = \"5GB\"\n"
-    );
-    p.spec.workers.buildkitd_config = "debug = true".into();
-    p.spec.workers.cache.local = None;
-    assert_eq!(buildkitd_config(&p), "debug = true");
-}
-
-/// The parsed `buildkitd.toml` of a cached pool whose own config is `cfg`.
+/// The parsed `buildkitd.toml` of a pool whose own config is `cfg`, with the cache.
 fn cached_config(cfg: &str) -> toml_edit::DocumentMut {
-    let mut p = cached_pool(2, 5);
-    p.spec.workers.buildkitd_config = cfg.into();
+    let p = pool("p", json!({"workers": {"buildkitdConfig": cfg}}));
     assert!(validate_template(&p.spec).is_empty(), "{cfg}");
-    let out = buildkitd_config(&p);
+    let out = buildkitd_config(&p.spec.workers.buildkitd_config, Some(HOST));
     out.parse()
         .unwrap_or_else(|e| panic!("{cfg:?} rendered invalid TOML {out:?}: {e}"))
 }
 
 #[test]
-fn buildkitd_config_edits_any_valid_toml_form() {
-    let bound = |d: &toml_edit::DocumentMut| {
+fn the_cache_registry_entry_uses_the_worker_key_pair_and_the_internal_ca() {
+    assert_eq!(
+        buildkitd_config("", Some(HOST)),
+        "[registry.\"bk-registry.bk.svc:5000\"]\nca = [\"/certs/ca.crt\"]\nkeypair = [{ key = \"/certs/tls.key\", cert = \"/certs/tls.crt\" }]\n"
+    );
+    // Without a cache host the config passes through unread.
+    assert_eq!(buildkitd_config("worker = 1\n", None), "worker = 1\n");
+    let entry = |d: &toml_edit::DocumentMut| {
+        let e = &d["registry"][HOST];
         (
-            d["worker"]["oci"]["maxUsedSpace"]
-                .as_str()
-                .map(str::to_owned),
-            d["worker"]["oci"]["gc"].as_bool(),
-            d["history"]["maxEntries"].as_integer(),
+            e["ca"].as_array().map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }),
+            e["keypair"].as_array().map(toml_edit::Array::len),
         )
     };
-    let ours = (Some("17179869184".to_owned()), Some(true), Some(0));
+    let ours = (Some("/certs/ca.crt".to_owned()), Some(1));
     for cfg in [
-        // A header with a trailing comment.
-        "[worker.oci] # tuned\nmax-parallelism = 4\n",
-        "[history] # kept short\nmaxAge = 60\n",
-        // Tables defined through dotted keys.
-        "[worker]\noci.gc = false\n",
-        "worker.oci.max-parallelism = 4\nhistory.maxEntries = 9\n",
-        // Inline tables.
-        "history = { maxAge = 3600 }\n",
-        "worker = { oci = { gc = false } }\n",
-        // Comments and gcpolicy entries that mention maxUsedSpace set no worker bound.
-        "# maxUsedSpace = \"1GB\"\n[worker.oci]\n",
-        "[[worker.oci.gcpolicy]]\nmaxUsedSpace = \"1GB\"\nall = true\n",
+        "[worker.oci]\nmax-parallelism = 4\n",
+        // Other registries stay.
+        "[registry.\"docker.io\"]\nmirrors = [\"mirror.internal\"]\n",
+        // An entry of the pool's own for the cache host is replaced.
+        "[registry.\"bk-registry.bk.svc:5000\"]\ninsecure = true\nca = [\"/x\"]\n",
+        // Dotted keys and inline tables.
+        "registry.\"docker.io\".mirrors = [\"m\"]\n",
+        "registry = { \"docker.io\" = { mirrors = [\"m\"] } }\n",
     ] {
         let d = cached_config(cfg);
-        assert_eq!(bound(&d), ours, "{cfg}");
+        assert_eq!(entry(&d), ours, "{cfg}");
     }
-    // The pool's own worker bound stays, with its own gc setting.
-    let d = cached_config("worker.oci = { maxUsedSpace = \"5GB\", gc = false }\n");
-    assert_eq!(bound(&d), (Some("5GB".to_owned()), Some(false), Some(0)));
+    let d = cached_config("[registry.\"docker.io\"]\nmirrors = [\"mirror.internal\"]\n");
+    assert_eq!(
+        d["registry"]["docker.io"]["mirrors"][0].as_str(),
+        Some("mirror.internal")
+    );
+    let d = cached_config("[registry.\"bk-registry.bk.svc:5000\"]\ninsecure = true\n");
+    assert_eq!(d["registry"][HOST]["insecure"].as_bool(), Some(true));
 }
 
 #[test]
-fn buildkitd_config_that_cannot_take_the_cache_settings_is_refused() {
+fn buildkitd_config_that_cannot_take_the_registry_entry_is_refused() {
     for cfg in [
-        "[worker.oci\n",
-        "worker = 1\n",
-        "worker.oci = \"x\"\n",
-        "[[worker.oci]]\n",
-        "history = []\n",
-        "[history]\n[history]\n",
+        "[registry\n",
+        "registry = 1\n",
+        "[[registry]]\n",
+        "[registry]\n[registry]\n",
     ] {
-        let mut p = cached_pool(2, 5);
-        p.spec.workers.buildkitd_config = cfg.into();
+        let p = pool("p", json!({"workers": {"buildkitdConfig": cfg}}));
         let c = validate_template(&p.spec);
         assert!(
             c.iter().any(|c| c.field == "spec.workers.buildkitdConfig"),
             "{cfg:?}: {c:?}"
         );
+        assert_eq!(buildkitd_config(cfg, Some(HOST)), cfg);
     }
-    // Without cache.local the config is passed through unread.
-    let p = pool("p", json!({"workers": {"buildkitdConfig": "worker = 1\n"}}));
-    assert!(validate_template(&p.spec).is_empty());
-    assert_eq!(buildkitd_config(&p), "worker = 1\n");
-}
-
-fn pod_ann<'a>(p: &'a k8s_openapi::api::core::v1::Pod, k: &str) -> Option<&'a str> {
-    p.metadata.annotations.as_ref()?.get(k).map(String::as_str)
 }
 
 #[test]
-fn cache_pools_run_the_init_step_before_buildkitd() {
-    let p = cached_pool(2, 5);
-    let spec = pod_spec(&p).unwrap();
-    let init = spec.init_containers.as_deref().unwrap();
-    assert_eq!(init.len(), 1);
-    let c = &init[0];
-    let main = &spec.containers[0];
-    assert_eq!(c.name, CACHE_INIT_NAME);
-    assert_eq!((&c.image, &c.resources), (&main.image, &main.resources));
-    let cmd = c.command.as_deref().unwrap();
-    assert_eq!(&cmd[..3], ["rootlesskit", "sh", "-c"]);
-    let script = &cmd[3];
-    for want in [
-        "d=/home/user/.local/share/buildkit",
-        GENERATION_FILE,
-        "rm -rf -- \"$d\"/* \"$d\"/.[!.]* \"$d\"/..?*",
-        "rm -f -- \"$d/history.db\"",
-        "${EXPECT_GENERATION:-$POD_UID}",
-    ] {
-        assert!(script.contains(want), "{want} missing from {script}");
-    }
-    // A wipe drops the generation file first and writes it last, so a wipe cut
-    // short leaves a volume without a generation, which the next pod empties.
-    let pos = |s: &str| script.find(s).unwrap_or_else(|| panic!("{s} missing"));
-    let drop_marker = pos("rm -f -- \"$m\"");
-    let wipe = pos("rm -rf -- ");
-    let write_marker = pos("printf %s \"$g\" > \"$m\"");
-    assert!(drop_marker < wipe && wipe < write_marker, "{script}");
-    let env: Vec<(&str, &str)> = c
-        .env
-        .iter()
-        .flatten()
-        .map(|e| {
-            let f = e.value_from.as_ref().unwrap().field_ref.as_ref().unwrap();
-            (e.name.as_str(), f.field_path.as_str())
-        })
-        .collect();
-    assert_eq!(
-        env,
-        [
-            (
-                "EXPECT_GENERATION",
-                "metadata.annotations['buildkit.smrt-devops.net/cache-generation']"
-            ),
-            ("POD_UID", "metadata.uid"),
-        ]
-    );
-    // The init step mounts the same state volume as buildkitd.
-    let m = &c.volume_mounts.as_deref().unwrap()[0];
-    let main_m = main
-        .volume_mounts
-        .iter()
-        .flatten()
-        .find(|v| v.name == "state")
-        .unwrap();
-    assert_eq!((&m.name, &m.mount_path), (&main_m.name, &main_m.mount_path));
-    // Without cache.local there is no init step.
-    assert!(
-        pod_spec(&pool("d", json!({})))
+fn the_worker_secret_carries_the_registry_entry_and_the_hash_does_not() {
+    let p = pool("p", json!({}));
+    let toml = |host| {
+        let s = worker_secret(&p, &default_inputs(), &fake_tls(), host).unwrap();
+        String::from_utf8(s.data.unwrap()["buildkitd.toml"].0.clone()).unwrap()
+    };
+    assert!(toml(Some(HOST)).contains("[registry.\"bk-registry.bk.svc:5000\"]"));
+    assert_eq!(toml(None), "");
+    // The pod and its hash are the same with or without the cache.
+    let pod = worker_pod(&p, &default_inputs()).unwrap();
+    assert!(pod.spec.as_ref().unwrap().init_containers.is_none());
+    assert!(state_volume(&pod).empty_dir.is_some());
+}
+
+#[test]
+fn workers_may_reach_the_cache_registry_and_nothing_else_new() {
+    let p = pool("p", json!({"network": {"egress": {"internet": "Deny"}}}));
+    let mut cfg = default_config();
+    let rules = |cfg: &RenderConfig| {
+        network_policy(&p, cfg)
             .unwrap()
-            .init_containers
-            .is_none()
+            .spec
+            .unwrap()
+            .egress
+            .unwrap()
+    };
+    let without = rules(&cfg);
+    cfg.cache_host = Some(HOST.into());
+    let with = rules(&cfg);
+    assert_eq!(with.len(), without.len() + 1);
+    let r = with.iter().find(|r| !without.contains(r)).unwrap();
+    let to = &r.to.as_ref().unwrap()[0];
+    assert_eq!(
+        to.pod_selector
+            .as_ref()
+            .unwrap()
+            .match_labels
+            .as_ref()
+            .unwrap()[LABEL_NAME],
+        REGISTRY_NAME
+    );
+    assert_eq!(
+        to.namespace_selector
+            .as_ref()
+            .unwrap()
+            .match_labels
+            .as_ref()
+            .unwrap()["kubernetes.io/metadata.name"],
+        default_config().controller_namespace
+    );
+    let ports = r.ports.as_ref().unwrap();
+    assert_eq!(ports.len(), 1);
+    assert_eq!(
+        ports[0].port,
+        Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(5000))
     );
 }
 
 #[test]
-fn cached_slot_pods_start_unbound() {
-    let p = cached_pool(1, 3);
-    let mut i = default_inputs();
-    i.slot = 0;
-    let pod = worker_pod(&p, &i).unwrap();
-    assert_eq!(pod_ann(&pod, KEY_CACHE_SCOPE), Some(""));
-    assert_eq!(pod_ann(&pod, KEY_CACHE_GENERATION), None);
-    i.slot = 1;
-    let pod = worker_pod(&p, &i).unwrap();
-    assert_eq!(pod_ann(&pod, KEY_CACHE_SCOPE), None);
-    // A pod outside a cached slot serves anyone; a cached one only its scope or any.
-    assert!(pod_serves(&pod, false, "a"));
-    assert!(!pod_serves(&pod, true, "a"));
-}
-
-#[test]
-fn bind_pod_keeps_only_the_owner_scope() {
-    let b = Binding::parse("s1@g1").unwrap();
-    assert_eq!(b.value(), "s1@g1");
-    for bad in ["", "s1", "@g", "s@", "s@g@h"] {
-        assert_eq!(Binding::parse(bad), None, "{bad}");
-    }
-    let pod = || {
-        let mut i = default_inputs();
-        i.slot = 0;
-        worker_pod(&cached_pool(1, 2), &i).unwrap()
-    };
-    // (binding, caller scope) -> (outcome, P cache-scope, P cache-generation)
-    let cases = [
-        (Some(&b), Some("s1"), Bound::Kept, "s1", Some("g1")),
-        (Some(&b), Some("s2"), Bound::Wiped, "s2", None),
-        (None, Some("s2"), Bound::Fresh, "s2", None),
-        (Some(&b), None, Bound::Kept, "s1", Some("g1")),
-        (None, None, Bound::Fresh, "", None),
-    ];
-    for (binding, scope, want, s, g) in cases {
-        let mut p = pod();
-        // A stale generation never survives a rebinding.
-        set_pod_cache_keys(&mut p, "k");
-        p.metadata
-            .annotations
-            .get_or_insert_default()
-            .insert(KEY_CACHE_GENERATION.into(), "stale".into());
-        assert_eq!(bind_pod(&mut p, binding, scope), want, "{scope:?}");
-        assert_eq!(pod_ann(&p, KEY_CACHE_SCOPE), Some(s));
-        assert_eq!(pod_ann(&p, KEY_CACHE_GENERATION), g);
+fn quantities_and_scope_ids_parse() {
+    assert_eq!(quantity_bytes("20Gi"), Some(20 << 30));
+    assert_eq!(quantity_bytes("1.5Gi"), Some(3 << 29));
+    assert_eq!(quantity_bytes("2G"), Some(2_000_000_000));
+    assert_eq!(quantity_bytes("1e9"), None);
+    let id = scope_id("[\"pool\"]");
+    assert!(is_scope_id(&id), "{id}");
+    for bad in [
+        "",
+        "ABCDEF0123456789abcdef0123456789",
+        "abc",
+        "../../../../../../../../../../..",
+    ] {
+        assert!(!is_scope_id(bad), "{bad}");
     }
 }
 
-#[test]
-fn won_binding_names_the_generation_on_the_volume() {
-    let mut p = {
-        let mut i = default_inputs();
-        i.slot = 0;
-        worker_pod(&cached_pool(1, 2), &i).unwrap()
-    };
-    p.metadata.uid = Some("u1".into());
-    // Unbound pod: it emptied the volume, so its uid is the generation.
-    let w = won_binding(&p, "s").unwrap();
-    assert_eq!(w.value(), "s@u1");
-    // Bound and kept by its own scope: the binding already says so.
-    let b = Binding::parse("s@g").unwrap();
-    bind_pod(&mut p, Some(&b), Some("s"));
-    assert_eq!(won_binding(&p, "s"), None);
-    // Bound to `t` on a volume of `s`: emptied, and the pod's uid starts `t`'s generation.
-    bind_pod(&mut p, Some(&b), Some("t"));
-    assert_eq!(won_binding(&p, "t").unwrap().value(), "t@u1");
-}
-
-proptest! {
-    /// Whatever the binding and the caller, a pod keeps a generation only when
-    /// the binding names the scope the pod serves, so a volume never reaches a
-    /// pod of another scope with its contents.
-    #[test]
-    fn a_kept_volume_always_belongs_to_the_pod_scope(
-        bound in proptest::option::of(("[a-c]", "[a-c]")),
-        caller in proptest::option::of("[a-c]"),
-    ) {
-        let mut i = default_inputs();
-        i.slot = 0;
-        let mut p = worker_pod(&cached_pool(1, 2), &i).unwrap();
-        let b = bound.map(|(s, g)| Binding { scope: s, generation: g });
-        let out = bind_pod(&mut p, b.as_ref(), caller.as_deref());
-        let serves = pod_ann(&p, KEY_CACHE_SCOPE).unwrap().to_owned();
-        if let Some(g) = pod_ann(&p, KEY_CACHE_GENERATION) {
-            let b = b.as_ref().unwrap();
-            prop_assert_eq!(out, Bound::Kept);
-            prop_assert_eq!(&b.scope, &serves);
-            prop_assert_eq!(&b.generation, g);
-            prop_assert!(caller.as_ref().is_none_or(|c| *c == serves));
-        } else {
-            prop_assert_ne!(out, Bound::Kept);
-        }
-        if let Some(c) = &caller {
-            prop_assert_eq!(&serves, c);
-            prop_assert!(pod_serves(&p, true, c));
-        }
-    }
+fn state_volume(p: &k8s_openapi::api::core::v1::Pod) -> k8s_openapi::api::core::v1::Volume {
+    let vs = p.spec.as_ref().unwrap().volumes.as_ref().unwrap();
+    vs.iter().find(|v| v.name == "state").unwrap().clone()
 }
 
 /// A network with the pod, service and node ranges of a dual-stack cluster.
@@ -1213,33 +975,6 @@ fn nat64_entries_are_checked_as_the_ipv4_they_reach() {
 }
 
 #[test]
-fn cache_settings_the_pod_never_reads_leave_the_hash_alone() {
-    let base = cached_pool(2, 5);
-    let hash = |p: &BuildKitPool| template_hash(p).unwrap();
-    let mut other = base.clone();
-    let lc = other.spec.workers.cache.local.as_mut().unwrap();
-    lc.keys_per_volume = 16;
-    lc.affinity = buildkit_controller_api::v1alpha1::CacheAffinity::Off;
-    assert_eq!(hash(&base), hash(&other));
-    for edit in [
-        |lc: &mut buildkit_controller_api::v1alpha1::LocalCache| {
-            lc.size = k8s_openapi::apimachinery::pkg::api::resource::Quantity("30Gi".into());
-        },
-        |lc: &mut buildkit_controller_api::v1alpha1::LocalCache| {
-            lc.storage_class = Some("fast".into());
-        },
-        |lc: &mut buildkit_controller_api::v1alpha1::LocalCache| lc.max_volumes = 3,
-        |lc: &mut buildkit_controller_api::v1alpha1::LocalCache| {
-            lc.scope = buildkit_controller_api::v1alpha1::CacheScope::Pool;
-        },
-    ] {
-        let mut p = base.clone();
-        edit(p.spec.workers.cache.local.as_mut().unwrap());
-        assert_ne!(hash(&base), hash(&p));
-    }
-}
-
-#[test]
 fn startup_is_probed_fast_and_readiness_slowly() {
     let spec = pod_spec(&pool("p", json!({}))).unwrap();
     let c = &spec.containers[0];
@@ -1252,25 +987,4 @@ fn startup_is_probed_fast_and_readiness_slowly() {
     assert!(budget > 30 * 60, "{budget}");
     assert_eq!(ready.period_seconds, Some(10));
     assert_eq!(c.image_pull_policy.as_deref(), Some("IfNotPresent"));
-}
-
-#[test]
-fn history_is_off_even_when_the_gc_bound_cannot_be_read() {
-    let mut p = cached_pool(2, 5);
-    p.spec.workers.cache.local.as_mut().unwrap().size =
-        k8s_openapi::apimachinery::pkg::api::resource::Quantity("25e9".into());
-    p.spec.workers.buildkitd_config = "debug = true\n".into();
-    let d: toml_edit::DocumentMut = buildkitd_config(&p).parse().unwrap();
-    assert_eq!(d["history"]["maxEntries"].as_integer(), Some(0));
-    assert!(
-        d.get("worker")
-            .is_none_or(|w| w.get("oci").is_none_or(|o| o.get("maxUsedSpace").is_none()))
-    );
-    // The config check runs all the same.
-    p.spec.workers.buildkitd_config = "worker = 1\n".into();
-    assert!(
-        validate_template(&p.spec)
-            .iter()
-            .any(|c| c.field == "spec.workers.buildkitdConfig")
-    );
 }

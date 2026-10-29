@@ -70,7 +70,8 @@ fn assert_leaf(
     ca: &Ca,
     cn: &str,
     sans: &[GeneralName<'_>],
-    client: bool,
+    // (clientAuth, serverAuth)
+    eku_want: (bool, bool),
     life: Duration,
     t: OffsetDateTime,
 ) {
@@ -82,7 +83,7 @@ fn assert_leaf(
     assert!(ku.critical);
     assert_eq!(ku.value.flags, 1, "digitalSignature only");
     let eku = x.extended_key_usage().unwrap().unwrap().value;
-    assert_eq!((eku.client_auth, eku.server_auth), (client, !client));
+    assert_eq!((eku.client_auth, eku.server_auth), eku_want);
     assert!(eku.other.is_empty() && !eku.any && !eku.code_signing && !eku.email_protection);
     let aki = x
         .iter_extensions()
@@ -149,7 +150,7 @@ fn allocation_profile_and_chain() {
         b.client_ca(),
         id.alloc_id.as_str(),
         &[GeneralName::URI(&uri)],
-        true,
+        (true, false),
         Duration::hours(1),
         t,
     );
@@ -253,7 +254,7 @@ fn worker_serving_profile_and_renewal() {
         b.internal_ca(),
         "buildkitd",
         &[GeneralName::DNSName(name)],
-        false,
+        (true, true),
         Duration::days(30),
         t,
     );
@@ -263,7 +264,8 @@ fn worker_serving_profile_and_renewal() {
         KeyUsage::server_auth(),
         t
     ));
-    assert!(!chain_ok(
+    // buildkitd presents it to the cache registry.
+    assert!(chain_ok(
         c.cert_der(),
         b.internal_ca().cert_der(),
         KeyUsage::client_auth(),
@@ -312,7 +314,7 @@ fn edge_serving_profile() {
         b.client_ca(),
         "buildkit.example.com",
         &sans,
-        false,
+        (false, true),
         Duration::days(30),
         t,
     );
@@ -361,7 +363,7 @@ fn edge_client_profile_and_renewal() {
         b.internal_ca(),
         "buildkit-edge",
         &[GeneralName::DNSName("buildkit-edge")],
-        true,
+        (true, false),
         Duration::hours(24),
         t,
     );
@@ -685,4 +687,34 @@ fn worker_identity_names_the_pod_incarnation() {
         a.dns_name(),
         format!("{}.p-0.p.ci.worker.buildkit.internal", a.nonce)
     );
+}
+
+#[test]
+fn cache_serving_profile() {
+    let t = now();
+    let b = CaBundle::generate(t).unwrap();
+    let name = "bk-registry.bk.svc";
+    let c = b.issue_cache_serving(name, t, Duration::days(30)).unwrap();
+    assert_eq!(c.profile(), Profile::CacheServing);
+    assert_leaf(
+        &c,
+        b.internal_ca(),
+        name,
+        &[GeneralName::DNSName(name)],
+        (false, true),
+        Duration::days(30),
+        t,
+    );
+    assert!(chain_ok(
+        c.cert_der(),
+        b.internal_ca().cert_der(),
+        KeyUsage::server_auth(),
+        t
+    ));
+    assert!(!chain_ok(
+        c.cert_der(),
+        b.client_ca().cert_der(),
+        KeyUsage::server_auth(),
+        t
+    ));
 }

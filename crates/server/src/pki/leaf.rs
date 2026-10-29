@@ -77,8 +77,11 @@ impl From<ring::error::Unspecified> for IssueError {
 pub enum Profile {
     /// Allocation certificate: client CA, clientAuth, never renewed.
     Allocation,
-    /// Worker serving certificate: internal CA, serverAuth.
+    /// Worker certificate: internal CA, serverAuth (buildkitd) and clientAuth (to the
+    /// cache registry).
     WorkerServing,
+    /// Cache registry serving certificate: internal CA, serverAuth.
+    CacheServing,
     /// Edge and API serving certificate: client CA, serverAuth (self-issued default).
     EdgeServing,
     /// Edge client certificate: internal CA, clientAuth.
@@ -277,7 +280,7 @@ struct Spec<'a> {
     profile: Profile,
     cn: &'a str,
     sans: Vec<SanType>,
-    eku: ExtendedKeyUsagePurpose,
+    eku: Vec<ExtendedKeyUsagePurpose>,
     not_before: OffsetDateTime,
     not_after: OffsetDateTime,
 }
@@ -301,7 +304,7 @@ fn issue(ca: &Ca, spec: Spec<'_>, key: LeafKey) -> Result<IssuedCert, IssueError
     p.subject_alt_names = spec.sans;
     p.is_ca = IsCa::ExplicitNoCa;
     p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-    p.extended_key_usages = vec![spec.eku];
+    p.extended_key_usages = spec.eku;
     p.use_authority_key_identifier_extension = true;
     p.not_before = spec.not_before;
     p.not_after = not_after;
@@ -345,7 +348,7 @@ impl CaBundle {
             profile: Profile::Allocation,
             cn: id.alloc_id.as_str(),
             sans: vec![SanType::URI(id.to_uri().try_into()?)],
-            eku: ExtendedKeyUsagePurpose::ClientAuth,
+            eku: vec![ExtendedKeyUsagePurpose::ClientAuth],
             not_before: checked_sub(now, BACKDATE)?,
             not_after: expires_at,
         };
@@ -373,7 +376,30 @@ impl CaBundle {
             profile: Profile::WorkerServing,
             cn: "buildkitd",
             sans: vec![dns(id.dns_name())?],
-            eku: ExtendedKeyUsagePurpose::ServerAuth,
+            // clientAuth too: buildkitd presents it to the cache registry.
+            eku: vec![
+                ExtendedKeyUsagePurpose::ServerAuth,
+                ExtendedKeyUsagePurpose::ClientAuth,
+            ],
+            not_before: checked_sub(now, BACKDATE)?,
+            not_after: checked_add(now, validity)?,
+        };
+        issue(self.internal_ca(), spec, LeafKey::Generate)
+    }
+
+    /// Cache registry serving certificate for DNS `name`, valid for `validity`.
+    pub fn issue_cache_serving(
+        &self,
+        name: &str,
+        now: OffsetDateTime,
+        validity: Duration,
+    ) -> Result<IssuedCert, IssueError> {
+        let now = whole_seconds(now);
+        let spec = Spec {
+            profile: Profile::CacheServing,
+            cn: name,
+            sans: vec![dns(name.to_owned())?],
+            eku: vec![ExtendedKeyUsagePurpose::ServerAuth],
             not_before: checked_sub(now, BACKDATE)?,
             not_after: checked_add(now, validity)?,
         };
@@ -409,7 +435,7 @@ impl CaBundle {
             profile: Profile::EdgeServing,
             cn: &names.server_name,
             sans,
-            eku: ExtendedKeyUsagePurpose::ServerAuth,
+            eku: vec![ExtendedKeyUsagePurpose::ServerAuth],
             not_before: checked_sub(now, BACKDATE)?,
             not_after: checked_add(now, validity)?,
         };
@@ -432,7 +458,7 @@ impl CaBundle {
             profile: Profile::EdgeClient,
             cn: "buildkit-edge",
             sans: vec![dns("buildkit-edge".to_owned())?],
-            eku: ExtendedKeyUsagePurpose::ClientAuth,
+            eku: vec![ExtendedKeyUsagePurpose::ClientAuth],
             not_before: checked_sub(now, BACKDATE)?,
             not_after: checked_add(now, validity)?,
         };

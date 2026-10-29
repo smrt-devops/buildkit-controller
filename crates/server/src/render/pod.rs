@@ -1,38 +1,34 @@
 //! The worker pod: the user template merged with the
-//! enforced fields.
+//! enfored fields.
 
 use std::collections::BTreeMap;
 
 use buildkit_controller_api::v1alpha1::{BuildKitPool, BuildkitdContainer, CONTAINER_NAME};
 use k8s_openapi::api::core::v1::{
-    AppArmorProfile, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource,
-    ExecAction, KeyToPath, ObjectFieldSelector, Pod, PodSecurityContext, PodSpec, Probe,
-    SeccompProfile, SecretVolumeSource, SecurityContext, Volume, VolumeMount,
+    AppArmorProfile, Container, ContainerPort, EmptyDirVolumeSource, ExecAction, KeyToPath, Pod,
+    PodSecurityContext, PodSpec, Probe, SeccompProfile, SecretVolumeSource, SecurityContext,
+    Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
 use super::validate::{check, single_arch};
 use super::{
-    ANN_ALLOC, ANN_ALLOCATED_AT, ANN_EXPIRES_AT, ANN_INTERNAL_CA, ANN_OWNER,
-    ANN_WORKER_CERT_NOT_AFTER, ANN_WORKER_NONCE, BUILDKIT_PORT, CONTROLLER, INTERNAL_CA_LABEL_LEN,
-    LABEL_MANAGED_BY, LABEL_NAME, LABEL_POOL, LABEL_STATE, LABEL_TEMPLATE_HASH, PodInputs,
-    RenderError, TemplateConflictField, WORKER_NAME, owner_ref, pool_identity, template_hash,
-    worker_object_name, worker_pod_name, worker_secret_name,
+    ANN_ALLOC, ANN_INTERNAL_CA, ANN_WORKER_CERT_NOT_AFTER, ANN_WORKER_NONCE, BUILDKIT_PORT,
+    CONTROLLER, INTERNAL_CA_LABEL_LEN, LABEL_MANAGED_BY, LABEL_NAME, LABEL_POOL, LABEL_STATE,
+    LABEL_TEMPLATE_HASH, PodInputs, RenderError, TemplateConflictField, WORKER_NAME, owner_ref,
+    pool_identity, template_hash, worker_object_name, worker_pod_name, worker_secret_name,
 };
 
 const SOCKET: &str = "unix:///run/user/1000/buildkit/buildkitd.sock";
 const RUN_AS: i64 = 1000;
 const CERTS_VOLUME: &str = "certs";
-use super::cache::{
-    KEY_CACHE_GENERATION, STATE_VOLUME, bind_pod, init_script, is_cached_slot, mount_cache_volume,
-};
+/// Name of the pod volume that holds the buildkitd state dir.
+const STATE_VOLUME: &str = "state";
 
 const STATE_DIR: &str = "/home/user/.local/share/buildkit";
 /// Failed startup probes (one a second) before kubelet gives up: past the
 /// longest `startTimeout` (30m), so the reconciler retires a slow pod first.
 const STARTUP_PROBE_LIMIT: i32 = 31 * 60;
-/// Name of the init container that prepares a cache volume.
-pub const CACHE_INIT_NAME: &str = "cache-init";
 
 fn s(v: &str) -> String {
     v.to_owned()
@@ -124,48 +120,6 @@ fn container(user: &BuildkitdContainer) -> Container {
     }
 }
 
-/// With `cache.local`: the init container that empties the state dir unless it
-/// holds the generation the pod was bound to (`P cache-generation`), and
-/// removes build history. Every pod of the pool runs it, so the spec stays
-/// slot-independent; on an `emptyDir` it has nothing to do.
-fn cache_init(pool: &BuildKitPool, main: &Container) -> Option<Container> {
-    pool.spec.workers.cache.local.as_ref()?;
-    let field = |path: String| EnvVarSource {
-        field_ref: Some(ObjectFieldSelector {
-            api_version: None,
-            field_path: path,
-        }),
-        ..EnvVarSource::default()
-    };
-    let env = |name: &str, path: String| EnvVar {
-        name: s(name),
-        value: None,
-        value_from: Some(field(path)),
-    };
-    Some(Container {
-        name: s(CACHE_INIT_NAME),
-        image: main.image.clone(),
-        image_pull_policy: main.image_pull_policy.clone(),
-        command: Some(vec![
-            s("rootlesskit"),
-            s("sh"),
-            s("-c"),
-            init_script(STATE_DIR),
-        ]),
-        env: Some(vec![
-            env(
-                "EXPECT_GENERATION",
-                format!("metadata.annotations['{KEY_CACHE_GENERATION}']"),
-            ),
-            env("POD_UID", s("metadata.uid")),
-        ]),
-        security_context: main.security_context.clone(),
-        resources: main.resources.clone(),
-        volume_mounts: Some(vec![mount(STATE_VOLUME, STATE_DIR)]),
-        ..Container::default()
-    })
-}
-
 fn volumes(pool: &BuildKitPool) -> Vec<Volume> {
     let item = |k: &str| KeyToPath {
         key: s(k),
@@ -252,7 +206,6 @@ pub fn pod_spec(pool: &BuildKitPool) -> Result<PodSpec, RenderError> {
         priority_class_name: t.priority_class_name.clone(),
         image_pull_secrets: non_empty(t.image_pull_secrets.clone()),
         volumes: Some(volumes(pool)),
-        init_containers: cache_init(pool, &main).map(|c| vec![c]),
         containers: vec![main],
         ..PodSpec::default()
     })
@@ -284,14 +237,7 @@ pub fn worker_pod(pool: &BuildKitPool, inputs: &PodInputs) -> Result<Pod, Render
         (s(LABEL_MANAGED_BY), s(CONTROLLER)),
         (s(LABEL_NAME), s(WORKER_NAME)),
         (s(LABEL_POOL), s(name)),
-        (
-            s(LABEL_STATE),
-            s(if inputs.claim.is_some() {
-                "allocated"
-            } else {
-                "free"
-            }),
-        ),
+        (s(LABEL_STATE), s("free")),
         (s(LABEL_TEMPLATE_HASH), hash),
     ]);
 
@@ -309,19 +255,9 @@ pub fn worker_pod(pool: &BuildKitPool, inputs: &PodInputs) -> Result<Pod, Render
         (s(ANN_INTERNAL_CA), fp),
         (s(ANN_WORKER_NONCE), inputs.nonce.clone()),
     ]);
-    match &inputs.claim {
-        None => {
-            annotations.insert(s(ANN_ALLOC), s("free"));
-        }
-        Some(c) => annotations.extend([
-            (s(ANN_ALLOC), c.alloc_id.clone()),
-            (s(ANN_OWNER), c.owner.clone()),
-            (s(ANN_ALLOCATED_AT), c.allocated_at.clone()),
-            (s(ANN_EXPIRES_AT), c.expires_at.clone()),
-        ]),
-    }
+    annotations.insert(s(ANN_ALLOC), s("free"));
 
-    let mut pod = Pod {
+    Ok(Pod {
         metadata: ObjectMeta {
             name: Some(pod_name),
             namespace: Some(s(ns)),
@@ -332,11 +268,5 @@ pub fn worker_pod(pool: &BuildKitPool, inputs: &PodInputs) -> Result<Pod, Render
         },
         spec: Some(spec),
         status: None,
-    };
-    if is_cached_slot(pool, inputs.slot) {
-        mount_cache_volume(&mut pod, name, inputs.slot);
-        // Serves any scope until a creator binds it (`bind_pod`).
-        bind_pod(&mut pod, None, None);
-    }
-    Ok(pod)
+    })
 }

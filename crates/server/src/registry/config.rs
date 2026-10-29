@@ -38,14 +38,19 @@ pub struct CacheArgs {
         default_value = "/etc/buildkit-cache/tls"
     )]
     pub tls_dir: PathBuf,
-    /// YAML list of static grants (`namespace`, `pod`, `repository`, `push`).
-    /// Without it every request is denied.
+    /// Namespaces whose pools and worker pods the role watches to authorize
+    /// workers, comma-separated; empty = all. The controller's `watchNamespaces`.
+    #[arg(long, env = "BUILDKIT_CACHE_WATCH_NAMESPACES", value_delimiter = ',')]
+    pub watch_namespaces: Vec<String>,
+    /// YAML list of static grants (`namespace`, `pod`, `repository`, `push`), for
+    /// tests: with it the role grants from the file instead of watching pods,
+    /// and every pool gets `--pool-max-size`.
     #[arg(long, env = "BUILDKIT_CACHE_GRANTS_FILE")]
     pub grants_file: Option<PathBuf>,
     /// Budget of the whole volume, e.g. `50Gi`.
     #[arg(long, env = "BUILDKIT_CACHE_MAX_SIZE", default_value = "50Gi", value_parser = parse_size)]
     pub max_size: u64,
-    /// Budget of each pool (repositories under `<namespace>/<pool>/`).
+    /// Budget of a pool without `cache.maxSize` (repositories under `<namespace>/<pool>/`).
     #[arg(long, env = "BUILDKIT_CACHE_POOL_MAX_SIZE", default_value = "10Gi", value_parser = parse_size)]
     pub pool_max_size: u64,
     /// Largest blob accepted.

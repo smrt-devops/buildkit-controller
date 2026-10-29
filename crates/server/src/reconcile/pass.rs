@@ -40,8 +40,6 @@ pub struct PoolMemory {
     recent_creates: Vec<CreateOutcome>,
     /// Generation and time of the last successful sandbox apply.
     sandbox_applied: Option<(i64, Timestamp)>,
-    /// Generation whose above-limit volume reap completed in this term.
-    volume_generation: Option<i64>,
     create_backoff: Option<(Timestamp, SignedDuration)>,
     ready: BTreeSet<String>,
     /// Uids seen up (see [`WorkerPod::up`]) in this term.
@@ -253,40 +251,9 @@ pub async fn run<O: KubeOps>(
         replica: &settings.replica,
         now,
     };
-    let mut report = execute(ops, guard, &env, &plan).await;
-    reap_volumes(ops, mem, pool, &observed.pods, &mut report).await;
+    let report = execute(ops, guard, &env, &plan).await;
     let requeue = remember(mem, pool, &plan, &report, ready_now, now);
     Outcome { report, requeue }
-}
-
-/// The above-limit volume reap: on the first pass of a
-/// term and on each new generation, until one completes. A volume whose slot a
-/// pod still holds keeps the generation unreaped, so a later pod event retries.
-async fn reap_volumes<O: KubeOps>(
-    ops: &O,
-    mem: &mut PoolMemory,
-    pool: &BuildKitPool,
-    pods: &[WorkerPod],
-    report: &mut Report,
-) {
-    let generation = pool.metadata.generation.unwrap_or_default();
-    if mem.volume_generation == Some(generation) {
-        return;
-    }
-    let name = pool.name_any();
-    let held: BTreeSet<u32> = pods
-        .iter()
-        .filter_map(|p| p.slot)
-        .chain(
-            report
-                .created
-                .iter()
-                .filter_map(|p| super::pods::parse_slot(&p.name_any(), &name)),
-        )
-        .collect();
-    if super::cache::reap_above_limit(ops, pool, &held, report).await {
-        mem.volume_generation = Some(generation);
-    }
 }
 
 /// Stores the term memory and returns the requeue.

@@ -872,6 +872,73 @@ fn claim_watch(
     (claim_store, claim_tx)
 }
 
+/// The worker stores: every `BuildKitPool` and every controller-managed pod
+/// in `namespaces` (`[]` = all), with the `pool_store` and `pod_store`
+/// readiness checks, and the pod event broadcast.
+#[must_use]
+pub fn worker_watches(
+    client: &Client,
+    namespaces: &[String],
+    metrics: &Arc<Metrics>,
+    readiness: &Arc<Readiness>,
+    shutdown: &CancellationToken,
+) -> (Store<BuildKitPool>, Store<Pod>, broadcast::Sender<PodEvent>) {
+    let report = |kind| NamespaceReport::full(kind, Arc::clone(metrics), Arc::clone(readiness));
+
+    let (pool_store, pool_writer) = reflector::store::<BuildKitPool>();
+    let events = tolerant_watch(
+        client.clone(),
+        namespaces,
+        &watcher::Config::default(),
+        pool_store.clone(),
+        report("pool"),
+    )
+    .modify(strip);
+    let m = Arc::clone(metrics);
+    spawn_until(
+        shutdown.clone(),
+        drive(
+            pool_writer,
+            events,
+            readiness.register("pool_store"),
+            move |e| {
+                warn!(error = %e, kind = "pool", "watch error");
+                m.watch_error("pool");
+            },
+            |_| {},
+        ),
+    );
+
+    let (pod_store, pod_writer) = reflector::store::<Pod>();
+    let (tx, _) = broadcast::channel(POD_EVENT_CAPACITY);
+    let cfg =
+        watcher::Config::default().labels(&format!("{LABEL_MANAGED_BY}={CONTROLLER},{LABEL_POOL}"));
+    let events = tolerant_watch(
+        client.clone(),
+        namespaces,
+        &cfg,
+        pod_store.clone(),
+        report("pod"),
+    )
+    .modify(strip);
+    let m = Arc::clone(metrics);
+    let ptx = tx.clone();
+    spawn_until(
+        shutdown.clone(),
+        drive(
+            pod_writer,
+            events,
+            readiness.register("pod_store"),
+            move |e| {
+                warn!(error = %e, kind = "pod", "watch error");
+                m.watch_error("pod");
+            },
+            move |ev| forward(&ptx, ev),
+        ),
+    );
+    (pool_store, pod_store, tx)
+}
+
 impl Stores {
     /// Start the root watch tasks.
     #[must_use]
@@ -886,60 +953,8 @@ impl Stores {
             metrics,
             readiness,
         } = spec;
-        let report =
-            |kind| NamespaceReport::full(kind, Arc::clone(&metrics), Arc::clone(&readiness));
-
-        let (pool_store, pool_writer) = reflector::store::<BuildKitPool>();
-        let events = tolerant_watch(
-            client.clone(),
-            watch_namespaces,
-            &watcher::Config::default(),
-            pool_store.clone(),
-            report("pool"),
-        )
-        .modify(strip);
-        let m = Arc::clone(&metrics);
-        spawn_until(
-            shutdown.clone(),
-            drive(
-                pool_writer,
-                events,
-                readiness.register("pool_store"),
-                move |e| {
-                    warn!(error = %e, kind = "pool", "watch error");
-                    m.watch_error("pool");
-                },
-                |_| {},
-            ),
-        );
-
-        let (pod_store, pod_writer) = reflector::store::<Pod>();
-        let (tx, _) = broadcast::channel(POD_EVENT_CAPACITY);
-        let cfg = watcher::Config::default()
-            .labels(&format!("{LABEL_MANAGED_BY}={CONTROLLER},{LABEL_POOL}"));
-        let events = tolerant_watch(
-            client.clone(),
-            watch_namespaces,
-            &cfg,
-            pod_store.clone(),
-            report("pod"),
-        )
-        .modify(strip);
-        let m = Arc::clone(&metrics);
-        let ptx = tx.clone();
-        spawn_until(
-            shutdown.clone(),
-            drive(
-                pod_writer,
-                events,
-                readiness.register("pod_store"),
-                move |e| {
-                    warn!(error = %e, kind = "pod", "watch error");
-                    m.watch_error("pod");
-                },
-                move |ev| forward(&ptx, ev),
-            ),
-        );
+        let (pool_store, pod_store, tx) =
+            worker_watches(&client, watch_namespaces, &metrics, &readiness, shutdown);
 
         let (claim_store, claim_tx) =
             claim_watch(&client, claim_namespaces, &metrics, &readiness, shutdown);

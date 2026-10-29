@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use buildkit_controller_api::claim::{BuildKitClaim, BuildKitClaimStatus};
 use futures::future::BoxFuture;
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret};
+use k8s_openapi::api::core::v1::{Pod, Secret};
 use kube::api::{DeleteParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::{Api, Client};
 use serde_json::{Value, json};
@@ -50,14 +50,6 @@ pub trait Backend: Send + Sync + 'static {
         name: &str,
         uid: &str,
         grace: Option<u32>,
-    ) -> BoxFuture<'static, Result<(), String>>;
-    /// JSON merge patch setting one annotation on a PVC.
-    fn annotate_pvc(
-        &self,
-        ns: &str,
-        name: &str,
-        key: &str,
-        value: &str,
     ) -> BoxFuture<'static, Result<(), String>>;
     /// `POST` a claim.
     fn create_claim(&self, claim: BuildKitClaim) -> BoxFuture<'static, Write>;
@@ -194,25 +186,6 @@ impl Backend for KubeBackend {
         Box::pin(async move {
             match written(done(t, api.delete(&name, &dp)).await) {
                 Write::Done | Write::Gone => Ok(()),
-                w => Err(format!("{w:?}")),
-            }
-        })
-    }
-
-    fn annotate_pvc(
-        &self,
-        ns: &str,
-        name: &str,
-        key: &str,
-        value: &str,
-    ) -> BoxFuture<'static, Result<(), String>> {
-        let api = self.api::<PersistentVolumeClaim>(ns);
-        let (name, t) = (name.to_owned(), self.timeout);
-        let patch = json!({"metadata": {"annotations": {key: value}}});
-        Box::pin(async move {
-            let pp = PatchParams::default();
-            match written(done(t, api.patch(&name, &pp, &Patch::Merge(patch))).await) {
-                Write::Done => Ok(()),
                 w => Err(format!("{w:?}")),
             }
         })
