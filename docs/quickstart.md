@@ -59,6 +59,8 @@ helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
 kubectl -n buildkit-system port-forward svc/buildkit-controller 8443:8443 8444:8444 &
 ```
 
+The chart also starts the build cache: a one-pod StatefulSet `buildkit-controller-registry` with a 60Gi volume, from your default StorageClass. kind has one. Check it with `kubectl -n buildkit-system get pods`. To run without a cache, add `--set cache.enabled=false`.
+
 ## 2. Create a pool
 
 ```sh
@@ -109,12 +111,12 @@ The inputs are:
 | `url` | Controller API base URL. Required. |
 | `pools` | Pools to allocate, one `namespace/pool` per entry. Required. |
 | `ttl` | Allocation TTL, for example `3600`, `90m` or `1h`. Defaults to the pool's. |
-| `queue-timeout` | How long to wait in the queue, for example `300` or `5m`. Defaults to the pool's. It also bounds the retries (see [Retries](ci/README.md#retries)). |
+| `queue-timeout` | How long to wait in the queue, for example `300` or `5m`. Defaults to the pool's. It also bounds the wait and the retries (see [Retries](ci/README.md#retries)). |
 | `audience` | OIDC token audience. Default `buildkit-controller`. |
 | `builder-name` | Name of the buildx builder. Default `bk-<first allocation id>`. |
 | `ca-cert` | PEM CA to trust for the API listener. Default the system roots. |
-| `cache` | `auto` (default, every layer the pool enables), `registry`, `local` or `none`. |
-| `cache-key` | Cache key for both layers. Defaults to the pool's registry `defaultKey`, else the pool name. |
+| `cache` | `auto` (default, use the built-in cache) or `none`. |
+| `cache-key` | Cache tag, so one repository can keep several caches. Defaults to the pool name. |
 | `cache-mode` | `max` or `min`, replaces the pool's mode in `cache-to`. |
 | `cache-from` | Extra `--cache-from` values, one per line. |
 
@@ -163,4 +165,4 @@ kubectl delete bkp --all -A
 kind delete cluster --name bk
 ```
 
-Helm does not remove the CRD. Delete it with `kubectl delete crd buildkitpools.buildkit.smrt-devops.net` when you no longer need pools.
+Helm does not remove the CRDs. Delete them with `kubectl delete crd buildkitpools.buildkit.smrt-devops.net buildkitclaims.buildkit.smrt-devops.net` when you no longer need them. The cache volume is a PVC in `buildkit-system`; `helm uninstall` leaves it, so delete it with `kubectl -n buildkit-system delete pvc -l app.kubernetes.io/name=buildkit-registry` if you want the space back.

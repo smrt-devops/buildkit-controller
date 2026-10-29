@@ -9,12 +9,10 @@ GitHub ARC, but for remote BuildKit daemons. The controller keeps a pool of Buil
 Long-lived BuildKit daemons share caches and CPU between unrelated jobs, and a compromised build can reach the next one. Per-job builders on a shared cluster fix that, but you then need warm capacity, queueing, expiry and certificates. buildkit-controller does that work.
 
 - Each build gets its own worker pod. No other build runs on it, and the controller deletes the pod when the allocation ends.
-- A pool keeps `scaling.min` warm pods (zero by default, or a time-of-day schedule) and grows to `scaling.max`. When the pool is full, requests queue up to the pool's `queueTimeout`.
+- A pool keeps `scaling.min` warm pods (zero by default, or a time-of-day schedule) and grows to `scaling.max`. When the pool is full, requests wait in one first-in, first-out queue per pool, up to the pool's `queueTimeout`. The queue is a list of `BuildKitClaim` objects, so it survives restarts and `kubectl get bkc -A` shows it. No HTTP request stays open longer than 25 seconds: the client polls for its place.
 - One install serves any number of pools in the namespaces you list in `watchNamespaces`, so amd64, arm64 and per-team pools live side by side. Outside them, its own namespace and `claims.namespaces` the controller can write nothing.
 - The GitHub Action allocates builders for one or more pools and releases them when the job finishes, even after a failure.
-- Build cache comes in two layers, both off by default. The registry layer gives each cache key a registry ref, and the controller returns the `--cache-from` and `--cache-to` values for it. Local volumes keep a worker's state directory on a PVC per cached slot. Each volume belongs to one cache scope, by default the caller's repository, ServiceAccount or claim namespace, and is emptied before a caller of another scope gets it. Pools with local volumes run buildkitd with build history off, so `buildx history` shows nothing there ([details](docs/architecture.md#build-cache)).
-
-How the layers behave under concurrency: the registry cache is shared, so ten builds of one key at once all import the same ref, and the last export to finish becomes the ref. A local volume serves one build at a time and speeds up only the build that lands on its slot. When builds of one key overlap, the allocator sends the second build to another slot and reports `spill`, and that build still gets the registry cache. A pool that runs concurrent builds of one repository should set the registry layer.
+- Builds get a cache with nothing to set up. The chart runs a small registry that only worker pods can reach, and the allocation response carries the `--cache-from` and `--cache-to` values for it. Each repository has its own cache. Pushes, schedules and manual runs read and write it. Fork pull requests read it and cannot write it, so they start warm and cannot poison it ([details](docs/architecture.md#build-cache)).
 
 ## Requirements
 
@@ -22,6 +20,7 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 
 - A CNI that enforces NetworkPolicy, such as Calico, Cilium, or the AWS VPC CNI with network policy turned on. On a CNI that ignores NetworkPolicy, such as kindnet or the default EKS VPC CNI, a build can reach every pod in the cluster and the cloud metadata endpoint.
 - Pool namespaces that admit privileged pods under Pod Security Admission. Rootless BuildKit needs unconfined seccomp and AppArmor, which `baseline` and `restricted` refuse. Label each pool namespace `pod-security.kubernetes.io/enforce=privileged` and give each pool its own namespace. If the label is missing, the pool reports `Degraded` with reason `PodCreateFailed` and the PodSecurity error.
+- A default StorageClass, or `cache.persistence.storageClass`, for the cache registry's 60Gi volume. Set `cache.enabled=false` to run without a cache.
 - On an IPv6 or dual-stack cluster, list the IPv6 pod, service and node ranges in `workerNetwork.clusterCIDRs`, plus any IPv4 pod or node ranges outside RFC 1918 and 100.64.0.0/10. Until it holds an IPv6 range, workers get no IPv6 egress, and on an IPv6-only cluster every image pull fails while the pool reports Ready.
 
 ## Quickstart
@@ -81,9 +80,8 @@ kubectl -n buildkit-system get configmap buildkit-controller-ca-bundle -o 'jsonp
 
 - Callers authenticate with a GitHub OIDC token or a Kubernetes ServiceAccount token. Each pool's `spec.access.rules` decides who may use it, and a pool with no rules denies everyone.
 - Every allocation gets a client certificate valid for at most `maxTTL` (24 hours by default). The client generates the key and sends only the public half, so the private key never leaves the CI job. A BuildKitClaim is the exception: the controller generates its key and writes it to the claim's Secret in the claim's namespace.
-- Each allocation gets its own pod. The pod runs rootless BuildKit behind a deny-by-default NetworkPolicy (enforced only by a NetworkPolicy-aware CNI), and the controller retires it when the allocation ends. Without `cache.local`, nothing of the pod outlives it. The pod runs with seccomp and AppArmor Unconfined, so for untrusted code such as fork pull requests use a dedicated node pool or a sandboxed runtime class ([Running untrusted builds](docs/operations.md#running-untrusted-builds)).
-- With `cache.local`, the pod's state directory is a PVC that outlives the pod. Builds of the same cache scope (by default one repository, ServiceAccount or claim namespace) read what earlier builds of that scope left there: cache records, layers and built images. Before a pod of another scope starts on the volume, an init step deletes everything on it. These pools record no BuildKit build history, so no build logs or build arguments reach a later allocation. `cache.local.scope: pool` shares the volumes among every caller the pool admits.
-- The registry cache layer is shared by every caller the pool admits and by anyone who can push to its repository. Enable it only on pools that admit one trust domain.
+- Each allocation gets its own pod. The pod runs rootless BuildKit behind a deny-by-default NetworkPolicy (enforced only by a NetworkPolicy-aware CNI), and the controller retires it when the allocation ends. Nothing of the pod outlives it: workers have no volumes. The pod runs with seccomp and AppArmor Unconfined, so for untrusted code such as fork pull requests use a dedicated node pool or a sandboxed runtime class ([Running untrusted builds](docs/operations.md#running-untrusted-builds)).
+- The build cache lives in a registry that only worker pods reach, over mTLS with the controller's internal CA. The registry reads the calling pod's live allocation and allows a pull from that caller's own cache and a push only when the pool trusts the caller. A build cannot read or write another repository's cache whatever `--cache-to` it passes. A fork pull request reads the cache and cannot write it. A pool decides who may write with `spec.workers.cache.writers`.
 - All traffic to a worker goes through the mTLS edge. The edge checks the client certificate, finds the pod in its watch cache, and opens a second mTLS connection to buildkitd, which only trusts the controller's internal CA.
 - The controller makes and repairs its own CAs. If the CA Secret goes missing or is corrupted, the leader saves a copy, creates a new one, and the pools recover without operator action.
 
@@ -97,7 +95,7 @@ The documentation site is at <https://smrt-devops.github.io/buildkit-controller/
 - [helm/README.md](helm/README.md): chart values.
 - [action/](action/action.yml) and [docs/ci/](docs/ci/README.md): the GitHub Action and the curl recipe for other CI systems.
 - [examples/](examples/README.md): pools and Helm values.
-- [BuildKitClaim](docs/architecture.md#buildkitclaim): `BuildKitClaim`, an opt-in CRD that gives in-cluster pipelines (Tekton, Argo) a builder without the HTTP API.
+- [BuildKitClaim](docs/architecture.md#buildkitclaim): the object behind every allocation. In-cluster pipelines (Tekton, Argo) can create one to get a builder without the HTTP API.
 - [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md).
 
 ## License

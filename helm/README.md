@@ -125,12 +125,12 @@ in the Gateway API repository.
 
 #### Timeouts
 
-A queued allocation request is silent until a worker is free: up to the pool's
-`allocation.maxQueueTimeout` plus `workers.startTimeout` plus 10 s, which is 12m10s
-with default pool settings. The HTTPRoute sets `timeouts.request` and
-`timeouts.backendRequest` to `gateway.api.timeouts` (15m); raise both when a pool
-allows longer waits (at most 1h + 30m + 10 s). Check the Gateway's own idle
-timeouts too. Envoy Gateway derives the route's idle timeout from the request
+No API request waits for a worker longer than 25 s: a queued allocation is a
+claim that the client polls (`POST /v1/allocations` answers within about 20 s, and
+`GET /v1/allocations/{id}?wait=25s` within 25 s). The HTTPRoute sets `timeouts.request`
+and `timeouts.backendRequest` to `gateway.api.timeouts` (15m), well above that, so
+the queue needs no tuning. Check the Gateway's own idle timeouts for long builds
+too. Envoy Gateway derives the route's idle timeout from the request
 timeout unless a ClientTrafficPolicy on the Gateway sets `streamIdleTimeout`;
 `gateway.envoy.enabled` covers that case. TLSRoutes carry no timeout fields: the
 gateway's TCP idle timeout applies, which in Envoy is 1 hour by default, and the
@@ -208,7 +208,7 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 | `resources` | 100m CPU and 128Mi memory requested, 512Mi memory limit. An established edge connection holds about 200 KiB and an idle replica about 14 MiB, so 512Mi holds about 2300 connections. Raise `resources.limits.memory` and `edge.maxConnections` together |
 | `affinity`, `topologySpreadConstraints` | when both are empty, a soft hostname anti-affinity spreads replicas |
 | `podDisruptionBudget.*` | rendered only when replicas exceed `minAvailable` |
-| `watchNamespaces` | namespaces whose pools the controller serves; recommended. The chart renders a Role and RoleBinding in each for pods, Secrets, ServiceAccounts, PVCs and NetworkPolicies, and only TokenReview stays cluster-wide. The list may not include the release namespace (the chart fails to render). The Role in each namespace is named `<fullname>-<release namespace>-workload` and grants `create` on Secrets only; Kubernetes garbage collection deletes a worker Secret with its pod. Pools elsewhere are ignored. `[]` (the default) = every namespace through a ClusterRole that can create pods and Secrets in any namespace, kube-system included; NOTES.txt warns about it |
+| `watchNamespaces` | namespaces whose pools the controller serves; recommended. The chart renders a Role and RoleBinding in each for pods, Secrets, ServiceAccounts and NetworkPolicies, and only TokenReview stays cluster-wide. The list may not include the release namespace (the chart fails to render). The Role in each namespace is named `<fullname>-<release namespace>-workload` and grants `create` on Secrets only; Kubernetes garbage collection deletes a worker Secret with its pod. Pools elsewhere are ignored. `[]` (the default) = every namespace through a ClusterRole that can create pods and Secrets in any namespace, kube-system included; NOTES.txt warns about it |
 | `watchNamespace` | deprecated single-namespace form of `watchNamespaces`; setting both fails to render |
 | `edge.*` | `endpoint`, `serverName`, `allocationDomain`, `extraNames`, `tls.secretName` (user serving cert, a `kubernetes.io/tls` Secret in the release namespace), `handshakeTimeout` (10s), `maxConnections` (2000 established, sized to the 512Mi memory limit), `maxHandshakes` (1024), `maxHandshakesPerIp` (32; 0 = no cap), `proxyProtocol.enabled` (false), `.trustedCIDRs` (required when enabled), `.headerTimeout` (5s) |
 | `api.*` | `maxConnections` (4096), `maxConnectionsPerIp` (128; 0 = no cap), `proxyProtocol` (as `edge.proxyProtocol`) |
@@ -223,17 +223,20 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 | `gateway.envoy.*` | `enabled` (false), `connectTimeout`, `tcpKeepalive`, `proxyProtocol` (false; PROXY protocol v2 to the listeners that read it): Envoy Gateway BackendTrafficPolicies |
 | `gateway.extraManifests` | extra objects (or `tpl` strings) for other implementations |
 | `metrics.port`, `metrics.serviceMonitor.enabled` | ops port (`/healthz`, `/readyz`, `/metrics`) on its own Service; ServiceMonitor `true`, `false` or `auto` (only when the CRD exists) |
-| `claims.enabled`, `claims.namespaces` | `BuildKitClaim` support, off by default. `namespaces` (required when enabled) lists the namespaces whose claims the controller serves, and it gets Secret get, create and delete there only. See [operations.md](../docs/operations.md#in-cluster-claims) |
-| `cacheDefaults.registry.repository` | registry cache repository that goes into every pool that sets none |
-| `pools` | list of `{name, namespace, spec, cache}`, one BuildKitPool each; `namespace` is required unless `watchNamespaces` has one entry, must be in `watchNamespaces` when that is set, and must not be the release namespace (the chart fails to render otherwise); namespaces are not created |
+| `cache.enabled` | the built-in cache registry, on by default: a one-replica StatefulSet `<fullname>-registry` with one PVC, a Service and a NetworkPolicy that admits worker pods only. `false` removes it, and allocations then carry no cache flags |
+| `cache.maxSize`, `.poolMaxSize`, `.maxBlobSize`, `.maxUploadSize`, `.gcInterval` | `40Gi` for the whole store, `10Gi` for a pool without `spec.workers.cache.maxSize`, `5Gi` for the largest blob, `10Gi` for uploads in progress together, `10m` between garbage collections |
+| `cache.persistence.size`, `.storageClass` | `60Gi`, and `""` for the cluster default. The volume must hold `maxSize` plus `maxUploadSize`; see [operations.md](../docs/operations.md#sizing-the-volume) |
+| `cache.resources`, `.podAnnotations`, `.nodeSelector`, `.tolerations`, `.affinity` | scheduling and resources of the cache pod (100m CPU and 128Mi requested, 512Mi memory limit) |
+| `claims.enabled`, `claims.namespaces` | `BuildKitClaim` support for pipelines in their own namespaces, off by default. The claim CRD itself is always installed, because every allocation is a claim. `namespaces` (required when enabled) lists the namespaces whose claims the controller serves, and it gets Secret get, create and delete there only. See [operations.md](../docs/operations.md#in-cluster-claims) |
+| `pools` | list of `{name, namespace, spec}`, one BuildKitPool each; `namespace` is required unless `watchNamespaces` has one entry, must be in `watchNamespaces` when that is set, and must not be the release namespace (the chart fails to render otherwise); namespaces are not created |
 
 ## Load balancer idle timeout
 
 This applies to `service.type: LoadBalancer`, and to the load balancer in front of a
-Gateway. A queued allocation request is silent for up to 12m10s with default pool
-timeouts, and builds can be quiet for long steps. TCP keepalive keeps most
+Gateway. Queued allocations are short polls and need no tuning, but builds can be
+quiet for long steps on the edge connection. TCP keepalive keeps most
 paths open. For a load balancer that ignores keepalives, raise its idle timeout
-above that bound, with `service.annotations` for the chart's Service or on the
+above your longest quiet step, with `service.annotations` for the chart's Service or on the
 Gateway's own Service.
 
 | Cloud | Annotation |

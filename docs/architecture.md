@@ -2,31 +2,55 @@
 
 This page is the short version of how the controller works. Day-two tasks are in [operations.md](operations.md) and a first install is in [quickstart.md](quickstart.md).
 
-## One binary, three roles
+## One binary, four roles
 
-The `buildkit-controller` binary (`crates/server`) runs as one Deployment with two replicas by default. Every replica runs these roles.
+The `buildkit-controller` binary (`crates/server`) runs as one Deployment with two replicas by default. Every replica runs three roles. A fourth, the cache registry, runs as its own single pod from the same binary.
 
 | Role | Port | Job | Runs on |
 |---|---|---|---|
-| API | 8443 (HTTPS) | Authenticates callers, picks a worker, issues an allocation certificate | every replica |
+| API | 8443 (HTTPS) | Authenticates callers, creates and reads allocation claims, answers with the certificate once a claim is bound | every replica |
 | Edge | 8444 (mTLS) | Proxies a build connection to its worker | every replica |
-| Reconciler | none | Keeps warm pods, retires expired ones, manages CAs and worker certificates, writes status | the Lease holder only |
+| Reconciler and allocator | none | Keeps warm pods, binds queued claims to pods, signs allocation certificates, retires expired pods, manages CAs and worker certificates, writes status | the Lease holder only |
+| Cache (`buildkit-controller cache`) | 5000 (mTLS), 8080 (ops) | Stores BuildKit cache for the workers | one StatefulSet pod |
 
 Clients reach the API and edge ports through a Gateway by default: the API through an HTTPRoute, where the gateway terminates TLS and re-encrypts to the controller, and the edge through a TLS passthrough TLSRoute, so that the edge itself checks the client certificate. A LoadBalancer Service is the alternative. See [Exposure](operations.md#exposure).
 
-A separate ops port (8080, plain HTTP, on its own ClusterIP Service) serves `/healthz`, `/readyz` and `/metrics`. All replicas share in-memory watch caches of pools and pods, so the API and edge read pools and pods from memory. On the request path the API calls the Kubernetes API only for TokenReview (ServiceAccount tokens), to create pre-claimed pods, and to patch pods when it claims or retires them.
+A separate ops port (8080, plain HTTP, on its own ClusterIP Service) serves `/healthz`, `/readyz` and `/metrics`. All replicas share in-memory watch caches of pools, claims and pods, so the API and edge read from memory. The API replicas hold no queue and sign nothing. They authenticate the caller, check the pool's access rules, and write or read a claim.
 
-## One CRD
+## Two CRDs
 
-`BuildKitPool` (`buildkit.smrt-devops.net/v1alpha1`, namespaced, short name `bkp`) is the only custom resource. A pool declares platforms, a pod template, scaling bounds and schedule, allocation TTLs and queue limits, egress rules, and access rules. One install serves any number of pools, like ARC runner scale sets. The field reference is the generated CRD, [buildkitpools.yaml](../helm/buildkit-controller/crds/buildkitpools.yaml), and `kubectl explain bkp.spec` prints the same descriptions.
+- `BuildKitPool` (`buildkit.smrt-devops.net/v1alpha1`, namespaced, short name `bkp`) declares platforms, a pod template, scaling bounds and schedule, allocation TTLs and queue limits, egress rules, cache settings and access rules. One install serves any number of pools, like ARC runner scale sets. The field reference is the generated CRD, [buildkitpools.yaml](../helm/buildkit-controller/crds/buildkitpools.yaml), and `kubectl explain bkp.spec` prints the same descriptions.
+- `BuildKitClaim` (short name `bkc`) is one request for one worker. Every allocation is a claim, whether it comes from CI over HTTP or from a pipeline in the cluster. See [BuildKitClaim](#buildkitclaim).
+
+There is no worker CRD and no cache CRD.
+
+## The claim queue
+
+An allocation is a `BuildKitClaim` that waits to be bound to a pod. The claims of a pool, oldest first, are its queue.
+
+1. `POST /v1/allocations` authenticates the caller, checks the pool's access rules and creates a claim in the controller's own namespace. The claim is named after the allocation id and carries the caller's public key and identity. Tenants have no write access to that namespace, and the controller honours a written `owner` only there, so a tenant cannot pass as a CI identity.
+2. The API waits up to 20 seconds for the claim to bind. Bound in time, it answers `201` with the endpoint, the CA and the allocation certificate. This is the warm-pod path, one round trip. Otherwise it answers `202` with `{"id", "state": "pending", "position"}`.
+3. The client then calls `GET /v1/allocations/{id}?wait=25s`. The call returns `200` with the full response once the claim is bound, `202` while it is pending, and the error JSON if the claim failed. Any replica can answer, because the state is the claim. A client that loses its connection polls again and keeps its place. No request stays open longer than 25 seconds, which is under the idle timeout of every common gateway and load balancer.
+4. `DELETE /v1/allocations/{id}` deletes the claim after an owner check, and the leader retires the pod.
+
+### The leader allocator
+
+The Lease holder runs one loop per pool. It takes the pool's pending claims in order of `creationTimestamp`, which the API server sets, so no replica can jump the queue, and breaks ties by name. Each claim gets a free pod. If none is free and the pool is under `scaling.max`, the reconciler creates pods for the waiters. A claim still pending at its queue timeout becomes `Failed` with reason `QueueTimeout`, and the client sees `503 pool_exhausted`.
+
+Binding is two writes, in this order:
+
+1. A JSON patch on the pod that tests the pod's labels and sets the allocation annotations, including the claim. The test makes a double booking fail, so a deposed leader cannot claim a pod that the new leader already gave away.
+2. The claim's status: `Bound`, the pod, the expiry and the certificate. The write carries the claim's `resourceVersion`.
+
+A claim from the API holds the caller's public key, so the leader signs the allocation certificate for it and writes the certificate into the status. The private key never reaches the cluster. A claim without a public key, which is what an in-cluster pipeline creates, gets a key the leader generates and a Secret `<claim>-buildkit` that holds it.
+
+Every 2 seconds the leader also tidies up: it expires bound claims at their TTL, marks claims whose pod is gone as `Lost`, deletes finished CI claims 10 minutes after they end, and retires pods whose claim is gone or ended. So `kubectl get bkc -A` shows recent history without growing forever, and a deleted claim never leaks a worker. `status.waiting` on the pool is the exact number of pending claims, and the reconciler sizes the pool from it.
+
+A claim lives in the API server, so a replica restart loses nothing. When the leader dies, binding pauses until another replica takes the Lease (15 seconds by default). On a rollout the old leader releases the Lease at once. Pending claims are never lost.
 
 ## Pods are the workers
 
-There is no worker CRD and no separate proxy service. The reconciler creates plain pods named `<pool>-<slot>` and owns them by label. A pod is `free`, `allocated` or `draining`. Claiming a free pod is one JSON patch with a test on its labels, so two replicas cannot claim the same pod. If no pod is free, the API creates a pre-claimed pod while the pool is under `scaling.max`, and otherwise queues the request. Retiring a pod is also a patch, followed by deletion. The reconciler force-deletes any owned pod that is still terminating 2 minutes after its grace period ended. The pod template is yours, but the controller owns the security context, TLS mounts, command and labels. The API server rejects a template that sets those.
-
-Each replica keeps one first-in, first-out queue per pool. A request that finds the queue non-empty goes to the back without trying for a pod itself, so a newcomer cannot take a freed pod from a request that has waited longer on the same replica. A request with `queueTimeoutSeconds: 0` that finds others waiting fails at once with `pool_exhausted`. Order across replicas is best effort: replicas do not share a queue, so a request on one replica can take a pod freed while another replica has waiters. Every replica writes its queue length to the pool's `status.waiters`. The leader keeps at least that many pods free or starting, up to `scaling.max`, so below `max` the waiters on every replica get pods. At `max`, the replicas race for each freed pod.
-
-A claim first holds the pod only briefly. Its `expires-at` is 60 seconds past the moment the pod can be ready: the claim itself for a free pod, the end of `workers.startTimeout` for a created one. Just before the API answers, it moves `expires-at` to the allocation's real expiry with a patch that tests the short value. If that patch fails, the request fails and the pod is retired. A replica killed before the commit therefore holds the pod for at most `startTimeout` plus 60 seconds, after which the reconciler retires it as expired. The window ends at the commit patch. A replica killed after it but before the response is written (SIGKILL, an out-of-memory kill, or the abort at the end of the drain budget) leaves an allocation that no client knows. The worker stays allocated until the real expiry, which is at most `maxTTL`. The two writes cannot be one atomic step. The claim always ends before the real expiry, so every commit changes `expires-at`. The reconciler's expiry and start-timeout retires of an allocated pod test the `expires-at` they judged, so neither can reap an allocation that committed in the meantime.
+The reconciler creates plain pods named `<pool>-<slot>` and owns them by label. A pod is `free`, `allocated` or `draining`. Retiring a pod is a patch, followed by deletion. The reconciler force-deletes any owned pod that is still terminating 2 minutes after its grace period ended. The pod template is yours, but the controller owns the security context, TLS mounts, command and labels. The API server rejects a template that sets those. Workers have no volumes: the buildkitd state directory is an `emptyDir` that goes away with the pod.
 
 A new pod is created before its worker Secret, and the Secret is created with the pod as its owner, so the garbage collector deletes it with the pod and no other object ever owns a worker's private key. A pod whose Secret was never created cannot mount it, never becomes ready, and is retired at `startTimeout`. When the answer to a pod create is lost, the controller reads the pod back and creates the Secret only if the pod exists.
 
@@ -37,18 +61,22 @@ sequenceDiagram
     participant CI as CI job
     participant API as API :8443
     participant K as Kubernetes API
+    participant L as Leader
     participant Edge as Edge :8444
     participant W as Worker pod (buildkitd)
+    participant C as Cache registry :5000
     CI->>API: POST /v1/allocations (bearer token, public key)
     API->>API: verify OIDC JWT or ServiceAccount token, check pool access rules
-    API->>K: claim a free pod, or create a pre-claimed pod
-    API-->>CI: endpoint, CA, allocation certificate (signed by client CA)
+    API->>K: create BuildKitClaim
+    L->>K: bind a free pod, write certificate to claim status
+    API-->>CI: 201, or 202 then GET ?wait=25s until 200
     CI->>Edge: buildx remote driver, mTLS with allocation certificate
     Edge->>Edge: verify certificate chain and URI SAN, look up pod in cache
     Edge->>W: mTLS with edge client certificate (internal CA)
     CI-->>W: build traffic, copied in both directions
+    W->>C: cache import and export, mTLS with the worker's certificate
     CI->>API: DELETE /v1/allocations/{id}
-    API->>K: retire pod, which is then deleted
+    API->>K: delete claim, which retires the pod
 ```
 
 The allocation certificate's URI SAN names the pod, the allocation and the pool. The edge reads those fields and finds the pod in its watch cache, so it needs no database and no per-request call to Kubernetes. When the allocation is released, expires, or the pod disappears, the edge closes its connections.
@@ -69,37 +97,59 @@ Every allocation records its caller as the owner, and only the same owner can re
 
 The owner is per run attempt, not per job. All jobs of one attempt, such as the legs of a matrix, have the same `run_id`, `run_attempt` and `job_workflow_ref`, so they share one owner, and any of them can release another's allocation if it learns the allocation id. Jobs of one workflow run are in one trust domain, so the controller does not separate them further. A token from the same job, such as the one the Action fetches in its post step, gives the same owner. A re-run attempt is a different owner and cannot release the earlier attempt's worker, which ends at its expiry.
 
+
 ## Build cache
 
-Each allocation gets its own worker pod, and the pod is deleted when the allocation ends. Cache comes from the pool's two layers, set under `spec.workers.cache`. Both are off by default.
+Builds get a cache from the cache registry, a built-in role of the controller binary. It runs as a one-replica StatefulSet `<fullname>-registry` with one volume, and the chart turns it on by default (`cache.enabled`). It serves the part of the OCI distribution API that BuildKit's registry cache exporter and importer use: blob upload (including cross-repository mount), blob and manifest read, and manifest write. It serves nothing else, and it verifies each blob against its digest as the blob streams in.
 
-- The registry layer (`cache.registry`) is the one to rely on. The allocation response carries buildx `--cache-to` and `--cache-from` values for the request's cache key, built from `repository`, the `ref` template, `mode` and `importFrom`. Every build of a key imports the same ref and exports to it, so ten concurrent builds all read the cache, and the last export to finish becomes the ref. The controller holds no registry credentials. Buildx sends the client's own credentials, so grant push on the cache repository to your CI identities. A client that does not pass the returned flags builds without this layer.
-- Local volumes (`cache.local`) keep a worker's whole buildkitd state directory on a PVC `<pool>-cache-<slot>`. That directory holds the content store, the cache records and every image built there. A volume belongs to one slot and one pod uses it at a time, so it speeds up only the build that lands on that slot. `maxVolumes` caps how many slots have a volume, and `affinity: soft` prefers a slot whose volume last served the same key. Affinity never makes a request wait.
+The allocation response carries the cache flags, and the client passes them to buildx:
 
-A request picks its key with `cacheKey` (1 to 63 characters of letters, digits, `.`, `_` and `-`, starting and ending with a letter or digit; default the pool's `registry.defaultKey`, else the pool name) and its layers with `cache`: `auto` (every layer the pool enables), `registry`, `local` or `none`. Asking for a layer the pool lacks is a 400.
+```
+--cache-from type=registry,ref=<registry>/<namespace>/<pool>/<scope>:<tag>
+--cache-to   type=registry,ref=<registry>/<namespace>/<pool>/<scope>:<tag>,mode=max,ignore-error=true,oci-mediatypes=true
+```
 
-`local.result` in the response and the allocation metric report how the slot matched: `hit` (the volume served this key before), `spill` (a volume of the caller's scope that served the key was busy, so another slot was used), `miss`, `cold` (the pod was created for this request), `wiped` (the pod was created for this request on a volume that belonged to another cache scope, so it started empty) or `uncached` (the slot has no volume). A request that left out the local layer but lands on a cached slot gets `reused` (or `wiped`) in the response, and the metric does not count it. `spill` is normal when builds of one key overlap, and that build still gets the registry cache. A pool that runs concurrent builds of one repository should set the registry layer.
+`<tag>` is the request's `cacheKey`, or the pool name when there is none. `ignore-error=true` means a cache outage slows a build and never fails it. A client that does not pass the flags builds without a cache. A request that sets `cache: none` gets no flags.
 
-### Who shares a local volume
+### Who may reach it
 
-Each volume belongs to one cache scope. `cache.local.scope` sets how scopes are drawn:
+Only worker pods can, over mTLS with the internal CA. The controller gives each worker a certificate that also carries the client-auth usage, and writes the worker's `buildkitd.toml` so buildkitd presents that certificate to the registry. There are no credentials for a build to steal or an operator to manage.
+
+The registry identifies the worker by its certificate and finds the pod in its watch cache, as the edge does. It reads the pod's live allocation: the pool, the caller's cache scope and the trust tier, which the leader wrote on the pod as the annotations `buildkit.smrt-devops.net/scope` and `buildkit.smrt-devops.net/tier`. It then allows:
+
+| Action | Allowed when |
+|---|---|
+| Pull from `<namespace>/<pool>/<scope>` | the pod holds a live allocation of that pool and scope |
+| Push to it | the same, and the allocation's tier is `trusted` |
+
+A worker with no live allocation gets nothing. A build cannot read or write another scope's cache, whatever `--cache-to` it passes.
+
+### Scope and trust tiers
+
+The scope says whose cache it is. `spec.workers.cache.scope` sets how scopes are drawn:
 
 - `identity`, the default, gives each caller its own scope. An OIDC token with a `repository_id` claim (GitHub Actions) is scoped to that repository id, one with only a `repository` claim to that name, and any other OIDC token to its `sub`. The token's issuer is always part of the scope. A ServiceAccount is scoped to its namespace and name, and a `BuildKitClaim` to its namespace. Every run, branch and pull request of one repository shares that repository's scope.
 - `pool` puts every caller the pool admits in one scope. Use it only when the pool's access rules admit a single trust domain.
 
-Within a scope everything in the state directory is shared: cache records, layers and the images built there. A later build of the same scope can read them through BuildKit's API, the content store included. Nothing crosses scopes:
+The tier says whether the caller may write. `spec.workers.cache.writers` lists the callers that may, in the syntax of `access.rules`. Everyone else reads only.
 
-- The volume's `buildkit.smrt-devops.net/cache-scope` annotation names the scope that owns its contents and a generation id. A file in the volume holds the same id.
-- A pod in a cached slot is bound to one scope when it is created. A warm pod takes the volume's scope, and a pod created for a request takes the caller's. Before buildkitd starts, the `cache-init` init container compares the file with the generation the pod was bound to. If they differ, or the pod was bound to a scope that does not own the volume, it deletes everything in the state directory. A volume with no owner is emptied the same way, and the pod that starts on it can serve any scope. The file decides, not the annotation, so a lost or late annotation write costs a cache miss and never exposes another scope's data.
-- A warm pod bound to another scope is never offered to a request. When a request finds no pod and no free slot, and nothing is starting or terminating, the allocator clears the owner of one such pod's volume and retires the pod. The slot's next pod then starts empty and serves any scope.
+- Unset, a GitHub Actions caller is trusted when its `event_name` claim is `push`, `schedule`, `workflow_dispatch` or `merge_group`. Every ServiceAccount and `BuildKitClaim` caller is trusted. A pull request is not, so a fork build starts warm from its own repository's cache and cannot change it. A caller whose token has no `event_name` claim, such as a GitLab job, reads only until you list it in `writers`.
+- `writers: []` trusts nobody.
+- A trusted allocation gets `--cache-to` and `--cache-from`. An untrusted one gets `--cache-from` only, and the Action logs that the cache is read only for the build.
 
-Pools with `cache.local` run buildkitd with `[history] maxEntries = 0`, which turns off BuildKit's build history, and `cache-init` also deletes `history.db`. Build records hold logs, build arguments and provenance, so a later allocation must not read them through the history API. `buildx history` and the build record export of `docker/build-push-action` therefore find nothing on these pools. Pools without `cache.local` keep history on the pod's `emptyDir`, which is deleted with the pod.
+### Limits and garbage collection
 
-The registry layer is not scoped. Every caller the pool admits can pass any `cacheKey`, and anyone with push access to the repository can write the refs, so cache written there can be read and overwritten by all of them. Enable the registry layer only on pools whose access rules admit one trust domain.
+- `spec.workers.cache.maxSize` caps what a pool's caches hold together. A pool without it gets the chart's `cache.poolMaxSize`. The chart's `cache.maxSize` caps the whole volume.
+- Every manifest records its last pull or push time. Over a budget, the oldest manifests go first. A periodic mark and sweep (`cache.gcInterval`, 10 minutes by default) then deletes the blobs that no manifest references.
+- A blob over `cache.maxBlobSize` is refused. Upload sessions expire after 1 hour idle. `cache.maxUploadSize` bounds the bytes that uploads in progress hold together, so size the volume to `cache.maxSize` plus `cache.maxUploadSize` ([sizing](operations.md#sizing)).
+- One replica means one volume. While the cache pod restarts, builds run uncached. The cache is an accelerator, so the allocation does not wait for it.
 
 ## BuildKitClaim
 
-`BuildKitClaim` (`buildkit.smrt-devops.net/v1alpha1`, namespaced, short name `bkc`) is a second, opt-in CRD for in-cluster pipelines such as Tekton or Argo. Instead of calling the HTTP API, a pipeline creates a claim and reads the credentials from a Secret. It is off by default (`claims.enabled`, see [operations.md](operations.md#in-cluster-claims)).
+A claim is the record of one allocation. Two kinds exist.
+
+- CI claims. The API creates them in the controller's namespace, named after the allocation id, with the caller's `publicKey` and `owner`. Callers use the HTTP API, never the claim.
+- In-cluster claims. A pipeline such as Tekton or Argo creates one in its own namespace and reads the credentials from a Secret, with no HTTP API. This part is opt-in (`claims.enabled`, see [operations.md](operations.md#in-cluster-claims)).
 
 ```yaml
 apiVersion: buildkit.smrt-devops.net/v1alpha1
@@ -107,16 +157,19 @@ kind: BuildKitClaim
 metadata: {name: build-42, namespace: ci}
 spec:
   poolRef: {namespace: buildkit, name: default}
-  ttl: 30m          # optional, the pool's allocation.defaultTTL when unset
+  ttl: 30m             # optional, the pool's allocation.defaultTTL when unset
+  queueTimeout: 5m     # optional, the pool's allocation.queueTimeout when unset
   cacheKey: app-main   # optional, same meaning as in the API
-  cache: auto          # optional: auto, registry, local or none
+  cache: auto          # optional: auto or none
 ```
 
-The spec is immutable, so a different builder is a different claim. The claim controller runs on the leader and allocates through the same engine and the same pool queue as the API. The pool must admit the claim with an access rule `claims: {namespaces: [...]}`. A claim's identity is its namespace, name and UID, which the API server sets, so a tenant cannot forge another namespace. A claim for a pool that is missing or does not admit its namespace fails the same way, with reason `PoolNotFound`. A claim under 30 seconds old stays Pending with that reason first, so a pool that is created together with the claim has time to appear.
+The spec is immutable, so a different builder is a different claim. The leader binds both kinds through the same queue. `kubectl get bkc -A` shows the pool, the phase, the queue position, the Secret and the expiry. An in-cluster claim must be admitted by a pool access rule `claims: {namespaces: [...]}`. A claim's identity is its namespace, name and UID, which the API server sets, so a tenant cannot forge another namespace. A claim for a pool that is missing or does not admit its namespace fails with reason `PoolNotFound`. A claim under 30 seconds old stays Pending with that reason first, so a pool that is created together with the claim has time to appear.
 
 When the worker is ready the controller creates a Secret `<claim>-buildkit` owned by the claim with `tls.crt`, `tls.key`, `ca.crt` (omitted when the edge uses public roots), `endpoint` and `server-name`, and sets `status.phase` to `Bound`. A claim ends as `Expired` at `status.expiresAt` or `Lost` if its worker pod disappears (the controller does not rebind it). A claim that cannot be served is `Failed`. All three are final: delete the claim and create a new one. Deleting a claim deletes its Secret, and the controller releases the worker within a few seconds.
 
-
 ## Failure handling
 
-If the leader dies, another replica takes the Lease within the lease duration (15 s by default), and API and edge traffic on other replicas continues. A stopping replica releases the Lease first, so leadership moves within seconds. `shutdown.delay` (5 s) after the signal, which lets endpoints converge, it closes the API listener and answers queued allocation requests with 503 `shutting_down` before claiming anything. The edge then stops accepting and keeps each open connection until it ends on its own (release, expiry, worker gone, certificate `notAfter`), at most 24h5m unless `shutdown.drainTimeout` caps it. Rollouts, scale-in and node drains therefore do not cut running builds; see [Stopping a replica](operations.md#stopping-a-replica).
+- Leader loss. Another replica takes the Lease within the lease duration (15 s by default). API and edge traffic on other replicas continues, and queued claims wait for the new leader.
+- Replica stop. A stopping replica releases the Lease first, so leadership moves within seconds. `shutdown.delay` (5 s) after the signal, which lets endpoints converge, it closes the API listener. A long poll in flight returns `202` at once, and the claim stays queued for the client's next poll to find on another replica. The edge then stops accepting and keeps each open connection until it ends on its own (release, expiry, worker gone, certificate `notAfter`), at most 24h5m unless `shutdown.drainTimeout` caps it. Rollouts, scale-in and node drains therefore do not cut running builds; see [Stopping a replica](operations.md#stopping-a-replica).
+- Lost response. A client that never saw the answer to its `POST` can read it again with `GET /v1/allocations/{id}`, because the allocation is a stored claim. If the client never returns, the claim ends at its TTL and the leader retires the pod.
+- Cache outage. Builds run without the cache and do not fail.

@@ -27,6 +27,10 @@ arm64 Mac with 10 CPUs and 12 GiB given to the Docker VM. The controller runs
 two replicas from the edge-verify fixture: restricted PodSecurity, read-only
 root filesystem, and the image from `cargo xtask image`.
 
+### After the claim queue
+
+The table above was measured before every allocation became a claim, when the API replica patched the pod itself. An allocation now costs about three API-server writes: the claim create, the pod patch and the claim status. One `cargo xtask perf` run on the same rig after the change measured a warm allocation p50 of 15.2 ms, p95 21.9 ms and p99 25.6 ms, still well inside the 150 ms target, and an idle replica at 12.4 and 15.0 MiB RSS. The edge is unchanged. Its throughput on kind was 129 MB/s in that run, below the 1 GiB/s target for the reason given above (kind is not a loopback-class link). One run is not a median, so treat the numbers as a check, not a new baseline.
+
 ### Allocation latency
 
 The client is `curl` in a pod in the pool namespace. It sends one HTTP POST to
