@@ -9,7 +9,12 @@ use super::*;
 use crate::alloc::cache;
 use crate::render::{ANN_SCOPE, ANN_TIER, is_scope_id, scope_id};
 
+/// A GitHub Actions token for `event` on the protected `main`.
 fn oidc(event: &str) -> Identity {
+    with_claims(oidc_unprotected(event), &json!({"ref_protected": "true"}))
+}
+
+fn oidc_unprotected(event: &str) -> Identity {
     let claims = json!({"repository_id": 42, "repository": "o/app", "event_name": event});
     Identity::Oidc {
         issuer: "https://token.actions.githubusercontent.com".into(),
@@ -41,7 +46,13 @@ fn default_writers_trust_push_events_and_in_cluster_callers() {
     for e in cache::TRUSTED_EVENTS {
         assert_eq!(cache::tier(&p, &oidc(e)), CacheTier::Trusted, "{e}");
     }
-    for e in ["pull_request", "pull_request_target", "issue_comment", ""] {
+    for e in [
+        "pull_request",
+        "pull_request_target",
+        "issue_comment",
+        "merge_group",
+        "",
+    ] {
         assert_eq!(cache::tier(&p, &oidc(e)), CacheTier::Untrusted, "{e}");
     }
     assert_eq!(cache::tier(&p, &sa("x")), CacheTier::Trusted);
@@ -241,4 +252,90 @@ async fn a_tenant_claim_is_scoped_to_its_namespace() {
         (Some(want.as_str()), Some("trusted"))
     );
     assert!(cached.unwrap().registry.unwrap().from[0].contains(&want));
+}
+
+/// `who` with `extra` claims added or replaced.
+fn with_claims(who: Identity, extra: &serde_json::Value) -> Identity {
+    let Identity::Oidc {
+        issuer,
+        subject,
+        mut claims,
+    } = who
+    else {
+        unreachable!("an OIDC identity")
+    };
+    claims.extend(extra.as_object().unwrap().clone());
+    Identity::Oidc {
+        issuer,
+        subject,
+        claims,
+    }
+}
+
+/// Every branch shares the repository's scope, so by default only a build of
+/// a protected ref may write it: a branch anyone with push access can write
+/// must not feed the protected branch's builds.
+#[test]
+fn by_default_only_protected_refs_write() {
+    let p = pool();
+    for e in cache::TRUSTED_EVENTS {
+        assert_eq!(
+            cache::tier(&p, &oidc_unprotected(e)),
+            CacheTier::Untrusted,
+            "{e}"
+        );
+        for v in [json!("false"), json!(""), json!(null), json!(1)] {
+            let who = with_claims(oidc(e), &json!({ "ref_protected": v }));
+            assert_eq!(cache::tier(&p, &who), CacheTier::Untrusted, "{e} {v}");
+        }
+        let who = with_claims(oidc(e), &json!({"ref_protected": true}));
+        assert_eq!(cache::tier(&p, &who), CacheTier::Trusted, "{e}");
+    }
+    // A writers rule decides on its own claims.
+    let mut p = pool();
+    p.spec.workers.cache.writers = Some(
+        serde_json::from_value(json!([{"oidc": {
+            "issuer": "https://token.actions.githubusercontent.com",
+            "claims": {"repository": "o/app"}
+        }}]))
+        .unwrap(),
+    );
+    assert_eq!(
+        cache::tier(&p, &oidc_unprotected("push")),
+        CacheTier::Trusted
+    );
+}
+
+/// Deployments can target any commit, and GitLab merge request pipelines can
+/// run a fork's code in the parent project: neither writes, whatever the
+/// writers say.
+#[test]
+fn deployments_and_merge_request_pipelines_never_write() {
+    let mut p = pool();
+    p.spec.workers.cache.writers = Some(
+        serde_json::from_value(json!([
+            {"oidc": {"issuer": "https://token.actions.githubusercontent.com", "claims": {"repository": "o/app"}}},
+            {"oidc": {"issuer": "https://gitlab.com", "claims": {"project_path": "g/app"}}}
+        ]))
+        .unwrap(),
+    );
+    for e in ["deployment", "deployment_status"] {
+        assert_eq!(cache::tier(&p, &oidc(e)), CacheTier::Untrusted, "{e}");
+    }
+    let gitlab = |source: &str| Identity::Oidc {
+        issuer: "https://gitlab.com".into(),
+        subject: "project_path:g/app:ref_type:branch:ref:main".into(),
+        claims:
+            json!({"project_path": "g/app", "pipeline_source": source, "ref_protected": "true"})
+                .as_object()
+                .unwrap()
+                .clone(),
+    };
+    for s in cache::READ_ONLY_PIPELINE_SOURCES {
+        assert_eq!(cache::tier(&p, &gitlab(s)), CacheTier::Untrusted, "{s}");
+    }
+    assert_eq!(cache::tier(&p, &gitlab("push")), CacheTier::Trusted);
+    // GitLab tokens carry no `event_name`, so without writers they never write.
+    p.spec.workers.cache.writers = None;
+    assert_eq!(cache::tier(&p, &gitlab("push")), CacheTier::Untrusted);
 }

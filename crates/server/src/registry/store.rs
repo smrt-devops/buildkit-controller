@@ -165,7 +165,8 @@ pub(super) struct Index {
 /// An upload in progress.
 pub struct Upload {
     repo: String,
-    /// The worker that opened it, `<namespace>/<pod>`.
+    /// The worker that opened it: the DNS name of its certificate, nonce
+    /// included, so a later pod of the same name starts with a clean quota.
     owner: String,
     file: tokio::fs::File,
     path: PathBuf,
@@ -453,17 +454,6 @@ impl Store {
         Some((self.blob_path(d), size))
     }
 
-    /// Links `d` into `to` when `from` links it. False when it does not.
-    pub async fn mount(&self, from: &str, to: &str, d: &Digest) -> io::Result<bool> {
-        let mut idx = self.index.lock().await;
-        let present = idx.blobs.contains_key(d)
-            && idx.repos.get(from).is_some_and(|r| r.links.contains_key(d));
-        if present {
-            self.link(&mut idx, to, d).await?;
-        }
-        Ok(present)
-    }
-
     async fn link(&self, idx: &mut Index, repo: &str, d: &Digest) -> io::Result<()> {
         let r = idx.repos.entry(repo.to_owned()).or_default();
         if !r.links.contains_key(d) {
@@ -473,19 +463,6 @@ impl Store {
         }
         r.links.insert(d.clone(), now_secs());
         Ok(())
-    }
-
-    /// Writes `bytes` to `path` through a synced temporary file and a rename.
-    async fn write_atomic(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
-        let tmp = self.write_tmp(bytes).await?;
-        if let Some(dir) = path.parent() {
-            tokio::fs::create_dir_all(dir).await?;
-        }
-        let r = tokio::fs::rename(&tmp, path).await;
-        if r.is_err() {
-            remove(&tmp).await;
-        }
-        r
     }
 
     async fn write_tmp(&self, bytes: &[u8]) -> io::Result<PathBuf> {
@@ -698,7 +675,8 @@ impl Store {
     }
 
     /// Stores a manifest and, for a tag, points the tag at it. Every blob it
-    /// references must already be linked in `repo`.
+    /// references must already be linked in `repo`. The files are written and
+    /// synced before the index lock and only renamed under it.
     pub async fn put_manifest(
         &self,
         repo: &str,
@@ -720,95 +698,117 @@ impl Store {
         if media_type.contains('\n') {
             return Err(StoreError::ManifestInvalid("bad media type".to_owned()));
         }
-        let tmp = self.write_tmp(body).await?;
-        let mut idx = self.index.lock().await;
-        let missing = refs.iter().find(|r| {
-            !idx.blobs.contains_key(*r)
-                || !idx
-                    .repos
-                    .get(repo)
-                    .is_some_and(|x| x.links.contains_key(*r))
-        });
-        if let Some(r) = missing {
-            let r = r.clone();
-            drop(idx);
-            remove(&tmp).await;
-            return Err(StoreError::ManifestBlobUnknown(r));
-        }
-        if let Err(e) = self
-            .commit(&mut idx, repo, &tmp, &d, body.len() as u64)
-            .await
-        {
-            drop(idx);
-            remove(&tmp).await;
-            return Err(e.into());
-        }
         let now = now_secs();
         let dir = self.repo_dir(repo);
-        self.write_atomic(
-            &dir.join("_manifests").join(d.hex()),
-            format!("{media_type}\n{now}\n").as_bytes(),
-        )
-        .await?;
-        if let Reference::Tag(t) = reference {
-            self.write_atomic(&dir.join("_tags").join(t), d.to_string().as_bytes())
+        // Each temporary file that is not renamed into place is removed below.
+        let mut tmps: Vec<PathBuf> = Vec::new();
+        let r: Result<(), StoreError> = async {
+            tmps.push(self.write_tmp(body).await?);
+            tmps.push(
+                self.write_tmp(format!("{media_type}\n{now}\n").as_bytes())
+                    .await?,
+            );
+            let mut places = vec![dir.join("_manifests").join(d.hex())];
+            if let Reference::Tag(t) = reference {
+                tmps.push(self.write_tmp(d.to_string().as_bytes()).await?);
+                places.push(dir.join("_tags").join(t));
+            }
+            let mut idx = self.index.lock().await;
+            let existing = idx.repos.get(repo);
+            if let Some(r) = refs.iter().find(|r| {
+                !idx.blobs.contains_key(*r) || !existing.is_some_and(|x| x.links.contains_key(*r))
+            }) {
+                return Err(StoreError::ManifestBlobUnknown(r.clone()));
+            }
+            self.commit(&mut idx, repo, &tmps[0], &d, body.len() as u64)
                 .await?;
+            for (tmp, path) in tmps[1..].iter().zip(&places) {
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::rename(tmp, path).await?;
+            }
+            let r = idx.repos.entry(repo.to_owned()).or_default();
+            r.manifests.insert(
+                d.clone(),
+                Manifest {
+                    media_type,
+                    refs,
+                    last_used: now,
+                    persisted: now,
+                },
+            );
+            if let Reference::Tag(t) = reference {
+                r.tags.insert(t.clone(), d.clone());
+            }
+            Ok(())
         }
-        let r = idx.repos.entry(repo.to_owned()).or_default();
-        r.manifests.insert(
-            d.clone(),
-            Manifest {
-                media_type,
-                refs,
-                last_used: now,
-                persisted: now,
-            },
-        );
-        if let Reference::Tag(t) = reference {
-            r.tags.insert(t.clone(), d.clone());
+        .await;
+        for tmp in &tmps {
+            remove(tmp).await;
         }
-        Ok(d)
+        r.map(|()| d)
     }
 
-    /// The manifest `reference` of `repo`. Records the pull.
-    pub async fn manifest(
-        &self,
-        repo: &str,
-        reference: &Reference,
-    ) -> io::Result<Option<FoundManifest>> {
-        let mut idx = self.index.lock().await;
-        let Index { blobs, repos } = &mut *idx;
-        let Some(r) = repos.get_mut(repo) else {
-            return Ok(None);
+    /// The manifest `reference` of `repo`. Records the pull, and writes it to
+    /// the manifest's record at most every [`PERSIST_EVERY`]: outside the
+    /// index lock and best effort, so a full disk never fails a read.
+    pub async fn manifest(&self, repo: &str, reference: &Reference) -> Option<FoundManifest> {
+        let (found, due) = {
+            let mut idx = self.index.lock().await;
+            let Index { blobs, repos } = &mut *idx;
+            let r = repos.get_mut(repo)?;
+            let d = match reference {
+                Reference::Tag(t) => r.tags.get(t)?.clone(),
+                Reference::Digest(d) => d.clone(),
+            };
+            let size = *blobs.get(&d)?;
+            let m = r.manifests.get_mut(&d)?;
+            let now = now_secs();
+            m.last_used = now;
+            // A failed write is tried again after another PERSIST_EVERY.
+            let due = now.saturating_sub(m.persisted) >= PERSIST_EVERY;
+            if due {
+                m.persisted = now;
+            }
+            let found = FoundManifest {
+                media_type: m.media_type.clone(),
+                size,
+                path: self.blob_path(&d),
+                digest: d,
+            };
+            (found, due.then_some(now))
         };
-        let d = match reference {
-            Reference::Tag(t) => match r.tags.get(t) {
-                Some(d) => d.clone(),
-                None => return Ok(None),
-            },
-            Reference::Digest(d) => d.clone(),
-        };
-        let (Some(m), Some(size)) = (r.manifests.get_mut(&d), blobs.get(&d)) else {
-            return Ok(None);
-        };
-        let now = now_secs();
-        m.last_used = now;
-        let found = FoundManifest {
-            media_type: m.media_type.clone(),
-            size: *size,
-            path: self.blob_path(&d),
-            digest: d,
-        };
-        if now.saturating_sub(m.persisted) >= PERSIST_EVERY {
-            m.persisted = now;
-            let record = format!("{}\n{now}\n", found.media_type);
+        if let Some(now) = due
+            && let Err(e) = self.persist(repo, &found, now).await
+        {
+            warn!(repository = repo, digest = %found.digest, error = %e, "recording a manifest pull");
+        }
+        Some(found)
+    }
+
+    /// Writes the pull time `now` into the record of `found`, unless garbage
+    /// collection has evicted it meanwhile.
+    async fn persist(&self, repo: &str, found: &FoundManifest, now: u64) -> io::Result<()> {
+        let record = format!("{}\n{now}\n", found.media_type);
+        let tmp = self.write_tmp(record.as_bytes()).await?;
+        let idx = self.index.lock().await;
+        let r = if idx
+            .repos
+            .get(repo)
+            .is_some_and(|r| r.manifests.contains_key(&found.digest))
+        {
             let path = self
                 .repo_dir(repo)
                 .join("_manifests")
                 .join(found.digest.hex());
-            self.write_atomic(&path, record.as_bytes()).await?;
-        }
-        Ok(Some(found))
+            tokio::fs::rename(&tmp, path).await
+        } else {
+            Ok(())
+        };
+        drop(idx);
+        remove(&tmp).await;
+        r
     }
 
     /// Deletes uploads idle for `max_age` that no request holds. Returns how many.
@@ -828,7 +828,9 @@ impl Store {
         gone.len()
     }
 
-    /// Runs one garbage collection (see [`gc`]).
+    /// Runs one garbage collection (see [`gc`]). Blobs are moved aside under
+    /// the index lock and deleted after it is released, so deleting large
+    /// files does not hold up requests.
     pub async fn gc(&self, budgets: &dyn Budgets, grace: Duration) -> GcReport {
         let mut idx = self.index.lock().await;
         let plan = gc::plan(&idx, budgets, now_secs(), grace.as_secs());
@@ -861,15 +863,29 @@ impl Store {
                 repo.links.remove(d);
             }
         }
+        let mut doomed = Vec::new();
         for d in &plan.delete {
-            remove(&self.blob_path(d)).await;
-            if let Some(size) = idx.blobs.remove(d) {
-                report.deleted_blobs += 1;
-                report.freed_bytes += size;
+            let Some(size) = idx.blobs.remove(d) else {
+                continue;
+            };
+            report.deleted_blobs += 1;
+            report.freed_bytes += size;
+            let aside = self.root.join("tmp").join(format!("gc-{}", d.hex()));
+            match tokio::fs::rename(self.blob_path(d), &aside).await {
+                Ok(()) => doomed.push(aside),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(digest = %d, error = %e, "moving a cache blob aside; deleting it in place");
+                    remove(&self.blob_path(d)).await;
+                }
             }
         }
         idx.repos
             .retain(|_, r| !(r.links.is_empty() && r.manifests.is_empty() && r.tags.is_empty()));
+        drop(idx);
+        for p in &doomed {
+            remove(p).await;
+        }
         report
     }
 
@@ -881,5 +897,48 @@ impl Store {
             blobs: idx.blobs.len() as u64,
             manifests: idx.repos.values().map(|r| r.manifests.len() as u64).sum(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// Recording a pull is bookkeeping: when the disk refuses the write, the
+    /// manifest is still served.
+    #[tokio::test]
+    async fn a_failed_pull_record_does_not_fail_the_read() {
+        let root = std::env::temp_dir().join(format!("bk-store-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let limits = StoreLimits {
+            max_blob: 1 << 20,
+            max_upload_bytes: 4 << 20,
+        };
+        let store = Store::open(&root, limits).unwrap();
+        let body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
+        let tag = Reference::Tag("t".into());
+        let d = store
+            .put_manifest("ns/p/app", &tag, None, body)
+            .await
+            .unwrap();
+        store
+            .index
+            .lock()
+            .await
+            .repos
+            .get_mut("ns/p/app")
+            .unwrap()
+            .manifests
+            .get_mut(&d)
+            .unwrap()
+            .persisted = 0;
+        // No temporary file can be created any more.
+        std::fs::remove_dir_all(root.join("tmp")).unwrap();
+        std::fs::write(root.join("tmp"), b"").unwrap();
+        let found = store.manifest("ns/p/app", &tag).await.unwrap();
+        assert_eq!(found.digest, d);
+        std::fs::remove_dir_all(&root).ok();
     }
 }
