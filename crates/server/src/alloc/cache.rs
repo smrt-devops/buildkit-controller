@@ -13,19 +13,29 @@ use super::pool::rules;
 use crate::auth::Identity;
 use crate::render::{self, ANN_SCOPE, ANN_TIER};
 
-/// GitHub Actions events whose builds may write the cache by default.
+/// GitHub Actions events whose builds may write the cache by default, when
+/// the token's `ref_protected` claim is also true.
 pub const TRUSTED_EVENTS: [&str; 4] = ["push", "schedule", "workflow_dispatch", "merge_group"];
 /// GitHub Actions events whose builds never write the cache, whatever
-/// `cache.writers` says: they can run code from forks, and `workflow_run` and
-/// the comment and review events do so from the base repository's own ref.
-pub const READ_ONLY_EVENTS: [&str; 6] = [
+/// `cache.writers` says: they can run code from forks or from unreviewed
+/// refs, and `workflow_run` and the comment and review events do so from the
+/// base repository's own ref. A `deployment` can target any commit,
+/// including a pull request's head.
+pub const READ_ONLY_EVENTS: [&str; 8] = [
     "pull_request",
     "pull_request_target",
     "workflow_run",
     "issue_comment",
     "pull_request_review",
     "pull_request_review_comment",
+    "deployment",
+    "deployment_status",
 ];
+/// GitLab CI `pipeline_source` values whose builds never write the cache,
+/// whatever `cache.writers` says: merge request pipelines, which can run a
+/// fork's code in the parent project.
+pub const READ_ONLY_PIPELINE_SOURCES: [&str; 2] =
+    ["merge_request_event", "external_pull_request_event"];
 
 /// The cache of one allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +147,15 @@ fn claim(claims: &serde_json::Map<String, Value>, k: &str) -> Option<String> {
     }
 }
 
+/// Whether the claim `k` is true: GitHub and GitLab send `"true"`.
+fn is_true(claims: &serde_json::Map<String, Value>, k: &str) -> bool {
+    match claims.get(k) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s == "true",
+        _ => false,
+    }
+}
+
 /// The scope id of `who` in `pool`.
 #[must_use]
 pub fn scope(pool: &BuildKitPool, who: &Identity) -> String {
@@ -144,22 +163,31 @@ pub fn scope(pool: &BuildKitPool, who: &Identity) -> String {
 }
 
 /// Whether `who` may write the cache of `pool`. An OIDC caller whose
-/// `event_name` is one of [`READ_ONLY_EVENTS`] never may. Otherwise, with
+/// `event_name` is one of [`READ_ONLY_EVENTS`], or whose `pipeline_source` is
+/// one of [`READ_ONLY_PIPELINE_SOURCES`], never may. Otherwise, with
 /// `cache.writers` set, a caller one of them matches; a malformed list trusts
-/// nobody. Unset, an OIDC caller whose `event_name` is one of
-/// [`TRUSTED_EVENTS`] and every in-cluster caller.
+/// nobody. Unset, every in-cluster caller, and an OIDC caller whose
+/// `event_name` is one of [`TRUSTED_EVENTS`] and whose `ref_protected` is
+/// true: every branch shares the repository's scope, so a build of a branch
+/// anyone with push access can write would otherwise feed the protected
+/// branch's builds.
 #[must_use]
 pub fn tier(pool: &BuildKitPool, who: &Identity) -> CacheTier {
-    let pull_request = matches!(who, Identity::Oidc { claims, .. }
-        if claim(claims, "event_name").is_some_and(|e| READ_ONLY_EVENTS.contains(&e.as_str())));
-    let trusted = !pull_request
+    let read_only = matches!(who, Identity::Oidc { claims, .. }
+        if claim(claims, "event_name").is_some_and(|e| READ_ONLY_EVENTS.contains(&e.as_str()))
+            || claim(claims, "pipeline_source")
+                .is_some_and(|s| READ_ONLY_PIPELINE_SOURCES.contains(&s.as_str())));
+    let trusted = !read_only
         && match &pool.spec.workers.cache.writers {
             Some(w) => {
                 rules(w).is_some_and(|r| r.allows(who, &pool.namespace().unwrap_or_default()))
             }
             None => match who {
-                Identity::Oidc { claims, .. } => claim(claims, "event_name")
-                    .is_some_and(|e| TRUSTED_EVENTS.contains(&e.as_str())),
+                Identity::Oidc { claims, .. } => {
+                    claim(claims, "event_name")
+                        .is_some_and(|e| TRUSTED_EVENTS.contains(&e.as_str()))
+                        && is_true(claims, "ref_protected")
+                }
                 Identity::ServiceAccount { .. } | Identity::Claim { .. } => true,
             },
         };
