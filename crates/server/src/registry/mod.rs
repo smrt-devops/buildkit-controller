@@ -33,7 +33,7 @@ pub use config::{CacheArgs, parse_duration, parse_size};
 pub use gc::{Budgets, FixedBudgets, Reason};
 pub use listener::{Limits, server_config};
 pub use metrics::RegistryMetrics;
-pub use store::{Digest, Reference, Stats, Store, StoreError};
+pub use store::{Digest, Reference, Stats, Store, StoreError, StoreLimits};
 
 use crate::runtime::metrics::Metrics;
 use crate::runtime::readiness::Readiness;
@@ -70,8 +70,12 @@ pub async fn run(args: CacheArgs, shutdown: CancellationToken) -> anyhow::Result
     };
     let (files, tls) = listener::load(&args.tls_dir)?;
     let store = {
-        let (dir, max) = (args.data_dir.clone(), args.max_blob_size);
-        tokio::task::spawn_blocking(move || Store::open(&dir, max))
+        let dir = args.data_dir.clone();
+        let limits = StoreLimits {
+            max_blob: args.max_blob_size,
+            max_upload_bytes: args.max_upload_size,
+        };
+        tokio::task::spawn_blocking(move || Store::open(&dir, limits))
             .await?
             .with_context(|| format!("opening the store at {}", args.data_dir.display()))?
     };

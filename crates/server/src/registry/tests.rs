@@ -11,6 +11,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use bytes::Bytes;
 
+use super::store::MAX_UPLOADS_PER_OWNER;
 use super::*;
 use crate::pki::WorkerIdentity;
 
@@ -54,7 +55,14 @@ fn dir(name: &str) -> PathBuf {
 
 fn registry(dir: &std::path::Path, max_blob: u64) -> Registry {
     Registry {
-        store: Store::open(dir, max_blob).unwrap(),
+        store: Store::open(
+            dir,
+            StoreLimits {
+                max_blob,
+                max_upload_bytes: 4 * max_blob,
+            },
+        )
+        .unwrap(),
         auth: Arc::new(grants()),
         metrics: RegistryMetrics::default(),
     }
@@ -697,6 +705,107 @@ async fn the_store_survives_a_restart() {
     assert_eq!(std::fs::read_dir(dir.join("uploads")).unwrap().count(), 0);
     let s = reg.store.stats().await;
     assert_eq!((s.blobs, s.manifests), (2, 1));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+async fn open_upload(reg: &Registry, pod: &str, repo: &str) -> Resp {
+    call(
+        reg,
+        pod,
+        Method::POST,
+        &format!("/v2/{repo}/blobs/uploads/"),
+        &[],
+        b"",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn one_worker_cannot_hold_every_upload_slot() {
+    let f = fixture("slots");
+    let reg = &f.reg;
+    for _ in 0..MAX_UPLOADS_PER_OWNER {
+        assert_eq!(
+            open_upload(reg, "writer", "ns/p/app").await.status,
+            StatusCode::ACCEPTED
+        );
+    }
+    let r = open_upload(reg, "writer", "ns/p/app").await;
+    assert_eq!(
+        (r.status, r.code().as_str()),
+        (StatusCode::TOO_MANY_REQUESTS, "TOOMANYREQUESTS")
+    );
+    assert_eq!(
+        open_upload(reg, "other", "ns/p/other").await.status,
+        StatusCode::ACCEPTED
+    );
+    // Expiry gives the slots back.
+    reg.store.expire_uploads(Duration::ZERO).await;
+    assert_eq!(
+        open_upload(reg, "writer", "ns/p/app").await.status,
+        StatusCode::ACCEPTED
+    );
+}
+
+#[tokio::test]
+async fn open_uploads_are_bounded_in_bytes_per_worker_and_in_total() {
+    let dir = dir("upload-bytes");
+    // One worker may hold max(12 / 4, 8) = 8 bytes; all of them 12.
+    let reg = Registry {
+        store: Store::open(
+            &dir,
+            StoreLimits {
+                max_blob: 8,
+                max_upload_bytes: 12,
+            },
+        )
+        .unwrap(),
+        auth: Arc::new(grants()),
+        metrics: RegistryMetrics::default(),
+    };
+    let reg = &reg;
+    let patch = async |pod: &str, repo: &str, data: &[u8]| {
+        let loc = open_upload(reg, pod, repo)
+            .await
+            .header("location")
+            .to_owned();
+        let r = call(reg, pod, Method::PATCH, &loc, &[], data).await;
+        (loc, r)
+    };
+    let (first, r) = patch("writer", "ns/p/app", b"12345678").await;
+    assert_eq!(r.status, StatusCode::ACCEPTED);
+    // Over the worker's share: refused, and that upload ends.
+    let (loc, r) = patch("writer", "ns/p/app", b"9").await;
+    assert_eq!(
+        (r.status, r.code().as_str()),
+        (StatusCode::TOO_MANY_REQUESTS, "TOOMANYREQUESTS")
+    );
+    assert_eq!(
+        call(reg, "writer", Method::PATCH, &loc, &[], b"")
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    // Over the total: another worker is refused too.
+    let (_, r) = patch("other", "ns/p/other", b"12345").await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    let (_, r) = patch("other", "ns/p/other", b"1234").await;
+    assert_eq!(r.status, StatusCode::ACCEPTED);
+    // A finished upload gives its bytes back.
+    let d = Digest::of(b"12345678");
+    let r = call(
+        reg,
+        "writer",
+        Method::PUT,
+        &format!("{first}?digest={d}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    // 4 held by the other worker plus 8 is exactly the total.
+    let (_, r) = patch("writer", "ns/p/app", b"abcdefgh").await;
+    assert_eq!(r.status, StatusCode::ACCEPTED);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

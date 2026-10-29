@@ -14,8 +14,10 @@
 //!    before the manifest that references them, and a HEAD or GET of a blob
 //!    renews its link. A blob no repository links is deleted.
 //!
-//! Recent links count against both budgets first, so a push in flight is
-//! never evicted to make room for older manifests.
+//! Recent links that no manifest reaches (a push in flight) count against
+//! both budgets first, so such a push is never evicted to make room for older
+//! manifests. Blobs a manifest reaches count only with that manifest, so a
+//! busy pool keeps its newest manifests rather than losing all of them.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -150,10 +152,17 @@ pub(super) fn plan(idx: &Index, budgets: &dyn Budgets, now: u64, grace: u64) -> 
                 .iter()
                 .map(|(d, m)| (name.clone(), d.clone(), m.last_used)),
         );
+        // Only uploads in flight: a young link a manifest reaches competes
+        // with that manifest, newest first, like any other.
+        let reached: HashSet<Digest> = repo
+            .manifests
+            .keys()
+            .flat_map(|d| closure(repo, d))
+            .collect();
         seed.extend(
             repo.links
                 .iter()
-                .filter(|(_, t)| young(**t))
+                .filter(|(d, t)| young(**t) && !reached.contains(*d))
                 .map(|(d, _)| d.clone()),
         );
     }
@@ -334,6 +343,36 @@ mod tests {
         let p = plan(&idx, &b, 100, 0);
         assert!(p.evict.is_empty(), "{:?}", p.evict);
         assert!(p.delete.is_empty());
+    }
+
+    /// A busy pool, whose recent pushes and pulls exceed its budget, keeps its
+    /// newest manifest instead of losing all of them.
+    #[test]
+    fn young_manifests_over_budget_keep_the_newest() {
+        for budgets in [
+            FixedBudgets {
+                pool: 15,
+                total: u64::MAX,
+            },
+            FixedBudgets {
+                pool: u64::MAX,
+                total: 15,
+            },
+        ] {
+            let mut idx = Index::default();
+            put(&mut idx, "ns/p/a", 1, 50, &[], 10);
+            put(&mut idx, "ns/p/a", 2, 90, &[], 10);
+            let repo = idx.repos.get_mut("ns/p/a").unwrap();
+            repo.links.insert(dg(1), 50);
+            repo.links.insert(dg(2), 90);
+            let p = plan(&idx, &budgets, 100, 60);
+            let reason = if budgets.pool == 15 {
+                Reason::Pool
+            } else {
+                Reason::Volume
+            };
+            assert_eq!(evicted(&p), vec![("ns/p/a".into(), 1, reason)]);
+        }
     }
 
     #[test]

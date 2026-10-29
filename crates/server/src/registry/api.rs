@@ -142,6 +142,11 @@ impl From<StoreError> for ApiError {
                 "MANIFEST_BLOB_UNKNOWN",
                 e.to_string(),
             ),
+            StoreError::UploadSpace => Self::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOOMANYREQUESTS",
+                e.to_string(),
+            ),
             StoreError::Stalled => Self::new(
                 StatusCode::REQUEST_TIMEOUT,
                 "BLOB_UPLOAD_INVALID",
@@ -504,7 +509,8 @@ async fn start_upload(
             ],
         );
     }
-    let id = reg.store.start_upload(name).await?.ok_or_else(|| {
+    let owner = format!("{}/{}", peer.namespace, peer.pod);
+    let id = reg.store.start_upload(name, &owner).await?.ok_or_else(|| {
         ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "TOOMANYREQUESTS",

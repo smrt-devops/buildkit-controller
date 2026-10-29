@@ -122,6 +122,8 @@ pub enum StoreError {
     ManifestInvalid(String),
     #[error("manifest references {0}, unknown in this repository")]
     ManifestBlobUnknown(Digest),
+    #[error("open uploads hold all the upload space")]
+    UploadSpace,
     #[error("request body stalled")]
     Stalled,
     #[error("request body: {0}")]
@@ -163,6 +165,8 @@ pub(super) struct Index {
 /// An upload in progress.
 pub struct Upload {
     repo: String,
+    /// The worker that opened it, `<namespace>/<pod>`.
+    owner: String,
     file: tokio::fs::File,
     path: PathBuf,
     hasher: Context,
@@ -206,15 +210,35 @@ pub struct GcReport {
 
 /// Uploads open at once; more are refused.
 pub const MAX_UPLOADS: usize = 1024;
+/// Uploads one worker may hold open at once.
+pub const MAX_UPLOADS_PER_OWNER: usize = 64;
+
+/// Size bounds of the store.
+#[derive(Clone, Copy, Debug)]
+pub struct StoreLimits {
+    /// Largest blob accepted.
+    pub max_blob: u64,
+    /// Bytes all open uploads may hold together. One worker may hold a
+    /// quarter of it, and never less than one largest blob.
+    pub max_upload_bytes: u64,
+}
+
+/// Slots and bytes held by open uploads, in total and per owner.
+#[derive(Debug, Default)]
+struct Quota {
+    bytes: u64,
+    owners: HashMap<String, (usize, u64)>,
+}
 /// How often a pulled manifest's last-used time is written back, at most.
 const PERSIST_EVERY: u64 = 60;
 
 /// The store.
 pub struct Store {
     root: PathBuf,
-    max_blob: u64,
+    limits: StoreLimits,
     index: Mutex<Index>,
     uploads: std::sync::Mutex<HashMap<String, Arc<Mutex<Upload>>>>,
+    quota: std::sync::Mutex<Quota>,
 }
 
 fn now_secs() -> u64 {
@@ -284,7 +308,7 @@ pub(super) fn manifest_refs(body: &[u8]) -> Result<(Option<String>, Vec<Digest>)
 impl Store {
     /// Opens the store at `root`, creating it if needed: clears `tmp/` and
     /// `uploads/` and rebuilds the index. Blocking; run it before serving.
-    pub fn open(root: &Path, max_blob: u64) -> io::Result<Self> {
+    pub fn open(root: &Path, limits: StoreLimits) -> io::Result<Self> {
         for d in ["tmp", "uploads"] {
             match std::fs::remove_dir_all(root.join(d)) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
@@ -306,9 +330,10 @@ impl Store {
         }
         let store = Self {
             root: root.to_owned(),
-            max_blob,
+            limits,
             index: Mutex::new(Index::default()),
             uploads: std::sync::Mutex::default(),
+            quota: std::sync::Mutex::default(),
         };
         store.scan(&root.join("repos"), "", &mut idx, now_secs())?;
         Ok(Self {
@@ -408,7 +433,7 @@ impl Store {
     /// The largest blob accepted.
     #[must_use]
     pub fn max_blob(&self) -> u64 {
-        self.max_blob
+        self.limits.max_blob
     }
 
     fn blob_path(&self, d: &Digest) -> PathBuf {
@@ -498,13 +523,15 @@ impl Store {
         self.link(idx, repo, d).await
     }
 
-    /// Starts an upload into `repo`. `None` when [`MAX_UPLOADS`] are open.
-    pub async fn start_upload(&self, repo: &str) -> io::Result<Option<String>> {
+    /// Starts an upload into `repo` for `owner`. `None` when [`MAX_UPLOADS`]
+    /// are open, or [`MAX_UPLOADS_PER_OWNER`] of the owner's.
+    pub async fn start_upload(&self, repo: &str, owner: &str) -> io::Result<Option<String>> {
         let id = random_id()?;
         let path = self.root.join("uploads").join(&id);
         let file = tokio::fs::File::create(&path).await?;
         let up = Upload {
             repo: repo.to_owned(),
+            owner: owner.to_owned(),
             file,
             path: path.clone(),
             hasher: Context::new(&SHA256),
@@ -513,13 +540,17 @@ impl Store {
         };
         let full = {
             let mut uploads = self.uploads();
-            let full = uploads.len() >= MAX_UPLOADS;
+            let mut q = self.quota();
+            let slots = &mut q.owners.entry(owner.to_owned()).or_default().0;
+            let full = uploads.len() >= MAX_UPLOADS || *slots >= MAX_UPLOADS_PER_OWNER;
             if !full {
+                *slots += 1;
                 uploads.insert(id.clone(), Arc::new(Mutex::new(up)));
             }
             full
         };
         if full {
+            self.release(owner, 0, 0);
             remove(&path).await;
             return Ok(None);
         }
@@ -530,6 +561,48 @@ impl Store {
         self.uploads
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn quota(&self) -> std::sync::MutexGuard<'_, Quota> {
+        self.quota
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn owner_bytes(&self) -> u64 {
+        let l = self.limits;
+        (l.max_upload_bytes / 4)
+            .max(l.max_blob)
+            .min(l.max_upload_bytes)
+    }
+
+    /// Takes `n` more upload bytes for `owner`, or fails when the total or
+    /// the owner's share would pass its bound.
+    fn reserve(&self, owner: &str, n: u64) -> Result<(), StoreError> {
+        let max_owner = self.owner_bytes();
+        let mut q = self.quota();
+        let held = q.owners.get(owner).map_or(0, |o| o.1);
+        if q.bytes.saturating_add(n) > self.limits.max_upload_bytes
+            || held.saturating_add(n) > max_owner
+        {
+            return Err(StoreError::UploadSpace);
+        }
+        q.bytes += n;
+        q.owners.entry(owner.to_owned()).or_default().1 += n;
+        Ok(())
+    }
+
+    /// Gives back `slots` uploads and `bytes` of `owner`.
+    fn release(&self, owner: &str, slots: usize, bytes: u64) {
+        let mut q = self.quota();
+        q.bytes = q.bytes.saturating_sub(bytes);
+        if let Some(o) = q.owners.get_mut(owner) {
+            o.0 = o.0.saturating_sub(slots);
+            o.1 = o.1.saturating_sub(bytes);
+            if *o == (0, 0) {
+                q.owners.remove(owner);
+            }
+        }
     }
 
     /// The upload `id` of `repo`, locked for this request. `Err(())` when
@@ -546,6 +619,7 @@ impl Store {
     /// Ends the upload `id` and deletes what it received.
     pub async fn abort(&self, id: &str, up: OwnedMutexGuard<Upload>) {
         self.uploads().remove(id);
+        self.release(&up.owner, 1, up.size);
         let path = up.path.clone();
         drop(up);
         remove(&path).await;
@@ -573,10 +647,15 @@ impl Store {
                 Ok(Some(Ok(c))) => c,
             };
             let size = up.size.saturating_add(chunk.len() as u64);
-            if size > self.max_blob {
-                return Err(StoreError::TooLarge(self.max_blob));
+            if size > self.limits.max_blob {
+                return Err(StoreError::TooLarge(self.limits.max_blob));
             }
-            up.file.write_all(&chunk).await?;
+            let n = chunk.len() as u64;
+            self.reserve(&up.owner, n)?;
+            if let Err(e) = up.file.write_all(&chunk).await {
+                self.release(&up.owner, 0, n);
+                return Err(e.into());
+            }
             up.hasher.update(&chunk);
             up.size = size;
             up.touched = Instant::now();
@@ -592,6 +671,7 @@ impl Store {
         want: &Digest,
     ) -> Result<(), StoreError> {
         self.uploads().remove(id);
+        self.release(&up.owner, 1, up.size);
         let got = Digest::finish(up.hasher.clone());
         let synced = async {
             up.file.flush().await?;
@@ -736,6 +816,7 @@ impl Store {
         let mut gone = Vec::new();
         self.uploads().retain(|_, slot| match slot.try_lock() {
             Ok(up) if up.touched.elapsed() >= max_age => {
+                self.release(&up.owner, 1, up.size);
                 gone.push(up.path.clone());
                 false
             }

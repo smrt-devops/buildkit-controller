@@ -51,6 +51,10 @@ pub struct CacheArgs {
     /// Largest blob accepted.
     #[arg(long, env = "BUILDKIT_CACHE_MAX_BLOB_SIZE", default_value = "5Gi", value_parser = parse_size)]
     pub max_blob_size: u64,
+    /// Bytes all uploads in progress may hold together; one worker may hold
+    /// a quarter. The volume needs room for `--max-size` plus this.
+    #[arg(long, env = "BUILDKIT_CACHE_MAX_UPLOAD_SIZE", default_value = "10Gi", value_parser = parse_size)]
+    pub max_upload_size: u64,
     /// Time between garbage collections, e.g. `10m`.
     #[arg(long, env = "BUILDKIT_CACHE_GC_INTERVAL", default_value = "10m", value_parser = parse_duration)]
     pub gc_interval: Duration,
