@@ -18,7 +18,9 @@ use time::OffsetDateTime;
 use super::pods::{ann, derived_alloc_id, parse_ts};
 use crate::auth::Identity;
 use crate::pki::AllocId;
-use crate::render::{ANN_ALLOC, ANN_CLAIM, ANN_EXPIRES_AT, ANN_OWNER, DRAINING, FREE};
+use crate::render::{
+    ANN_ALLOC, ANN_CLAIM, ANN_CLAIM_UID, ANN_EXPIRES_AT, ANN_OWNER, DRAINING, FREE,
+};
 
 /// `(namespace, name)` of a pool.
 pub type PoolKey = (String, String);
@@ -313,9 +315,10 @@ pub fn collectable(c: &BuildKitClaim, own: &str, now: OffsetDateTime) -> bool {
         })
 }
 
-/// Pods whose allocation no longer has a claim to serve, by `(namespace, name)`
-/// of the pod: the claim is gone or replaced, has ended, or is bound to another
-/// pod (a bind a deposed leader made). Pods bound before every allocation was
+/// Pods whose allocation no longer has a claim to serve: the claim named by
+/// `(namespace, name)` is gone, is another claim of that name (another uid),
+/// has ended, or is bound to another pod (a bind a deposed leader made). Pods
+/// bound before every allocation was
 /// a claim carry no `P claim`: the ones an in-cluster claim owned count when
 /// that claim (by uid) is gone, has ended, or names another allocation id.
 /// Only served namespaces count; claims nobody watches, and pre-claim
@@ -351,6 +354,11 @@ pub fn strays<'a, S: std::hash::BuildHasher>(
             let Some(c) = by_ref.get(cref) else {
                 return true;
             };
+            // A claim of the same name made after the pod's claim went: the pod
+            // was released, and never serves the new one.
+            if ann(p, ANN_CLAIM_UID) != c.metadata.uid.as_deref() {
+                return true;
+            }
             if alloc_id(c, own).is_none_or(|a| a.as_str() != id) {
                 return true;
             }

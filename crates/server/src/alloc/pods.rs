@@ -6,10 +6,11 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Value, json};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
-use crate::pki::AllocId;
+use crate::pki::{AllocId, ClientPublicKey};
 use crate::render::{
-    ANN_ALLOC, ANN_ALLOCATED_AT, ANN_CLAIM, ANN_EXPIRES_AT, ANN_INTERNAL_CA, ANN_OWNER,
-    ANN_WORKER_CERT_NOT_AFTER, DRAINING, FREE, LABEL_POOL, LABEL_STATE, LABEL_TEMPLATE_HASH,
+    ANN_ALLOC, ANN_ALLOCATED_AT, ANN_CLAIM, ANN_CLAIM_UID, ANN_EXPIRES_AT, ANN_INTERNAL_CA,
+    ANN_OWNER, ANN_WORKER_CERT_NOT_AFTER, DRAINING, FREE, LABEL_POOL, LABEL_STATE,
+    LABEL_TEMPLATE_HASH,
 };
 
 /// At most this many warm candidates per claim.
@@ -100,6 +101,8 @@ pub struct Bind<'a> {
     pub owner: &'a str,
     /// `<namespace>/<name>` of the claim.
     pub claim: &'a str,
+    /// The claim's uid.
+    pub claim_uid: &'a str,
     /// `allocated-at`.
     pub now: &'a str,
     /// `expires-at`, the allocation's expiry.
@@ -117,6 +120,7 @@ pub fn claim_patch(uid: &str, b: &Bind<'_>) -> Value {
         {"op": "replace", "path": ptr("labels", LABEL_STATE), "value": "allocated"},
         {"op": "add", "path": ptr("annotations", ANN_OWNER), "value": b.owner},
         {"op": "add", "path": ptr("annotations", ANN_CLAIM), "value": b.claim},
+        {"op": "add", "path": ptr("annotations", ANN_CLAIM_UID), "value": b.claim_uid},
         {"op": "add", "path": ptr("annotations", ANN_ALLOCATED_AT), "value": b.now},
         {"op": "add", "path": ptr("annotations", ANN_EXPIRES_AT), "value": b.expires},
     ])
@@ -197,6 +201,16 @@ pub fn new_alloc_id() -> Option<AllocId> {
 #[must_use]
 pub fn derived_alloc_id(uid: &str) -> Option<AllocId> {
     let d = ring::digest::digest(&ring::digest::SHA256, uid.as_bytes());
+    alloc_id_of(d.as_ref().get(..16)?.try_into().ok()?)
+}
+
+/// The allocation id of an HTTP allocation: the first 16 bytes of SHA-256 over
+/// the client's public key point, as [`new_alloc_id`] encodes them. The same
+/// key always names the same claim, so a client that repeats its `POST` finds
+/// the allocation it already made.
+#[must_use]
+pub fn key_alloc_id(key: &ClientPublicKey) -> Option<AllocId> {
+    let d = ring::digest::digest(&ring::digest::SHA256, key.point());
     alloc_id_of(d.as_ref().get(..16)?.try_into().ok()?)
 }
 

@@ -25,12 +25,12 @@ async function run() {
   const getToken = () => L.fetchOidcToken(aud, gha.setSecret);
 
   const lr = await L.requestWithRetry(`${api}/v1/pools`, { ca, timeoutMs: 30000 },
-    { what: 'list pools', getToken, budgetMs: L.SHORT_BUDGET_MS, idempotent: true, log: gha.info });
+    { what: 'list pools', getToken, budgetMs: L.SHORT_BUDGET_MS, log: gha.info });
   if (lr.status !== 200) throw L.apiError('list pools', lr);
   const found = L.validatePools(JSON.parse(lr.body), pools);
 
-  const keys = pools.map(() => L.generateKey());
-  keys.forEach((k) => gha.setSecret(k.privateKey));
+  // The key of each pool's current allocation; a new allocation after a queue timeout gets a new one.
+  const keys = [];
   // Persist state before any POST so a cancel mid-way still releases what succeeded.
   gha.saveState('api', api);
   gha.saveState('audience', aud);
@@ -45,21 +45,26 @@ async function run() {
     gha.saveState('dirs', ids.map((id) => path.join(root, `buildkit-${id}`)).join(','));
   };
   const results = await Promise.allSettled(pools.map(async (p, i) => {
-    // Only a 503 with Retry-After or a failure before the request was sent is retried: anything
-    // else may have claimed a worker whose id we would never learn. A 202 hands out the id, which
-    // is polled until bound; a queue timeout that runs out on the poll starts a fresh POST.
-    // A retry queues only for what is left of the budget, so the total stays near the queue timeout
-    // + 60 s. Without queue-timeout, the pool default from GET /v1/pools sets the budget.
+    // The key names the allocation, so a POST that fails in transit or with a 5xx is repeated with the
+    // same key and finds the allocation the first one made. A 202 hands out the id, which is polled
+    // until bound; a queue timeout that runs out starts a fresh POST with a new key. A retry queues
+    // only for what is left of the budget, so the total stays near the queue timeout + 60 s. Without
+    // queue-timeout, the pool default from GET /v1/pools sets the budget.
     const pqt = L.effectiveQueueTimeout(qt, found[i]);
-    const attemptOpts = ({ remainingMs }) => {
+    const newKey = () => {
+      keys[i] = L.generateKey();
+      gha.setSecret(keys[i].privateKey);
+      return keys[i];
+    };
+    const attemptOpts = ({ remainingMs, publicKey }) => {
       const q = L.queueTimeoutFor(pqt, remainingMs);
       return {
         method: 'POST', ca, timeoutMs: L.postTimeoutMs(remainingMs), headers: { 'Content-Type': 'application/json' },
-        body: L.allocationBody(p, keys[i].publicKey, ttl, q, cache),
+        body: L.allocationBody(p, publicKey, ttl, q, cache),
       };
     };
     const a = await L.allocate(api, {
-      what: `allocate ${p.namespace}/${p.pool}`, ca, getToken, attemptOpts, budgetMs: L.retryBudgetMs(pqt), log: gha.info,
+      what: `allocate ${p.namespace}/${p.pool}`, ca, getToken, attemptOpts, newKey, budgetMs: L.retryBudgetMs(pqt), log: gha.info,
       onId: (id) => { live.add(id); saveIds(); },
       onGone: (id) => { live.delete(id); saveIds(); },
     });

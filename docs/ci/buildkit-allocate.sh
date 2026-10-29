@@ -46,9 +46,10 @@ curl_api() { # curl_api args... ; honours API_CA
   if [ -n "$CA_OPT" ]; then curl -sS --proto =https --cacert "$CA_OPT" "$@"; else curl -sS --proto =https "$@"; fi
 }
 
-# idem WHAT BUDGET_SECONDS curl-args... : an idempotent request (GET, DELETE) with auth, a 30 s limit and
-# retries of HTTP 503 with Retry-After and of curl failing to resolve or connect (exit 6 or 7), until the
-# next wait would pass BUDGET_SECONDS. Leaves the status in $code (000 on a curl failure), the body in $D/io.
+# idem WHAT BUDGET_SECONDS curl-args... : a request (GET, DELETE) with auth, a 30 s limit and retries
+# of any curl failure and any 5xx, after Retry-After when the answer has one, else after 1, 2, 4 ... 30 s,
+# until the next wait would pass BUDGET_SECONDS. Leaves the status in $code (000 on a curl failure),
+# the body in $D/io.
 idem() {
   _what=$1; _budget=$2; shift 2
   _start=$(date +%s)
@@ -57,15 +58,14 @@ idem() {
     _rc=0
     code=$(curl_api --max-time 30 -H @"$D/auth" -D "$D/ih" -o "$D/io" -w '%{http_code}' "$@") || _rc=$?
     [ -n "$code" ] || code=000
+    case $code in 000|5??) ;; *) break ;; esac
     _wait=
-    if [ "$code" = 503 ]; then
-      _wait=$(retry_wait "$D/ih")
-    elif [ "$_rc" = 6 ] || [ "$_rc" = 7 ]; then
+    [ "$code" = 000 ] || _wait=$(retry_wait "$D/ih")
+    if [ -z "$_wait" ]; then
       _wait=$_backoff
       _backoff=$(( _backoff * 2 ))
       [ "$_backoff" -le 30 ] || _backoff=30
     fi
-    [ -n "$_wait" ] || break
     [ $(( $(date +%s) - _start + _wait )) -le "$_budget" ] || break
     echo "$_what: HTTP $code (curl $_rc), retrying in ${_wait}s" >&2
     sleep "$_wait"
@@ -113,16 +113,20 @@ fi
 # Total time for retries: queue timeout (1 h, the largest allowed, if unknown) + 60 s.
 RETRY_BUDGET=$(( ${QUEUE_TIMEOUT:-3600} + 60 ))
 
-openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$D/key.pem" 2>/dev/null
-openssl pkey -in "$D/key.pem" -pubout -out "$D/pub.pem"
+# new_key : a fresh key pair. Only the public half is sent, and it names the allocation.
+new_key() {
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$D/key.pem" 2>/dev/null
+  openssl pkey -in "$D/key.pem" -pubout -out "$D/pub.pem"
+}
+new_key
 
-# A lost response cannot be recovered (the key is ours, the id is not), so only two failures are
-# retried, both of which happen before the server claims anything: HTTP 503 with Retry-After, and
-# curl failing to resolve or connect (exit 6 or 7). A reset after sending, a timeout and every other
-# status end the run. Retries stop once the next wait would pass queue timeout + 60 s.
-# The server answers a POST within about 20 s (201, or 202 with an id), so the client timeout is 40 s.
-# A 202 is polled by id (poll_alloc). Queue timeout running out on a poll is terminal for that id and
-# is retried like a pool_exhausted 503 from the POST: a fresh POST, if the budget allows.
+# The public key names the allocation, so a POST is safe to repeat: the controller answers a repeat
+# with the same key for the allocation the first one made, and never makes a second. Any curl failure
+# (a reset or a timeout after sending too) and any 5xx is retried with the same key, after Retry-After
+# when the answer has one, else after 1, 2, 4 ... 30 s. Retries stop once the next wait would pass
+# queue timeout + 60 s. A 202 is polled by id (poll_alloc). The queue timeout running out (503
+# pool_exhausted, on a poll or on the POST) ends that allocation: a fresh POST with a new key follows,
+# if the budget allows. 503 pod_lost and every 4xx end the run.
 # A retry queues only for what is left of the budget (QUEUE_TIMEOUT less the time already spent), so
 # a busy pool does not double the total wait.
 # QUEUE_TIMEOUT stays unset only when the server reports no pool default; the server default then applies.
@@ -208,30 +212,45 @@ while :; do
   wait "$CMD" || rc=$?
   CMD=
   code=$(cat "$D/status" 2>/dev/null || :)
-  wait=
+  [ -n "$code" ] || code=000
   if [ "$code" = 202 ]; then
     check_id
     echo "allocate $POOL: queued as $ID" >&2
     poll_alloc
+    # 000 here is the budget running out while polling, not a failed POST.
+    [ "$code" != 000 ] || break
   fi
-  if [ "$code" = 503 ]; then
-    # Only the codes the controller sends with Retry-After before it claims a worker; an intermediary
-    # that adds Retry-After to its own 503 may have forwarded the request. start_timeout and
-    # shutting_down: v0.1.0 only (v0.1.0 upgrade shim: remove them in the release after v3).
-    case $(jq -r '.error.code // empty' "$D/alloc.json" 2>/dev/null || :) in
-      pool_exhausted|start_timeout|shutting_down|upstream_error) wait=$(retry_wait "$D/hdr") ;;
-    esac
-    why="HTTP 503"
-  elif [ "$rc" = 6 ] || [ "$rc" = 7 ]; then
-    wait=$backoff
-    backoff=$(( backoff * 2 ))
-    [ "$backoff" -le 30 ] || backoff=30
-    why="connect failed (curl $rc)"
-  fi
-  [ -n "$wait" ] || break
+  wait=
+  fresh=
+  case $code in
+    000|5??)
+      err=
+      [ "$code" = 000 ] || err=$(jq -r '.error.code // empty' "$D/alloc.json" 2>/dev/null || :)
+      case $err in
+        pod_lost) break ;;
+        pool_exhausted)
+          wait=$(retry_wait "$D/hdr")
+          [ -n "$wait" ] || wait=5
+          fresh=1 ;;
+        *)
+          [ "$code" = 000 ] || wait=$(retry_wait "$D/hdr")
+          if [ -z "$wait" ]; then
+            wait=$backoff
+            backoff=$(( backoff * 2 ))
+            [ "$backoff" -le 30 ] || backoff=30
+          fi ;;
+      esac ;;
+    *) break ;;
+  esac
   [ $(( $(date +%s) - start + wait )) -le "$RETRY_BUDGET" ] || break
   attempt=$(( attempt + 1 ))
-  echo "allocate $POOL: $why, retrying in ${wait}s (attempt $attempt)" >&2
+  if [ -n "$fresh" ]; then
+    echo "allocate $POOL: queue timeout ran out, allocating again with a new key in ${wait}s (attempt $attempt)" >&2
+    new_key
+    backoff=1
+  else
+    echo "allocate $POOL: HTTP $code (curl $rc), retrying with the same key in ${wait}s (attempt $attempt)" >&2
+  fi
   sleep "$wait"
 done
 case $code in

@@ -66,6 +66,9 @@ pub const ANN_INTERNAL_CA: &str = "buildkit.smrt-devops.net/internal-ca";
 pub const ANN_WORKER_NONCE: &str = "buildkit.smrt-devops.net/worker-nonce";
 /// `P claim`: `<namespace>/<name>` of the claim an allocated pod serves.
 pub const ANN_CLAIM: &str = "buildkit.smrt-devops.net/claim";
+/// `P claim-uid`: the uid of that claim, so a later claim of the same name is
+/// told apart.
+pub const ANN_CLAIM_UID: &str = "buildkit.smrt-devops.net/claim-uid";
 /// `P alloc` of an unclaimed pod.
 pub const FREE: &str = "free";
 /// `P alloc` of a retired pod.
