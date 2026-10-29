@@ -2,7 +2,7 @@
 {{- $ns := .Release.Namespace -}}
 {{- $watch := include "bkc.watchNamespaces" . | fromJsonArray -}}
 {{- $subjects := list (dict "kind" "ServiceAccount" "name" $fn "namespace" $ns) -}}
-{{- /* PVC list and delete serve only the one-time removal of v0.1.0 cache volumes. v0.1.0 upgrade shim: remove in the release after v3. */ -}}
+{{- /* PVC list and delete serve only the one-time removal of v0.1.0 cache volumes. v0.1.0 upgrade shim: remove in the release after 0.2.0. */ -}}
 {{- $workload := list
   (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitpools") "verbs" (list "get" "list" "watch"))
   (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitpools/status") "verbs" (list "patch"))

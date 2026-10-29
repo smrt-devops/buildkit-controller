@@ -496,7 +496,7 @@ pub fn strays<'a, S: std::hash::BuildHasher>(
 /// A pod bound for an in-cluster claim before every allocation was a claim
 /// (owner `claim:<ns>/<name>#<uid>`, no `P claim`) whose claim is gone, has
 /// ended, or records another allocation id. v0.1.0 upgrade shim: remove in
-/// the release after v3.
+/// the release after 0.2.0.
 fn unclaimed_stray<S: std::hash::BuildHasher>(
     p: &Pod,
     id: &str,

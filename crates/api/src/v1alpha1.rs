@@ -485,13 +485,17 @@ pub struct Cache {
     /// when they are one trust domain.
     pub scope: CacheScope,
     /// Callers whose builds may write the cache, in the syntax of `access.rules`; the
-    /// rest only read it. Unset trusts OIDC tokens whose `event_name` claim is `push`,
-    /// `schedule`, `workflow_dispatch` or `merge_group`, and every `ServiceAccount` and
-    /// `BuildKitClaim` caller. `[]` trusts nobody. A token whose `event_name` is
-    /// `pull_request`, `pull_request_target`, `workflow_run`, `issue_comment`,
-    /// `pull_request_review` or `pull_request_review_comment` only reads, whatever these
-    /// rules say, since those jobs can run fork code. Pin `event_name` in OIDC rules here
-    /// (for example `push`) rather than matching on the repository alone.
+    /// rest only read it. Unset trusts every `ServiceAccount` and `BuildKitClaim` caller,
+    /// and OIDC tokens whose `event_name` claim is `push`, `schedule` or
+    /// `workflow_dispatch` and whose `ref_protected` claim is `true`. `[]` trusts nobody.
+    /// A token whose `event_name` is `pull_request`, `pull_request_target`,
+    /// `workflow_run`, `issue_comment`, `pull_request_review`,
+    /// `pull_request_review_comment`, `deployment` or `deployment_status`, or whose GitLab
+    /// `pipeline_source` is `merge_request_event`, `external_pull_request_event` or
+    /// `parent_pipeline`, only reads, whatever these rules say, since those jobs can run
+    /// code from forks or unreviewed refs. Pin `event_name` and `ref_protected: "true"` in
+    /// OIDC rules here (GitLab: `ref_protected` and `pipeline_source`) rather than
+    /// matching on the repository alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64))]
     pub writers: Option<Vec<AccessRule>>,

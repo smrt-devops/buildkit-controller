@@ -123,7 +123,7 @@ trap 'exit 143' TERM
 # stay inside the default + 60 s. A server that does not report it leaves QUEUE_TIMEOUT unset.
 # A pool entry with queueTimeoutSeconds marks the current server (CURRENT=1), which answers a POST
 # within about 20 s: its POST gets a 40 s limit. v0.1.0 holds the POST open through the queue wait, so
-# without the field the POST keeps the whole budget (upgrade shim; drop it in the release after v3).
+# without the field the POST keeps the whole budget (upgrade shim; drop it in the release after 0.2.0).
 POOL_QT=
 idem "list pools" 60 "$API/v1/pools"
 if [ "$code" = 200 ]; then

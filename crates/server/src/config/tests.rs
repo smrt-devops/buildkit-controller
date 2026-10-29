@@ -808,3 +808,10 @@ fn always_denied_is_the_protected_ranges_without_loopback() {
         assert!(r.parse::<crate::net::Cidr>().is_ok(), "{r}");
     }
 }
+
+#[test]
+fn version_prints_the_crate_version() {
+    let e = Cli::try_parse_from(["x", "--version"]).unwrap_err();
+    assert_eq!(e.kind(), clap::error::ErrorKind::DisplayVersion);
+    assert!(e.to_string().contains(env!("CARGO_PKG_VERSION")));
+}

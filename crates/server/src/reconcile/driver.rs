@@ -115,7 +115,7 @@ pub struct Reconciler {
     ctx: AppContext,
     metrics: ReconcileMetrics,
     /// The v0.1.0 cache volumes are gone ([`super::sweep`]). v0.1.0 upgrade
-    /// shim: remove in the release after v3.
+    /// shim: remove in the release after 0.2.0.
     swept: Arc<AtomicBool>,
 }
 
@@ -287,7 +287,7 @@ async fn run_term(ctx: AppContext, metrics: ReconcileMetrics, side: impl Future<
 }
 
 /// Leader work beside the passes: the sweep of v0.1.0 cache volumes, once per
-/// process (v0.1.0 upgrade shim: remove in the release after v3), then the
+/// process (v0.1.0 upgrade shim: remove in the release after 0.2.0), then the
 /// cache registry certificate. Never returns.
 async fn side_work(ctx: AppContext, swept: Arc<AtomicBool>) {
     let client = ctx.client();

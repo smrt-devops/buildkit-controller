@@ -3,10 +3,10 @@
 #
 # Each repository has its own cache (scope: identity, the default). A build
 # reads its repository's cache, and writes it only when a writers rule matches
-# the caller. Without writers, push, schedule, workflow_dispatch and
-# merge_group events and in-cluster callers write; pull requests only read.
-# Here only pushes to main write, so branch builds start warm from main
-# without changing it.
+# the caller. Without writers, push, schedule and workflow_dispatch runs on a
+# protected ref (ref_protected: "true") and in-cluster callers write; pull
+# requests only read. Here only pushes to main write, so branch builds start
+# warm from main without changing it.
 apiVersion: buildkit.smrt-devops.net/v1alpha1
 kind: BuildKitPool
 metadata:
@@ -20,10 +20,14 @@ spec:
       writers:
         - oidc:
             issuer: https://token.actions.githubusercontent.com
-            claims: {event_name: push, ref: refs/heads/main}
+            claims: {event_name: push, ref: refs/heads/main, ref_protected: "true"}
   access:
     rules:
+      # Pushes only: pull_request_target, workflow_run and issue_comment runs can
+      # run fork code, and this pool has no node isolation (see "Running untrusted
+      # builds" in docs/operations.md).
       - oidc:
           issuer: https://token.actions.githubusercontent.com
           claims:
             repository_id: "87654321"   # gh api repos/example/app --jq .id; names can be re-registered
+            event_name: push

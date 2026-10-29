@@ -212,7 +212,7 @@ impl Component for AllocService {
                 metrics,
             )
             .with_stopping(shutdown.clone())
-            // v0.1.0 upgrade shim: remove in the release after v3.
+            // v0.1.0 upgrade shim: remove in the release after 0.2.0.
             .with_pods(ctx.pods());
             ctx.wait_synced().await;
             let _ = cell.set(Arc::new(front));
