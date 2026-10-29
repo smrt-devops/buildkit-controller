@@ -173,12 +173,13 @@ impl<A: LeaseApi, C: Clock> Elector<A, C> {
     }
 
     /// The larger of our `leaseDuration` and the one the holder wrote, which
-    /// counts up to twice ours: a Lease written with a huge duration must not
-    /// keep every replica waiting.
+    /// counts up to the largest valid `leaseDuration`: a Lease written with a
+    /// huge duration must not keep every replica waiting, and a holder that
+    /// still runs a longer valid one keeps it.
     fn expiry(&self, o: &Observed) -> std::time::Duration {
         let theirs = u64::try_from(o.snap.spec.lease_duration_seconds.unwrap_or(0)).unwrap_or(0);
         let ours = self.t.lease_duration;
-        ours.max(std::time::Duration::from_secs(theirs).min(ours.saturating_mul(2)))
+        ours.max(std::time::Duration::from_secs(theirs).min(crate::config::MAX_LEASE_DURATION))
     }
 
     fn secs(&self) -> i32 {

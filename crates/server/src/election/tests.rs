@@ -461,7 +461,8 @@ async fn a_lease_deleted_under_a_live_holder_is_not_taken_at_once() {
     assert!(leads(&b), "b took over once a's lease ran out");
 }
 
-/// A holder-written `leaseDurationSeconds` counts for at most twice ours.
+/// A holder-written `leaseDurationSeconds` counts for at most the largest
+/// valid `leaseDuration`.
 #[tokio::test(start_paused = true)]
 async fn a_huge_holder_lease_duration_is_capped() {
     let f = Fake::default();
@@ -469,8 +470,8 @@ async fn a_huge_holder_lease_duration_is_capped() {
     s.lease_duration_seconds = Some(i32::MAX);
     f.seed(s);
     let a = start("a", &f);
-    secs(29).await;
-    assert!(!leads(&a), "twice our 15 s");
+    secs(599).await;
+    assert!(!leads(&a), "capped at 10 min, not ignored");
     secs(2).await;
     assert!(leads(&a));
 }

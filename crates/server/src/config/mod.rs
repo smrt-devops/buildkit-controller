@@ -619,7 +619,7 @@ fn secs(d: &CrdDuration, field: &str, problems: &mut Vec<String>) -> Duration {
 const MAX_DURATION: Duration = Duration::from_hours(366 * 24);
 /// The longest `leaderElection.leaseDuration`: a replica waits this long for
 /// a Lease whose holder vanished.
-const MAX_LEASE_DURATION: Duration = Duration::from_mins(10);
+pub const MAX_LEASE_DURATION: Duration = Duration::from_mins(10);
 /// The longest `shutdown.delay`.
 const MAX_SHUTDOWN_DELAY: Duration = Duration::from_hours(1);
 /// The longest `shutdown.drainTimeout`.
