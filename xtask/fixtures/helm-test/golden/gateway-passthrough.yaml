@@ -116,7 +116,7 @@ data:
       handshakeTimeout: 10s
       maxConnections: 2000
       maxHandshakes: 1024
-      maxHandshakesPerIp: 32
+      maxHandshakesPerIp: 0
       serverName: bk.example.com
       serviceName: buildkit-controller
       tls:
@@ -493,7 +493,7 @@ spec:
         app.kubernetes.io/version: "0.2.0"
         helm.sh/chart: buildkit-controller-0.2.0
       annotations:
-        checksum/config: 9b2893f38878e36d9b2907ab908b9d8706110430bbf7bc1dcd65dd989a493454
+        checksum/config: 1eaa6d35ea5aabdf9ed4784dd250d4666a3a80740143ea451fd2c0a28537aea4
     spec:
       serviceAccountName: buildkit-controller
       terminationGracePeriodSeconds: 86715

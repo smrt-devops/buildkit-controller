@@ -35,6 +35,11 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
   {{- $issuers = append $issuers $c -}}
 {{- end -}}
 {{- $fn := include "bkc.fullname" . -}}
+{{- /* Behind a Gateway without PROXY protocol every edge connection comes from the
+       gateway's address, so a per-address handshake cap would evict other clients'
+       handshakes. The chart turns it off. */ -}}
+{{- $perIp := int .Values.edge.maxHandshakesPerIp -}}
+{{- if and (include "bkc.gateway" . | fromJson).edgeRefs (not .Values.edge.proxyProtocol.enabled) }}{{ $perIp = 0 }}{{ end -}}
 {{- $cfg := dict
   "listen" (dict "api" "0.0.0.0:8443" "edge" "0.0.0.0:8444" "ops" (printf "0.0.0.0:%d" (int .Values.metrics.port)))
   "pki" (dict "caSecretName" (printf "%s-ca" $fn))
@@ -49,7 +54,7 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
     "handshakeTimeout" .Values.edge.handshakeTimeout
     "maxConnections" (int .Values.edge.maxConnections)
     "maxHandshakes" (int .Values.edge.maxHandshakes)
-    "maxHandshakesPerIp" (int .Values.edge.maxHandshakesPerIp))
+    "maxHandshakesPerIp" $perIp)
   "api" (dict
     "maxConnections" (int .Values.api.maxConnections)
     "maxConnectionsPerIp" (int .Values.api.maxConnectionsPerIp))
