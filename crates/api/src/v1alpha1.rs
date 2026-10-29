@@ -486,7 +486,8 @@ pub struct Cache {
     /// Callers whose builds may write the cache, in the syntax of `access.rules`; the
     /// rest only read it. Unset trusts OIDC tokens whose `event_name` claim is `push`,
     /// `schedule`, `workflow_dispatch` or `merge_group`, and every `ServiceAccount` and
-    /// `BuildKitClaim` caller. `[]` trusts nobody.
+    /// `BuildKitClaim` caller. `[]` trusts nobody. A token whose `event_name` is
+    /// `pull_request` or `pull_request_target` only reads, whatever these rules say.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64))]
     pub writers: Option<Vec<AccessRule>>,
