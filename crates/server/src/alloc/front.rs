@@ -581,7 +581,9 @@ impl Front {
     }
 
     /// Refuse a new claim, with the retryable 503 `pool_exhausted`, when its
-    /// caller already holds or waits for [`max_per_owner`] claims of the pool.
+    /// caller already holds or waits for twice [`max_per_owner`] claims of the
+    /// pool: as many workers as the leader will bind to it, and as many again
+    /// waiting behind them.
     /// The claim `id` itself, made by an earlier try with the same key, never counts.
     fn room_for(
         &self,
@@ -592,7 +594,7 @@ impl Front {
     ) -> Result<(), AllocError> {
         let key = (req.namespace.clone(), req.pool.clone());
         let all = self.claims.state();
-        let cap = max_per_owner(pool);
+        let cap = 2 * max_per_owner(pool);
         if claims::active_of(&all, &self.namespace, &who.owner(), &key, id) >= cap {
             info!(namespace = %req.namespace, pool = %req.pool, reason = "owner_limit", "allocation refused");
             return Err(AllocError::PoolExhausted(format!(

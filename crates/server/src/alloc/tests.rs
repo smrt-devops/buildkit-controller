@@ -1531,14 +1531,15 @@ async fn a_lookup_by_id_never_reads_the_api_server() {
     ));
 }
 
-/// One owner may hold or wait for at most half of `scaling.max` (4 here) in
-/// a pool. Over that a POST gets the retryable `pool_exhausted`; a repeat of
-/// a key it already holds and other owners are unaffected.
+/// One owner may hold half of `scaling.max` (4 here) and wait for as many
+/// again. Over that a POST gets the retryable `pool_exhausted`; a repeat of a
+/// key it already holds and other owners are unaffected.
 #[tokio::test(start_paused = true)]
-async fn one_owner_takes_at_most_half_the_pool() {
+async fn one_owner_holds_or_waits_for_at_most_the_pool_size() {
     let e = env();
     let first = post_req(&fresh_key());
-    for req in [&first, &post_req(&fresh_key())] {
+    let more: Vec<_> = (0..3).map(|_| post_req(&fresh_key())).collect();
+    for req in std::iter::once(&first).chain(&more) {
         assert!(matches!(
             e.front.allocate(&sa("alice"), req).await,
             Ok(Outcome::Pending(_))
@@ -1557,7 +1558,7 @@ async fn one_owner_takes_at_most_half_the_pool() {
         e.front.allocate(&sa("bob"), &post_req(&fresh_key())).await,
         Ok(Outcome::Pending(_))
     ));
-    assert_eq!(claim_names(&e).len(), 3);
+    assert_eq!(claim_names(&e).len(), 5);
 }
 
 /// The leader binds no more than the cap to one owner either, so claims that
