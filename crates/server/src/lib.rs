@@ -9,6 +9,7 @@ pub mod http;
 pub mod net;
 pub mod pki;
 pub mod reconcile;
+pub mod registry;
 pub mod render;
 pub mod runtime;
 pub mod telemetry;

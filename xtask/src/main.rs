@@ -23,6 +23,7 @@ mod perf;
 mod proc;
 mod proxy_verify;
 mod reconcile_verify;
+mod registry_verify;
 mod render_verify;
 mod runtime_verify;
 mod soak;
@@ -39,6 +40,7 @@ use image::{image, prune};
 use perf::{perf, perf_loopback};
 use proxy_verify::proxy_verify;
 use reconcile_verify::reconcile_verify;
+use registry_verify::registry_verify;
 use render_verify::render_verify;
 use runtime_verify::runtime_verify;
 use soak::soak;
@@ -93,6 +95,8 @@ enum Task {
     ApiVerify,
     /// Run the reconciler against a throwaway kind cluster. Covers warm pods, the pool maximum, idle and expiry handling, CA repair and replacement, the sandbox, slot holds and the absence of idle polling.
     ReconcileVerify,
+    /// Run the cache registry role on a throwaway kind cluster with two real buildkitd pods. Checks a `mode=max` registry cache export, a cache hit from a fresh daemon over mTLS, and that a read-only grant cannot push.
+    RegistryVerify,
     /// Run `helm lint` and golden `helm template` tests of the chart. Needs no cluster.
     HelmTest {
         /// Rewrite the golden files.
@@ -333,6 +337,7 @@ fn main() -> Result<()> {
         Task::AllocVerify => alloc_verify(),
         Task::ApiVerify => api_verify(),
         Task::ReconcileVerify => reconcile_verify(),
+        Task::RegistryVerify => registry_verify(),
         Task::HelmTest { update } => helm_test(update),
         Task::HelmVerify => helm_verify(),
         Task::DrainVerify => drain_verify(),

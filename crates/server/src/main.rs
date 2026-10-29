@@ -1,5 +1,8 @@
 //! `buildkit-controller`: API, edge and reconciler in one binary.
 //!
+//! `buildkit-controller cache` runs the cache registry role instead (see
+//! `registry`): no kube client, no election, only its own flags.
+//!
 //! Startup runs config (exit 2 when invalid), telemetry, kube client, shared
 //! stores, election, ops server, then the module hooks. On SIGTERM or SIGINT,
 //! `/readyz` fails, leader work stops and the Lease is released, then after
@@ -31,6 +34,7 @@ use buildkit_controller::election::kube_api::KubeLeaseApi;
 use buildkit_controller::election::{Elector, TokioClock};
 use buildkit_controller::http::HttpComponent;
 use buildkit_controller::reconcile::Reconciler;
+use buildkit_controller::registry::CacheArgs;
 use buildkit_controller::runtime::AppContext;
 use buildkit_controller::runtime::hooks::{Component, Hooks, LeaderWork};
 use buildkit_controller::runtime::leader::supervise;
@@ -41,6 +45,9 @@ use buildkit_controller::runtime::stop::Shutdown;
 use buildkit_controller::telemetry::{logs, ops};
 
 fn main() -> ExitCode {
+    if std::env::args_os().nth(1).is_some_and(|a| a == "cache") {
+        return cache_main();
+    }
     let cli = Cli::parse();
     let settings = match Settings::load(cli, |k| std::env::var(k).ok()) {
         Ok(s) => s,
@@ -93,6 +100,45 @@ fn main() -> ExitCode {
             if e.downcast_ref::<InvalidServingSecret>().is_some() {
                 return ExitCode::from(2);
             }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The `cache` role. The first SIGTERM or SIGINT drains, a second exits at once.
+fn cache_main() -> ExitCode {
+    let args = CacheArgs::parse_from(std::env::args_os().skip(1));
+    let replica = std::env::var("POD_NAME").unwrap_or_else(|_| "cache".to_owned());
+    if let Err(e) = logs::init(&args.log_level, args.log_format, &replica) {
+        eprintln!("{e:#}");
+        return ExitCode::from(2);
+    }
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            error!(error = %e, "building the tokio runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = rt.block_on(async {
+        let mut signals = Signals::new().context("installing signal handlers")?;
+        let stop = CancellationToken::new();
+        let mut task = tokio::spawn(buildkit_controller::registry::run(args, stop.clone()));
+        tokio::select! {
+            r = &mut task => return r?,
+            code = signals.recv() => info!(signal_exit_code = code, "signal received"),
+        }
+        signals.exit_after(1);
+        stop.cancel();
+        task.await?
+    });
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            error!(error = format!("{e:#}"), "fatal");
             ExitCode::FAILURE
         }
     }
