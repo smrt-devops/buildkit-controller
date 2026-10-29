@@ -485,6 +485,7 @@ mod tests {
             inputs_hash(&root, false).unwrap(),
             "a new file rebuilds"
         );
+        let before = inputs_hash(&root, false).unwrap();
         assert_ne!(
             inputs_hash(&root, false).unwrap(),
             inputs_hash(&root, true).unwrap(),
@@ -492,7 +493,7 @@ mod tests {
         );
         write("xtask/src/image.rs", "flags");
         assert_ne!(
-            changed,
+            before,
             inputs_hash(&root, false).unwrap(),
             "image.rs is an input"
         );
