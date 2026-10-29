@@ -1,0 +1,5 @@
+---
+source: crates/server/src/render/tests.rs
+expression: err.to_string()
+---
+template conflict: spec.template.metadata.annotations[network.cilium.io/ipv4-pool] (annotation key changes the pod's network or runtime outside the worker sandbox)

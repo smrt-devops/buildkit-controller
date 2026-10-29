@@ -11,7 +11,7 @@ metadata:
     app.kubernetes.io/name: buildkitd
     buildkit.smrt-devops.net/pool: nodelocal-dns
     buildkit.smrt-devops.net/state: free
-    buildkit.smrt-devops.net/template-hash: 4ac7d9dfdf
+    buildkit.smrt-devops.net/template-hash: 858596bd87
   name: nodelocal-dns-0
   namespace: render-verify
   ownerReferences:
@@ -58,6 +58,9 @@ spec:
         ephemeral-storage: 1Gi
         memory: 1Gi
     securityContext:
+      capabilities:
+        drop:
+        - NET_RAW
       privileged: false
     startupProbe:
       exec:
