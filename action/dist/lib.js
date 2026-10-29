@@ -64,7 +64,7 @@ function allocationBody({ namespace, pool }, publicKey, ttl, queueTimeout, cache
 }
 
 const CACHE_CHOICES = ['auto', 'none'];
-// v0.1.0 upgrade shim: remove in the release after v3. Workflows pinned to @v0 that
+// v0.1.0 upgrade shim: remove in the release after 0.2.0. Workflows pinned to @v0 that
 // still pass a v0.1.0 cache layer get the built-in cache instead of a failed job.
 const OLD_CACHE_CHOICES = ['registry', 'local'];
 const CACHE_KEY = /^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/;
@@ -247,7 +247,7 @@ function isCurrentServer(pool) {
  * response is retried with the same key long before the claim looks abandoned. A v0.1.0 controller
  * holds the POST open through the queue wait and the pod start, so it gets the whole budget left; a
  * short timeout would fail an allocation whose id the client never saw. v0.1.0 upgrade shim: drop the
- * long branch in the release after v3.
+ * long branch in the release after 0.2.0.
  */
 function postTimeoutMs(remainingMs, current = false) {
   const t = Math.max(1000, remainingMs);

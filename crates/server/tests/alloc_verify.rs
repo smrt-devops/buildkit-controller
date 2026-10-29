@@ -846,7 +846,7 @@ async fn cold(stop: &CancellationToken) {
 /// Scenario 8, an upgrade: pods allocated before every allocation was a claim
 /// carry no `P claim`. An API caller's is released by its owner's DELETE, and
 /// an in-cluster claim's whose claim is gone is retired by the leader's sweep.
-/// v0.1.0 upgrade shim: remove in the release after v3.
+/// v0.1.0 upgrade shim: remove in the release after 0.2.0.
 async fn upgrade(h: &H) {
     let names = h.warm("u", 2).await;
     let (api_id, claim_id) = (

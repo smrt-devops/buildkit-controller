@@ -134,7 +134,7 @@ data:
       handshakeTimeout: 5s
       maxConnections: 20000
       maxHandshakes: 512
-      maxHandshakesPerIp: 16
+      maxHandshakesPerIp: 0
       serverName: bk.example.com
       serviceName: bkc
       tls:
@@ -534,7 +534,7 @@ spec:
         helm.sh/chart: buildkit-controller-0.2.0
         team: ci
       annotations:
-        checksum/config: 91aaf9f76152f4c5cf50aa07ded69dd099a4eb82cdf85574d2139198abcd0158
+        checksum/config: fc80d6d0020b65b2d05a7d32c5ad4a3b9ed2808447fca5eeac37ce042ac9e09c
         example.com/x: "1"
     spec:
       serviceAccountName: bkc
