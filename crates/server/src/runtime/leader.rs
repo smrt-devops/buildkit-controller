@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio::task::{JoinError, JoinHandle};
@@ -10,7 +11,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 use super::hooks::LeaderWork;
+use super::stores::STALE_AFTER;
 use crate::election::LeaderState;
+
+/// How long a term waits for the stores to sync before it fails. A replica
+/// campaigns only after its stores synced once, so a term waits only when a
+/// store went stale since; past this bound the stores are not recovering, and
+/// the replica gives up the Lease so that a replica that can sync takes over.
+pub const SYNC_GATE: Duration = Duration::from_secs(2 * STALE_AFTER.as_secs());
 
 /// Boxed unit future.
 pub type BoxFut = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -32,24 +40,34 @@ pub enum TermFailed {
         /// The term.
         term: u64,
     },
+    /// The stores did not sync within [`SYNC_GATE`].
+    #[error(
+        "leader work of term {term} did not start: the stores did not sync within {SYNC_GATE:?}"
+    )]
+    NotSynced {
+        /// The term.
+        term: u64,
+    },
 }
 
-/// Follow `rx`. On each new term, wait for `synced()` and then run `work`.
+/// Follow `rx`. On each new term, wait for `synced()` (at most [`SYNC_GATE`])
+/// and then run `work`.
 /// Drop (abort) the work when leadership ends or the term changes.
 /// Returns `Ok` after `shutdown` once the work has stopped.
 ///
 /// # Errors
 ///
-/// When the work of the current term panics or returns while this replica
-/// still leads. A leader without a reconciler must not keep the Lease, so the
-/// caller shuts the process down, which releases it.
+/// When the work of the current term panics or returns, or its stores do not
+/// sync within [`SYNC_GATE`], while this replica still leads. A leader without
+/// a reconciler must not keep the Lease, so the caller shuts the process down,
+/// which releases it.
 pub async fn supervise(
     mut rx: watch::Receiver<LeaderState>,
     shutdown: CancellationToken,
     synced: impl Fn() -> BoxFut,
     work: Arc<dyn LeaderWork>,
 ) -> Result<(), TermFailed> {
-    let mut current: Option<(u64, JoinHandle<()>)> = None;
+    let mut current: Option<(u64, JoinHandle<bool>)> = None;
     loop {
         let state = *rx.borrow_and_update();
         match state {
@@ -60,8 +78,11 @@ pub async fn supervise(
                 current = Some((
                     term,
                     tokio::spawn(async move {
-                        gate.await;
+                        if tokio::time::timeout(SYNC_GATE, gate).await.is_err() {
+                            return false;
+                        }
                         run.await;
+                        true
                     }),
                 ));
             }
@@ -82,17 +103,19 @@ pub async fn supervise(
     Ok(())
 }
 
-/// Resolves when the current term's task ends; never without one.
-async fn ended(current: &mut Option<(u64, JoinHandle<()>)>) -> (u64, Result<(), JoinError>) {
+/// Resolves when the current term's task ends (`false`: it never synced);
+/// never without one.
+async fn ended(current: &mut Option<(u64, JoinHandle<bool>)>) -> (u64, Result<bool, JoinError>) {
     match current {
         Some((term, h)) => (*term, h.await),
         None => std::future::pending().await,
     }
 }
 
-fn failure(term: u64, r: Result<(), JoinError>) -> TermFailed {
+fn failure(term: u64, r: Result<bool, JoinError>) -> TermFailed {
     match r {
-        Ok(()) => TermFailed::Returned { term },
+        Ok(true) => TermFailed::Returned { term },
+        Ok(false) => TermFailed::NotSynced { term },
         Err(e) => {
             let message = match e.try_into_panic() {
                 Ok(p) => p
@@ -107,7 +130,7 @@ fn failure(term: u64, r: Result<(), JoinError>) -> TermFailed {
     }
 }
 
-async fn stop(task: Option<(u64, JoinHandle<()>)>) {
+async fn stop(task: Option<(u64, JoinHandle<bool>)>) {
     if let Some((_, h)) = task {
         h.abort();
         let _ = h.await;
