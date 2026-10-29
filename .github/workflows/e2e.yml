@@ -131,14 +131,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [soak, perf, drain-verify --long]
+        suite: [soak, perf, perf --loopback, drain-verify --long]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
       - run: cargo xtask ${{ matrix.suite }}
-      # The perf table (target/perf/result-*.md) is a report: a MISS does not fail the job.
+      # The kind perf table (target/perf/result-*.md) is a report: a MISS does not fail the
+      # job. The loopback benchmark fails on a MISS.
       - name: Keep the results and logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

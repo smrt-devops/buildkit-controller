@@ -58,6 +58,11 @@ const CONNECTS: usize = 2000;
 /// Total bytes per throughput run, split across the streams.
 const BULK: u64 = 512 * 1024 * 1024;
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+/// Least edge throughput as a share of direct, per row. The edge decrypts and
+/// re-encrypts every byte, so about half of direct is the CPU-bound ceiling.
+const MIN_SHARE: f64 = 0.4;
+/// The p99 connect overhead target.
+const TARGET_OVERHEAD_MS: f64 = 5.0;
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
@@ -400,12 +405,28 @@ async fn main() {
         BULK >> 20
     );
     println!("| Metric | direct | edge |\n|---|---|---|");
+    let mut verdicts = Vec::new();
     for conc in [1, 8] {
         let mut rows = Vec::new();
         for p in [&direct, &through] {
             latencies(p, CONNECTS / 10, conc).await;
             rows.push(latencies(p, CONNECTS, conc).await);
         }
+        // As `xtask perf` on kind: the direct p99-p50 spread is the noise, and
+        // only an overhead past both it and the target is a MISS.
+        let over = pct(&rows[1], 99.0) - pct(&rows[0], 99.0);
+        let spread = pct(&rows[0], 99.0) - pct(&rows[0], 50.0);
+        let verdict = if over < TARGET_OVERHEAD_MS {
+            "PASS"
+        } else if over < spread {
+            "inconclusive"
+        } else {
+            "MISS"
+        };
+        verdicts.push(format!(
+            "{verdict}: connect overhead p99 < {TARGET_OVERHEAD_MS} ms, {conc} at a time \
+             ({over:+.2} ms, direct spread {spread:.2} ms)"
+        ));
         for q in [50.0, 95.0, 99.0] {
             let (d, e) = (pct(&rows[0], q), pct(&rows[1], q));
             println!(
@@ -427,6 +448,19 @@ async fn main() {
             cells[1],
             cells[1] / cells[0] * 100.0
         );
+        let share = cells[1] / cells[0];
+        verdicts.push(format!(
+            "{}: edge {dir}, {streams} stream(s) >= {:.0}% of direct ({:.0}%)",
+            if share >= MIN_SHARE { "PASS" } else { "MISS" },
+            MIN_SHARE * 100.0,
+            share * 100.0
+        ));
     }
     stop.cancel();
+    for v in &verdicts {
+        println!("{v}");
+    }
+    if verdicts.iter().any(|v| v.starts_with("MISS")) {
+        std::process::exit(1);
+    }
 }
