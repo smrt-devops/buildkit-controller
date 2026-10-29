@@ -15,7 +15,7 @@ claim queue (see [Before the claim queue](#before-the-claim-queue)).
 | Allocation p50 with a warm pod under 150 ms | p50 15.2 ms, p95 21.9 ms, p99 25.6 ms (one run, with the claim queue) | 15.2 / 21.9 / 25.6 ms | none | Pass |
 | Edge connect overhead p99 under 5 ms, 1 connection at a time | p99 +0.0 ms, p50 +0.3 ms | +0.3 / +0.3 ms | -0.3 / +0.2 ms | p99 not resolved on kind; p50 overhead +0.2 to +0.3 ms. Pass on loopback, see below |
 | Edge connect overhead p99 under 5 ms, 8 connections at a time | p99 -2.0 ms, p50 +0.5 ms | -2.6 / +0.5 ms | -1.4 / +0.5 ms | p99 not resolved on kind; p50 overhead +0.5 ms in both runs. Pass on loopback, see below |
-| Edge build throughput at least 50% of direct on kind (1 GiB/s on loopback) | edge 310 MB/s, direct 349 MB/s | 343 / 364 MB/s | 276 / 333 MB/s | Pass at 89% of direct. Loopback measures 1.6 GiB/s with one stream, see below |
+| Edge build throughput at least 50% of direct on kind (loopback checks at least 40% of direct) | edge 310 MB/s, direct 349 MB/s | 343 / 364 MB/s | 276 / 333 MB/s | Pass at 89% of direct. Loopback measures 1.6 GiB/s with one stream, see below |
 | Idle replica RSS under 40 MiB | 12.9 to 14.3 MiB per replica | 14.3, 13.3 MiB | 12.9, 13.8 MiB | Pass |
 | No API-server polling while idle | 0 get or list calls in 300 s | 0 | 0 | Pass |
 
@@ -101,7 +101,8 @@ the proxy without buildkit or a cluster. No product change was needed.
 
 ## Loopback
 
-`cargo xtask perf --loopback` resolves the two targets that kind could not. It
+`cargo xtask perf --loopback` checks the two targets that kind could not
+resolve: the edge's share of direct throughput and its connect overhead. It
 needs no kind and no Docker. The benchmark is
 `crates/server/benches/loopback.rs`, built in release mode, and it uses only
 the public `edge` API. One process on 127.0.0.1 holds:
@@ -127,7 +128,7 @@ Three runs on 2026-10-20 on an arm64 Mac, medians:
 
 | Target | Measured, median of 3 | Run 1 / 2 / 3 | Verdict |
 |---|---|---|---|
-| Edge throughput at least 1 GiB/s | 1 stream: upload 1.62, download 1.60 GiB/s. 8 streams: upload 2.82, download 2.25 GiB/s | upload 1 stream 1.57 / 1.62 / 1.62 | Pass |
+| Edge throughput at least 40% of direct | 1 stream: upload 1.62, download 1.60 GiB/s, about 55 to 87 percent of direct. 8 streams: upload 2.82, download 2.25 GiB/s, about half of direct | upload 1 stream 1.57 / 1.62 / 1.62 | Pass |
 | Edge connect overhead p99 under 5 ms, 1 at a time | +0.42 ms (edge p99 0.70 ms, direct 0.28 ms) | +0.47 / +0.42 / +0.42 | Pass |
 | Edge connect overhead p99 under 5 ms, 8 at a time | +0.72 ms (edge p99 1.21 ms, direct 0.48 ms) | +0.71 / +0.72 / +0.74 | Pass |
 
