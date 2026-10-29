@@ -113,7 +113,7 @@ The allocation response carries the cache flags, and the client passes them to b
 
 ### Who may reach it
 
-Only worker pods can, over mTLS with the internal CA. The controller gives each worker a certificate that also carries the client-auth usage, and writes the worker's `buildkitd.toml` so buildkitd presents that certificate to the registry. There are no credentials for a build to steal or an operator to manage.
+Only worker pods can, and mTLS is the boundary: the registry accepts a connection only with a valid worker client certificate, and a NetworkPolicy that admits worker pods to its port is an extra layer, not the check. Each worker has two certificates. Its serving certificate comes from the internal CA and is for serverAuth only, so it cannot be used as a client. A second leaf, issued by the client CA for the worker's DNS name and valid for clientAuth only, is the one the worker's `buildkitd.toml` presents to the registry. buildkitd trusts the internal CA alone and the edge wants an allocation URI, so no certificate a worker holds opens any buildkitd or the edge. The registry's serving certificate is from the internal CA and its trust anchor for clients is the client CA; the leader reissues the serving certificate when either CA changes. There are no credentials for a build to steal or an operator to manage.
 
 The registry identifies the worker by its certificate and finds the pod in its watch cache, as the edge does. It reads the pod's live allocation: the pool, the caller's cache scope and the trust tier, which the leader wrote on the pod as the annotations `buildkit.smrt-devops.net/scope` and `buildkit.smrt-devops.net/tier`. It then allows:
 
@@ -134,6 +134,7 @@ The scope says whose cache it is. `spec.workers.cache.scope` sets how scopes are
 The tier says whether the caller may write. `spec.workers.cache.writers` lists the callers that may, in the syntax of `access.rules`. Everyone else reads only.
 
 - Unset, a GitHub Actions caller is trusted when its `event_name` claim is `push`, `schedule`, `workflow_dispatch` or `merge_group`. Every ServiceAccount and `BuildKitClaim` caller is trusted. A pull request is not, so a fork build starts warm from its own repository's cache and cannot change it. A caller whose token has no `event_name` claim, such as a GitLab job, reads only until you list it in `writers`.
+- `pull_request` and `pull_request_target` builds are always read-only, whatever `writers` says. A rule that would match one is ignored for it.
 - `writers: []` trusts nobody.
 - A trusted allocation gets `--cache-to` and `--cache-from`. An untrusted one gets `--cache-from` only, and the Action logs that the cache is read only for the build.
 

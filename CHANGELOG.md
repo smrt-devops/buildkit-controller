@@ -35,7 +35,8 @@ v3 replaces the per-replica allocation queues with one claim queue and replaces 
 
 ### Changed
 
-- Worker certificates carry the client-auth usage, and the pool's `buildkitd.toml` names the cache registry with the worker's key pair.
+- Each worker gets a second certificate, a clientAuth-only leaf from the client CA, which the pool's `buildkitd.toml` presents to the cache registry. The serving certificate stays serverAuth only. The registry trusts the client CA for clients, and mTLS is its boundary.
+- `pull_request` and `pull_request_target` builds never write the cache, whatever `spec.workers.cache.writers` says.
 - The claim CRD is always installed. `claims.enabled` only adds the tenant namespaces whose claims the controller serves.
 - A draining replica no longer hands queued requests off. Pending claims stay pending and another replica answers the client's next poll.
 - Removed from the allocator: per-replica queues and wake-ups, API replicas creating pre-claimed pods, the provisional-expiry commit and its orphan guard, and the commit-on-body step.
