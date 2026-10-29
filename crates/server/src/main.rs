@@ -14,8 +14,9 @@
 //! budget count from the signal. The drain is bounded by
 //! `shutdown.drainTimeout`, or when unset by the longest connection lifetime.
 //! The watches and the ops server stop last. A failed component starts the
-//! same shutdown without the delay and the drain, and the process exits
-//! non-zero so that kubelet restarts it. A SIGTERM or SIGINT
+//! same shutdown and the process exits non-zero, so kubelet restarts it: with
+//! no delay or drain when a serving stage failed, with the drain cut to five
+//! minutes when leader work failed. A SIGTERM or SIGINT
 //! during shutdown exits at once.
 
 use std::process::ExitCode;
@@ -46,6 +47,9 @@ use buildkit_controller::runtime::metrics::Metrics;
 use buildkit_controller::runtime::readiness::Readiness;
 use buildkit_controller::runtime::stop::Shutdown;
 use buildkit_controller::telemetry::{logs, ops};
+
+/// The longest drain after leader work failed (see `run`).
+const LEADER_FAILURE_DRAIN: Duration = Duration::from_mins(5);
 
 fn main() -> ExitCode {
     if std::env::args_os().nth(1).is_some_and(|a| a == "registry") {
@@ -270,12 +274,15 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
     let mut failed = None;
     let mut ops_done = false;
     let mut leader_done = false;
+    // The API, the edge, the certificate loader or the ops server failed.
+    let mut serving_failed = false;
     tokio::select! {
         code = signals.recv() => {
             info!(signal_exit_code = code, "signal received");
         }
         e = stages.exited() => {
             error!(error = format!("{e:#}"), "component stopped, shutting down");
+            serving_failed = true;
             failed = Some(e);
         }
         e = leader.exited() => {
@@ -290,6 +297,7 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
                 Err(e) => anyhow::anyhow!("ops server panicked: {e}"),
             };
             error!(error = format!("{e:#}"), "ops server stopped, shutting down");
+            serving_failed = true;
             failed = Some(e);
         }
         // A leader without a reconciler must not keep the Lease: shutting down releases it.
@@ -308,7 +316,19 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
     // The drain has begun, by a signal or a failure: the next signal ends it.
     signals.exit_after(1);
     let config = ctx.config();
-    let failing = failed.is_some();
+    // After a failure the process exits, so kubelet restarts it, rather than
+    // drain NotReady for up to a day with /healthz passing. A broken serving
+    // stage has nothing worth draining. Leader work that failed leaves the
+    // edge healthy: its builds get a short drain, so a failure that recurs on
+    // each new leader does not cut every build at once.
+    let (delay, drain_budget) = match (failed.is_some(), serving_failed) {
+        (true, true) => (Duration::ZERO, Duration::ZERO),
+        (true, false) => (
+            config.shutdown_delay(),
+            config.drain_budget().min(LEADER_FAILURE_DRAIN),
+        ),
+        (false, _) => (config.shutdown_delay(), config.drain_budget()),
+    };
     Shutdown {
         started,
         readiness,
@@ -323,19 +343,8 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
         request_timeout: config.request_timeout(),
         elect_stop,
         elector: elect_task,
-        // After a failure the process only hands over the Lease and exits, so
-        // kubelet restarts it: a replica that drained NotReady with /healthz
-        // passing would stay out of service for up to a day.
-        delay: if failing {
-            Duration::ZERO
-        } else {
-            config.shutdown_delay()
-        },
-        drain_budget: if failing {
-            Duration::ZERO
-        } else {
-            config.drain_budget()
-        },
+        delay,
+        drain_budget,
         stages,
         watches,
         ops_stop,
