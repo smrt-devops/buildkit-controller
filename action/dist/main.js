@@ -20,7 +20,7 @@ async function run() {
   const cache = L.parseCacheInputs({
     cache: gha.getInput('cache'), cacheKey: gha.getInput('cache-key'),
     cacheMode: gha.getInput('cache-mode'), cacheFrom: gha.getInput('cache-from'),
-  });
+  }, gha.warning);
   const aud = gha.getInput('audience') || 'buildkit-controller';
   const getToken = () => L.fetchOidcToken(aud, gha.setSecret);
 

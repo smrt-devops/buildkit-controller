@@ -29,20 +29,20 @@ use anyhow::{Context, Result, bail};
 use crate::kube::{CLUSTER_VAR, Cluster};
 use crate::proc::{Spawned, Timed, status};
 
-/// Suites on the shared cluster, longest first, so the slow ones start first
-/// when `--jobs` limits how many run at once.
+/// Suites on the shared cluster, longest first by measured time, so the slow ones
+/// start first when `--jobs` limits how many run at once.
 pub(crate) const SHARED: &[&str] = &[
     "reconcile-verify",
+    "alloc-verify",
     "e2e",
     "drain-verify",
     "proxy-verify",
-    "alloc-verify",
     "edge-verify",
+    "api-verify",
     "helm-verify",
     "registry-verify",
-    "api-verify",
-    "render-verify",
     "crd-verify",
+    "render-verify",
 ];
 
 /// Suites that cannot share a cluster, run in this order on the second one.

@@ -51,6 +51,24 @@ jobs:
             echo "::error::no successful push run of action.yml on $SHA"
             exit 1
           fi
+      - name: Require the tag to name the version in the tree
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # v0.2.0-rc1 releases the 0.2.0 tree. A checkout of the tag installs the chart's
+          # appVersion image, so the tree must name the release (a unit test ties the chart to Cargo.toml).
+          version="${REF_NAME#v}"
+          version="${version%%-*}"
+          if ! grep -qx "version = \"$version\"" Cargo.toml ||
+            ! grep -qx "appVersion: \"$version\"" helm/buildkit-controller/Chart.yaml; then
+            echo "::error::Cargo.toml and Chart.yaml must say $version for $REF_NAME; bump them first"
+            exit 1
+          fi
+      # The push runs may predate an advisory published before the tag.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check advisories
 
   build:
     name: Build ${{ matrix.arch }}
@@ -75,6 +93,7 @@ jobs:
       # Built on a trixie-compatible glibc (ubuntu 24.04 has a different glibc, so
       # build inside the pinned rust trixie image to match distroless/cc-debian13).
       # cargo-auditable embeds the crate list in the binary so syft can put the crates in the SBOM.
+      # Keep this step the same as the image job in rust.yml, which runs it on every pull request.
       - name: Compile in the pinned trixie rust image
         env:
           AUDITABLE_VERSION: "0.7.5"
@@ -262,30 +281,63 @@ jobs:
 
   helm:
     name: Package Helm chart
-    needs: tag
+    needs: [index, tag]
     runs-on: ubuntu-24.04
     permissions:
       contents: write # create the release and upload assets
+      id-token: write # chart provenance
+      attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+        with:
+          version: v4.2.4
       - name: helm package
         env:
           REF_NAME: ${{ github.ref_name }}
         run: |
           version="${REF_NAME#v}"
           helm package helm/buildkit-controller --version "$version" --app-version "$version" --destination dist
+      - name: Chart provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/*.tgz
+      - name: Write the release notes header
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          DIGEST: ${{ needs.index.outputs.digest }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<NOTES
+          The changes are in [CHANGELOG.md](https://github.com/${REPO}/blob/${REF_NAME}/CHANGELOG.md).
+
+          Image: \`${IMAGE}@${DIGEST}\`. Pin the digest with \`image.tag: ${REF_NAME#v}@${DIGEST}\`.
+
+          Verify the image and the chart:
+
+          \`\`\`sh
+          cosign verify ${IMAGE}@${DIGEST} \\
+            --certificate-identity https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${REF_NAME} \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          gh attestation verify oci://${IMAGE}@${DIGEST} -R ${REPO}
+          gh attestation verify buildkit-controller-${REF_NAME#v}.tgz -R ${REPO}
+          \`\`\`
+          NOTES
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*.tgz
+          body_path: notes.md
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
 
   action-tag:
     name: Move major tag for the GitHub Action
-    needs: helm
+    # gate is listed so the move never outlives a reorder of the jobs: vN moves only for a
+    # tag on main whose CI passed and whose version matches the tree.
+    needs: [gate, helm]
     if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-24.04
     permissions:
