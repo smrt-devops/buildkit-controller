@@ -1039,8 +1039,13 @@ async fn reconcile_verify() {
         cond(&h.pool("q").await, "Degraded") == Some(("True".into(), "SlotTaken".into()))
     })
     .await;
-    tokio::time::sleep(Duration::from_secs(70)).await;
-    let conflicts = completed(&audit())
+    // 9 shares this window. With q-0 held for 10 minutes after its one 409 the
+    // controller has nothing to do, so the same minute shows it does not poll.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let before = audit().len();
+    tokio::time::sleep(Duration::from_mins(1)).await;
+    let all = audit();
+    let conflicts = completed(&all)
         .filter(|e| {
             e["verb"] == "create"
                 && e["objectRef"]["resource"] == "pods"
@@ -1055,11 +1060,7 @@ async fn reconcile_verify() {
         "S8 PASS: Degraded=SlotTaken; creates of q-0 over 70s+: {conflicts:?} (one 409 per 10 min hold); pod_operations_total sum {metric_409}"
     ));
 
-    // 9. The controller does not poll the API while idle.
-    tokio::time::sleep(Duration::from_secs(10)).await;
-    let before = audit().len();
-    tokio::time::sleep(Duration::from_mins(1)).await;
-    let all = audit();
+    // 9. The controller does not poll the API while idle (the minute above).
     let mut idle: BTreeMap<String, usize> = BTreeMap::new();
     for e in completed(&all[before..]) {
         *idle.entry(key(e)).or_default() += 1;
