@@ -12,10 +12,11 @@
 //!   and Envoy Gateway is installed on it once.
 //! - `bk-solo` runs [`SOLO`] one after the other, because they cannot share.
 //!
-//! Each suite's output goes to `target/kind-all/<suite>.log`. Soak and perf are
-//! not here: they measure a quiet cluster over long windows and run nightly.
-//! Both clusters are deleted at the end unless `--keep`; `--down` deletes kept
-//! ones. Cluster names get `-$BK_KIND_SUFFIX` when that is set.
+//! Each suite's output goes to `target/kind-all/<suite>.log`. Soak and perf
+//! measure a quiet cluster over long windows: they run only with `--nightly`
+//! (or `--only`), each on its own cluster once the others are done and their
+//! clusters deleted. The two shared clusters are deleted at the end unless
+//! `--keep`; `--down` deletes kept ones. Cluster names get `-$BK_KIND_SUFFIX` when that is set.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -50,6 +51,9 @@ pub(crate) const SHARED: &[&str] = &[
 /// would answer every other suite's claims and reconcile their pools.
 pub(crate) const SOLO: &[&str] = &["runtime-verify", "claim-verify"];
 
+/// The long runs, each on a cluster of its own, after the others.
+pub(crate) const NIGHTLY: &[&str] = &["soak", "perf"];
+
 /// What `kind-all` was asked to do.
 pub(crate) struct Opts {
     /// Run only these suites; empty runs all.
@@ -60,6 +64,8 @@ pub(crate) struct Opts {
     pub(crate) down: bool,
     /// How many shared-cluster suites run at once; 0 is all of them.
     pub(crate) jobs: usize,
+    /// Also run [`NIGHTLY`].
+    pub(crate) nightly: bool,
 }
 
 /// One suite's outcome.
@@ -90,42 +96,23 @@ pub(crate) fn kind_all(opts: &Opts) -> Result<()> {
         solo.keep();
     }
     for name in &opts.only {
-        if !SHARED.contains(&name.as_str()) && !SOLO.contains(&name.as_str()) {
-            bail!("no kind suite {name}; the suites are {SHARED:?} and {SOLO:?}");
+        if ![SHARED, SOLO, NIGHTLY]
+            .iter()
+            .any(|l| l.contains(&name.as_str()))
+        {
+            bail!("no kind suite {name}; the suites are {SHARED:?}, {SOLO:?} and {NIGHTLY:?}");
         }
     }
-    let pick = |list: &[&'static str]| -> Vec<&'static str> {
+    let pick = |list: &[&'static str], by_default: bool| -> Vec<&'static str> {
         list.iter()
             .copied()
-            .filter(|s| opts.only.is_empty() || opts.only.iter().any(|o| o == s))
+            .filter(|s| (opts.only.is_empty() && by_default) || opts.only.iter().any(|o| o == s))
             .collect()
     };
-    let (shared, alone) = (pick(SHARED), pick(SOLO));
+    let (shared, alone) = (pick(SHARED, true), pick(SOLO, true));
+    let nightly = pick(NIGHTLY, opts.nightly);
 
-    std::thread::scope(|s| {
-        let built = s.spawn(prebuild);
-        let main_up = (!shared.is_empty()).then(|| s.spawn(|| create_main(&main, &work)));
-        let solo_up = (!alone.is_empty()).then(|| s.spawn(|| solo.create(None, "120s")));
-        join(built)?;
-        if let Some(t) = main_up {
-            join(t)?;
-        }
-        if let Some(t) = solo_up {
-            join(t)?;
-        }
-        Ok::<_, anyhow::Error>(())
-    })?;
-    std::thread::scope(|s| {
-        let main_ready = (!shared.is_empty()).then(|| s.spawn(|| prepare_main(&main, &work)));
-        let solo_ready = (!alone.is_empty()).then(|| s.spawn(|| prepare_solo(&solo)));
-        if let Some(t) = main_ready {
-            join(t)?;
-        }
-        if let Some(t) = solo_ready {
-            join(t)?;
-        }
-        Ok::<_, anyhow::Error>(())
-    })?;
+    setup(&main, &solo, &work, !shared.is_empty(), !alone.is_empty())?;
     println!(
         "kind-all: clusters ready after {}s",
         start.elapsed().as_secs()
@@ -141,7 +128,7 @@ pub(crate) fn kind_all(opts: &Opts) -> Result<()> {
     std::thread::scope(|s| {
         s.spawn(|| {
             for suite in &alone {
-                let o = run_suite(suite, &solo, &work);
+                let o = run_suite(suite, Some(&solo), &work);
                 lock(&outcomes).push(o);
             }
         });
@@ -151,9 +138,20 @@ pub(crate) fn kind_all(opts: &Opts) -> Result<()> {
                     let Some(suite) = lock(&queue).pop_front() else {
                         break;
                     };
-                    let o = run_suite(suite, &main, &work);
+                    let o = run_suite(suite, Some(&main), &work);
                     lock(&outcomes).push(o);
                 }
+            });
+        }
+    });
+    // The long runs get the host to themselves.
+    drop(main);
+    drop(solo);
+    std::thread::scope(|s| {
+        for suite in &nightly {
+            s.spawn(|| {
+                let o = run_suite(suite, None, &work);
+                lock(&outcomes).push(o);
             });
         }
     });
@@ -162,6 +160,41 @@ pub(crate) fn kind_all(opts: &Opts) -> Result<()> {
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     report(&outcomes, start.elapsed())
+}
+
+/// Builds what the suites share and creates and prepares the clusters that
+/// will be used, all at once where they do not depend on each other.
+fn setup(
+    main: &Cluster,
+    solo: &Cluster,
+    work: &Path,
+    use_main: bool,
+    use_solo: bool,
+) -> Result<()> {
+    std::thread::scope(|s| {
+        let built = s.spawn(prebuild);
+        let main_up = use_main.then(|| s.spawn(|| create_main(main, work)));
+        let solo_up = use_solo.then(|| s.spawn(|| solo.create(None, "120s")));
+        join(built)?;
+        if let Some(t) = main_up {
+            join(t)?;
+        }
+        if let Some(t) = solo_up {
+            join(t)?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
+    std::thread::scope(|s| {
+        let main_ready = use_main.then(|| s.spawn(|| prepare_main(main, work)));
+        let solo_ready = use_solo.then(|| s.spawn(|| prepare_solo(solo)));
+        if let Some(t) = main_ready {
+            join(t)?;
+        }
+        if let Some(t) = solo_ready {
+            join(t)?;
+        }
+        Ok(())
+    })
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -243,11 +276,16 @@ fn prepare_solo(solo: &Cluster) -> Result<()> {
     ))
 }
 
-/// Runs `cargo xtask <suite>` on `cluster`, its output in `<work>/<suite>.log`.
-fn run_suite(suite: &'static str, cluster: &Cluster, work: &Path) -> Outcome {
+/// Runs `cargo xtask <suite>` on `cluster`, or on a cluster of its own when
+/// `None`, its output in `<work>/<suite>.log`.
+fn run_suite(suite: &'static str, cluster: Option<&Cluster>, work: &Path) -> Outcome {
     let log = work.join(format!("{suite}.log"));
     let started = Instant::now();
-    println!("kind-all: {suite} started on {}", cluster.name());
+    let name = cluster.map_or_else(
+        || crate::kind_cluster(&format!("bk-{suite}")),
+        |c| c.name().to_owned(),
+    );
+    println!("kind-all: {suite} started on {name}");
     let passed = spawn_suite(suite, cluster, &log).unwrap_or_else(|e| {
         eprintln!("kind-all: {suite}: {e:#}");
         false
@@ -260,21 +298,22 @@ fn run_suite(suite: &'static str, cluster: &Cluster, work: &Path) -> Outcome {
     );
     Outcome {
         suite,
-        cluster: cluster.name().to_owned(),
+        cluster: name,
         took,
         passed,
         log,
     }
 }
 
-fn spawn_suite(suite: &str, cluster: &Cluster, log: &Path) -> Result<bool> {
+fn spawn_suite(suite: &str, cluster: Option<&Cluster>, log: &Path) -> Result<bool> {
     let exe = std::env::current_exe().context("finding the xtask binary")?;
     let out = std::fs::File::create(log).with_context(|| log.display().to_string())?;
     let mut c = Command::new(exe);
-    c.arg(suite)
-        .env(CLUSTER_VAR, cluster.name())
-        .stdout(out.try_clone()?)
-        .stderr(out);
+    c.arg(suite).stdout(out.try_clone()?).stderr(out);
+    match cluster {
+        Some(cl) => c.env(CLUSTER_VAR, cl.name()),
+        None => c.env_remove(CLUSTER_VAR),
+    };
     Ok(Spawned::spawn(&mut c)?.wait()?.success())
 }
 
@@ -311,12 +350,11 @@ fn report(outcomes: &[Outcome], total: Duration) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SHARED, SOLO};
+    use super::{NIGHTLY, SHARED, SOLO};
     use clap::CommandFactory as _;
 
     /// A new kind suite cannot be left out of the PR gate by accident: every
-    /// task that names a kind suite is in kind-all, or is one of the long
-    /// nightly runs, or does not run a suite.
+    /// task that names a kind suite is in kind-all, or does not run a suite.
     #[test]
     fn every_kind_suite_is_in_kind_all() {
         let not_suites = [
@@ -328,18 +366,16 @@ mod tests {
             "e2e-up",
             "kind-all",
             "help",
-            // Nightly, with long windows on a quiet cluster.
-            "soak",
-            "perf",
         ];
         for task in crate::Cli::command().get_subcommands() {
             let name = task.get_name();
             assert!(
-                not_suites.contains(&name) || SHARED.contains(&name) || SOLO.contains(&name),
+                not_suites.contains(&name)
+                    || [SHARED, SOLO, NIGHTLY].iter().any(|l| l.contains(&name)),
                 "{name} is not in kind-all"
             );
         }
-        for s in SHARED.iter().chain(SOLO) {
+        for s in SHARED.iter().chain(SOLO).chain(NIGHTLY) {
             assert!(
                 crate::Cli::command().find_subcommand(s).is_some(),
                 "{s} is not a task"

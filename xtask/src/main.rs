@@ -140,6 +140,9 @@ enum Task {
         /// How many suites run at once on the shared cluster; 0 runs all of them.
         #[arg(long, default_value_t = 0)]
         jobs: usize,
+        /// Also run soak and perf, each on its own cluster, once the others are done.
+        #[arg(long)]
+        nightly: bool,
     },
     /// Install the chart on kind behind Envoy Gateway, trust GitHub OIDC for REPO (owner/name) and leave the cluster running. Used by the CI Action job.
     E2eUp {
@@ -379,11 +382,13 @@ fn main() -> Result<()> {
             keep,
             down,
             jobs,
+            nightly,
         } => kind_all::kind_all(&kind_all::Opts {
             only,
             keep,
             down,
             jobs,
+            nightly,
         }),
         Task::Perf { loopback: true, .. } => perf_loopback(),
         Task::Perf {

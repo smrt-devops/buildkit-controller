@@ -540,17 +540,34 @@ fn watch_build(c: &Client<'_>, build: &mut Spawned, log: &Path) -> Result<()> {
 }
 
 /// `drain_budget_s` of the controller's `draining` log line, if it has one.
+/// Text logs may carry ANSI colour codes, which are dropped first.
 fn drain_budget(logs: &str) -> Option<u64> {
-    logs.lines()
-        .filter(|l| l.contains(" draining "))
-        .find_map(|l| {
-            l.split("drain_budget_s=")
-                .nth(1)?
-                .split_whitespace()
-                .next()?
-                .parse()
-                .ok()
-        })
+    logs.lines().map(strip_ansi).find_map(|l| {
+        let fields = l.split_once(" draining ")?.1;
+        fields
+            .split_whitespace()
+            .find_map(|f| f.strip_prefix("drain_budget_s="))?
+            .parse()
+            .ok()
+    })
+}
+
+/// `line` without ANSI escape sequences (`ESC [ ... <letter>`).
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// b. SIGTERM to the leader moves the Lease to a live replica within seconds.
@@ -721,5 +738,7 @@ mod tests {
             None
         );
         assert_eq!(drain_budget(""), None);
+        let colour = "\u{1b}[32m INFO\u{1b}[0m stop: draining \u{1b}[3mdrain_budget_s\u{1b}[0m\u{1b}[2m=\u{1b}[0m86700";
+        assert_eq!(drain_budget(colour), Some(86700));
     }
 }
