@@ -3,14 +3,14 @@
 //!
 //! - `GET /v2/`
 //! - `HEAD`/`GET /v2/<name>/blobs/<digest>`, with a single `Range`
-//! - `POST /v2/<name>/blobs/uploads/`, with `?mount=&from=`
+//! - `POST /v2/<name>/blobs/uploads/`
 //! - `PATCH` and `PUT ?digest=` on the upload's `Location`
 //! - `HEAD`/`GET`/`PUT /v2/<name>/manifests/<reference>`
 //!
 //! Everything else gets 405 or 404 `UNSUPPORTED`. Every route checks the
-//! caller's grant first: pull for reads, push for writes, and pull on `from`
-//! for a cross-repository mount (a mount the caller may not read falls back
-//! to a plain upload, as in the reference registry).
+//! caller's grant first: pull for reads, push for writes. A grant covers one
+//! repository, so a cross-repository mount (`?mount=&from=`) is never allowed
+//! and falls back to a plain upload, as in the reference registry.
 
 use std::collections::HashMap;
 use std::io::SeekFrom;
@@ -25,7 +25,7 @@ use axum::http::header::{
 use axum::http::{HeaderValue, Method, Request, Response, StatusCode};
 use futures::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::OwnedMutexGuard;
+use tokio::sync::{OwnedMutexGuard, Semaphore};
 use tokio_util::io::ReaderStream;
 use tracing::{error, info};
 
@@ -36,6 +36,8 @@ use crate::pki::WorkerIdentity;
 
 /// Largest manifest accepted (the reference registry's limit).
 pub const MAX_MANIFEST: usize = 4 << 20;
+/// Manifest bodies buffered at once (each up to [`MAX_MANIFEST`]); more wait.
+static MANIFEST_PUTS: Semaphore = Semaphore::const_new(16);
 /// Longest gap between two chunks of a request body.
 pub const BODY_IDLE: Duration = Duration::from_mins(1);
 
@@ -494,22 +496,9 @@ async fn start_upload(
             "single-request uploads are not served; PUT to the upload location",
         ));
     }
-    if let (Some(mount), Some(from)) = (q.get("mount"), q.get("from"))
-        && let Ok(d) = mount.parse::<Digest>()
-        && valid_repository(from)
-        && reg.allowed(peer, from, Action::Pull)
-        && reg.store.mount(from, name, &d).await?
-    {
-        return empty(
-            StatusCode::CREATED,
-            &[
-                ("location", format!("/v2/{name}/blobs/{d}")),
-                (DIGEST_HEADER, d.to_string()),
-                ("content-length", "0".into()),
-            ],
-        );
-    }
-    let owner = format!("{}/{}", peer.namespace, peer.pod);
+    // The full identity, nonce included: a later pod of the same name starts
+    // with a clean quota.
+    let owner = peer.dns_name();
     let id = reg.store.start_upload(name, &owner).await?.ok_or_else(|| {
         ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -637,7 +626,7 @@ async fn get_manifest(
             "manifest unknown",
         )
     };
-    let m = reg.store.manifest(name, r).await?.ok_or_else(unknown)?;
+    let m = reg.store.manifest(name, r).await.ok_or_else(unknown)?;
     let body = if head {
         Body::empty()
     } else {
@@ -670,6 +659,10 @@ async fn put_manifest(
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_owned);
+    let _permit = MANIFEST_PUTS
+        .acquire()
+        .await
+        .map_err(|e| internal(&std::io::Error::other(e)))?;
     let mut body = req.into_body().into_data_stream();
     let mut buf = Vec::new();
     loop {

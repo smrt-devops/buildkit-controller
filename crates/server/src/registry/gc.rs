@@ -10,8 +10,7 @@
 //!    kept newest first (a manifest by last pull or push, a link by when it
 //!    was made or last read) while the distinct blobs they hold fit the pool
 //!    budget. One that does not fit is removed and the scan goes on, so one
-//!    oversized push cannot empty the pool. A repository keeps at most
-//!    [`MAX_KEPT_MANIFESTS`] manifests.
+//!    oversized push cannot empty the pool.
 //! 2. The same over every remaining candidate, against the volume budget.
 //! 3. Mark and sweep: a repository keeps a blob link while a remaining
 //!    manifest of it reaches the blob, or while the link is younger than the
@@ -21,12 +20,9 @@
 //! of unreferenced uploads can push a pool past its budget or evict more than
 //! a newer manifest of the same size would.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use super::store::{Digest, Index, Repo};
-
-/// Manifests one repository keeps; older ones are evicted whatever their size.
-pub const MAX_KEPT_MANIFESTS: usize = 1024;
 
 /// The byte budgets.
 pub trait Budgets: Send + Sync {
@@ -109,13 +105,12 @@ enum Kind {
 /// `(repository, digest, last used, kind)`.
 type Candidate<'a> = (&'a str, &'a Digest, u64, Kind);
 
-/// Splits `cands` into those kept within `budget` (and `per_repo` manifests
-/// per repository), newest first, and those removed.
+/// Splits `cands` into those kept within `budget`, newest first, and those
+/// removed.
 fn fit<'a>(
     idx: &'a Index,
     mut cands: Vec<Candidate<'a>>,
     budget: u64,
-    per_repo: usize,
 ) -> (Vec<Candidate<'a>>, Vec<Candidate<'a>>) {
     cands.sort_by(|a, b| {
         b.2.cmp(&a.2)
@@ -128,7 +123,6 @@ fn fit<'a>(
     let mut blobs: HashSet<&Digest> = HashSet::new();
     let mut kept_manifests: HashSet<(&str, &Digest)> = HashSet::new();
     let mut removed_manifests: HashSet<(&str, &Digest)> = HashSet::new();
-    let mut counts: HashMap<&str, usize> = HashMap::new();
     let (mut kept, mut removed) = (Vec::new(), Vec::new());
     for c in cands {
         let (name, d, _, kind) = c;
@@ -153,25 +147,18 @@ fn fit<'a>(
                     .copied()
                     .filter(|b| repo.manifests.contains_key(*b))
                     .collect();
-                let new = manifests
-                    .iter()
-                    .filter(|b| !kept_manifests.contains(&(name, **b)))
-                    .count();
                 let add: u64 = reached
                     .iter()
                     .filter(|b| !blobs.contains(**b))
                     .map(|b| size(b))
                     .sum();
-                let count = counts.entry(name).or_default();
                 // A manifest whose closure lost a manifest already cannot be whole.
                 let fits = used.saturating_add(add) <= budget
-                    && count.saturating_add(new) <= per_repo
                     && !manifests
                         .iter()
                         .any(|b| removed_manifests.contains(&(name, *b)));
                 if fits {
                     used += add;
-                    *count += new;
                     kept_manifests.extend(manifests.into_iter().map(|b| (name, b)));
                     blobs.extend(reached);
                 } else {
@@ -211,11 +198,11 @@ pub(super) fn plan(idx: &Index, budgets: &dyn Budgets, now: u64, grace: u64) -> 
     let mut removed: Vec<(Candidate, Reason)> = Vec::new();
     let mut all = Vec::new();
     for (pool, cands) in pools {
-        let (kept, gone) = fit(idx, cands, budgets.pool(pool), MAX_KEPT_MANIFESTS);
+        let (kept, gone) = fit(idx, cands, budgets.pool(pool));
         all.extend(kept);
         removed.extend(gone.into_iter().map(|c| (c, Reason::Pool)));
     }
-    let (_, gone) = fit(idx, all, budgets.total(), usize::MAX);
+    let (_, gone) = fit(idx, all, budgets.total());
     removed.extend(gone.into_iter().map(|c| (c, Reason::Volume)));
 
     let mut out = Plan::default();
@@ -519,38 +506,5 @@ mod tests {
             assert_eq!(evicted(&p), vec![("ns/p/a".into(), 1, reason)]);
             assert_eq!(kept_bytes(&idx, &p), 20);
         }
-    }
-
-    #[test]
-    fn a_repository_keeps_a_bounded_number_of_manifests() {
-        let mut idx = Index::default();
-        let repo = idx.repos.entry("ns/p/a".to_owned()).or_default();
-        let n = MAX_KEPT_MANIFESTS + 3;
-        let digests: Vec<Digest> = (0..n).map(|i| Digest::of(&i.to_be_bytes())).collect();
-        for (i, d) in digests.iter().enumerate() {
-            repo.links.insert(d.clone(), 0);
-            repo.manifests.insert(
-                d.clone(),
-                Manifest {
-                    media_type: "application/vnd.oci.image.index.v1+json".into(),
-                    refs: Vec::new(),
-                    last_used: i as u64,
-                    persisted: 0,
-                },
-            );
-            idx.blobs.insert(d.clone(), 1);
-        }
-        let mut gone: Vec<Digest> = plan(&idx, &BIG, 10_000, 0)
-            .evict
-            .into_iter()
-            .map(|(_, d, r)| {
-                assert_eq!(r, Reason::Pool);
-                d
-            })
-            .collect();
-        gone.sort();
-        let mut want = digests[..3].to_vec();
-        want.sort();
-        assert_eq!(gone, want);
     }
 }

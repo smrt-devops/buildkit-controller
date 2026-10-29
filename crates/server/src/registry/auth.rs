@@ -15,8 +15,9 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::pki::{WorkerIdentity, is_worker_nonce};
 
-/// What a worker may do: pull from `repository` and the repositories below
-/// it, and push there too when `push` is set.
+/// What a worker may do: pull from `repository`, and push there too when
+/// `push` is set. Nothing else, not even a repository nested below it, so one
+/// allocation's cache is one repository.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct Grant {
     /// `<pool-namespace>/<pool>/<scope>`.
@@ -47,11 +48,7 @@ impl Grant {
     /// Whether this grant allows `action` on `repository`.
     #[must_use]
     pub fn allows(&self, repository: &str, action: Action) -> bool {
-        let inside = repository == self.repository
-            || repository
-                .strip_prefix(self.repository.as_str())
-                .is_some_and(|rest| rest.starts_with('/'));
-        inside && (action == Action::Pull || self.push)
+        repository == self.repository && (action == Action::Pull || self.push)
     }
 }
 
@@ -184,13 +181,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn grants_cover_the_repository_and_below_only() {
+    fn grants_cover_exactly_the_repository() {
         let g = Grant {
             repository: "ns/pool/app".into(),
             push: false,
         };
         assert!(g.allows("ns/pool/app", Action::Pull));
-        assert!(g.allows("ns/pool/app/sub", Action::Pull));
+        assert!(!g.allows("ns/pool/app/sub", Action::Pull));
         assert!(!g.allows("ns/pool/apple", Action::Pull));
         assert!(!g.allows("ns/pool", Action::Pull));
         assert!(!g.allows("ns/pool/app", Action::Push));

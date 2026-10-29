@@ -470,8 +470,11 @@ async fn every_route_enforces_the_grant() {
     let d = push_blob(reg, "writer", "ns/p/app", b"data").await;
     let r = put_index(reg, "writer", "ns/p/app", "t", &[&d]).await;
     assert_eq!(r.status, StatusCode::CREATED);
-    // Below the granted repository is inside the grant.
-    push_blob(reg, "writer", "ns/p/app/sub", b"data").await;
+    // Below the granted repository is outside the grant.
+    assert_eq!(
+        open_upload(reg, "writer", "ns/p/app/sub").await.status,
+        StatusCode::FORBIDDEN
+    );
 
     // A read-only grant pulls but never pushes.
     let blob = format!("/v2/ns/p/app/blobs/{d}");
@@ -546,7 +549,7 @@ async fn every_route_enforces_the_grant() {
 }
 
 #[tokio::test]
-async fn blobs_are_per_repository_and_mount_needs_pull_on_the_source() {
+async fn blobs_are_per_repository_and_never_mount_across() {
     let f = fixture("mount");
     let reg = &f.reg;
     let d = push_blob(reg, "other", "ns/p/other", b"secret layer").await;
@@ -558,7 +561,7 @@ async fn blobs_are_per_repository_and_mount_needs_pull_on_the_source() {
             .status,
         StatusCode::NOT_FOUND
     );
-    // A mount from a repository the caller cannot pull falls back to an upload.
+    // A grant covers one repository, so a mount always falls back to an upload.
     let mount = format!("/v2/ns/p/app/blobs/uploads/?mount={d}&from=ns%2Fp%2Fother");
     let r = call(reg, "writer", Method::POST, &mount, &[], b"").await;
     assert_eq!(r.status, StatusCode::ACCEPTED);
@@ -568,17 +571,11 @@ async fn blobs_are_per_repository_and_mount_needs_pull_on_the_source() {
             .status,
         StatusCode::NOT_FOUND
     );
-    // With pull on the source, the mount links the blob.
+    // A grant on the pool does not reach the repositories below it.
     let r = call(reg, "wide", Method::POST, &mount, &[], b"").await;
-    assert_eq!(r.status, StatusCode::CREATED);
-    assert_eq!(r.header("location"), here);
-    assert_eq!(r.header("docker-content-digest"), d.to_string());
-    assert_eq!(
-        call(reg, "writer", Method::HEAD, &here, &[], b"")
-            .await
-            .status,
-        StatusCode::OK
-    );
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let r = call(reg, "wide", Method::HEAD, &here, &[], b"").await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -1036,4 +1033,28 @@ async fn the_listener_admits_only_worker_client_certs() {
     stop.cancel();
     server.await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Pod names are reused: the next incarnation of a pod does not inherit the
+/// uploads, and so the quota, of the previous one.
+#[tokio::test]
+async fn a_new_incarnation_of_a_pod_has_its_own_upload_quota() {
+    let f = fixture("incarnation");
+    let reg = &f.reg;
+    for _ in 0..MAX_UPLOADS_PER_OWNER {
+        assert_eq!(
+            open_upload(reg, "writer", "ns/p/app").await.status,
+            StatusCode::ACCEPTED
+        );
+    }
+    let next = WorkerIdentity {
+        nonce: "fedcba9876543210".to_owned(),
+        ..worker("writer")
+    };
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v2/ns/p/app/blobs/uploads/")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(handle(reg, &next, req).await.status(), StatusCode::ACCEPTED);
 }
