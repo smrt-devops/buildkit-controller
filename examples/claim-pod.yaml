@@ -1,6 +1,6 @@
 # A BuildKitClaim and a pod that builds through it. The claim and the pod run in `apps`,
 # not in the pool namespace `ci`, which holds no other workloads. Needs the chart installed
-# with `claims.enabled: true` and `apps` in `claims.namespaces`, and a pool in `ci`
+# with `apps` in `claims.namespaces`, and a pool in `ci`
 # whose access rules admit the `apps` namespace, for example:
 #
 #   spec:

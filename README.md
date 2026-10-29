@@ -25,7 +25,7 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 
 ## Quickstart
 
-You need a cluster that meets the requirements above, `helm`, and a GitHub repository that can run Actions. The chart exposes the controller through a Gateway API Gateway you run: an HTTPS listener for the API and a TLS passthrough listener for the edge, with the Gateway API v1.5.0 or later CRDs ([helm/README.md](helm/README.md#exposure) has an example and the implementations that support it). Without one, add `--set service.type=LoadBalancer`. [docs/quickstart.md](docs/quickstart.md) has the kind version.
+You need a cluster that meets the requirements above, `helm`, and a GitHub repository that can run Actions. The chart exposes the controller through a Gateway API Gateway you run: an HTTPS listener for the API and a TLS passthrough listener for the edge, with the Gateway API v1.5.0 or later CRDs ([the chart README](helm/buildkit-controller/README.md#exposure) has an example and the implementations that support it). Without one, add `--set service.type=LoadBalancer`. [docs/quickstart.md](docs/quickstart.md) has the kind version.
 
 ```sh
 # 1. Install the controller and its CRD, attached to the Gateway bk in gateway-system.
@@ -92,7 +92,7 @@ The documentation site is at <https://smrt-devops.github.io/buildkit-controller/
 - [docs/quickstart.md](docs/quickstart.md): install, first pool, first build.
 - [docs/architecture.md](docs/architecture.md): roles, the CRD, the data path.
 - [docs/operations.md](docs/operations.md): sizing, scaling, upgrades, CA rotation, metrics, troubleshooting.
-- [helm/README.md](helm/README.md): chart values.
+- [helm/buildkit-controller/README.md](helm/buildkit-controller/README.md): chart values.
 - [action/](action/action.yml) and [docs/ci/](docs/ci/README.md): the GitHub Action and the curl recipe for other CI systems.
 - [examples/](examples/README.md): pools and Helm values.
 - [BuildKitClaim](docs/architecture.md#buildkitclaim): the object behind every allocation. In-cluster pipelines (Tekton, Argo) can create one to get a builder without the HTTP API.

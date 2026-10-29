@@ -214,12 +214,10 @@ fn error_codes_match_spec_table() {
         ),
         (ErrorCode::Internal, "internal", 500),
         (ErrorCode::PoolExhausted, "pool_exhausted", 503),
-        (ErrorCode::StartTimeout, "start_timeout", 503),
         (ErrorCode::PodLost, "pod_lost", 503),
         (ErrorCode::NotReady, "not_ready", 503),
         (ErrorCode::CaUnavailable, "ca_unavailable", 503),
         (ErrorCode::UpstreamError, "upstream_error", 503),
-        (ErrorCode::ShuttingDown, "shutting_down", 503),
     ];
     assert_eq!(table.len(), ErrorCode::ALL.len());
     for (code, s, status) in table {
@@ -230,8 +228,6 @@ fn error_codes_match_spec_table() {
         assert!(ErrorCode::ALL.contains(&code));
     }
     assert_eq!(ErrorCode::PoolExhausted.retry_after_seconds(), Some(5));
-    assert_eq!(ErrorCode::StartTimeout.retry_after_seconds(), Some(5));
     assert_eq!(ErrorCode::NotReady.retry_after_seconds(), None);
-    assert_eq!(ErrorCode::ShuttingDown.retry_after_seconds(), Some(1));
     assert_eq!(ErrorCode::UpstreamError.retry_after_seconds(), Some(2));
 }

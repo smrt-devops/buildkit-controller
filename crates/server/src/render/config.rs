@@ -6,15 +6,15 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TomlError, Value};
 
 use super::hash::sha256_hex;
 
-/// The pool's `buildkitdConfig` with a `[registry."<cache_host>"]` entry that
+/// The pool's `buildkitdConfig` with a `[registry."<registry_host>"]` entry that
 /// trusts the internal CA and presents the worker's registry client certificate
 /// (`client.crt`, from the client CA, which no buildkitd trusts). Without a
 /// cache host, or for a config [`with_registry`] refuses, the config is
 /// returned unchanged: `validate_template` reports a refused one, so no pod
 /// is rendered from it.
 #[must_use]
-pub fn buildkitd_config(cfg: &str, cache_host: Option<&str>) -> String {
-    cache_host
+pub fn buildkitd_config(cfg: &str, registry_host: Option<&str>) -> String {
+    registry_host
         .and_then(|h| with_registry(cfg, h).ok())
         .unwrap_or_else(|| cfg.to_owned())
 }

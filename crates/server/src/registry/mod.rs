@@ -1,4 +1,4 @@
-//! The `cache` role: a built-in registry for `BuildKit`'s registry cache.
+//! The `registry` role: the built-in cache registry behind `BuildKit`'s registry cache.
 //!
 //! It serves the part of the OCI distribution API that `--cache-to
 //! type=registry` and `--cache-from type=registry` use ([`api`]), over mTLS
@@ -30,7 +30,7 @@ use tracing::{info, warn};
 
 pub use api::{MAX_MANIFEST, Registry, handle};
 pub use auth::{Action, Authorizer, Grant, PeerError, StaticGrants, peer_identity};
-pub use config::{CacheArgs, parse_duration, parse_size};
+pub use config::{RegistryArgs, parse_duration, parse_size};
 pub use gc::{Budgets, FixedBudgets, Reason};
 pub use listener::{Limits, server_config};
 pub use metrics::RegistryMetrics;
@@ -47,7 +47,7 @@ use crate::telemetry::ops;
 pub const UPLOAD_TTL: Duration = Duration::from_hours(1);
 
 /// Runs the role until `shutdown`, then drains.
-pub async fn run(args: CacheArgs, shutdown: CancellationToken) -> anyhow::Result<()> {
+pub async fn run(args: RegistryArgs, shutdown: CancellationToken) -> anyhow::Result<()> {
     info!(
         version = env!("CARGO_PKG_VERSION"),
         "cache registry starting"
@@ -151,7 +151,7 @@ async fn collect(
 /// Who may do what, and each pool's budget: from the worker pods and pools
 /// in the watched namespaces, or, with `--grants-file`, from the file.
 async fn authorizer(
-    args: &CacheArgs,
+    args: &RegistryArgs,
     metrics: &Arc<Metrics>,
     readiness: &Arc<Readiness>,
     stop: &CancellationToken,

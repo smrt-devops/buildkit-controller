@@ -134,10 +134,6 @@ List this cluster's pod, service and node ranges:
   helm upgrade {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} --reuse-values \
     --set 'workerNetwork.clusterCIDRs={10.244.0.0/16,10.96.0.0/12}'
 {{- end }}
-{{- if .Values.watchNamespace }}
-
-watchNamespace is deprecated; set watchNamespaces: [{{ .Values.watchNamespace }}] instead.
-{{- end }}
 {{- if not .Values.pools }}
 
 The chart created no pools. Add them under `pools:` in values, or apply BuildKitPool objects separately.

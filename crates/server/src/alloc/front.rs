@@ -20,16 +20,16 @@ use tracing::{error, info, warn};
 
 use super::backend::{Backend, Write};
 use super::bind::retire_pod;
-use super::bind::{MIN_TTL, access_rules, pool_ready, seconds};
 use super::cache;
 use super::certs::CertSource;
+use super::claims;
 use super::error::AllocError;
 use super::metrics::AllocMetrics;
-use super::pods::{ANN_CLAIM, ann, new_alloc_id, of_pool};
+use super::pods::{ann, new_alloc_id, of_pool};
+use super::pool::{MIN_TTL, access_rules, pool_ready, seconds};
 use crate::auth::Identity;
-use crate::claim::logic;
 use crate::pki::{AllocId, ClientPublicKey, Namespace, PoolName};
-use crate::render::{ANN_ALLOC, ANN_OWNER, LABEL_POOL};
+use crate::render::{ANN_ALLOC, ANN_CLAIM, ANN_OWNER, LABEL_POOL};
 use crate::runtime::stores::{ClaimEvent, ClaimSubscription};
 
 /// How long `POST /v1/allocations` waits for the claim to bind.
@@ -59,6 +59,7 @@ pub struct Front {
     metrics: AllocMetrics,
     stopping: CancellationToken,
     /// Worker pods, for releasing allocations made before claims existed.
+    /// v0.1.0 upgrade shim: remove in the release after v3.
     pods: Option<Store<Pod>>,
 }
 
@@ -91,7 +92,8 @@ impl Front {
     }
 
     /// Releases of allocations made before every allocation was a claim
-    /// retire their pods from this store.
+    /// retire their pods from this store. v0.1.0 upgrade shim: remove in the
+    /// release after v3.
     #[must_use]
     pub fn with_pods(mut self, pods: Store<Pod>) -> Self {
         self.pods = Some(pods);
@@ -179,7 +181,7 @@ impl Front {
     ) -> Result<Outcome, AllocError> {
         let mut sub = (self.subscribe)();
         let c = self.owned(who, id).await?;
-        let c = if logic::phase(&c) == ClaimPhase::Pending && !wait.is_zero() {
+        let c = if claims::phase(&c) == ClaimPhase::Pending && !wait.is_zero() {
             // A claim the store does not hold yet answers as last read.
             let at = Instant::now() + wait.min(MAX_WAIT);
             self.settle(id, at, &mut sub).await.unwrap_or(c)
@@ -213,6 +215,7 @@ impl Front {
     /// Release an allocation made before every allocation was a claim: its
     /// pods carry the id and the caller's owner but no `P claim`. Each retire
     /// tests the uid and `alloc == id`, so a look-alike pod is harmless.
+    /// v0.1.0 upgrade shim: remove in the release after v3.
     async fn release_unclaimed(&self, who: &Identity, id: &str) -> Result<(), AllocError> {
         let Some(pods) = &self.pods else {
             return Err(AllocError::NotFound);
@@ -294,7 +297,7 @@ impl Front {
                 }
             },
         };
-        let owner = logic::caller(&c, &self.namespace).map(|c| c.owner);
+        let owner = claims::caller(&c, &self.namespace).map(|c| c.owner);
         if owner.as_deref().map(str::as_bytes) != Some(who.owner().as_bytes()) {
             warn!(
                 alloc_id = id,
@@ -321,7 +324,7 @@ impl Front {
         loop {
             let c = self.stored(id);
             if c.as_ref()
-                .is_some_and(|c| logic::phase(c) != ClaimPhase::Pending)
+                .is_some_and(|c| claims::phase(c) != ClaimPhase::Pending)
             {
                 return c;
             }
@@ -340,17 +343,17 @@ impl Front {
 
     /// The API answer for a claim.
     fn outcome(&self, c: &BuildKitClaim) -> Result<Outcome, AllocError> {
-        if let Some((code, message)) = logic::api_error(c) {
+        if let Some((code, message)) = claims::api_error(c) {
             return Err(AllocError::of_claim(code, message));
         }
         let id = c.metadata.name.clone().unwrap_or_default();
         let s = c
             .status
             .as_ref()
-            .filter(|_| logic::phase(c) == ClaimPhase::Bound);
+            .filter(|_| claims::phase(c) == ClaimPhase::Bound);
         let Some(s) = s else {
             let all = self.claims.state();
-            return Ok(pending(&id, logic::position(&all, &self.served, c)));
+            return Ok(pending(&id, claims::position(&all, &self.served, c)));
         };
         let bundle = self.certs.bundle().ok_or(AllocError::CaUnavailable)?;
         let field = |v: &Option<String>| v.clone().ok_or(AllocError::Internal);
@@ -358,7 +361,7 @@ impl Front {
             id: field(&s.allocation_id)?,
             namespace: c.spec.pool_ref.namespace.clone(),
             pool: c.spec.pool_ref.name.clone(),
-            owner: logic::caller(c, &self.namespace)
+            owner: claims::caller(c, &self.namespace)
                 .map(|c| c.owner)
                 .unwrap_or_default(),
             endpoint: field(&s.endpoint)?,

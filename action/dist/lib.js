@@ -232,7 +232,8 @@ function effectiveQueueTimeout(queueTimeoutSeconds, pool) {
 /**
  * Socket timeout of a POST: the whole budget left. A v3 controller answers within about 20 s, but a
  * v0.1.0 controller holds the POST open through the queue wait and the pod start, so a short timeout
- * would fail an allocation whose id the client never saw.
+ * would fail an allocation whose id the client never saw. v0.1.0 upgrade shim: remove in the release
+ * after v3, with a 40 s timeout like the polls.
  */
 function postTimeoutMs(remainingMs) {
   return Math.max(1000, remainingMs);
@@ -258,7 +259,8 @@ function queueTimeoutFor(queueTimeoutSeconds, remainingMs) {
 /** Total retry budget of a release or a pool listing: neither queues, so neither follows the queue timeout. */
 const SHORT_BUDGET_MS = 60000;
 
-// Error codes the controller answers 503 with Retry-After before it claims anything.
+// Error codes the controller answers 503 with Retry-After before it claims anything (start_timeout and
+// shutting_down: v0.1.0 only; v0.1.0 upgrade shim: remove them in the release after v3).
 const CLAIM_FREE_CODES = new Set(['pool_exhausted', 'start_timeout', 'shutting_down', 'upstream_error']);
 // Error codes that end a queued allocation's id for good: GET /v1/allocations/{id} will not change its answer.
 const TERMINAL_POLL_CODES = new Set(['pool_exhausted', 'pod_lost', 'not_found', 'forbidden']);

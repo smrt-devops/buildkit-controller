@@ -1,0 +1,5 @@
+# expect: at '': additional properties 'watchNamespace' not allowed
+# The single-namespace form is gone; use watchNamespaces.
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+watchNamespace: ci
+gateway: {enabled: false}

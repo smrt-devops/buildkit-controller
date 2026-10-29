@@ -27,7 +27,7 @@ pub struct Shutdown {
     pub leader_stop: CancellationToken,
     /// Resolves when the reconciler supervisor has returned.
     pub reconciler: BoxFuture<'static, ()>,
-    /// Leader-gated components (the claim controller).
+    /// Leader-gated components (the allocator).
     pub leader: Stages,
     /// Bound on stopping the leader-gated components (`kube.requestTimeout`).
     pub request_timeout: Duration,

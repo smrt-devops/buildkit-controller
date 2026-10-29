@@ -2,7 +2,7 @@
 {{- $ns := .Release.Namespace -}}
 {{- $watch := include "bkc.watchNamespaces" . | fromJsonArray -}}
 {{- $subjects := list (dict "kind" "ServiceAccount" "name" $fn "namespace" $ns) -}}
-{{- /* PVC list and delete serve only the one-time removal of v0.1.0 cache volumes; drop them in the next release. */ -}}
+{{- /* PVC list and delete serve only the one-time removal of v0.1.0 cache volumes. v0.1.0 upgrade shim: remove in the release after v3. */ -}}
 {{- $workload := list
   (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitpools") "verbs" (list "get" "list" "watch"))
   (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitpools/status") "verbs" (list "patch"))
@@ -127,10 +127,7 @@ metadata:
   labels: {{- include "bkc.labels" . | nindent 4 }}
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: {{ $fn }}}
 subjects: {{- toYaml $subjects | nindent 2 }}
-{{- if .Values.claims.enabled }}
-{{- if empty .Values.claims.namespaces }}
-{{- fail "claims.namespaces must list the namespaces whose claims the controller serves" }}
-{{- end }}
+{{- if .Values.claims.namespaces }}
 {{- $claimRules := list
   (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitclaims") "verbs" (list "get" "list" "watch"))
   (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitclaims/status") "verbs" (list "get" "patch" "update")) }}

@@ -454,6 +454,10 @@ pub struct Workers {
     /// How long a pod may take to become Ready, from 10s to 30m.
     #[schemars(extend("x-kubernetes-validations" = [{"rule": "duration(self) >= duration('10s') && duration(self) <= duration('30m')", "message": "startTimeout must be between 10s and 30m"}]))]
     pub start_timeout: Duration,
+    /// Size limit of the buildkitd state `emptyDir`. When unset, the
+    /// ephemeral-storage limit bounds it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_size_limit: Option<Quantity>,
     /// Build cache settings.
     pub cache: Cache,
 }
@@ -463,6 +467,7 @@ impl Default for Workers {
         Self {
             buildkitd_config: String::new(),
             start_timeout: dur("2m"),
+            state_size_limit: None,
             cache: Cache::default(),
         }
     }
@@ -472,10 +477,6 @@ impl Default for Workers {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Cache {
-    /// Size limit of the buildkitd state `emptyDir`. When unset, the
-    /// ephemeral-storage limit bounds it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub size_limit: Option<Quantity>,
     /// Who shares a cache in the built-in registry. `identity` (the default) gives each
     /// caller its own cache. An OIDC token is scoped to its issuer and its `repository_id`
     /// claim (GitHub Actions), else its `repository` claim, else its `sub`. A

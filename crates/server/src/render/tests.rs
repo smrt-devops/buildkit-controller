@@ -346,7 +346,7 @@ fn hash_covers_template_and_buildkitd_config() {
         json!({"template": {"metadata": {"labels": {"a": "b"}}}}),
         json!({"template": {"spec": {"containers": [{"name": "buildkitd", "image": "other", "resources": {"limits": {"memory": "1Gi", "ephemeral-storage": "1Gi"}}}]}}}),
         json!({"platforms": ["linux/arm64"]}),
-        json!({"workers": {"cache": {"sizeLimit": "1Gi"}}}),
+        json!({"workers": {"stateSizeLimit": "1Gi"}}),
     ] {
         assert_ne!(
             base,
@@ -681,7 +681,7 @@ fn workers_may_reach_the_cache_registry_and_nothing_else_new() {
             .unwrap()
     };
     let without = rules(&cfg);
-    cfg.cache_host = Some(HOST.into());
+    cfg.registry_host = Some(HOST.into());
     let with = rules(&cfg);
     assert_eq!(with.len(), without.len() + 1);
     let r = with.iter().find(|r| !without.contains(r)).unwrap();

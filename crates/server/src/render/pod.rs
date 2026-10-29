@@ -154,7 +154,7 @@ fn volumes(pool: &BuildKitPool) -> Vec<Volume> {
             name: s(STATE_VOLUME),
             empty_dir: Some(EmptyDirVolumeSource {
                 medium: None,
-                size_limit: pool.spec.workers.cache.size_limit.clone(),
+                size_limit: pool.spec.workers.state_size_limit.clone(),
             }),
             ..Volume::default()
         },

@@ -20,7 +20,6 @@
     "affinity": {"type": "object"},
     "topologySpreadConstraints": {"type": "array"},
     "priorityClassName": {"type": "string"},
-    "watchNamespace": {"type": "string"},
     "watchNamespaces": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", "maxLength": 63}},
     "logLevel": {"type": "string"},
     "logFormat": {"enum": ["json", "text"]},
@@ -195,7 +194,6 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "enabled": {"type": "boolean"},
         "namespaces": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", "maxLength": 63}}
       }
     },

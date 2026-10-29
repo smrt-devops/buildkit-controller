@@ -234,9 +234,6 @@ pub enum ErrorCode {
     /// HTTP 503 when the allocation waited its whole queue timeout (at once with `0s`)
     /// without a worker.
     PoolExhausted,
-    /// HTTP 503 when a worker pod is not Ready within `startTimeout`. Not sent since
-    /// allocations queue as claims; kept so older clients still parse it.
-    StartTimeout,
     /// HTTP 503 when the worker pod of a bound allocation is gone.
     PodLost,
     /// HTTP 503 when pool `Ready` is not True for a reason other than the CA.
@@ -245,9 +242,6 @@ pub enum ErrorCode {
     CaUnavailable,
     /// HTTP 503 when a Kubernetes API call times out or returns 5xx. Retry after `Retry-After`.
     UpstreamError,
-    /// HTTP 503 when the replica is shutting down. Not sent since allocations queue as
-    /// claims, which outlive a replica; kept so older clients still parse it.
-    ShuttingDown,
 }
 
 impl ErrorCode {
@@ -263,12 +257,10 @@ impl ErrorCode {
             Self::UnsupportedMediaType => 415,
             Self::Internal => 500,
             Self::PoolExhausted
-            | Self::StartTimeout
             | Self::PodLost
             | Self::NotReady
             | Self::CaUnavailable
-            | Self::UpstreamError
-            | Self::ShuttingDown => 503,
+            | Self::UpstreamError => 503,
         }
     }
 
@@ -276,8 +268,7 @@ impl ErrorCode {
     #[must_use]
     pub const fn retry_after_seconds(self) -> Option<u64> {
         match self {
-            Self::PoolExhausted | Self::StartTimeout => Some(5),
-            Self::ShuttingDown => Some(1),
+            Self::PoolExhausted => Some(5),
             Self::UpstreamError => Some(2),
             _ => None,
         }
@@ -315,7 +306,7 @@ impl ErrorBody {
 
 impl ErrorCode {
     /// Every code, in the order of the API error table.
-    pub const ALL: [ErrorCode; 15] = [
+    pub const ALL: [ErrorCode; 13] = [
         Self::InvalidRequest,
         Self::Unauthenticated,
         Self::Forbidden,
@@ -325,12 +316,10 @@ impl ErrorCode {
         Self::UnsupportedMediaType,
         Self::Internal,
         Self::PoolExhausted,
-        Self::StartTimeout,
         Self::PodLost,
         Self::NotReady,
         Self::CaUnavailable,
         Self::UpstreamError,
-        Self::ShuttingDown,
     ];
 
     /// The stable wire string. It is also the metrics `result` label value.
@@ -346,12 +335,10 @@ impl ErrorCode {
             Self::UnsupportedMediaType => "unsupported_media_type",
             Self::Internal => "internal",
             Self::PoolExhausted => "pool_exhausted",
-            Self::StartTimeout => "start_timeout",
             Self::PodLost => "pod_lost",
             Self::NotReady => "not_ready",
             Self::CaUnavailable => "ca_unavailable",
             Self::UpstreamError => "upstream_error",
-            Self::ShuttingDown => "shutting_down",
         }
     }
 }

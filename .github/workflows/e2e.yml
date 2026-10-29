@@ -51,11 +51,7 @@ jobs:
           set -euo pipefail
           kind create cluster --name bk-examples --wait 120s
           trap 'kind delete cluster --name bk-examples' EXIT
-          kubectl apply --server-side -f helm/buildkit-controller/crds/buildkitpools.yaml
-          helm template bk helm/buildkit-controller --show-only templates/crd-buildkitclaims.yaml \
-            --set claims.enabled=true --set 'claims.namespaces={apps}' --set gateway.enabled=false \
-            --set edge.endpoint=tcp://bk.example.com:8444 --set edge.serverName=bk.example.com |
-            kubectl apply --server-side -f -
+          kubectl apply --server-side -f helm/buildkit-controller/crds/
           kubectl wait --for condition=established --timeout=60s crd --all
           kubectl create namespace ci
           kubectl create namespace apps
@@ -119,9 +115,8 @@ jobs:
           kubectl --kubeconfig target/e2e/kubeconfig -n envoy-gateway-system logs deploy/envoy-gateway --tail=100
 
   # The long runs, nightly and on demand only: the certificate soak, the performance
-  # rig, a drain that outlasts the old 300 s budget, and an allocation queued past
-  # Envoy's 5-minute stream idle timeout. Each leg has its own runner, so none needs
-  # a BK_KIND_SUFFIX.
+  # rig and a drain that outlasts the old 300 s budget. Each leg has its own runner,
+  # so none needs a BK_KIND_SUFFIX.
   nightly:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -129,7 +124,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [soak, perf, drain-verify --long, e2e --long]
+        suite: [soak, perf, drain-verify --long]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

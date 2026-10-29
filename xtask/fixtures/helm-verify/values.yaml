@@ -11,5 +11,4 @@ edge:
   serverName: bk.example.com
 watchNamespaces: [bk-helm-pool, bk-helm-pool-b]
 claims:
-  enabled: true
   namespaces: [bk-helm-apps]

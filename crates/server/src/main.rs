@@ -1,14 +1,15 @@
 //! `buildkit-controller`: API, edge and reconciler in one binary.
 //!
-//! `buildkit-controller cache` runs the cache registry role instead (see
+//! `buildkit-controller registry` runs the cache registry instead (see
 //! `registry`): no kube client, no election, only its own flags.
 //!
 //! Startup runs config (exit 2 when invalid), telemetry, kube client, shared
 //! stores, election, ops server, then the module hooks. On SIGTERM or SIGINT,
-//! `/readyz` fails, leader work stops and the Lease is released, then after
-//! `shutdown.delay` the components stop in stages: the API (queued
-//! allocations are claims and outlive the replica), the edge (open connections drain until
-//! each ends on its own), the certificate loader. The delay and the drain
+//! `/readyz` fails, leader work (the reconciler and the allocator) stops and
+//! the Lease is released, then after `shutdown.delay` the components stop in
+//! stages: the API (queued allocations are claims and outlive the replica),
+//! the edge (open connections drain until each ends on its own), the
+//! certificate loader. The delay and the drain
 //! budget count from the signal. The drain is bounded by
 //! `shutdown.drainTimeout`, or when unset by the longest connection lifetime.
 //! The watches and the ops server stop last. A second SIGTERM or SIGINT during
@@ -33,19 +34,18 @@ use buildkit_controller::election::kube_api::KubeLeaseApi;
 use buildkit_controller::election::{Elector, TokioClock};
 use buildkit_controller::http::HttpComponent;
 use buildkit_controller::reconcile::Reconciler;
-use buildkit_controller::registry::CacheArgs;
+use buildkit_controller::registry::RegistryArgs;
 use buildkit_controller::runtime::AppContext;
 use buildkit_controller::runtime::hooks::{Component, Hooks, LeaderWork};
 use buildkit_controller::runtime::leader::supervise;
 use buildkit_controller::runtime::metrics::Metrics;
 use buildkit_controller::runtime::readiness::Readiness;
-use buildkit_controller::runtime::shutdown::Stages;
 use buildkit_controller::runtime::stop::Shutdown;
 use buildkit_controller::telemetry::{logs, ops};
 
 fn main() -> ExitCode {
-    if std::env::args_os().nth(1).is_some_and(|a| a == "cache") {
-        return cache_main();
+    if std::env::args_os().nth(1).is_some_and(|a| a == "registry") {
+        return registry_main();
     }
     let cli = Cli::parse();
     let settings = match Settings::load(cli, |k| std::env::var(k).ok()) {
@@ -79,9 +79,9 @@ fn main() -> ExitCode {
         reconcile: |ctx| -> Arc<dyn LeaderWork> { Arc::new(Reconciler::new(ctx)) },
         pki: Arc::clone(&certs) as Arc<dyn Component>,
         alloc: Arc::new(alloc.clone()),
+        allocator: Arc::new(alloc.allocator()),
         http: Arc::new(HttpComponent::new(alloc, certs.subscribe())),
         edge: Arc::new(EdgeComponent::proxy(certs.subscribe())),
-        extra: Vec::new(),
     };
     match rt.block_on(run(settings, hooks)) {
         Ok(()) => ExitCode::SUCCESS,
@@ -95,10 +95,10 @@ fn main() -> ExitCode {
     }
 }
 
-/// The `cache` role. The first SIGTERM or SIGINT drains, a second exits at once.
-fn cache_main() -> ExitCode {
-    let args = CacheArgs::parse_from(std::env::args_os().skip(1));
-    let replica = std::env::var("POD_NAME").unwrap_or_else(|_| "cache".to_owned());
+/// The `registry` role. The first SIGTERM or SIGINT drains, a second exits at once.
+fn registry_main() -> ExitCode {
+    let args = RegistryArgs::parse_from(std::env::args_os().skip(1));
+    let replica = std::env::var("POD_NAME").unwrap_or_else(|_| "registry".to_owned());
     if let Err(e) = logs::init(&args.log_level, args.log_format, &replica) {
         eprintln!("{e:#}");
         return ExitCode::from(2);
@@ -247,21 +247,11 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
         }
     });
 
-    // Stop order after the shutdown delay: the API first (no new allocations,
-    // queued ones get 503), then the edge (open connections drain until each
-    // ends), then the certificate loader. The Pod and Secret watches stop last.
-    let mut stages = Stages::new(&["api", "edge", "pki"]);
-    for c in [&hooks.alloc, &hooks.http] {
-        spawn(&mut stages, API_STAGE, c, &ctx);
-    }
-    // Leader-gated components (the claim controller) stop with the reconciler,
-    // before the Lease is released.
-    let mut leader = Stages::new(&["leader"]);
-    for c in &hooks.extra {
-        spawn(&mut leader, 0, c, &ctx);
-    }
-    spawn(&mut stages, EDGE_STAGE, &hooks.edge, &ctx);
-    spawn(&mut stages, PKI_STAGE, &hooks.pki, &ctx);
+    // The allocator stops with the reconciler, before the Lease is released.
+    // After the shutdown delay the API stops (long polls answer 202; queued
+    // claims stay in the API server), then the edge (open connections drain
+    // until each ends), then the certificate loader. The watches stop last.
+    let (mut leader, mut stages) = hooks.start(|c, stop| c.run(ctx.clone(), stop));
 
     let mut failed = None;
     let mut ops_done = false;
@@ -336,15 +326,4 @@ async fn run(settings: Settings, hooks: Hooks) -> anyhow::Result<()> {
     .run()
     .await;
     failed.map_or(Ok(()), Err)
-}
-
-const API_STAGE: usize = 0;
-const EDGE_STAGE: usize = 1;
-const PKI_STAGE: usize = 2;
-
-fn spawn(stages: &mut Stages, stage: usize, c: &Arc<dyn Component>, ctx: &AppContext) {
-    let (c, ctx) = (Arc::clone(c), ctx.clone());
-    stages.spawn(stage, c.name(), move |stop| async move {
-        c.run(ctx, stop).await
-    });
 }

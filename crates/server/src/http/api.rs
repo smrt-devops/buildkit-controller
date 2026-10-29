@@ -29,8 +29,8 @@ pub const PUBLIC_KEY_REQUIRED: &str =
     "publicKey is required: generate an ECDSA P-256 key pair and send the PEM SPKI public key";
 
 use super::metrics::HttpMetrics;
-use crate::alloc::bind::access_rules;
 use crate::alloc::front::MAX_WAIT;
+use crate::alloc::pool::access_rules;
 use crate::alloc::{AllocError, AllocService, Outcome};
 use crate::auth::{AuthError, Authenticator, Identity, TokenReviewer, bearer_token};
 
