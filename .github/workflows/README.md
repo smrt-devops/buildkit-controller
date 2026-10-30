@@ -53,7 +53,7 @@ Settings, Pages, Source: "GitHub Actions". Until then the `deploy` job of every 
 
 ### Package visibility
 
-The release workflow pushes `ghcr.io/smrt-devops/buildkit-controller`. After the first release, set the package visibility to public and link it to the repository under the package's settings, so users can pull without credentials. If the package already exists, grant this repository write access under the package's "Manage Actions access", or the release fails at the registry push.
+The release workflow pushes the image `ghcr.io/smrt-devops/buildkit-controller` and the OCI chart `ghcr.io/smrt-devops/charts/buildkit-controller`. GHCR creates the chart package private on its first push. After the first release, set both packages to public and link them to the repository under each package's settings, so users can pull without credentials. If a package already exists, grant this repository write access under the package's "Manage Actions access", or the release fails at the registry push.
 
 ### Notifications and security
 
