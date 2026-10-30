@@ -20,7 +20,7 @@ jobs:
   # One kind cluster and one end-to-end build through the chart. The full kind sweep runs
   # locally before a release (.github/workflows/README.md). The suite log is kept as an artifact.
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

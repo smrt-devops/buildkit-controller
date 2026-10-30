@@ -189,9 +189,15 @@ pub(crate) fn fixture(rel: &str, work: &Path, subs: &[(&str, String)]) -> Result
 /// Builds the controller binary for the host and returns its path, wherever
 /// `CARGO_TARGET_DIR` or `build.target-dir` puts it.
 pub(crate) fn build_controller() -> Result<PathBuf> {
+    build_controller_profile(false)
+}
+
+/// [`build_controller`] with the `--release` profile when `release` is set.
+pub(crate) fn build_controller_profile(release: bool) -> Result<PathBuf> {
     let out = Command::new("cargo")
         .current_dir(root())
         .args(["build", "--locked", "-p", "buildkit-controller"])
+        .args(release.then_some("--release"))
         .args(["--bin", "buildkit-controller"])
         .arg("--message-format=json-render-diagnostics")
         .stderr(std::process::Stdio::inherit())

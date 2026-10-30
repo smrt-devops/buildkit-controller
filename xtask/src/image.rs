@@ -179,26 +179,23 @@ pub(crate) fn prune() -> Result<()> {
     Ok(())
 }
 
-/// Whether the host builds the image's own platform (linux/amd64), so cargo can compile
-/// into the workspace target dir, which CI caches, instead of a throwaway docker volume.
-fn native_host(os: &str, arch: &str) -> bool {
-    os == "linux" && arch == "x86_64"
+/// Whether to compile on the host: only a GitHub Actions linux/amd64 runner, into the target
+/// dir CI caches. The job pins ubuntu-24.04 (glibc 2.39), older than the runtime base
+/// image's 2.41, so the binary runs there; other hosts may have a newer glibc.
+fn native_host(os: &str, arch: &str, github_actions: bool) -> bool {
+    github_actions && os == "linux" && arch == "x86_64"
 }
 
-/// Compile the release binary on the host and copy it to `out`. The runtime base image
-/// (glibc 2.41) is newer than the runner's (2.39), so the binary runs there.
-fn compile_native(root: &Path, out: &Path) -> Result<()> {
-    run(Command::new("cargo").current_dir(root).args([
-        "build",
-        "--release",
-        "--locked",
-        "-p",
-        "buildkit-controller",
-        "--bin",
-        BINARY,
-    ]))?;
-    std::fs::copy(root.join("target/release").join(BINARY), out.join(BINARY))
-        .context("copying the native binary")?;
+/// Compile the release binary on the host and copy it to `out`.
+fn compile_native(out: &Path) -> Result<()> {
+    let built = crate::build_controller_profile(true)?;
+    let dest = out.join(BINARY);
+    // A root-owned copy left by the docker path would make the copy fail.
+    match std::fs::remove_file(&dest) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    std::fs::copy(&built, &dest).context("copying the native binary")?;
     Ok(())
 }
 
@@ -371,8 +368,12 @@ fn build(root: &Path, tag: &str, hash: &str) -> Result<()> {
         .context("reading docker/builder-image")?;
     let rust = rust_image(&toolchain, &pinned)?;
 
-    if native_host(std::env::consts::OS, std::env::consts::ARCH) {
-        compile_native(&root, &ctx)?;
+    if native_host(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::env::var_os("GITHUB_ACTIONS").is_some_and(|v| v == "true"),
+    ) {
+        compile_native(&ctx)?;
     } else {
         vendor(&root, &work)?;
         compile(&root, &work, &rust, &ctx).context(
@@ -475,10 +476,10 @@ mod tests {
 
     #[test]
     fn only_linux_amd64_hosts_compile_natively() {
-        assert!(native_host("linux", "x86_64"));
-        assert!(!native_host("linux", "aarch64"));
-        assert!(!native_host("macos", "x86_64"));
-        assert!(!native_host("macos", "aarch64"));
+        assert!(native_host("linux", "x86_64", true));
+        assert!(!native_host("linux", "x86_64", false));
+        assert!(!native_host("linux", "aarch64", true));
+        assert!(!native_host("macos", "aarch64", true));
     }
 
     /// The image is rebuilt exactly when a file it is built from changes.
