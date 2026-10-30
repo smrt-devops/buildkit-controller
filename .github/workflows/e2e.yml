@@ -22,8 +22,8 @@ jobs:
   e2e:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    # The test image needs no LTO or single codegen unit: this cuts the compile from about
-    # 5 minutes to 1. The release workflow builds the shipped binary with the full profile.
+    # The test image needs no LTO or single codegen unit: this cuts the warm compile from about
+    # 5 minutes to 2. The release workflow builds the shipped binary with the full profile.
     env:
       CARGO_PROFILE_RELEASE_LTO: "false"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
