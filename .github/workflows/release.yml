@@ -40,7 +40,8 @@ jobs:
             echo "::error::no successful push run of rust.yml on $SHA"
             exit 1
           fi
-          # e2e.yml runs every kind suite (kind-all), the examples and the real Action job.
+          # e2e.yml runs the smoke kind suites, the examples and the real Action job; the
+          # kind-all job below runs the full sweep on this commit.
           n="$(gh api "repos/$REPO/actions/workflows/e2e.yml/runs?head_sha=$SHA&event=push&status=success" --jq .total_count)"
           if [ "$n" -lt 1 ]; then
             echo "::error::no successful push run of e2e.yml on $SHA"
