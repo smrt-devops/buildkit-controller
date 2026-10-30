@@ -27,6 +27,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        # Caches target/ (release included), where the image build now compiles the controller.
       - run: cargo xtask kind-all --only e2e
       - name: Show the runner's disk and memory on failure
         if: failure()

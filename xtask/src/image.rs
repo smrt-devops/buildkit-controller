@@ -179,6 +179,29 @@ pub(crate) fn prune() -> Result<()> {
     Ok(())
 }
 
+/// Whether the host builds the image's own platform (linux/amd64), so cargo can compile
+/// into the workspace target dir, which CI caches, instead of a throwaway docker volume.
+fn native_host(os: &str, arch: &str) -> bool {
+    os == "linux" && arch == "x86_64"
+}
+
+/// Compile the release binary on the host and copy it to `out`. The runtime base image
+/// (glibc 2.41) is newer than the runner's (2.39), so the binary runs there.
+fn compile_native(root: &Path, out: &Path) -> Result<()> {
+    run(Command::new("cargo").current_dir(root).args([
+        "build",
+        "--release",
+        "--locked",
+        "-p",
+        "buildkit-controller",
+        "--bin",
+        BINARY,
+    ]))?;
+    std::fs::copy(root.join("target/release").join(BINARY), out.join(BINARY))
+        .context("copying the native binary")?;
+    Ok(())
+}
+
 /// Compile the release binary in the rust image and copy it to `out`.
 fn compile(root: &Path, work: &Path, image: &str, out: &Path) -> Result<()> {
     ensure_volume(root)?;
@@ -348,11 +371,15 @@ fn build(root: &Path, tag: &str, hash: &str) -> Result<()> {
         .context("reading docker/builder-image")?;
     let rust = rust_image(&toolchain, &pinned)?;
 
-    vendor(&root, &work)?;
-    compile(&root, &work, &rust, &ctx).context(
-        "compiling in the rust image; if rustup could not download the pinned toolchain \
-         and Docker is offline, retry with BK_IMAGE_PREINSTALLED=1 (local builds only)",
-    )?;
+    if native_host(std::env::consts::OS, std::env::consts::ARCH) {
+        compile_native(&root, &ctx)?;
+    } else {
+        vendor(&root, &work)?;
+        compile(&root, &work, &rust, &ctx).context(
+            "compiling in the rust image; if rustup could not download the pinned toolchain \
+             and Docker is offline, retry with BK_IMAGE_PREINSTALLED=1 (local builds only)",
+        )?;
+    }
     std::fs::copy(root.join("docker/Dockerfile"), ctx.join("Dockerfile"))
         .context("copying Dockerfile")?;
     run(Command::new("docker")
@@ -445,6 +472,14 @@ pub(crate) fn copy_busybox(dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_linux_amd64_hosts_compile_natively() {
+        assert!(native_host("linux", "x86_64"));
+        assert!(!native_host("linux", "aarch64"));
+        assert!(!native_host("macos", "x86_64"));
+        assert!(!native_host("macos", "aarch64"));
+    }
 
     /// The image is rebuilt exactly when a file it is built from changes.
     #[test]
