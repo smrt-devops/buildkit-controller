@@ -4,15 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
-  schedule:
-    - cron: "17 3 * * *"
-  workflow_dispatch:
 
 permissions:
   contents: read
 
-# A newer push or pull request update cancels the older run on the same ref. The event name
-# keeps the nightly and on-demand runs apart from push runs.
+# A newer push or pull request update cancels the older run on the same ref.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
@@ -21,15 +17,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The PR smoke tier: six shared-cluster suites that cover the end-to-end build, the API,
-  # the chart, the CRD, the rendered pools and the registry role (cargo xtask kind-all
-  # --only). The image is built once, and bk-solo is never created because no solo suite is
-  # picked. The full sweep runs nightly, on demand and on a release tag. The suites' logs
-  # are kept as an artifact.
-  # --jobs 3: with no solo thread, three shared suites are one per CPU on the 4-CPU runner,
-  # the same load the full sweep runs at.
-  kind-all:
-    if: github.event_name == 'pull_request' || github.event_name == 'push'
+  # One kind cluster and one end-to-end build through the chart. The full kind sweep runs
+  # locally before a release (.github/workflows/README.md). The suite log is kept as an artifact.
+  e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -37,11 +27,11 @@ jobs:
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-      - run: cargo xtask kind-all --jobs 3 --only e2e,api-verify,helm-verify,crd-verify,render-verify,registry-verify
+      - run: cargo xtask kind-all --only e2e
       - name: Show the runner's disk and memory on failure
         if: failure()
         run: df -h / && free -m && docker system df
-      - name: Keep the suite logs
+      - name: Keep the suite log
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -52,7 +42,6 @@ jobs:
   # examples/*.yaml against the CRDs in a real API server, so a field rename that breaks the files
   # the README tells users to apply fails here.
   examples:
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -72,91 +61,3 @@ jobs:
             echo "== $f"
             kubectl apply --dry-run=server --validate=strict -f "$f"
           done
-
-  # The real GitHub Action with this job's OIDC token, against a kind install
-  # that trusts GitHub's issuer for this repository only. The install sits behind
-  # Envoy Gateway; target/e2e/api-ca.pem is the Gateway's self-signed certificate.
-  action:
-    if: >-
-      github.event_name != 'schedule' &&
-      (github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository)
-    # Fork PRs get no id-token, so the Action cannot authenticate there.
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-      - name: Install the controller on kind
-        run: |
-          cargo xtask e2e-up "$GITHUB_REPOSITORY"
-          echo "BK_URL=$(cat target/e2e/api-url)" >> "$GITHUB_ENV"
-          {
-            echo 'BK_CA<<BK_CA_EOF'
-            cat target/e2e/api-ca.pem
-            echo 'BK_CA_EOF'
-          } >> "$GITHUB_ENV"
-          mkdir -p "$RUNNER_TEMP/ctx"
-          echo multi > "$RUNNER_TEMP/ctx/note"
-          printf 'FROM scratch\nCOPY note /note\n' > "$RUNNER_TEMP/ctx/Dockerfile"
-      - name: Allocate a worker
-        id: bk
-        uses: ./action
-        with:
-          url: ${{ env.BK_URL }}
-          pools: ci/amd64
-          ca-cert: ${{ env.BK_CA }}
-      - name: Build through the builder the Action created
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
-        with:
-          context: ${{ runner.temp }}/ctx
-          builder: ${{ steps.bk.outputs.builder }}
-          platforms: linux/amd64
-          push: false
-          outputs: type=cacheonly
-      - name: Show controller logs on failure
-        if: failure()
-        run: |
-          kubectl --kubeconfig target/e2e/kubeconfig get pods -A
-          kubectl --kubeconfig target/e2e/kubeconfig -n bk-system logs deploy/buildkit-controller --tail=100
-          kubectl --kubeconfig target/e2e/kubeconfig get gateway,httproute,tlsroute,backendtlspolicy -A -o yaml
-          kubectl --kubeconfig target/e2e/kubeconfig -n envoy-gateway-system logs deploy/envoy-gateway --tail=100
-
-  # The long runs, nightly and on demand only: the full kind sweep (every suite
-  # but soak and perf, cargo xtask kind-all --jobs 3), the certificate soak, the performance
-  # rig and a drain that outlasts the old 300 s budget. Each leg has its own runner,
-  # so none needs a BK_KIND_SUFFIX.
-  nightly:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        suite: [kind-all --jobs 3, soak, perf, perf --loopback, drain-verify --long]
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-      - run: cargo xtask ${{ matrix.suite }}
-      # The kind perf table (target/perf/result-*.md) is a report: a MISS does not fail the
-      # job. The loopback benchmark fails on a MISS.
-      - name: Keep the results and logs
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: nightly-${{ strategy.job-index }}
-          path: |
-            target/soak/result.txt
-            target/soak/client.log
-            target/perf/result-*.md
-            target/perf/alloc-*.txt
-            target/kind-all/*.log
-            target/drain-verify/*.log
-          if-no-files-found: ignore
