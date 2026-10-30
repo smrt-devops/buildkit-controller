@@ -33,7 +33,7 @@ use api_verify::api_verify;
 use claim_verify::claim_verify;
 use docs::docs;
 use drain_verify::drain_verify;
-use e2e::{e2e, e2e_up};
+use e2e::e2e;
 use edge_verify::edge_verify;
 use helm_test::helm_test;
 use helm_verify::helm_verify;
@@ -110,7 +110,7 @@ enum Task {
     HelmVerify,
     /// Install the chart with two replicas on a throwaway kind cluster and check that stopping a replica never cuts a live build: a long build survives a rollout, the Lease moves within seconds after the allocator has stopped, and a pending (202) claim survives a rollout of both replicas and binds once the worker is free.
     DrainVerify {
-        /// Run the build past the old 300 s drain budget (390 s), as the nightly job does.
+        /// Run the build past the old 300 s drain budget (390 s).
         #[arg(long)]
         long: bool,
     },
@@ -124,7 +124,7 @@ enum Task {
     ProxyVerify,
     /// Run the end-to-end suite on a kind cluster, exposed through Envoy Gateway. Covers chart install, the Gateway API routes, OIDC and `TokenReview`, builds, an external registry cache, the built-in cache registry for trusted and untrusted callers, the v0.1.0 volume sweep, queueing, a long poll, multi-platform builds and the Envoy extras.
     E2e,
-    /// Run every kind suite but soak and perf in one go: build once, two shared clusters, suites side by side. Logs go to target/kind-all/<suite>.log.
+    /// Run every kind suite but soak and perf in one go: build once, two shared clusters, suites side by side. `--only soak,perf` runs those two, each on its own cluster. Logs go to target/kind-all/<suite>.log.
     KindAll {
         /// Run only these suites (comma-separated).
         #[arg(long, value_delimiter = ',')]
@@ -138,14 +138,6 @@ enum Task {
         /// How many suites run at once on the shared cluster; 0 runs all of them.
         #[arg(long, default_value_t = 0)]
         jobs: usize,
-        /// Also run soak and perf, each on its own cluster, once the others are done.
-        #[arg(long)]
-        nightly: bool,
-    },
-    /// Install the chart on kind behind Envoy Gateway, trust GitHub OIDC for REPO (owner/name) and leave the cluster running. Used by the CI Action job.
-    E2eUp {
-        /// Repository whose workflow tokens may allocate.
-        repo: String,
     },
     /// Measure the plan's efficiency targets on a throwaway kind cluster: allocation latency, edge connect overhead, edge throughput, idle RSS and idle API requests. Method in docs/performance.md.
     Perf {
@@ -352,19 +344,16 @@ fn main() -> Result<()> {
         Task::Docs => docs(),
         Task::ProxyVerify => proxy_verify(),
         Task::E2e => e2e(),
-        Task::E2eUp { repo } => e2e_up(&repo),
         Task::KindAll {
             only,
             keep,
             down,
             jobs,
-            nightly,
         } => kind_all::kind_all(&kind_all::Opts {
             only,
             keep,
             down,
             jobs,
-            nightly,
         }),
         Task::Perf { loopback: true, .. } => perf_loopback(),
         Task::Perf {

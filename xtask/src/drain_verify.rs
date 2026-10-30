@@ -7,7 +7,7 @@
 //!    controller is rolled (`kubectl rollout restart`). The replica carrying the
 //!    connection starts draining while the build runs, with a budget above the
 //!    old fixed 300 s one, the build succeeds, and the replica exits once the
-//!    connection ends. With `--long` (nightly) the RUN step takes 390 s and the
+//!    connection ends. With `--long` the RUN step takes 390 s and the
 //!    carrier is seen draining for more than 300 s; 390 s leaves room for the
 //!    rollout to reach the carrier late.
 //! b. The Lease moves to a live replica within 15 s of SIGTERM to the leader,

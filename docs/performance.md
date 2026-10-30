@@ -206,5 +206,4 @@ direct: the edge decrypts and re-encrypts every byte, so about half of direct
 is its CPU-bound ceiling, and the lowest row measured on the Mac was 45
 percent. Each connect row uses the kind rule above: under 5 ms at p99 is a
 pass, over 5 ms but inside the direct p99-p50 spread is inconclusive, and past
-both is a miss. Any MISS makes the benchmark exit non-zero. The nightly E2E
-workflow runs it.
+both is a miss. Any MISS makes the benchmark exit non-zero.
