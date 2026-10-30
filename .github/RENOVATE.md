@@ -16,14 +16,6 @@ Renovate groups updates by manager, and each group runs before 10am UTC on Monda
 
 Renovate merges minor and patch updates by squash only after the required status checks pass, and only once a release is three days old (`minimumReleaseAge`). GitHub Action pins and Docker digests never automerge, because they run with release credentials. Major updates need a manual review. Security vulnerability alerts get the `security` label.
 
-## Setup
-
-1. Install the [Renovate app](https://github.com/apps/renovate) from GitHub Marketplace.
-2. Grant it access to this repository.
-3. Merge the onboarding pull request if Renovate opens one.
-
-Renovate reads `renovate.json` on its next run. This repository has no `.github/dependabot.yml`, so Renovate and Dependabot do not open duplicate pull requests. Dependabot alerts can stay enabled.
-
 ## Changing the behavior
 
 Edit `renovate.json`.
