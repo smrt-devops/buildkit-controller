@@ -62,7 +62,7 @@ The image build keeps its cache in a Docker volume named from a hash of the chec
 4. Use [Conventional Commits](https://www.conventionalcommits.org/) for messages, for example `fix(server/edge): close connections when a pod disappears`.
 5. Open the pull request, fill in the template and link the issue.
 
-A pull request needs one maintainer approval and the required checks listed in [.github/workflows/README.md](.github/workflows/README.md#branch-protection-for-main). If you change the CRD types, run `cargo xtask crdgen` and commit the result.
+A pull request needs one maintainer approval and passing CI. If you change the CRD types, run `cargo xtask crdgen` and commit the result.
 
 ## Releases
 
