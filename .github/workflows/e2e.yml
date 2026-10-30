@@ -21,15 +21,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Every kind suite but soak and perf in one run (cargo xtask kind-all): the controller
-  # image is built once, the suites share two kind clusters and run side by side. The
-  # suites' logs are kept as an artifact.
-  # --jobs 3: three shared suites plus the solo thread is one suite per CPU on the 4-CPU
-  # runner. Measured locally, reconcile-verify (330-430 s) is the critical path and the
-  # other shared suites (about 750 s together) fit beside it on two lanes, so 3 is as fast
-  # as 4 with less contention. --jobs 2 would add about 5 minutes.
+  # The PR smoke tier: six shared-cluster suites that cover the end-to-end build, the API,
+  # the chart, the CRD, the rendered pools and the registry role (cargo xtask kind-all
+  # --only). The image is built once, and bk-solo is never created because no solo suite is
+  # picked. The full sweep runs nightly, on demand and on a release tag. The suites' logs
+  # are kept as an artifact.
+  # --jobs 3: with no solo thread, three shared suites are one per CPU on the 4-CPU runner,
+  # the same load the full sweep runs at.
   kind-all:
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -37,7 +37,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-      - run: cargo xtask kind-all --jobs 3
+      - run: cargo xtask kind-all --jobs 3 --only e2e,api-verify,helm-verify,crd-verify,render-verify,registry-verify
       - name: Show the runner's disk and memory on failure
         if: failure()
         run: df -h / && free -m && docker system df
@@ -127,7 +127,8 @@ jobs:
           kubectl --kubeconfig target/e2e/kubeconfig get gateway,httproute,tlsroute,backendtlspolicy -A -o yaml
           kubectl --kubeconfig target/e2e/kubeconfig -n envoy-gateway-system logs deploy/envoy-gateway --tail=100
 
-  # The long runs, nightly and on demand only: the certificate soak, the performance
+  # The long runs, nightly and on demand only: the full kind sweep (every suite
+  # but soak and perf, cargo xtask kind-all --jobs 3), the certificate soak, the performance
   # rig and a drain that outlasts the old 300 s budget. Each leg has its own runner,
   # so none needs a BK_KIND_SUFFIX.
   nightly:
@@ -137,7 +138,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [soak, perf, perf --loopback, drain-verify --long]
+        suite: [kind-all --jobs 3, soak, perf, perf --loopback, drain-verify --long]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -156,5 +157,6 @@ jobs:
             target/soak/client.log
             target/perf/result-*.md
             target/perf/alloc-*.txt
+            target/kind-all/*.log
             target/drain-verify/*.log
           if-no-files-found: ignore

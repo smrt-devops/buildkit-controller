@@ -20,7 +20,7 @@ The workspace has `crates/api` (CRD and API types, and the HTTP client), `crates
 
 ## Checks
 
-Run these before opening a pull request. CI also runs `cargo xtask crdgen --check`, `cargo xtask helm-test`, the release image build on amd64 and arm64, and `cargo xtask kind-all --jobs 3`.
+Run these before opening a pull request. CI also runs `cargo xtask crdgen --check`, `cargo xtask helm-test`, the release image build on amd64 and arm64, and a smoke subset of the kind suites (`cargo xtask kind-all --only e2e,api-verify,helm-verify,crd-verify,render-verify,registry-verify`). The full sweep (`cargo xtask kind-all`) runs nightly and on release tags.
 
 ```sh
 cargo fmt --all --check
