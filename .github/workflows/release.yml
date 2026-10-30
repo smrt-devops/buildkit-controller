@@ -8,6 +8,7 @@ permissions: {}
 
 env:
   IMAGE: ghcr.io/smrt-devops/buildkit-controller
+  CHART: ghcr.io/smrt-devops/charts/buildkit-controller
 
 jobs:
   gate:
@@ -285,7 +286,8 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write # create the release and upload assets
-      id-token: write # chart provenance
+      packages: write # push the OCI chart
+      id-token: write # cosign keyless + chart provenance
       attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -304,10 +306,37 @@ jobs:
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: dist/*.tgz
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: push
+        name: Push the chart to GHCR
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          helm push "dist/buildkit-controller-${REF_NAME#v}.tgz" oci://ghcr.io/smrt-devops/charts | tee push.log
+          digest="$(sed -n 's/^Digest: //p' push.log)"
+          case "$digest" in sha256:????????????????????????????????????????????????????????????????) ;; *) echo "::error::no chart digest in helm push output"; exit 1 ;; esac
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - name: Sign the OCI chart (keyless, GitHub OIDC)
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "${CHART}@${DIGEST}"
+      - name: OCI chart provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ${{ env.CHART }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
       - name: Write the release notes header
         env:
           REF_NAME: ${{ github.ref_name }}
           DIGEST: ${{ needs.index.outputs.digest }}
+          CHART_DIGEST: ${{ steps.push.outputs.digest }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -316,6 +345,8 @@ jobs:
 
           Image: \`${IMAGE}@${DIGEST}\`. Pin the digest with \`image.tag: ${REF_NAME#v}@${DIGEST}\`.
 
+          Chart: \`oci://${CHART}:${REF_NAME#v}\` (\`${CHART_DIGEST}\`), also attached as a .tgz.
+
           Verify the image and the chart:
 
           \`\`\`sh
@@ -323,6 +354,10 @@ jobs:
             --certificate-identity https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${REF_NAME} \\
             --certificate-oidc-issuer https://token.actions.githubusercontent.com
           gh attestation verify oci://${IMAGE}@${DIGEST} -R ${REPO}
+          cosign verify ${CHART}@${CHART_DIGEST} \\
+            --certificate-identity https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${REF_NAME} \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          gh attestation verify oci://${CHART}@${CHART_DIGEST} -R ${REPO}
           gh attestation verify buildkit-controller-${REF_NAME#v}.tgz -R ${REPO}
           \`\`\`
           NOTES
