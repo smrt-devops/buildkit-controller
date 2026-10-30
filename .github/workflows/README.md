@@ -17,5 +17,5 @@ The release notes start with the image digest and the commands that verify the i
 1. Bump the version in one commit: `version` in `Cargo.toml` and the four path-dependency pins in `crates/api/Cargo.toml`, `crates/server/Cargo.toml` and `xtask/Cargo.toml`, then `cargo update -w`, `version` and `appVersion` in `helm/buildkit-controller/Chart.yaml`, then `cargo xtask helm-test --update`. `cargo test` fails while `Chart.yaml` and `Cargo.toml` disagree. Move the `CHANGELOG.md` entries under the new version.
 2. Push to main and wait for green push runs of Rust, E2E and Action on that commit.
 3. On that commit, run the full kind sweep locally: `cargo xtask kind-all`. For a release that touches the edge or the certificates, also run `cargo xtask kind-all --only soak,perf`. For one that touches shutdown or draining, run `cargo xtask drain-verify --long`.
-4. Optionally tag `vX.Y.Z-rc1` first: a pre-release with a signed image and the chart, which does not move `vN`.
+4. Tag `vX.Y.Z-rc1` first: a pre-release with a signed image and the chart, which does not move `vN`. Pull requests build no release image, so this is the first run of the arm64 and `cargo auditable` builds.
 5. Tag `vX.Y.Z` on that commit and push the tag.
