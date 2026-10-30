@@ -208,13 +208,24 @@ fn join<T>(t: std::thread::ScopedJoinHandle<'_, Result<T>>) -> Result<T> {
 
 /// Builds everything the suites would otherwise each build: the controller
 /// image, the pinned images, the kind-backed test binaries and the debug
-/// controller the host-run suites start.
+/// controller the host-run suites start. The host builds run beside the image
+/// build: its last step compiles the server crate on one core
+/// (`codegen-units = 1`), which leaves the other cores free for them.
 fn prebuild() -> Result<()> {
     let _t = Timed::named("prebuild");
-    crate::image::controller()?;
-    crate::image::ensure_worker()?;
-    crate::image::ensure(crate::e2e::REGISTRY_IMAGE)?;
-    crate::gateway::ensure_image(crate::gateway::SOCAT.0, crate::gateway::SOCAT.1)?;
+    std::thread::scope(|s| {
+        let host = s.spawn(host_builds);
+        crate::image::controller()?;
+        crate::image::ensure_worker()?;
+        crate::image::ensure(crate::e2e::REGISTRY_IMAGE)?;
+        crate::gateway::ensure_image(crate::gateway::SOCAT.0, crate::gateway::SOCAT.1)?;
+        join(host)
+    })
+}
+
+/// The kind-backed test binaries and the debug controller, built on the host.
+fn host_builds() -> Result<()> {
+    let _t = Timed::named("host builds");
     let mut c = Command::new("cargo");
     crate::kube::scrub(&mut c)
         .current_dir(crate::root())
