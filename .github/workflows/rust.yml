@@ -85,10 +85,22 @@ jobs:
   # renders, the invalid-values fixtures and the NOTES checks pass. Needs no cluster.
   chart:
     runs-on: ubuntu-latest
+    env:
+      # The goldens are rendered by this helm; v3 differs in blank lines and needs a kubeconfig file.
+      HELM_VERSION: "4.2.4"
+      HELM_SHA256: "c306b46f719b0a4da32d0f78ee21bf90ce8d602f15b22ab753f0674d1670a7f3"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - name: Install checksum-pinned helm
+        run: |
+          set -euo pipefail
+          curl -sSfL --proto =https -o helm.tgz "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tgz" | sha256sum -c -
+          tar -xzf helm.tgz --strip-components=1 linux-amd64/helm
+          sudo install -m 0755 helm /usr/local/bin/helm
+          helm version --short
       - run: cargo xtask crdgen --check
       - run: cargo xtask helm-test
