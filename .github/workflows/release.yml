@@ -306,15 +306,17 @@ jobs:
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: dist/*.tgz
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - id: push
         name: Push the chart to GHCR
         env:
           REF_NAME: ${{ github.ref_name }}
-          ACTOR: ${{ github.actor }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          printf %s "$GH_TOKEN" | helm registry login ghcr.io -u "$ACTOR" --password-stdin
           helm push "dist/buildkit-controller-${REF_NAME#v}.tgz" oci://ghcr.io/smrt-devops/charts | tee push.log
           digest="$(sed -n 's/^Digest: //p' push.log)"
           case "$digest" in sha256:????????????????????????????????????????????????????????????????) ;; *) echo "::error::no chart digest in helm push output"; exit 1 ;; esac
