@@ -225,9 +225,16 @@ impl Gateway {
             &format!("--cert={}", ca.display()),
             &format!("--key={}", key.display()),
         ])?;
+        // externalTrafficPolicy Cluster: with Local (Envoy Gateway's default),
+        // v1.9.3 gives the Gateway only the addresses of nodes that have a Ready
+        // Envoy endpoint, and it reads them only when the Envoy Deployment or
+        // Service changes. When the EndpointSlice turns Ready after the
+        // Deployment does, the Gateway keeps no address and is never Programmed
+        // (seen on the GitHub runner). Cluster gives it every node's address.
+        // Nothing here reads the client address Local would keep.
         let service = match self.node_ports {
             Some((api, edge)) => format!(
-                "        type: NodePort\n        patch:\n          type: StrategicMerge\n          value:\n            spec:\n              ports:\n                - {{port: 8443, nodePort: {api}}}\n                - {{port: 8444, nodePort: {edge}}}"
+                "        type: NodePort\n        externalTrafficPolicy: Cluster\n        patch:\n          type: StrategicMerge\n          value:\n            spec:\n              ports:\n                - {{port: 8443, nodePort: {api}}}\n                - {{port: 8444, nodePort: {edge}}}"
             ),
             None => "        type: ClusterIP".to_owned(),
         };
