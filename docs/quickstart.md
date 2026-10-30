@@ -11,7 +11,14 @@ This page installs the controller, creates a pool and runs one build with the Gi
 
 ## 1. Install
 
-The chart is also a release asset. Wherever a command below says `helm install bk helm/buildkit-controller`, you can install the packaged chart instead, without a checkout:
+Each release publishes the chart to GHCR. Wherever a command below says `helm install bk helm/buildkit-controller`, you can install the published chart instead, without a checkout:
+
+```sh
+helm install bk oci://ghcr.io/smrt-devops/charts/buildkit-controller --version 0.2.0 \
+  -n buildkit-system --create-namespace   # plus the same --set flags as below
+```
+
+The packaged chart is also a release asset:
 
 ```sh
 helm install bk https://github.com/smrt-devops/buildkit-controller/releases/download/v0.2.0/buildkit-controller-0.2.0.tgz \
@@ -22,7 +29,7 @@ A checkout installs the image of its `Chart.yaml` `appVersion`, so check out the
 
 ### Verify a release
 
-The release workflow signs the image with cosign (keyless, GitHub OIDC) and attaches build provenance to the image and the chart. Each release's notes give the image digest and these commands with the values filled in:
+The release workflow signs the image with cosign (keyless, GitHub OIDC) and signs the OCI chart the same way, and attaches build provenance to the image and both forms of the chart. Each release's notes give the image digest and these commands with the values filled in:
 
 ```sh
 IMAGE=ghcr.io/smrt-devops/buildkit-controller DIGEST=sha256:<digest from the release notes>
@@ -30,6 +37,11 @@ cosign verify "$IMAGE@$DIGEST" \
   --certificate-identity https://github.com/smrt-devops/buildkit-controller/.github/workflows/release.yml@refs/tags/v0.2.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 gh attestation verify "oci://$IMAGE@$DIGEST" -R smrt-devops/buildkit-controller
+CHART=ghcr.io/smrt-devops/charts/buildkit-controller CHART_DIGEST=sha256:<chart digest from the release notes>
+cosign verify "$CHART@$CHART_DIGEST" \
+  --certificate-identity https://github.com/smrt-devops/buildkit-controller/.github/workflows/release.yml@refs/tags/v0.2.0 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+gh attestation verify "oci://$CHART@$CHART_DIGEST" -R smrt-devops/buildkit-controller
 curl -sSfLO https://github.com/smrt-devops/buildkit-controller/releases/download/v0.2.0/buildkit-controller-0.2.0.tgz
 gh attestation verify buildkit-controller-0.2.0.tgz -R smrt-devops/buildkit-controller
 ```
