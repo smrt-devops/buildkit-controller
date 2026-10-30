@@ -1,4 +1,4 @@
-//! `cargo xtask kind-all` runs every kind suite in one go: the PR gate.
+//! `cargo xtask kind-all` runs every kind suite in one go: the sweep before a release.
 //!
 //! It builds what the suites share once (the controller image, skipped when
 //! its inputs are unchanged, the debug controller binary and the kind-backed
@@ -13,8 +13,8 @@
 //! - `bk-solo` runs [`SOLO`] one after the other, because they cannot share.
 //!
 //! Each suite's output goes to `target/kind-all/<suite>.log`. Soak and perf
-//! measure a quiet cluster over long windows: they run only with `--nightly`
-//! (or `--only`), each on its own cluster once the others are done and their
+//! measure a quiet cluster over long windows: they run only when `--only` names
+//! them, each on its own cluster once the others are done and their
 //! clusters deleted. The two shared clusters are deleted at the end unless
 //! `--keep`; `--down` deletes kept ones. Cluster names get `-$BK_KIND_SUFFIX` when that is set.
 
@@ -52,7 +52,7 @@ pub(crate) const SHARED: &[&str] = &[
 pub(crate) const SOLO: &[&str] = &["runtime-verify", "claim-verify"];
 
 /// The long runs, each on a cluster of its own, after the others.
-pub(crate) const NIGHTLY: &[&str] = &["soak", "perf"];
+pub(crate) const LONG: &[&str] = &["soak", "perf"];
 
 /// What `kind-all` was asked to do.
 pub(crate) struct Opts {
@@ -64,8 +64,6 @@ pub(crate) struct Opts {
     pub(crate) down: bool,
     /// How many shared-cluster suites run at once; 0 is all of them.
     pub(crate) jobs: usize,
-    /// Also run [`NIGHTLY`].
-    pub(crate) nightly: bool,
 }
 
 /// One suite's outcome.
@@ -96,11 +94,11 @@ pub(crate) fn kind_all(opts: &Opts) -> Result<()> {
         solo.keep();
     }
     for name in &opts.only {
-        if ![SHARED, SOLO, NIGHTLY]
+        if ![SHARED, SOLO, LONG]
             .iter()
             .any(|l| l.contains(&name.as_str()))
         {
-            bail!("no kind suite {name}; the suites are {SHARED:?}, {SOLO:?} and {NIGHTLY:?}");
+            bail!("no kind suite {name}; the suites are {SHARED:?}, {SOLO:?} and {LONG:?}");
         }
     }
     let pick = |list: &[&'static str], by_default: bool| -> Vec<&'static str> {
@@ -110,7 +108,7 @@ pub(crate) fn kind_all(opts: &Opts) -> Result<()> {
             .collect()
     };
     let (shared, alone) = (pick(SHARED, true), pick(SOLO, true));
-    let nightly = pick(NIGHTLY, opts.nightly);
+    let long = pick(LONG, false);
 
     setup(&main, &solo, &work, !shared.is_empty(), !alone.is_empty())?;
     println!(
@@ -148,7 +146,7 @@ pub(crate) fn kind_all(opts: &Opts) -> Result<()> {
     drop(main);
     drop(solo);
     std::thread::scope(|s| {
-        for suite in &nightly {
+        for suite in &long {
             s.spawn(|| {
                 let o = run_suite(suite, None, &work);
                 lock(&outcomes).push(o);
@@ -361,10 +359,10 @@ fn report(outcomes: &[Outcome], total: Duration) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NIGHTLY, SHARED, SOLO};
+    use super::{LONG, SHARED, SOLO};
     use clap::CommandFactory as _;
 
-    /// A new kind suite cannot be left out of the PR gate by accident: every
+    /// A new kind suite cannot be left out of kind-all by accident: every
     /// task that names a kind suite is in kind-all, or does not run a suite.
     #[test]
     fn every_kind_suite_is_in_kind_all() {
@@ -374,7 +372,6 @@ mod tests {
             "image",
             "helm-test",
             "docs",
-            "e2e-up",
             "kind-all",
             "help",
         ];
@@ -382,11 +379,11 @@ mod tests {
             let name = task.get_name();
             assert!(
                 not_suites.contains(&name)
-                    || [SHARED, SOLO, NIGHTLY].iter().any(|l| l.contains(&name)),
+                    || [SHARED, SOLO, LONG].iter().any(|l| l.contains(&name)),
                 "{name} is not in kind-all"
             );
         }
-        for s in SHARED.iter().chain(SOLO).chain(NIGHTLY) {
+        for s in SHARED.iter().chain(SOLO).chain(LONG) {
             assert!(
                 crate::Cli::command().find_subcommand(s).is_some(),
                 "{s} is not a task"

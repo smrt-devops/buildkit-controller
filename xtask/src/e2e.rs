@@ -14,9 +14,6 @@
 //! Every kind, kubectl and helm call gets the private kubeconfig under
 //! `target/e2e` (`target/e2e-<suffix>` with `BK_KIND_SUFFIX`). The task never
 //! touches `~/.kube/config`, and `e2e` deletes the cluster on every exit path.
-//! `e2e-up` installs the same cluster trusting GitHub's OIDC issuer and leaves
-//! it running, for the Action job in CI. It writes the API URL to `api-url` in
-//! the work directory.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -54,16 +51,7 @@ const CACHE_HOST: &str = "buildkit-controller-registry.bk-system.svc:5000";
 /// A cache volume as v0.1.0 labelled it, created before install; the leader
 /// deletes it. v0.1.0 upgrade shim: remove in the release after 0.2.0.
 const OLD_VOLUME: &str = "v010-volume";
-const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const AUD: &str = "buildkit-controller";
-
-/// Which issuer the controller trusts.
-enum Mode<'a> {
-    /// The in-process mock issuer.
-    Mock(&'a Issuer),
-    /// GitHub's, for the repository `owner/name`.
-    Github(&'a str),
-}
 
 /// Kind's pod and service ranges, set in `xtask/fixtures/e2e/kind.yaml`. The
 /// controller lists them as cluster ranges, and the pools open them (the
@@ -116,7 +104,7 @@ fn pool_yaml(name: &str, platforms: &str, rules: &str) -> String {
 #[allow(clippy::too_many_lines, reason = "one linear install script")]
 /// Create the cluster and install the chart with its pools. Returns the API CA
 /// file (the client CA, which signs the API serving certificate).
-fn install(env: &Cluster, work: &Path, mode: &Mode) -> Result<PathBuf> {
+fn install(env: &Cluster, work: &Path, issuer: &Issuer) -> Result<PathBuf> {
     let root = root();
     // A leftover cluster of this name holds the ports; delete it before checking them.
     let ports = *PORTS;
@@ -136,14 +124,9 @@ fn install(env: &Cluster, work: &Path, mode: &Mode) -> Result<PathBuf> {
 
     crate::image::load_controller(env)?;
     crate::image::ensure_worker()?;
-    let mut images = vec![WORKER_IMAGE];
-    if matches!(mode, Mode::Mock(_)) {
-        crate::image::ensure(REGISTRY_IMAGE)?;
-        images.push(REGISTRY_IMAGE);
-        crate::gateway::ensure_image(crate::gateway::SOCAT.0, crate::gateway::SOCAT.1)?;
-        images.push(crate::gateway::SOCAT.0);
-    }
-    for image in images {
+    crate::image::ensure(REGISTRY_IMAGE)?;
+    crate::gateway::ensure_image(crate::gateway::SOCAT.0, crate::gateway::SOCAT.1)?;
+    for image in [WORKER_IMAGE, REGISTRY_IMAGE, crate::gateway::SOCAT.0] {
         status(&mut crate::kube::kind_load(image, env.name()))?;
     }
     let gateway_ca = crate::gateway::E2E.install(env, work)?;
@@ -156,62 +139,47 @@ fn install(env: &Cluster, work: &Path, mode: &Mode) -> Result<PathBuf> {
         "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: {OLD_VOLUME}\n  namespace: {POOL_NS}\n  labels: {{app.kubernetes.io/managed-by: buildkit-controller, app.kubernetes.io/name: buildkit-cache}}\nspec:\n  accessModes: [ReadWriteOnce]\n  resources: {{requests: {{storage: 1Mi}}}}\n"
     ))?;
 
-    let (issuer_url, oidc_ca, rules) = match mode {
-        Mode::Mock(i) => {
-            let ca = write(&work.join("oidc-ca.crt"), &i.ca_pem)?;
-            env.kubectl(&["create", "namespace", "bk-oidc"])?;
-            env.kubectl(&[
-                "create",
-                "configmap",
-                "mock-oidc-ca",
-                "-n",
-                NS,
-                &format!("--from-file=ca.crt={ca}"),
-            ])?;
-            let key = write(&work.join("oidc-key.pem"), &i.key_pem)?;
-            let discovery = write(&work.join("discovery.json"), &i.discovery)?;
-            let jwks = write(&work.join("jwks.json"), &i.jwks)?;
-            env.kubectl(&[
-                "create",
-                "secret",
-                "generic",
-                "mock-oidc",
-                "-n",
-                "bk-oidc",
-                &format!("--from-file=tls.crt={ca}"),
-                &format!("--from-file=tls.key={key}"),
-                &format!("--from-file=discovery.json={discovery}"),
-                &format!("--from-file=jwks.json={jwks}"),
-            ])?;
-            env.kubectl(&[
-                "apply",
-                "-f",
-                &crate::fixture("e2e/mock-oidc.yaml", work, &[])?.to_string_lossy(),
-            ])?;
-            env.kubectl(&[
-                "apply",
-                "-f",
-                &root
-                    .join("xtask/fixtures/e2e/registry.yaml")
-                    .to_string_lossy(),
-            ])?;
-            (
-                i.url.clone(),
-                "      caBundleConfigMap: {name: mock-oidc-ca, key: ca.crt}\n".to_owned(),
-                format!(
-                    "          - oidc: {{issuer: \"{}\", claims: {{team: e2e}}}}\n          - serviceAccount: {{name: builder}}",
-                    i.url
-                ),
-            )
-        }
-        Mode::Github(repo) => (
-            GITHUB_ISSUER.to_owned(),
-            String::new(),
-            format!(
-                "          - oidc: {{issuer: \"{GITHUB_ISSUER}\", claims: {{repository: \"{repo}\"}}}}"
-            ),
-        ),
-    };
+    let ca = write(&work.join("oidc-ca.crt"), &issuer.ca_pem)?;
+    env.kubectl(&["create", "namespace", "bk-oidc"])?;
+    env.kubectl(&[
+        "create",
+        "configmap",
+        "mock-oidc-ca",
+        "-n",
+        NS,
+        &format!("--from-file=ca.crt={ca}"),
+    ])?;
+    let key = write(&work.join("oidc-key.pem"), &issuer.key_pem)?;
+    let discovery = write(&work.join("discovery.json"), &issuer.discovery)?;
+    let jwks = write(&work.join("jwks.json"), &issuer.jwks)?;
+    env.kubectl(&[
+        "create",
+        "secret",
+        "generic",
+        "mock-oidc",
+        "-n",
+        "bk-oidc",
+        &format!("--from-file=tls.crt={ca}"),
+        &format!("--from-file=tls.key={key}"),
+        &format!("--from-file=discovery.json={discovery}"),
+        &format!("--from-file=jwks.json={jwks}"),
+    ])?;
+    env.kubectl(&[
+        "apply",
+        "-f",
+        &crate::fixture("e2e/mock-oidc.yaml", work, &[])?.to_string_lossy(),
+    ])?;
+    env.kubectl(&[
+        "apply",
+        "-f",
+        &root
+            .join("xtask/fixtures/e2e/registry.yaml")
+            .to_string_lossy(),
+    ])?;
+    let rules = format!(
+        "          - oidc: {{issuer: \"{}\", claims: {{team: e2e}}}}\n          - serviceAccount: {{name: builder}}",
+        issuer.url
+    );
 
     let values = format!(
         "\
@@ -240,7 +208,9 @@ auth:
   oidc:
     - url: \"{issuer_url}\"
       audiences: [{AUD}]
-{oidc_ca}",
+      caBundleConfigMap: {{name: mock-oidc-ca, key: ca.crt}}
+",
+        issuer_url = issuer.url,
         edge_port = ports.edge,
         gw = crate::gateway::E2E.name,
         gw_ns = crate::gateway::E2E.ns,
@@ -255,16 +225,13 @@ auth:
     // emulation and no pin.
     let host = host_platform()?;
     let foreign = if host == "arm64" { "amd64" } else { "arm64" };
-    let platforms: Vec<(String, String)> = match mode {
-        Mode::Mock(_) => vec![
-            (host.to_owned(), format!("linux/{host}")),
-            (
-                foreign.to_owned(),
-                format!("linux/{foreign}, linux/riscv64"),
-            ),
-        ],
-        Mode::Github(_) => vec![(host.to_owned(), format!("linux/{host}"))],
-    };
+    let platforms: Vec<(String, String)> = vec![
+        (host.to_owned(), format!("linux/{host}")),
+        (
+            foreign.to_owned(),
+            format!("linux/{foreign}, linux/riscv64"),
+        ),
+    ];
     let mut pools = String::from("pools:\n");
     for (p, plats) in &platforms {
         pools.push_str(&pool_yaml(p, plats, &rules));
@@ -336,20 +303,6 @@ auth:
     }
     println!("PASS routes Accepted: HTTPRoute and BackendTLSPolicy (API), TLSRoute (edge)");
     Ok(path)
-}
-
-/// Install a cluster for the GitHub Action job and leave it running.
-pub(crate) fn e2e_up(repo: &str) -> Result<()> {
-    let work = work_dir();
-    std::fs::create_dir_all(&work)?;
-    let env = cluster(&work)?;
-    // Left running for the Action job, whether or not the install succeeds.
-    env.keep();
-    let ca = install(&env, &work, &Mode::Github(repo))?;
-    // The CI job reads the URL from this file, not from a fixed port.
-    write(&work.join("api-url"), &format!("{}\n", *API))?;
-    println!("e2e-up: API {}, CA {}", *API, ca.display());
-    Ok(())
 }
 
 pub(crate) fn e2e() -> Result<()> {
@@ -478,7 +431,7 @@ fn prepare(work: &Path) -> Result<(PathBuf, PathBuf)> {
 #[allow(clippy::too_many_lines, reason = "one linear scenario script")]
 fn run(env: &Cluster, work: &Path) -> Result<()> {
     let issuer = Issuer::new(OIDC_HOST)?;
-    let ca = install(env, work, &Mode::Mock(&issuer))?;
+    let ca = install(env, work, &issuer)?;
     let (ctx, mp) = prepare(work)?;
     let host = host_platform()?;
     let pool = format!("{POOL_NS}/{host}");
