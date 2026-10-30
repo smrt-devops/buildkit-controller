@@ -18,50 +18,5 @@ The release notes start with the image digest and the commands that verify the i
 
 ## Where nightly failures show
 
-A failed nightly run is a failed job and nothing more. Look under Actions, in the `E2E` and `Audit` workflows, filtered with `event:schedule`. GitHub emails a failed scheduled run only to the account that last changed its `cron` line, so that account needs "Actions" notifications on (see below). The nightly artifacts hold the soak result and client log, the perf table and the `drain-verify --long` log.
+A failed nightly run is a failed job and nothing more. Look under Actions, in the `E2E` and `Audit` workflows, filtered with `event:schedule`. The nightly artifacts hold the soak result and client log, the perf table and the `drain-verify --long` log.
 
-## Repository settings
-
-These are set in the GitHub UI. The workflows behave safely without them, but each item says what goes wrong until it is set.
-
-### Workflow permissions
-
-Settings, Actions, General, Workflow permissions: "Read repository contents and packages permissions". Each workflow requests the extra permissions it needs (`packages: write`, `id-token: write`, `attestations: write`, `contents: write`) in its own `permissions` block.
-
-### Branch protection for main
-
-Settings, Branches, rule for `main`: require a pull request with one approval, dismiss stale approvals, require status checks to pass with the branch up to date. Required checks, named exactly as a finished run shows them:
-
-- Rust: `fmt`, `clippy`, `test`, `deny`, `chart`, `Image build amd64 (no push)`, `Image build arm64 (no push)`.
-- E2E: `kind-all`, `examples`.
-
-Remove the old `Image build (no push)` check, or every pull request waits for it. Do not require `action`, which is skipped on fork pull requests, or the `Action` workflow, which runs only when `action/` or `docs/ci/` change. With `kind-all` required, a Renovate or Dependabot pull request cannot automerge until the kind suites pass. Until this is set, the release gate still refuses any commit whose push runs are red, but main can hold a commit that cannot be released.
-
-### Tag rulesets
-
-Settings, Rules, Rulesets, new tag ruleset "release tags", enforcement Active:
-
-- Target `refs/tags/v*`. That covers the release tags and the `v0` tag that users of `smrt-devops/buildkit-controller/action@v0` run.
-- Turn on "Restrict creations", "Restrict updates", "Restrict deletions" and "Block force pushes".
-- Bypass list: the Repository admin role and, when the repository belongs to an organization, the GitHub Actions app, so the `action-tag` job can move `v0`.
-
-On a personal account the GitHub Actions app cannot be a bypass actor. Then the `action-tag` job's push is refused and the job fails after everything else is published. Move the tag yourself once the release run is otherwise green: `git tag -fa v0 -m "Release vX.Y.Z" vX.Y.Z^{} && git push --force origin refs/tags/v0`. Until `v0` is in a ruleset, anyone with push access can move it, and every `@v0` user runs what it points at; pinning the Action to `@vX.Y.Z` or a commit SHA avoids that.
-
-### GitHub Pages
-
-Settings, Pages, Source: "GitHub Actions". Until then the `deploy` job of every Docs push run fails at `configure-pages`. It is not part of the release gate.
-
-### Package visibility
-
-The release workflow pushes the image `ghcr.io/smrt-devops/buildkit-controller` and the OCI chart `ghcr.io/smrt-devops/charts/buildkit-controller`. GHCR creates the chart package private on its first push. After the first release, set both packages to public and link them to the repository under each package's settings, so users can pull without credentials. If a package already exists, grant this repository write access under the package's "Manage Actions access", or the release fails at the registry push.
-
-### Notifications and security
-
-- Renovate: install the [Renovate app](https://github.com/apps/renovate) for the repository. Without it, nothing updates the pinned actions.
-- Your own Settings, Notifications, System, Actions: on, so failed scheduled runs reach you by email.
-- Settings, Security: Dependabot alerts, Dependabot security updates and private vulnerability reporting on.
-
-### Test the setup
-
-1. Open a pull request. Branch protection must block the merge until the required checks above pass.
-2. Push a pre-release tag for the version in the tree, such as `v0.2.0-test1`. The Release workflow must publish a GitHub pre-release with the chart attached and must not move `v0`. Delete the tag, the release and the test image afterwards.
