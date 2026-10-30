@@ -97,6 +97,7 @@ jobs:
       - name: Install checksum-pinned helm
         run: |
           set -euo pipefail
+          cd "$RUNNER_TEMP"
           curl -sSfL --proto =https -o helm.tgz "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
           echo "${HELM_SHA256}  helm.tgz" | sha256sum -c -
           tar -xzf helm.tgz --strip-components=1 linux-amd64/helm
