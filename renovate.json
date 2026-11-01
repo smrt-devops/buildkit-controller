@@ -80,7 +80,5 @@
   "timezone": "UTC",
   "prCreation": "not-pending",
   "rebaseWhen": "behind-base-branch",
-  "rebaseStalePrs": true,
-  "updateLockFiles": true,
   "separateMinorPatch": true
 }
