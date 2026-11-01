@@ -14,14 +14,13 @@ Renovate groups updates by manager, and each group runs before 10am UTC on Monda
 
 ## Merging
 
-Renovate merges minor and patch updates by squash only after the required status checks pass, and only once a release is three days old (`minimumReleaseAge`). GitHub Action pins and Docker digests never automerge, because they run with release credentials. Major updates need a manual review. Security vulnerability alerts get the `security` label.
+Renovate never merges. A maintainer reviews and merges every update pull request once the required status checks pass. Renovate proposes a release only once it is three days old (`minimumReleaseAge`). Security vulnerability alerts get the `security` label.
 
 ## Changing the behavior
 
 Edit `renovate.json`.
 
 - To change the update schedule, edit the `schedule` field.
-- To stop auto-merge, set `automerge` to `false` in the minor and patch rule.
 - To handle another package manager, add an entry to `packageRules`.
 - To change pull request limits, edit `prConcurrentLimit` and `prHourlyLimit`.
 

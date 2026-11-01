@@ -57,14 +57,7 @@
     },
     {
       "matchUpdateTypes": ["minor", "patch"],
-      "labels": ["dependencies", "minor-update"],
-      "automerge": true,
-      "automergeType": "pr",
-      "automergeStrategy": "squash"
-    },
-    {
-      "matchManagers": ["github-actions", "dockerfile"],
-      "automerge": false
+      "labels": ["dependencies", "minor-update"]
     },
     {
       "matchDepTypes": ["indirect"],
@@ -85,9 +78,6 @@
   },
   "schedule": ["before 10am on monday"],
   "timezone": "UTC",
-  "automerge": false,
-  "automergeType": "pr",
-  "platformAutomerge": true,
   "prCreation": "not-pending",
   "rebaseWhen": "behind-base-branch",
   "rebaseStalePrs": true,
