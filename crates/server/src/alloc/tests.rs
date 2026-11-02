@@ -1541,6 +1541,9 @@ async fn a_bound_claim_without_a_ca_answers_pending() {
 #[path = "tests_cache.rs"]
 mod cache_tests;
 
+#[path = "tests_idle.rs"]
+mod idle_tests;
+
 fn fresh_key() -> String {
     rcgen::KeyPair::generate().unwrap().public_key_pem()
 }

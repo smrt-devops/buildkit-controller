@@ -111,12 +111,22 @@ impl AllocMetrics {
         self.conflicts.get_or_create(&pool(ns, p)).inc();
     }
 
-    /// `reason` = `released` (the claim was deleted or ended) or `pod_lost` (the claimed pod was
+    /// `reason` = `released` (the claim was deleted or ended), `allocation_idle`
+    /// (its delivered claim went unused) or `pod_lost` (the claimed pod was
     /// terminating).
     pub fn release(&self, ns: &str, p: &str, reason: &str) {
         self.releases
             .get_or_create(&with(pool(ns, p), "reason", reason))
             .inc();
+    }
+
+    /// Releases counted for `reason` (tests).
+    #[must_use]
+    #[cfg(test)]
+    pub fn released(&self, ns: &str, p: &str, reason: &str) -> u64 {
+        self.releases
+            .get_or_create(&with(pool(ns, p), "reason", reason))
+            .get()
     }
 
     /// One `201` that carried cache flags; `tier` = `trusted` or `untrusted`.

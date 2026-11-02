@@ -28,6 +28,7 @@ use super::pods::PodView;
 use super::revoke::{MAX_CONNECTIONS_PER_ALLOCATION, Registry};
 use super::tls::EdgeTls;
 use super::upstream::{dial, worker_name};
+use crate::alloc::EdgeActivity;
 use crate::pki::AllocationId;
 use crate::runtime::stores::PodSubscription;
 
@@ -35,6 +36,10 @@ use crate::runtime::stores::PodSubscription;
 const BUF: usize = 64 * 1024;
 /// Bound on sending `close_notify` to both legs once a connection ends.
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
+/// How often the edge looks for claims to stamp. The stamp of a claim in use
+/// is written once it is [`SEEN_EVERY`](crate::alloc::claims::SEEN_EVERY)
+/// old, so while writes succeed it is never older than the two together.
+const ACTIVITY_EVERY: Duration = Duration::from_secs(5);
 
 /// Proxy limits from `edge.*`.
 #[derive(Debug, Clone, Copy)]
@@ -91,6 +96,24 @@ impl ProxyHandler {
             .live
             .follow(self.inner.view.clone(), sub, stop)
             .await;
+    }
+
+    /// Records this replica's edge activity on the claims every
+    /// [`ACTIVITY_EVERY`] until `stop`, so the leader can tell a delivered
+    /// allocation in use from one its client left.
+    pub async fn record_activity(&self, activity: EdgeActivity, stop: CancellationToken) {
+        let mut tick = tokio::time::interval(ACTIVITY_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = stop.cancelled() => return,
+                _ = tick.tick() => {}
+            }
+            let (live, closed) = self.inner.live.activity();
+            activity
+                .stamp(&live, closed, OffsetDateTime::now_utc())
+                .await;
+        }
     }
 
     /// Open proxied connections (tests, debugging).

@@ -1,10 +1,12 @@
 //! Live-connection index for revocation: connections keyed by
-//! pod uid, cancelled from Pod events within the event's delivery.
+//! pod uid, cancelled from Pod events within the event's delivery. It also
+//! tells the claim stamper which allocations hold or closed a connection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use time::OffsetDateTime;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -39,6 +41,9 @@ pub fn namespace_cap(max_connections: usize) -> usize {
 pub struct Registry {
     next: AtomicU64,
     live: Mutex<Index>,
+    /// Allocations whose connections closed since [`Registry::activity`] last
+    /// ran, with when.
+    closed: Mutex<HashMap<String, OffsetDateTime>>,
     /// Cap per pod uid; 0 disables it.
     max_per_pod: usize,
 }
@@ -59,11 +64,19 @@ pub struct Registration {
 impl Drop for Registration {
     fn drop(&mut self) {
         let mut live = self.registry.lock();
-        if let Some(conns) = live.get_mut(&self.uid) {
-            conns.remove(&self.key);
-            if conns.is_empty() {
-                live.remove(&self.uid);
-            }
+        let Some(conns) = live.get_mut(&self.uid) else {
+            return;
+        };
+        // A connection revoked is already out of the index; its allocation ended.
+        let gone = conns.remove(&self.key);
+        if conns.is_empty() {
+            live.remove(&self.uid);
+        }
+        drop(live);
+        if let Some(l) = gone {
+            self.registry
+                .closed_lock()
+                .insert(l.alloc.as_str().to_owned(), OffsetDateTime::now_utc());
         }
     }
 }
@@ -75,12 +88,29 @@ impl Registry {
         Self {
             next: AtomicU64::new(0),
             live: Mutex::default(),
+            closed: Mutex::default(),
             max_per_pod,
         }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Index> {
         self.live.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn closed_lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, OffsetDateTime>> {
+        self.closed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The allocation ids holding a connection now, and the ones whose
+    /// connections closed since the last call, with when.
+    pub fn activity(&self) -> (HashSet<String>, HashMap<String, OffsetDateTime>) {
+        let live = self
+            .lock()
+            .values()
+            .flat_map(HashMap::values)
+            .map(|l| l.alloc.as_str().to_owned())
+            .collect();
+        (live, std::mem::take(&mut *self.closed_lock()))
     }
 
     /// Indexes a connection; the receiver fires with the reason it must close.

@@ -42,10 +42,18 @@ pub const FINISHED_TTL: Duration = Duration::from_mins(10);
 /// way, a 30 s `Retry-After`), plus [`SEEN_EVERY`], plus clock skew between
 /// the replica that writes `seen-at` and the leader that reads it.
 pub const ABANDON_AFTER: Duration = Duration::from_mins(3);
-/// The API refreshes a claim's `seen-at` at most this often.
+/// The API refreshes a claim's `seen-at`, and each replica its `edge-seen-at`,
+/// at most this often.
 pub const SEEN_EVERY: Duration = Duration::from_secs(15);
 /// Claim annotation: when the API last answered the claim's caller.
 pub const ANN_SEEN_AT: &str = "buildkit.smrt-devops.net/seen-at";
+/// Claim annotation: when the API answered with the bound allocation, written
+/// with `delivered`. Only claims that carry it can be released as idle.
+pub const ANN_DELIVERED_AT: &str = "buildkit.smrt-devops.net/delivered-at";
+/// Claim annotation: when a replica last held an edge connection of the
+/// claim's allocation, written while it holds one and once more after its
+/// last one closes.
+pub const ANN_EDGE_SEEN_AT: &str = "buildkit.smrt-devops.net/edge-seen-at";
 /// Claim annotation `true` once the API has answered with the bound allocation.
 pub const ANN_DELIVERED: &str = "buildkit.smrt-devops.net/delivered";
 
@@ -75,6 +83,9 @@ pub mod reason {
     pub const WORKER_LOST: &str = "WorkerLost";
     /// The allocation TTL ran out.
     pub const EXPIRED: &str = "Expired";
+    /// A delivered allocation had no edge connection for the pool's
+    /// `scaling.idleTimeout`.
+    pub const IDLE: &str = "Idle";
 }
 
 /// Who a claim allocates for.
@@ -385,11 +396,19 @@ pub fn delivered(c: &BuildKitClaim) -> bool {
     claim_ann(c, ANN_DELIVERED) == Some("true")
 }
 
+fn stamp(c: &BuildKitClaim, key: &str) -> Option<OffsetDateTime> {
+    parse_ts(claim_ann(c, key)?)
+}
+
+/// Seconds since the time in annotation `key` of `c`; `None` without it.
+fn age(c: &BuildKitClaim, key: &str, now: OffsetDateTime) -> Option<u64> {
+    u64::try_from(now.unix_timestamp() - stamp(c, key)?.unix_timestamp()).ok()
+}
+
 /// Seconds since the API last answered the caller of `c`; `None` for a claim
 /// without `seen-at` (an in-cluster claim, or one made before it existed).
 fn unseen_for(c: &BuildKitClaim, now: OffsetDateTime) -> Option<u64> {
-    let at = parse_ts(claim_ann(c, ANN_SEEN_AT)?)?;
-    u64::try_from(now.unix_timestamp() - at.unix_timestamp()).ok()
+    age(c, ANN_SEEN_AT, now)
 }
 
 /// True when the API should refresh `seen-at` of `c` at `now`.
@@ -398,10 +417,59 @@ pub fn seen_due(c: &BuildKitClaim, now: OffsetDateTime) -> bool {
     !delivered(c) && unseen_for(c, now).is_some_and(|s| s >= SEEN_EVERY.as_secs())
 }
 
+/// True when `edge-seen-at` of `c` should record edge activity at `since`:
+/// `c` is a delivered, bound claim of the controller's namespace `own`, and
+/// its stamp is missing or older than `since`.
+#[must_use]
+pub fn edge_behind(c: &BuildKitClaim, own: &str, since: OffsetDateTime) -> bool {
+    c.metadata.namespace.as_deref() == Some(own)
+        && c.metadata.deletion_timestamp.is_none()
+        && phase(c) == ClaimPhase::Bound
+        && delivered(c)
+        && stamp(c, ANN_EDGE_SEEN_AT).is_none_or(|t| t.unix_timestamp() < since.unix_timestamp())
+}
+
+/// True when a replica should write `edge-seen-at` of `c` at `now` for edge
+/// activity at `since`: [`edge_behind`], and the stamp is missing or at least
+/// [`SEEN_EVERY`] old, the throttle of `seen-at`.
+#[must_use]
+pub fn edge_due(c: &BuildKitClaim, own: &str, since: OffsetDateTime, now: OffsetDateTime) -> bool {
+    edge_behind(c, own, since)
+        && age(c, ANN_EDGE_SEEN_AT, now).is_none_or(|s| s >= SEEN_EVERY.as_secs())
+}
+
+/// When delivered claim `c` was last in use: the later of its delivery
+/// (`delivered-at`) and its last edge activity. `None` for a claim delivered
+/// by a version that wrote no `delivered-at`: its edge may run on a replica
+/// that never stamps, so it is left to its TTL.
+#[must_use]
+pub fn last_active(c: &BuildKitClaim) -> Option<OffsetDateTime> {
+    let delivered = stamp(c, ANN_DELIVERED_AT)?;
+    Some(delivered.max(stamp(c, ANN_EDGE_SEEN_AT).unwrap_or(delivered)))
+}
+
+/// True when delivered CI claim `c` of the controller's namespace `own` has
+/// been bound with no edge connection on any replica for `idle_secs` (the
+/// pool's `scaling.idleTimeout`) at `now`: its client is gone without a
+/// `DELETE`. A replica refreshes `edge-seen-at` every [`SEEN_EVERY`] while it
+/// holds a connection, and `idleTimeout` is at least a minute, so a claim in
+/// use is never idle. A claim without `delivered-at` is never idle.
+#[must_use]
+pub fn idle(c: &BuildKitClaim, own: &str, idle_secs: u64, now: OffsetDateTime) -> bool {
+    let idle = i64::try_from(idle_secs).unwrap_or(i64::MAX);
+    c.metadata.namespace.as_deref() == Some(own)
+        && c.metadata.deletion_timestamp.is_none()
+        && phase(c) == ClaimPhase::Bound
+        && delivered(c)
+        && last_active(c)
+            .is_some_and(|t| now.unix_timestamp() >= t.unix_timestamp().saturating_add(idle))
+}
+
 /// True when CI claim `c` of the controller's namespace `own` is pending, or
 /// bound with its answer never delivered, and its caller has not asked for it
 /// for [`ABANDON_AFTER`]: the client is gone, and the claim is deleted so it
-/// holds no place and no worker. A delivered claim lives to its TTL.
+/// holds no place and no worker. A delivered claim lives to its TTL, or
+/// until it is [`idle`].
 #[must_use]
 pub fn abandoned(c: &BuildKitClaim, own: &str, now: OffsetDateTime) -> bool {
     c.metadata.namespace.as_deref() == Some(own)
@@ -583,6 +651,25 @@ pub fn ended_status(c: &BuildKitClaim, phase: ClaimPhase) -> BuildKitClaimStatus
     } else {
         (reason::EXPIRED, "the allocation TTL ran out")
     };
+    finished(c, phase, reason, message)
+}
+
+/// Status for a delivered claim released for idleness: `Expired`, reason
+/// `Idle`, so the API answers `not_found` as for a claim at its TTL.
+#[must_use]
+pub fn idle_status(c: &BuildKitClaim, idle_timeout: &str) -> BuildKitClaimStatus {
+    let message = format!(
+        "no edge connection for {idle_timeout} (the pool's scaling.idleTimeout); the allocation was released"
+    );
+    finished(c, ClaimPhase::Expired, reason::IDLE, &message)
+}
+
+fn finished(
+    c: &BuildKitClaim,
+    phase: ClaimPhase,
+    reason: &str,
+    message: &str,
+) -> BuildKitClaimStatus {
     let mut s = c.status.clone().unwrap_or_default();
     s.phase = Some(phase);
     s.secret_name = None;

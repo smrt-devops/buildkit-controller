@@ -172,6 +172,12 @@ impl Binder {
         &self.metrics
     }
 
+    /// Pool `key` from the store.
+    #[must_use]
+    pub fn pool(&self, key: &PoolKey) -> Option<Arc<BuildKitPool>> {
+        self.pools.get(&ObjectRef::new(&key.1).within(&key.0))
+    }
+
     fn memory(&self) -> std::sync::MutexGuard<'_, Memory> {
         self.memory.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -207,10 +213,7 @@ impl Binder {
                     .is_none_or(|u| !m.bound.contains_key(u))
             });
         }
-        let pool = self
-            .pools
-            .get(&ObjectRef::new(&key.1).within(&key.0))
-            .filter(|p| p.metadata.uid.is_some());
+        let pool = self.pool(key).filter(|p| p.metadata.uid.is_some());
         let mut pass = Pass {
             held: self.held(&all, key),
             ..Pass::default()
