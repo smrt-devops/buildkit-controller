@@ -20,11 +20,14 @@
 #[path = "support/kind.rs"]
 mod harness;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use buildkit_controller::alloc::{AllocError, AllocService, Outcome};
+use buildkit_controller::alloc::pods::fmt_ts;
+use buildkit_controller::alloc::{
+    AllocError, AllocService, EdgeActivity, Outcome, claims, kube_backend,
+};
 use buildkit_controller::auth::Identity;
 use buildkit_controller::certs::Certs;
 use buildkit_controller::config::{Cli, Config, Settings};
@@ -45,6 +48,7 @@ use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::{Namespace, Pod, Secret};
 use kube::ResourceExt;
 use kube::api::{Api, ListParams, Patch, PatchParams, PostParams};
+use kube::runtime::reflector::ObjectRef;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tokio::sync::watch;
@@ -724,9 +728,71 @@ async fn alloc_verify() {
         )
     );
 
+    idle(&h).await;
     upgrade(&h).await;
     cold(&stop).await;
     stop.cancel();
+}
+
+/// A delivered allocation whose client left without a `DELETE`: the follower
+/// records an edge connection closing, as its edge would, then the stamps are
+/// backdated past the pool's 10 minute `idleTimeout`. The leader ends the
+/// claim `Expired/Idle` and retires the worker as `allocation_idle`.
+async fn idle(h: &H) {
+    let names = h.warm("i", 1).await;
+    let who = sa(NS, "idler");
+    let svc = &h.leader.svc;
+    let r = bound(svc.allocate(&who, &req(NS, 900, 0)).await);
+    let ns = system(NS);
+    let follower = h.follower.ctx.claims();
+    let at = ObjectRef::new(&r.id).within(&ns);
+    wait(
+        "the follower sees the delivery",
+        Duration::from_secs(30),
+        || follower.get(&at).is_some_and(|c| claims::delivered(&c)),
+    )
+    .await;
+    let act = EdgeActivity::new(kube_backend(&h.follower.ctx).unwrap(), follower, ns);
+    let now = OffsetDateTime::now_utc();
+    act.stamp(&HashSet::new(), [(r.id.clone(), now)], now).await;
+    let c = h.claims.get(&r.id).await.unwrap();
+    assert_eq!(
+        c.annotations().get(claims::ANN_EDGE_SEEN_AT),
+        Some(&fmt_ts(now)),
+        "the close is stamped"
+    );
+    let old = fmt_ts(now - time::Duration::minutes(11));
+    let anns = json!({claims::ANN_SEEN_AT: old, claims::ANN_EDGE_SEEN_AT: old});
+    h.claims
+        .patch(
+            &r.id,
+            &PatchParams::default(),
+            &Patch::Merge(json!({"metadata": {"annotations": anns}})),
+        )
+        .await
+        .unwrap();
+    let leader = h.leader.ctx.claims();
+    wait("the idle claim ends", Duration::from_secs(30), || {
+        leader
+            .get(&at)
+            .is_some_and(|c| claims::reason(&c) == Some(claims::reason::IDLE))
+    })
+    .await;
+    h.gone(&names).await;
+    assert_eq!(
+        metric(&h.leader.metrics, "reason=\"allocation_idle\""),
+        1,
+        "{}",
+        h.leader.metrics.render()
+    );
+    assert_eq!(
+        svc.get(&who, &r.id, Duration::ZERO).await,
+        Err(AllocError::NotFound)
+    );
+    println!(
+        "SCENARIO idle: delivered allocation {} stamped by the follower, released at idleTimeout, worker {} retired as allocation_idle",
+        r.id, names[0]
+    );
 }
 
 /// Scenario 7, the cold path: a pool with `min: 0` and no warm pod. The claim waits,

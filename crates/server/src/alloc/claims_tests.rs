@@ -423,3 +423,64 @@ fn pre_claim_pods_of_ended_claims_are_strays() {
         .collect();
     assert_eq!(got, ["default-1", "default-2", "default-3"]);
 }
+
+/// The idle rule counts from the later of delivery (`seen-at`) and the last
+/// edge stamp, and holds only for delivered, bound claims of the controller's
+/// namespace. The edge stamps the same claims, throttled to every 15 s.
+#[test]
+fn idle_counts_from_the_last_use_of_a_delivered_claim() {
+    let t = |s: &str| crate::alloc::pods::parse_ts(s).unwrap();
+    let with = |mut c: BuildKitClaim, anns: &[(&str, &str)]| {
+        let a = c.metadata.annotations.get_or_insert_default();
+        for (k, v) in anns {
+            a.insert((*k).into(), (*v).into());
+        }
+        c
+    };
+    let bound = with_phase(
+        claim(OWN, "a", "u1", "2026-01-01T00:00:00Z"),
+        ClaimPhase::Bound,
+    );
+    let delivered = with(
+        bound.clone(),
+        &[
+            (ANN_DELIVERED, "true"),
+            (ANN_SEEN_AT, "2026-01-01T00:00:00Z"),
+        ],
+    );
+    assert!(!idle(&delivered, OWN, 600, t("2026-01-01T00:09:59Z")));
+    assert!(idle(&delivered, OWN, 600, t("2026-01-01T00:10:00Z")));
+    // Undelivered, another namespace, or ended: never idle.
+    let undelivered = with(bound.clone(), &[(ANN_SEEN_AT, "2026-01-01T00:00:00Z")]);
+    assert!(!idle(&undelivered, OWN, 600, t("2026-01-02T00:00:00Z")));
+    assert!(!idle(&delivered, "other", 600, t("2026-01-02T00:00:00Z")));
+    let ended = with_phase(delivered.clone(), ClaimPhase::Expired);
+    assert!(!idle(&ended, OWN, 600, t("2026-01-02T00:00:00Z")));
+    // An edge stamp after delivery moves the start; one before it does not.
+    let used = with(
+        delivered.clone(),
+        &[(ANN_EDGE_SEEN_AT, "2026-01-01T01:00:00Z")],
+    );
+    assert!(!idle(&used, OWN, 600, t("2026-01-01T01:09:59Z")));
+    assert!(idle(&used, OWN, 600, t("2026-01-01T01:10:00Z")));
+    let early = with(
+        delivered.clone(),
+        &[(ANN_EDGE_SEEN_AT, "2025-12-31T23:00:00Z")],
+    );
+    assert_eq!(last_active(&early), Some(t("2026-01-01T00:00:00Z")));
+    // Stamps: only for delivered claims, when behind, at most every 15 s.
+    let now = t("2026-01-01T01:00:10Z");
+    assert!(!edge_due(&undelivered, OWN, now, now));
+    assert!(edge_due(&delivered, OWN, now, now), "no stamp yet");
+    assert!(!edge_due(&used, OWN, now, now), "stamped 10 s ago");
+    assert!(edge_due(
+        &used,
+        OWN,
+        now + time::Duration::seconds(5),
+        now + time::Duration::seconds(5)
+    ));
+    assert!(
+        !edge_behind(&used, OWN, t("2026-01-01T01:00:00Z")),
+        "already recorded"
+    );
+}

@@ -2,6 +2,12 @@
 
 All notable changes are listed here, newest first.
 
+## Unreleased
+
+### Changed
+
+- A delivered allocation whose client died without a `DELETE` no longer holds its worker until the TTL. Each replica stamps the claim with an `edge-seen-at` annotation while its edge holds a connection for the allocation and once after the connection closes, and the leader ends a delivered claim (`Expired`, reason `Idle`) once neither delivery nor any stamp is newer than the pool's `scaling.idleTimeout` (10 minutes by default). It logs `released an idle allocation` and counts the worker in `buildkit_releases_total{reason="allocation_idle"}`. A job that holds an allocation with no edge connection for longer than `idleTimeout`, such as a long test step between two builds, now loses its worker; raise `scaling.idleTimeout` for such pools. See [Abandoned allocations](docs/operations.md#abandoned-allocations).
+
 ## 0.2.0
 
 0.2.0 replaces the per-replica allocation queues with one claim queue and replaces both cache layers with a built-in cache registry. Read [From 0.1.0 to 0.2.0](docs/operations.md#from-010-to-020) before upgrading.

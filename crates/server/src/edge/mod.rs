@@ -45,6 +45,7 @@ pub use proxy::{End, ProxyHandler, ProxyOptions, pump};
 pub use tls::{EdgeTls, TlsBuilder};
 pub use upstream::client_config;
 
+use crate::alloc::{EdgeActivity, kube_backend};
 use crate::certs::CertMaterial;
 use crate::net::ProxyProtocol;
 use crate::render::BUILDKIT_PORT;
@@ -120,6 +121,15 @@ impl Component for EdgeComponent {
                 let (p, sub, stop) = (proxy.clone(), ctx.pod_events(), revoke_stop.clone());
                 async move { p.revoke_on(sub, stop).await }
             });
+            let activity = EdgeActivity::new(
+                kube_backend(&ctx)?,
+                ctx.claims(),
+                ctx.namespace().to_owned(),
+            );
+            let recorder = tokio::spawn({
+                let (p, stop) = (proxy.clone(), revoke_stop.clone());
+                async move { p.record_activity(activity, stop).await }
+            });
             let handler: Arc<dyn ConnectionHandler> = Arc::new(proxy);
             let builder = TlsBuilder::new(Arc::clone(&handler), metrics.clone());
             let material_stop = CancellationToken::new();
@@ -137,6 +147,7 @@ impl Component for EdgeComponent {
             let _ = material.await;
             revoke_stop.cancel();
             let _ = revoker.await;
+            let _ = recorder.await;
             Ok(())
         })
     }
