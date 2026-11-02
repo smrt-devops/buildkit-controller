@@ -762,7 +762,7 @@ async fn idle(h: &H) {
         "the close is stamped"
     );
     let old = fmt_ts(now - time::Duration::minutes(11));
-    let anns = json!({claims::ANN_SEEN_AT: old, claims::ANN_EDGE_SEEN_AT: old});
+    let anns = json!({claims::ANN_DELIVERED_AT: old, claims::ANN_EDGE_SEEN_AT: old});
     h.claims
         .patch(
             &r.id,

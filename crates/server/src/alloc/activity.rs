@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use buildkit_controller_api::claim::BuildKitClaim;
+use futures::stream::{self, StreamExt};
 use kube::runtime::reflector::{ObjectRef, Store};
 use time::OffsetDateTime;
 use tracing::{debug, warn};
@@ -16,6 +17,9 @@ use tracing::{debug, warn};
 use super::backend::{Backend, Write};
 use super::claims;
 use super::pods::fmt_ts;
+
+/// Stamp writes one round has in flight at once.
+const WRITES: usize = 16;
 
 /// Writes `edge-seen-at` for one replica's edge connections.
 pub struct EdgeActivity {
@@ -73,6 +77,7 @@ impl EdgeActivity {
                 )
                 .collect()
         };
+        let mut due = Vec::new();
         for (id, since) in wanted {
             let c = self
                 .claims
@@ -82,10 +87,19 @@ impl EdgeActivity {
                 self.settle(&id, since);
                 continue;
             };
-            if claims::edge_due(&c, &self.namespace, since, now) && self.write(&c, now).await {
-                self.settle(&id, since);
+            if claims::edge_due(&c, &self.namespace, since, now) {
+                due.push((id, since, c));
             }
         }
+        // Concurrent, so a slow API server does not stretch a round past the
+        // stamp interval when this replica proxies many allocations.
+        stream::iter(due)
+            .for_each_concurrent(WRITES, |(id, since, c)| async move {
+                if self.write(&c, now).await {
+                    self.settle(&id, since);
+                }
+            })
+            .await;
     }
 
     /// Forget the close of `id` at `since`, unless a later one came in.

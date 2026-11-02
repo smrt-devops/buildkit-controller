@@ -45,9 +45,11 @@ pub const ABANDON_AFTER: Duration = Duration::from_mins(3);
 /// The API refreshes a claim's `seen-at`, and each replica its `edge-seen-at`,
 /// at most this often.
 pub const SEEN_EVERY: Duration = Duration::from_secs(15);
-/// Claim annotation: when the API last answered the claim's caller. Once the
-/// claim is delivered it stays at the time of delivery.
+/// Claim annotation: when the API last answered the claim's caller.
 pub const ANN_SEEN_AT: &str = "buildkit.smrt-devops.net/seen-at";
+/// Claim annotation: when the API answered with the bound allocation, written
+/// with `delivered`. Only claims that carry it can be released as idle.
+pub const ANN_DELIVERED_AT: &str = "buildkit.smrt-devops.net/delivered-at";
 /// Claim annotation: when a replica last held an edge connection of the
 /// claim's allocation, written while it holds one and once more after its
 /// last one closes.
@@ -437,10 +439,13 @@ pub fn edge_due(c: &BuildKitClaim, own: &str, since: OffsetDateTime, now: Offset
 }
 
 /// When delivered claim `c` was last in use: the later of its delivery
-/// (`seen-at`, frozen once delivered) and its last edge activity.
+/// (`delivered-at`) and its last edge activity. `None` for a claim delivered
+/// by a version that wrote no `delivered-at`: its edge may run on a replica
+/// that never stamps, so it is left to its TTL.
 #[must_use]
 pub fn last_active(c: &BuildKitClaim) -> Option<OffsetDateTime> {
-    stamp(c, ANN_SEEN_AT).max(stamp(c, ANN_EDGE_SEEN_AT))
+    let delivered = stamp(c, ANN_DELIVERED_AT)?;
+    Some(delivered.max(stamp(c, ANN_EDGE_SEEN_AT).unwrap_or(delivered)))
 }
 
 /// True when delivered CI claim `c` of the controller's namespace `own` has
@@ -448,7 +453,7 @@ pub fn last_active(c: &BuildKitClaim) -> Option<OffsetDateTime> {
 /// pool's `scaling.idleTimeout`) at `now`: its client is gone without a
 /// `DELETE`. A replica refreshes `edge-seen-at` every [`SEEN_EVERY`] while it
 /// holds a connection, and `idleTimeout` is at least a minute, so a claim in
-/// use is never idle. A claim with neither stamp is never idle.
+/// use is never idle. A claim without `delivered-at` is never idle.
 #[must_use]
 pub fn idle(c: &BuildKitClaim, own: &str, idle_secs: u64, now: OffsetDateTime) -> bool {
     let idle = i64::try_from(idle_secs).unwrap_or(i64::MAX);

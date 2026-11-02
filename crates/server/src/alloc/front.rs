@@ -223,9 +223,9 @@ impl Front {
 
     /// Mark `c` delivered before its bound answer `r` goes out, so the leader
     /// never takes it for abandoned while its client holds the certificate.
-    /// The same write sets `seen-at`, which then holds the delivery time the
-    /// idle rule counts from ([`claims::idle`]). A mark that fails turns the
-    /// answer into a 503 that the client retries.
+    /// The same write sets `delivered-at`, the time the idle rule counts from
+    /// ([`claims::idle`]). A mark that fails turns the answer into a 503 that
+    /// the client retries.
     async fn deliver(
         &self,
         c: &BuildKitClaim,
@@ -239,7 +239,7 @@ impl Front {
             c,
             BTreeMap::from([
                 (claims::ANN_DELIVERED.to_owned(), "true".to_owned()),
-                (claims::ANN_SEEN_AT.to_owned(), now),
+                (claims::ANN_DELIVERED_AT.to_owned(), now),
             ]),
         )
         .await?;
