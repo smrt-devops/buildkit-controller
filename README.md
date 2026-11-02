@@ -62,14 +62,14 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: smrt-devops/buildkit-controller/action@v0.2.0   # or a commit SHA
+      - uses: smrt-devops/buildkit-controller/action@v0.3.0   # or a commit SHA
         with:
           url: https://bk.example.com
           pools: ci/amd64
       - run: docker buildx build --platform linux/amd64 .
 ```
 
-Pin the Action to a release tag such as `@v0.2.0`, or to a commit SHA. The `@v0` tag moves to each new 0.x release.
+Pin the Action to a release tag such as `@v0.3.0`, or to a commit SHA. The `@v0` tag moves to each new 0.x release.
 
 Replace `bk.example.com` with a DNS name that points at the Gateway, and use the port of its HTTPS listener in `url` if it is not 443. The Gateway terminates the API's TLS with its own certificate, so with a publicly trusted one the Action needs no `ca-cert`. The edge passes through to the controller, and the Action takes its CA from each allocation.
 

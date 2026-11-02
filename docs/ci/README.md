@@ -4,10 +4,10 @@ Clients use the buildx remote driver, and there is no CLI. The GitHub Action and
 
 ## GitHub Actions
 
-See `action/`. The job needs `permissions: id-token: write`. Pin the Action to a release tag such as `@v0.2.0`, or to a commit SHA; the `@v0` tag moves to each new 0.x release.
+See `action/`. The job needs `permissions: id-token: write`. Pin the Action to a release tag such as `@v0.3.0`, or to a commit SHA; the `@v0` tag moves to each new 0.x release.
 
 ```yaml
-- uses: smrt-devops/buildkit-controller/action@v0.2.0
+- uses: smrt-devops/buildkit-controller/action@v0.3.0
   with:
     url: https://bk.example.com
     # ca-cert: ${{ vars.BK_CA }}   # see "Trusting the API" below
@@ -85,7 +85,7 @@ With `docker/build-push-action`:
 
 ```yaml
 - id: bk
-  uses: smrt-devops/buildkit-controller/action@v0.2.0
+  uses: smrt-devops/buildkit-controller/action@v0.3.0
   with:
     url: https://bk.example.com
     pools: ci/amd64

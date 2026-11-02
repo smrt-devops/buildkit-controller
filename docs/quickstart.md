@@ -14,18 +14,18 @@ This page installs the controller, creates a pool and runs one build with the Gi
 Each release publishes the chart to GHCR. Wherever a command below says `helm install bk helm/buildkit-controller`, you can install the published chart instead, without a checkout:
 
 ```sh
-helm install bk oci://ghcr.io/smrt-devops/charts/buildkit-controller --version 0.2.0 \
+helm install bk oci://ghcr.io/smrt-devops/charts/buildkit-controller --version 0.3.0 \
   -n buildkit-system --create-namespace   # plus the same --set flags as below
 ```
 
 The packaged chart is also a release asset:
 
 ```sh
-helm install bk https://github.com/smrt-devops/buildkit-controller/releases/download/v0.2.0/buildkit-controller-0.2.0.tgz \
+helm install bk https://github.com/smrt-devops/buildkit-controller/releases/download/v0.3.0/buildkit-controller-0.3.0.tgz \
   -n buildkit-system --create-namespace   # plus the same --set flags as below
 ```
 
-A checkout installs the image of its `Chart.yaml` `appVersion`, so check out the release tag (`git checkout v0.2.0`), not a branch.
+A checkout installs the image of its `Chart.yaml` `appVersion`, so check out the release tag (`git checkout v0.3.0`), not a branch.
 
 ### Verify a release
 
@@ -34,19 +34,19 @@ The release workflow signs the image with cosign (keyless, GitHub OIDC) and sign
 ```sh
 IMAGE=ghcr.io/smrt-devops/buildkit-controller DIGEST=sha256:<digest from the release notes>
 cosign verify "$IMAGE@$DIGEST" \
-  --certificate-identity https://github.com/smrt-devops/buildkit-controller/.github/workflows/release.yml@refs/tags/v0.2.0 \
+  --certificate-identity https://github.com/smrt-devops/buildkit-controller/.github/workflows/release.yml@refs/tags/v0.3.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 gh attestation verify "oci://$IMAGE@$DIGEST" -R smrt-devops/buildkit-controller
 CHART=ghcr.io/smrt-devops/charts/buildkit-controller CHART_DIGEST=sha256:<chart digest from the release notes>
 cosign verify "$CHART@$CHART_DIGEST" \
-  --certificate-identity https://github.com/smrt-devops/buildkit-controller/.github/workflows/release.yml@refs/tags/v0.2.0 \
+  --certificate-identity https://github.com/smrt-devops/buildkit-controller/.github/workflows/release.yml@refs/tags/v0.3.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 gh attestation verify "oci://$CHART@$CHART_DIGEST" -R smrt-devops/buildkit-controller
-curl -sSfLO https://github.com/smrt-devops/buildkit-controller/releases/download/v0.2.0/buildkit-controller-0.2.0.tgz
-gh attestation verify buildkit-controller-0.2.0.tgz -R smrt-devops/buildkit-controller
+curl -sSfLO https://github.com/smrt-devops/buildkit-controller/releases/download/v0.3.0/buildkit-controller-0.3.0.tgz
+gh attestation verify buildkit-controller-0.3.0.tgz -R smrt-devops/buildkit-controller
 ```
 
-To run exactly the image you verified, pin its digest: `--set image.tag=0.2.0@sha256:<digest>`.
+To run exactly the image you verified, pin its digest: `--set image.tag=0.3.0@sha256:<digest>`.
 
 ### On a real cluster
 
@@ -126,7 +126,7 @@ permissions:
   contents: read
 steps:
   - uses: actions/checkout@v4
-  - uses: smrt-devops/buildkit-controller/action@v0.2.0   # pin a release tag or a commit SHA
+  - uses: smrt-devops/buildkit-controller/action@v0.3.0   # pin a release tag or a commit SHA
     with:
       url: https://bk.example.com   # https://bk.example.com:8443 with a LoadBalancer
       pools: ci/amd64

@@ -2,7 +2,9 @@
 
 All notable changes are listed here, newest first.
 
-## Unreleased
+## 0.3.0
+
+0.3.0 frees the worker of a client that died after it received its allocation. Upgrade from 0.2.0 only; clients from 0.2.0 keep working.
 
 ### Changed
 
