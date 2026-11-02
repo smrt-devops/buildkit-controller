@@ -222,8 +222,10 @@ impl Front {
     }
 
     /// Mark `c` delivered before its bound answer `r` goes out, so the leader
-    /// never takes it for abandoned while its client holds the certificate. A
-    /// mark that fails turns the answer into a 503 that the client retries.
+    /// never takes it for abandoned while its client holds the certificate.
+    /// The same write sets `delivered-at`, the time the idle rule counts from
+    /// ([`claims::idle`]). A mark that fails turns the answer into a 503 that
+    /// the client retries.
     async fn deliver(
         &self,
         c: &BuildKitClaim,
@@ -232,8 +234,15 @@ impl Front {
         if !matches!(r, Ok(Outcome::Bound(_))) || claims::delivered(c) {
             return r;
         }
-        self.annotate(c, claims::ANN_DELIVERED, "true".into())
-            .await?;
+        let now = fmt_ts(OffsetDateTime::now_utc());
+        self.annotate(
+            c,
+            BTreeMap::from([
+                (claims::ANN_DELIVERED.to_owned(), "true".to_owned()),
+                (claims::ANN_DELIVERED_AT.to_owned(), now),
+            ]),
+        )
+        .await?;
         r
     }
 
@@ -245,7 +254,8 @@ impl Front {
         if !claims::seen_due(c, now) {
             return;
         }
-        if let Err(e) = self.annotate(c, claims::ANN_SEEN_AT, fmt_ts(now)).await {
+        let set = BTreeMap::from([(claims::ANN_SEEN_AT.to_owned(), fmt_ts(now))]);
+        if let Err(e) = self.annotate(c, set).await {
             warn!(claim = ?c.metadata.name, error = %e, "recording that a claim was asked for");
         }
     }
@@ -253,14 +263,12 @@ impl Front {
     async fn annotate(
         &self,
         c: &BuildKitClaim,
-        key: &str,
-        value: String,
+        set: BTreeMap<String, String>,
     ) -> Result<(), AllocError> {
         let (Some(name), Some(uid)) = (c.metadata.name.as_deref(), c.metadata.uid.as_deref())
         else {
             return Err(AllocError::Internal);
         };
-        let set = BTreeMap::from([(key.to_owned(), value)]);
         match self
             .backend
             .annotate_claim(&self.namespace, name, uid, set)

@@ -412,6 +412,48 @@ fn each_allocation_is_capped_and_a_closed_connection_frees_its_slot() {
     assert_eq!(held.len(), 100);
 }
 
+/// The claim stamper learns which allocations hold a connection, and each
+/// close once, with its time. A revoked connection's allocation has ended,
+/// so its close is not reported.
+#[tokio::test]
+async fn activity_reports_live_allocations_and_each_close_once() {
+    let registry = Arc::new(Registry::default());
+    let (a, _) = registry.register(&id()).unwrap();
+    let (b, _) = registry.register(&id()).unwrap();
+    let (live, closed) = registry.activity();
+    assert_eq!(live, [ALLOC.to_owned()].into());
+    assert!(closed.is_empty());
+    let before = OffsetDateTime::now_utc();
+    drop(a);
+    let (live, closed) = registry.activity();
+    assert_eq!(live, [ALLOC.to_owned()].into(), "one still open");
+    assert!(closed[ALLOC] >= before, "{closed:?}");
+    drop(b);
+    let (live, closed) = registry.activity();
+    assert!(live.is_empty());
+    assert_eq!(closed.len(), 1);
+    assert!(
+        registry.activity().1.is_empty(),
+        "each close is reported once"
+    );
+    // A revoked connection is out of the index before it drops.
+    let (reg, rx) = registry.register(&id()).unwrap();
+    let (tx, sub) = broadcast::channel(8);
+    tx.send(PodEvent::Delete(Arc::new(pod(|_| {})))).unwrap();
+    drop(tx);
+    // The closed broadcast ends the follow once the delete is handled.
+    registry
+        .follow(
+            view(vec![]),
+            PodSubscription::new(sub),
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(rx.await.ok(), Some(Revocation::PodGone));
+    drop(reg);
+    assert!(registry.activity().1.is_empty());
+}
+
 /// The proxy's back half over `pods`, with no TLS generation loaded.
 fn inner(pods: Vec<Pod>, max_per_pod: usize) -> super::Inner {
     inner_capped(pods, max_per_pod, 0)

@@ -2,8 +2,9 @@
 //! runs the pool passes ([`Binder::pass`]) on claim and pod events, and every
 //! 2 s (and at once after a claim is deleted) it tidies up: claims from
 //! namespaces it does not serve fail, bound claims expire or lose their worker,
-//! finished claims of CI callers are deleted after [`claims::FINISHED_TTL`],
-//! and pods whose claim is gone or ended are retired.
+//! delivered claims nobody uses through the edge are released, finished claims
+//! of CI callers are deleted after [`claims::FINISHED_TTL`], and pods whose
+//! claim is gone or ended are retired.
 //!
 //! `main` runs it in the leader stage, which stops before the Lease is
 //! released, so no claim or pod write of this replica overlaps the next
@@ -25,7 +26,7 @@ use tracing::{info, warn};
 
 use super::backend::Write;
 use super::claims::{self, reason};
-use super::pods::{ann, is_ready};
+use super::pods::{ann, fmt_ts, is_ready};
 use super::{BindConfig, Binder, Shared};
 use crate::reconcile::driver::{Trigger, schedule};
 use crate::render::{ANN_ALLOC, ANN_CLAIM, ANN_OWNER, FREE, LABEL_POOL};
@@ -36,6 +37,11 @@ use crate::runtime::stores::{ClaimEvent, PodEvent};
 
 /// How often the allocator tidies claims.
 const TICK: Duration = Duration::from_secs(2);
+/// `buildkit_releases_total` reason of a worker whose delivered claim went
+/// unused for the pool's `scaling.idleTimeout`. Not `idle`: that reason is
+/// the reconciler's scale-down of free pods, and this one takes a worker
+/// from a client.
+pub const ALLOCATION_IDLE: &str = "allocation_idle";
 
 type Labels = Vec<(&'static str, String)>;
 
@@ -290,6 +296,10 @@ pub(crate) async fn tidy_with(
             ClaimPhase::Bound if claims::lost(c, pods.iter().map(AsRef::as_ref), now) => {
                 end(binder, c, ClaimPhase::Lost).await
             }
+            ClaimPhase::Bound => match idle_timeout(binder, c, own, now) {
+                Some(t) => release_idle(binder, c, &t).await,
+                None => None,
+            },
             p if p.is_terminal() && claims::collectable(c, own, now) => collect(binder, c).await,
             _ => None,
         };
@@ -348,24 +358,8 @@ async fn refuse(b: &Binder, c: &BuildKitClaim) -> Option<&'static str> {
 /// the gone pod. The pod is retired by the reconciler at its expiry, or by
 /// the sweep once the claim has ended.
 async fn end(b: &Binder, c: &BuildKitClaim, phase: ClaimPhase) -> Option<&'static str> {
-    let (ns, name, uid) = names(c)?;
-    if let Some(secret) = c.status.as_ref().and_then(|s| s.secret_name.as_deref()) {
-        match b.backend().get_secret(ns, secret).await {
-            Ok(Some(s)) if claims::controlled_by(&s, uid) => {
-                // The uid precondition spares a Secret recreated since the read.
-                let suid = s.metadata.uid.unwrap_or_default();
-                if !matches!(
-                    b.backend().delete_secret(ns, secret, &suid).await,
-                    Write::Done | Write::Gone
-                ) {
-                    return None;
-                }
-            }
-            Ok(_) => {}
-            Err(_) => return None,
-        }
-    }
-    if !write_status(b, c, &claims::ended_status(c, phase)).await {
+    let (ns, name, _) = names(c)?;
+    if !finish(b, c, &claims::ended_status(c, phase)).await {
         return None;
     }
     info!(
@@ -379,6 +373,66 @@ async fn end(b: &Binder, c: &BuildKitClaim, phase: ClaimPhase) -> Option<&'stati
     } else {
         "expired"
     })
+}
+
+/// The pool's `scaling.idleTimeout`, as written, when delivered claim `c` has
+/// been [`claims::idle`] that long at `now`.
+fn idle_timeout(b: &Binder, c: &BuildKitClaim, own: &str, now: OffsetDateTime) -> Option<String> {
+    let t = &b.pool(&claims::pool_key(c))?.spec.scaling.idle_timeout;
+    claims::idle(c, own, t.seconds().ok()?, now).then(|| t.as_str().to_owned())
+}
+
+/// End a delivered claim nobody has used through the edge for its pool's
+/// `scaling.idleTimeout`, as [`end`] does at its TTL: the client went without
+/// a `DELETE`. The sweep then retires its worker as [`ALLOCATION_IDLE`]. The
+/// status write names the resourceVersion read, so an edge stamp written since
+/// makes the API server refuse it.
+async fn release_idle(b: &Binder, c: &BuildKitClaim, idle_timeout: &str) -> Option<&'static str> {
+    let (ns, name, _) = names(c)?;
+    if !finish(b, c, &claims::idle_status(c, idle_timeout)).await {
+        return None;
+    }
+    let s = c.status.as_ref();
+    info!(
+        namespace = ns,
+        claim = name,
+        pool_namespace = %c.spec.pool_ref.namespace,
+        pool = %c.spec.pool_ref.name,
+        alloc_id = s.and_then(|s| s.allocation_id.as_deref()).unwrap_or_default(),
+        pod = s.and_then(|s| s.pod.as_deref()).unwrap_or_default(),
+        idle_timeout,
+        last_active = claims::last_active(c).map(fmt_ts).unwrap_or_default(),
+        "released an idle allocation"
+    );
+    Some("idle")
+}
+
+/// Delete the Secret of ending claim `c`, then write its final `status`.
+async fn finish(
+    b: &Binder,
+    c: &BuildKitClaim,
+    status: &buildkit_controller_api::claim::BuildKitClaimStatus,
+) -> bool {
+    let Some((ns, _, uid)) = names(c) else {
+        return false;
+    };
+    if let Some(secret) = c.status.as_ref().and_then(|s| s.secret_name.as_deref()) {
+        match b.backend().get_secret(ns, secret).await {
+            Ok(Some(s)) if claims::controlled_by(&s, uid) => {
+                // The uid precondition spares a Secret recreated since the read.
+                let suid = s.metadata.uid.unwrap_or_default();
+                if !matches!(
+                    b.backend().delete_secret(ns, secret, &suid).await,
+                    Write::Done | Write::Gone
+                ) {
+                    return false;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    write_status(b, c, status).await
 }
 
 /// Delete a CI claim whose client is gone: never answered with its bound
@@ -427,6 +481,12 @@ async fn sweep(
     served: &HashSet<String>,
     own: &str,
 ) -> Vec<&'static str> {
+    // Workers of claims released for idleness, by `P claim`.
+    let idle: HashSet<String> = claims
+        .iter()
+        .filter(|c| claims::reason(c) == Some(reason::IDLE))
+        .filter_map(|c| claims::claim_ref(c))
+        .collect();
     let mut done = Vec::new();
     for p in claims::strays(pods.iter().map(AsRef::as_ref), claims, served, own) {
         let (Some(ns), Some(pool), Some(id)) = (
@@ -436,8 +496,13 @@ async fn sweep(
         ) else {
             continue;
         };
-        if b.retire(ns, pool, p, id, "released").await {
-            info!(namespace = ns, pool = %pool, pod = ?p.metadata.name, alloc_id = id, reason = "released", "released worker of a gone or ended claim");
+        let why = if ann(p, ANN_CLAIM).is_some_and(|r| idle.contains(r)) {
+            ALLOCATION_IDLE
+        } else {
+            "released"
+        };
+        if b.retire(ns, pool, p, id, why).await {
+            info!(namespace = ns, pool = %pool, pod = ?p.metadata.name, alloc_id = id, reason = why, "released worker of a gone or ended claim");
             done.push("released");
         }
     }

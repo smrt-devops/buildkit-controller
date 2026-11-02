@@ -12,12 +12,15 @@
 //!   free warm pods, and tidies claims that ended or lost their pod.
 //! - [`claims`]: pure decisions about claims. [`pods`]: pure pod logic.
 //!   [`pool`]: pool access rules, readiness and durations.
+//! - [`activity`]: every replica's record, on the claim, that its edge
+//!   proxies the allocation, from which the leader releases idle claims.
 //!
 //! HTTP counts in `buildkit_allocations_total` only the rejections it makes
 //! itself (`unauthenticated`, `payload_too_large`, `unsupported_media_type`,
 //! bad JSON). The front door counts the requests it refuses; the leader counts
 //! how each claim ends.
 
+pub mod activity;
 pub mod backend;
 pub mod bind;
 mod cache;
@@ -41,6 +44,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
+pub use activity::EdgeActivity;
 pub use backend::{Backend, KubeBackend};
 pub use bind::{BindConfig, Binder};
 pub use certs::{CertSource, MaterialSource};
@@ -76,18 +80,26 @@ impl Shared {
 
     /// The API server and certificate sources both components use.
     fn sources(&self, ctx: &AppContext) -> anyhow::Result<(Arc<dyn Backend>, Arc<dyn CertSource>)> {
-        let timeout = ctx
-            .config()
-            .kube
-            .request_timeout
-            .seconds()
-            .map(Duration::from_secs)
-            .map_err(|e| anyhow::anyhow!("kube.requestTimeout: {e}"))?;
         Ok((
-            Arc::new(KubeBackend::new(ctx.client(), timeout)),
+            kube_backend(ctx)?,
             Arc::new(MaterialSource::new(self.material.clone())),
         ))
     }
+}
+
+/// The API server, each call bounded by `kube.requestTimeout`.
+///
+/// # Errors
+/// A `kube.requestTimeout` that does not parse.
+pub fn kube_backend(ctx: &AppContext) -> anyhow::Result<Arc<dyn Backend>> {
+    let timeout = ctx
+        .config()
+        .kube
+        .request_timeout
+        .seconds()
+        .map(Duration::from_secs)
+        .map_err(|e| anyhow::anyhow!("kube.requestTimeout: {e}"))?;
+    Ok(Arc::new(KubeBackend::new(ctx.client(), timeout)))
 }
 
 /// Handle to allocation; clone it into the HTTP layer.
