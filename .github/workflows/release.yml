@@ -295,7 +295,7 @@ jobs:
           persist-credentials: false
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
         with:
-          version: v4.2.4
+          version: v4.3.1
       - name: helm package
         env:
           REF_NAME: ${{ github.ref_name }}
