@@ -70,6 +70,17 @@ impl Grant {
             Writes::Branch(b) => repository == b || (scope && action == Action::Pull),
         }
     }
+
+    /// Where a read of `repository` falls back when it does not hold what was
+    /// asked for: the grant's own scope, for its own branch scope only. Reads
+    /// only; pushes never fall back.
+    #[must_use]
+    pub fn fallback(&self, repository: &str) -> Option<&str> {
+        match &self.writes {
+            Writes::Branch(b) if b == repository => Some(&self.repository),
+            _ => None,
+        }
+    }
 }
 
 /// Maps a verified worker to its grant. `None` denies everything.
@@ -246,6 +257,14 @@ mod tests {
         assert!(g.allows("ns/pool/br", Action::Push));
         assert!(g.allows("ns/pool/app", Action::Pull));
         assert!(!g.allows("ns/pool/app", Action::Push));
+        assert_eq!(g.fallback("ns/pool/br"), Some("ns/pool/app"));
+        assert_eq!(g.fallback("ns/pool/app"), None);
+        assert_eq!(g.fallback("ns/pool/other"), None);
+        let t = Grant {
+            writes: Writes::Scope,
+            ..g.clone()
+        };
+        assert_eq!(t.fallback("ns/pool/br"), None);
         for other in ["ns/pool/other", "ns/pool/br/sub", "ns/pool/brx", "ns/pool"] {
             assert!(!g.allows(other, Action::Pull), "{other}");
             assert!(!g.allows(other, Action::Push), "{other}");

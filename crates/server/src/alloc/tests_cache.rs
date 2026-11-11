@@ -377,13 +377,79 @@ fn branch_scopes_are_per_branch_and_repository() {
         cache::branch_scope(&shared, &on_ref(43, "refs/heads/a"))
     );
     assert_ne!(s42.as_deref(), Some(a.as_str()));
-    // Fork-capable events write their own branch scope too.
+    // A fork-capable event has a branch scope of its own on the same ref.
     let pr = with_claims(oidc("pull_request"), &json!({"ref": "refs/pull/7/merge"}));
+    let pr = cache::branch_scope(&p, &pr);
+    assert!(pr.is_some());
+    assert_ne!(
+        pr,
+        cache::branch_scope(&p, &on_ref(42, "refs/pull/7/merge"))
+    );
+}
+
+/// `pull_request_target`, `issue_comment` and the other fork-capable events
+/// carry the base ref. Each gets a branch scope apart from an untrusted
+/// `workflow_dispatch` or push of that ref, and from each other.
+#[test]
+fn fork_capable_events_on_the_base_ref_get_their_own_branch_scope() {
+    let p = pool();
+    let main = |event: &str| {
+        let who = with_claims(oidc_unprotected(event), &json!({"ref": "refs/heads/main"}));
+        cache::branch_scope(&p, &who).unwrap()
+    };
+    let dispatch = main("workflow_dispatch");
+    assert_eq!(dispatch, main("push"), "other events hash as before");
     assert_eq!(
-        cache::branch_scope(&p, &pr),
-        cache::branch_scope(
-            &p,
-            &with_claims(on_ref(42, "refs/pull/7/merge"), &json!({}))
+        dispatch,
+        render::branch_scope_id(
+            &json!([
+                "oidc",
+                "https://token.actions.githubusercontent.com",
+                "repository_id",
+                "42"
+            ])
+            .to_string(),
+            &json!([
+                "oidc",
+                "https://token.actions.githubusercontent.com",
+                "repository_id",
+                "42"
+            ])
+            .to_string(),
+            "refs/heads/main",
+            None
+        )
+    );
+    let mut seen = vec![dispatch];
+    for e in cache::READ_ONLY_EVENTS {
+        let s = main(e);
+        assert!(!seen.contains(&s), "{e}");
+        seen.push(s);
+    }
+    let gitlab = |source: &str| {
+        let who = Identity::Oidc {
+            issuer: "https://gitlab.com".into(),
+            subject: "s".into(),
+            claims: json!({"repository": "g/app", "ref": "main", "pipeline_source": source})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        cache::branch_scope(&p, &who).unwrap()
+    };
+    let push = gitlab("push");
+    for s in cache::READ_ONLY_PIPELINE_SOURCES {
+        assert_ne!(push, gitlab(s), "{s}");
+    }
+    // The event part cannot be forged through the ref.
+    let id = render::branch_scope_id;
+    assert_ne!(
+        id("t", "r", "refs/heads/main", Some("pull_request_target")),
+        id(
+            "t",
+            "r",
+            "refs/heads/main\0\0\0\0\0\0\0\x13pull_request_target",
+            None
         )
     );
 }
@@ -422,7 +488,7 @@ fn only_untrusted_oidc_callers_with_a_ref_have_a_branch_scope() {
 /// never lands on another caller's input.
 #[test]
 fn the_branch_scope_separator_cannot_be_forged() {
-    let id = render::branch_scope_id;
+    let id = |t, r, g| render::branch_scope_id(t, r, g, None);
     let base = id("t", "o/app", "refs/heads/a");
     for (t, r, g) in [
         ("t", "o/app/", "refs/heads/a"),
@@ -497,7 +563,11 @@ fn the_response_has_one_shape_per_tier() {
     }
     let f = flags(CacheTier::Untrusted, Some(&branch));
     assert_eq!(f.to, Some(to(&branch)));
-    assert_eq!(f.from, [from(&branch), from(&scope)]);
+    assert_eq!(
+        f.from,
+        [from(&branch)],
+        "one source: the registry falls back"
+    );
     for b in [None, Some("../../x"), Some(scope.as_str())] {
         let f = flags(CacheTier::Untrusted, b);
         assert_eq!(f.to, None, "{b:?}");
@@ -571,13 +641,7 @@ async fn an_untrusted_api_allocation_writes_its_branch_cache() {
             refr(&branch)
         ))
     );
-    assert_eq!(
-        flags.from,
-        [
-            format!("type=registry,ref={}", refr(&branch)),
-            format!("type=registry,ref={}", refr(&scope))
-        ]
-    );
+    assert_eq!(flags.from, [format!("type=registry,ref={}", refr(&branch))]);
     let s = e.fake.status(OWN, &r.id);
     let pod = e.fake.pod(s.pod.as_deref().unwrap());
     assert_eq!(ann(&pod, ANN_BRANCH_SCOPE), Some(branch.as_str()));

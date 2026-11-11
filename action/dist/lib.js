@@ -114,22 +114,20 @@ function cacheFlags(allocs, { mode, from: extra = [] } = {}) {
 }
 
 /**
- * What one allocation may do with the cache, for the log line: 'trusted' writes
- * the shared cache, 'branch' writes its branch's cache and reads the shared one
- * last, 'read-only' only reads. `null` without registry flags.
+ * What one allocation may do with the cache, for the log line: 'writes' reads and
+ * writes one cache, which is the shared cache for a trusted build and the branch's
+ * own for any other (the response looks the same for both; the registry reads the
+ * shared cache for a branch that lacks a step), 'read-only' only reads. `null`
+ * without registry flags.
  */
 function cacheAccess(alloc) {
   const reg = alloc && alloc.cache && alloc.cache.registry;
   if (!reg) return null;
-  if (!reg.to) return 'read-only';
-  const ref = (flag) => (String(flag).split(',').find((p) => p.startsWith('ref=')) || '').slice(4);
-  const from = reg.from || [];
-  return from.length > 1 && ref(reg.to) !== ref(from[from.length - 1]) ? 'branch' : 'trusted';
+  return reg.to ? 'writes' : 'read-only';
 }
 
 const CACHE_NOTES = {
-  trusted: 'writes the shared cache',
-  branch: "writes this branch's own cache, reads it first and the shared cache after",
+  writes: "reads and writes the shared cache if the pool trusts this build, else this branch's own",
   'read-only': 'read only for this build',
 };
 

@@ -637,22 +637,137 @@ async fn branch_scopes_follow_the_table() {
         let r = put_index(reg, pod, "ns/p/br", "main", &[&shared]).await;
         assert_eq!(r.status, StatusCode::FORBIDDEN, "{pod}");
     }
-    // A mount from the trusted scope is a plain upload: a manifest of the
-    // branch cannot reference a blob that was never uploaded into it.
+    // A mount is a plain upload, and a branch manifest cannot reference a
+    // blob that only another branch holds.
     let s = status(
         "branch2",
         Method::POST,
-        format!("/v2/ns/p/br2/blobs/uploads/?mount={shared}&from=ns%2Fp%2Fapp"),
+        format!("/v2/ns/p/br2/blobs/uploads/?mount={own}&from=ns%2Fp%2Fbr"),
     )
     .await;
     assert_eq!(s, StatusCode::ACCEPTED);
-    let r = put_index(reg, "branch2", "ns/p/br2", "main", &[&shared]).await;
+    let r = put_index(reg, "branch2", "ns/p/br2", "main", &[&own]).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{:?}", r.body);
     // The layer both scopes hold is stored once.
     let files = std::fs::read_dir(f.dir.join("blobs/sha256"))
         .unwrap()
         .count();
     assert_eq!(files, 4, "two layers and two manifests");
+}
+
+/// A read of a branch scope that lacks a manifest or blob is answered from
+/// the caller's trusted scope: HEAD and GET, tags and digests, ranges. Never
+/// from another branch or repository, never for a push, and it writes
+/// nothing into the branch scope.
+#[tokio::test]
+async fn a_branch_scope_reads_through_to_its_trusted_scope() {
+    let f = fixture("fallback");
+    let reg = &f.reg;
+    let shared = push_blob(reg, "writer", "ns/p/app", b"base layer").await;
+    let r = put_index(reg, "writer", "ns/p/app", "main", &[&shared]).await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    let index = r.header("docker-content-digest").to_owned();
+    let elsewhere = push_blob(reg, "other", "ns/p/other", b"other repository").await;
+    let theirs = push_blob(reg, "branch2", "ns/p/br2", b"other branch").await;
+    let get = |pod: &'static str,
+               m: Method,
+               uri: String,
+               h: &'static [(&'static str, &'static str)]| async move {
+        call(reg, pod, m, &uri, h, b"").await
+    };
+    for m in [Method::HEAD, Method::GET] {
+        for t in ["main", index.as_str()] {
+            let r = get(
+                "branch",
+                m.clone(),
+                format!("/v2/ns/p/br/manifests/{t}"),
+                &[],
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::OK, "{m} {t}");
+            assert_eq!(r.header("docker-content-digest"), index, "{m} {t}");
+        }
+        let r = get(
+            "branch",
+            m.clone(),
+            format!("/v2/ns/p/br/blobs/{shared}"),
+            &[],
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{m}");
+    }
+    let r = get(
+        "branch",
+        Method::GET,
+        format!("/v2/ns/p/br/blobs/{shared}"),
+        &[("range", "bytes=5-9")],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(&r.body[..], b"layer");
+    // Never another branch's or another repository's content.
+    for d in [&elsewhere, &theirs] {
+        let r = get("branch", Method::GET, format!("/v2/ns/p/br/blobs/{d}"), &[]).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{d}");
+    }
+    let r = put_index(reg, "branch2", "ns/p/br2", "main", &[&theirs]).await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    let r = get(
+        "branch",
+        Method::GET,
+        "/v2/ns/p/br/manifests/main".into(),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        r.header("docker-content-digest"),
+        index,
+        "not branch2's tag"
+    );
+    // A trusted or read-only worker gets no fallback, and a fallback read
+    // created nothing in the branch scope.
+    for pod in ["writer", "reader"] {
+        let r = get(pod, Method::GET, "/v2/ns/p/br/manifests/main".into(), &[]).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{pod}");
+    }
+    assert!(!f.dir.join("repos/ns/p/br").exists());
+    // A push names the branch scope only. A manifest may reference what the
+    // trusted scope holds, and the branch then links it itself.
+    let own = push_blob(reg, "branch", "ns/p/br", b"branch layer").await;
+    let r = put_index(reg, "branch", "ns/p/br", "main", &[&shared, &own]).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    let mine = r.header("docker-content-digest").to_owned();
+    assert_ne!(mine, index);
+    assert!(
+        f.dir
+            .join("repos/ns/p/br/_links")
+            .join(shared.hex())
+            .exists()
+    );
+    let r = get(
+        "branch",
+        Method::GET,
+        "/v2/ns/p/br/manifests/main".into(),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        r.header("docker-content-digest"),
+        mine,
+        "its own manifest wins"
+    );
+    let r = get(
+        "writer",
+        Method::HEAD,
+        format!("/v2/ns/p/app/blobs/{own}"),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::NOT_FOUND,
+        "nothing reached the trusted scope"
+    );
 }
 
 #[tokio::test]

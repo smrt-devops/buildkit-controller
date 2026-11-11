@@ -98,9 +98,9 @@ pub struct BuildKitClaimSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheTier {
-    /// Pull and push.
+    /// Pull and push the scope.
     Trusted,
-    /// Pull only.
+    /// Pull the scope. With a branch scope, pull and push that too.
     Untrusted,
 }
 

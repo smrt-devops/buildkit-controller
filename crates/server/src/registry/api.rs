@@ -32,7 +32,7 @@ use tokio::sync::{OwnedMutexGuard, Semaphore};
 use tokio_util::io::ReaderStream;
 use tracing::{error, info};
 
-use super::auth::{Action, Authorizer};
+use super::auth::{Action, Authorizer, Grant};
 use super::metrics::RegistryMetrics;
 use super::store::{Digest, Reference, Store, StoreError, Upload};
 use crate::pki::WorkerIdentity;
@@ -289,9 +289,15 @@ pub async fn handle(reg: &Registry, peer: &WorkerIdentity, req: Request<Body>) -
 }
 
 impl Registry {
-    fn authorize(&self, peer: &WorkerIdentity, repo: &str, action: Action) -> Result<(), ApiError> {
-        if self.allowed(peer, repo, action) {
-            return Ok(());
+    /// The caller's grant, when it allows `action` on `repo`.
+    fn authorize(
+        &self,
+        peer: &WorkerIdentity,
+        repo: &str,
+        action: Action,
+    ) -> Result<Grant, ApiError> {
+        if let Some(g) = self.auth.grant(peer).filter(|g| g.allows(repo, action)) {
+            return Ok(g);
         }
         self.metrics.denied(action.label());
         info!(
@@ -301,12 +307,6 @@ impl Registry {
             "cache request denied"
         );
         Err(denied())
-    }
-
-    fn allowed(&self, peer: &WorkerIdentity, repo: &str, action: Action) -> bool {
-        self.auth
-            .grant(peer)
-            .is_some_and(|g| g.allows(repo, action))
     }
 
     fn upload(&self, repo: &str, id: &str) -> Result<OwnedMutexGuard<Upload>, ApiError> {
@@ -355,9 +355,13 @@ async fn dispatch(
             let d = d
                 .parse::<Digest>()
                 .map_err(|()| digest_invalid("unsupported digest"))?;
-            reg.authorize(peer, name, Action::Pull)?;
+            let g = reg.authorize(peer, name, Action::Pull)?;
             let range = req.headers().get(RANGE).cloned();
-            get_blob(reg, name, &d, range.as_ref(), m == Method::HEAD).await
+            let at = Source {
+                repo: name,
+                fallback: g.fallback(name),
+            };
+            get_blob(reg, at, &d, range.as_ref(), m == Method::HEAD).await
         }
         Route::Uploads(name) if m == Method::POST => {
             reg.authorize(peer, name, Action::Push)?;
@@ -375,12 +379,16 @@ async fn dispatch(
             let r = r.parse::<Reference>().map_err(|()| {
                 ApiError::new(StatusCode::BAD_REQUEST, "TAG_INVALID", "invalid reference")
             })?;
+            let action = if read { Action::Pull } else { Action::Push };
+            let g = reg.authorize(peer, name, action)?;
+            let at = Source {
+                repo: name,
+                fallback: g.fallback(name),
+            };
             if read {
-                reg.authorize(peer, name, Action::Pull)?;
-                get_manifest(reg, name, &r, m == Method::HEAD).await
+                get_manifest(reg, at, &r, m == Method::HEAD).await
             } else {
-                reg.authorize(peer, name, Action::Push)?;
-                put_manifest(reg, name, &r, req).await
+                put_manifest(reg, at, &r, req).await
             }
         }
         _ => Err(unsupported()),
@@ -439,9 +447,17 @@ fn parse_range(header: Option<&HeaderValue>, size: u64) -> Result<Option<(u64, u
     Ok(Some((start, end)))
 }
 
+/// The repository a request names, and the one a read of it falls back to:
+/// the caller's trusted scope when `repo` is its branch scope.
+#[derive(Clone, Copy)]
+struct Source<'a> {
+    repo: &'a str,
+    fallback: Option<&'a str>,
+}
+
 async fn get_blob(
     reg: &Registry,
-    name: &str,
+    at: Source<'_>,
     d: &Digest,
     range: Option<&HeaderValue>,
     head: bool,
@@ -453,7 +469,16 @@ async fn get_blob(
             "blob unknown to registry",
         )
     };
-    let (path, size) = reg.store.blob(name, d).await.ok_or_else(unknown)?;
+    // A branch scope that lacks the blob reads it from the trusted scope;
+    // that read counts as use of the trusted link.
+    let found = match reg.store.blob(at.repo, d).await {
+        Some(f) => Some(f),
+        None => match at.fallback {
+            Some(t) => reg.store.blob(t, d).await,
+            None => None,
+        },
+    };
+    let (path, size) = found.ok_or_else(unknown)?;
     let range = if head {
         None
     } else {
@@ -624,7 +649,7 @@ async fn put_upload(
 
 async fn get_manifest(
     reg: &Registry,
-    name: &str,
+    at: Source<'_>,
     r: &Reference,
     head: bool,
 ) -> Result<Response<Body>, ApiError> {
@@ -635,7 +660,16 @@ async fn get_manifest(
             "manifest unknown",
         )
     };
-    let m = reg.store.manifest(name, r).await.ok_or_else(unknown)?;
+    // As for blobs: the trusted scope answers what the branch scope lacks,
+    // and the pull is recorded on the trusted manifest.
+    let m = match reg.store.manifest(at.repo, r).await {
+        Some(m) => Some(m),
+        None => match at.fallback {
+            Some(t) => reg.store.manifest(t, r).await,
+            None => None,
+        },
+    };
+    let m = m.ok_or_else(unknown)?;
     let body = if head {
         Body::empty()
     } else {
@@ -656,7 +690,7 @@ async fn get_manifest(
 
 async fn put_manifest(
     reg: &Registry,
-    name: &str,
+    at: Source<'_>,
     r: &Reference,
     req: Request<Body>,
 ) -> Result<Response<Body>, ApiError> {
@@ -694,12 +728,12 @@ async fn put_manifest(
     reg.metrics.received(buf.len() as u64);
     let d = reg
         .store
-        .put_manifest(name, r, media.as_deref(), &buf)
+        .put_manifest(at.repo, at.fallback, r, media.as_deref(), &buf)
         .await?;
     empty(
         StatusCode::CREATED,
         &[
-            ("location", format!("/v2/{name}/manifests/{d}")),
+            ("location", format!("/v2/{}/manifests/{d}", at.repo)),
             (DIGEST_HEADER, d.to_string()),
             ("content-length", "0".into()),
         ],
