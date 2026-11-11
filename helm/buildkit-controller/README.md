@@ -258,7 +258,7 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 
 ## Access rules
 
-An `oidc` rule may require that a claim is present without naming its value: a value made only of `*` matches a non-empty string claim, or an array claim holding one, and never a missing or empty claim. Such a rule needs another claim with a real value, such as `repository_owner_id`, so it is always pinned. `exclude` maps a claim name to patterns, and a token that matches any of them is refused, so `claims: {repository_owner_id: "146818127", repo_property_domain: "*"}` with `exclude: {repo_property_domain: [pci]}` admits every domain of one organisation except `pci`. `exclude` never admits a caller on its own, and a value made only of `*` is refused in it. Both work in `spec.workers.cache.writers` too. See `examples/pool-github-oidc.yaml`.
+An `oidc` rule may require that a claim is present without naming its value: a value made only of `*` matches a non-empty string claim, or an array claim holding one, and never a missing or empty claim. Such a rule needs another claim with a real value, such as `repository_owner_id`, so it is always pinned. `exclude` maps a claim name to patterns, and a token that matches any of them does not match that rule, so `claims: {repository_owner_id: "146818127", repo_property_domain: "*"}` with `exclude: {repo_property_domain: [pci]}` admits every domain of one organisation except `pci`, provided no other rule in the list admits it (add the same `exclude` to those rules). `exclude` never admits a caller on its own, and a value made only of `*` is refused in it. Both work in `spec.workers.cache.writers` too. See `examples/pool-github-oidc.yaml`.
 
 ## Build cache
 

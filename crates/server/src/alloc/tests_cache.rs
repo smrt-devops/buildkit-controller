@@ -339,3 +339,33 @@ fn deployments_and_merge_request_pipelines_never_write() {
     p.spec.workers.cache.writers = None;
     assert_eq!(cache::tier(&p, &gitlab("push")), CacheTier::Untrusted);
 }
+
+/// A `writers` rule takes the presence value and `exclude` like an access rule.
+#[test]
+fn writers_rule_takes_presence_and_exclude() {
+    let mut p = pool();
+    p.spec.workers.cache.writers = Some(
+        serde_json::from_value(json!([{"oidc": {
+            "issuer": "https://token.actions.githubusercontent.com",
+            "claims": {"repository_id": "42", "repo_property_domain": "*"},
+            "exclude": {"repo_property_domain": ["pci"]}
+        }}]))
+        .unwrap(),
+    );
+    let with = |d: serde_json::Value| {
+        with_claims(
+            oidc_unprotected("push"),
+            &json!({"repository_id": "42", "repo_property_domain": d}),
+        )
+    };
+    assert_eq!(
+        cache::tier(&p, &with(json!("payments"))),
+        CacheTier::Trusted
+    );
+    assert_eq!(cache::tier(&p, &with(json!("pci"))), CacheTier::Untrusted);
+    assert_eq!(cache::tier(&p, &with(json!(""))), CacheTier::Untrusted);
+    assert_eq!(
+        cache::tier(&p, &oidc_unprotected("push")),
+        CacheTier::Untrusted
+    );
+}
