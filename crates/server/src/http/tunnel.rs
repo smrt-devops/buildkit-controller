@@ -51,9 +51,12 @@ const MISSED_PINGS: u32 = 2;
 /// fragments; a larger one closes the tunnel. tungstenite buffers a whole
 /// message, so this bounds what an unauthenticated tunnel can pin.
 ///
-/// A tunnel costs about 200 KiB at worst: the 64 KiB HTTP/2 stream window
-/// (HTTP/1 has the socket buffer instead), one message, and the edge's 64 KiB
-/// copy buffer.
+/// The worst case per tunnel is about 400-460 KiB, reached by a client that
+/// sends into a stalled worker and never reads: the TCP edge part (two 64 KiB
+/// copy buffers and two TLS sessions, about 200 KiB), the 64 KiB HTTP/2 stream
+/// window, the 64-128 KiB read side (input buffer plus the pending message)
+/// and the 65 KiB write buffer. Size `edge.maxConnections` against that, not
+/// against a TCP connection.
 pub const MAX_MESSAGE: usize = 64 * 1024;
 /// The largest frame the server sends (clients send at most this much too).
 const WRITE_CHUNK: usize = 64 * 1024;
