@@ -16,8 +16,12 @@ The tunnel is now the default way to reach the controller. Builds run inside a W
 - The examples use the tunnel default. `examples/helm-values-tcp.yaml` keeps a TCP passthrough install.
 - The controller memory limit rises from 512Mi to 1536Mi. The limit is about 14 MiB plus 460 KiB per established tunnelled connection (`edge.maxConnections`) plus 280 KiB per handshake in progress (`edge.maxHandshakes`), about 1.16 GiB at the defaults, so the limit leaves about 344 MiB of margin. Lower those caps or raise the limit together with them.
 
+- Untrusted builds cache their own work. An OIDC caller that may not write the shared cache and whose token has a `ref` claim, such as a `pull_request` or a push to an unprotected branch, gets a branch cache: one per repository and ref. Its allocation exports to the branch cache and reads the branch cache first and the shared cache second, so a branch's second run reuses its own layers. Another branch cannot read it, a trusted build never reads any branch cache, and an untrusted build still never writes the shared cache. A caller without a `ref` claim reads only, as before. The worker pod carries the branch cache in the new annotation `buildkit.smrt-devops.net/branch-scope`. Branch caches count against the pool's `spec.workers.cache.maxSize`, so a burst of pull request builds can evict older manifests of the shared cache. There is no new setting. See [Cache trust](docs/operations.md#cache-trust).
+- The Action logs one of three lines per allocation: `writes the shared cache`, `writes this branch's own cache, reads it first and the shared cache after`, or `read only for this build`.
+
 ### Compatibility
 
+- During a rollout, an untrusted build whose claim an older API replica wrote, or that an older leader binds, gets no branch cache and reads only. An older registry replica ignores the branch annotation, so the branch build's export fails and the build goes on uncached.
 - Action versions before this one cannot use a tunnel endpoint: `buildx create` refuses the path. Upgrade the Action before you drop `edge.endpoint` on an install that clients already use.
 
 ## 0.3.0
