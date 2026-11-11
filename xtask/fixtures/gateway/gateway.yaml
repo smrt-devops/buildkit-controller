@@ -1,8 +1,11 @@
 # A Gateway a suite's routes attach to: GW_NAME in namespace GW_NS, of the
 # GatewayClass GW_CLASS (filled in by xtask/src/gateway.rs). Each suite on a
-# shared cluster has its own, so their routes never meet. e2e's Envoy Service is
+# shared cluster has its own, so their routes never meet. The TLS passthrough
+# listeners in passthrough-listeners.yaml go at the end for e2e and proxy-verify;
+# tunnel-verify's Gateway has only the HTTPS listener. e2e's Envoy Service is
 # a NodePort on the ports the kind config publishes on loopback; proxy-verify's
-# is a ClusterIP Service that the host reaches through kubectl port-forward.
+# is a ClusterIP Service that the host reaches through kubectl port-forward;
+# tunnel-verify's is a NodePort for the HTTPS listener alone.
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: EnvoyProxy
 metadata:
@@ -50,19 +53,4 @@ spec:
         certificateRefs: [{name: bk-gateway-api}]
       allowedRoutes:
         namespaces: {from: All}
-    # The edge: passthrough, so the controller sees the client certificate.
-    - name: edge
-      protocol: TLS
-      port: 8444
-      tls:
-        mode: Passthrough
-      allowedRoutes:
-        namespaces: {from: All}
-    # The API by passthrough, for gateway.api.mode=passthrough.
-    - name: api-passthrough
-      protocol: TLS
-      port: 9443
-      tls:
-        mode: Passthrough
-      allowedRoutes:
-        namespaces: {from: All}
+PASSTHROUGH_LISTENERS

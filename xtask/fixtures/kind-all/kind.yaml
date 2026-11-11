@@ -3,6 +3,7 @@
 # - e2e: the pod and service ranges of KIND_CIDRS in xtask/src/e2e.rs, and its
 #   Gateway's NodePorts 30080 and 30081 on the loopback ports E2E_API and E2E_EDGE.
 # - drain-verify: the chart's NodePorts 30082 and 30083 on DRAIN_API and DRAIN_EDGE.
+# - tunnel-verify: its Gateway's NodePort 30084 on TUNNEL_API.
 # - reconcile-verify: the API server audit log of its controller's requests
 #   (the policy logs that ServiceAccount and nothing else).
 # - every suite at once: room for more than the default 110 pods.
@@ -22,6 +23,7 @@ nodes:
       - {containerPort: 30081, hostPort: E2E_EDGE, listenAddress: "127.0.0.1"}
       - {containerPort: 30082, hostPort: DRAIN_API, listenAddress: "127.0.0.1"}
       - {containerPort: 30083, hostPort: DRAIN_EDGE, listenAddress: "127.0.0.1"}
+      - {containerPort: 30084, hostPort: TUNNEL_API, listenAddress: "127.0.0.1"}
     extraMounts:
       - hostPath: POLICY_DIR
         containerPath: /etc/kubernetes/policies
