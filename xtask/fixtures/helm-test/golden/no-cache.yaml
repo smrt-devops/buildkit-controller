@@ -9,8 +9,8 @@ metadata:
     app.kubernetes.io/name: buildkit-controller
     app.kubernetes.io/instance: bk
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.3.0"
-    helm.sh/chart: buildkit-controller-0.3.0
+    app.kubernetes.io/version: "0.4.0"
+    helm.sh/chart: buildkit-controller-0.4.0
 spec:
   minAvailable: 1
   selector:
@@ -29,8 +29,8 @@ metadata:
     app.kubernetes.io/name: buildkit-controller
     app.kubernetes.io/instance: bk
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.3.0"
-    helm.sh/chart: buildkit-controller-0.3.0
+    app.kubernetes.io/version: "0.4.0"
+    helm.sh/chart: buildkit-controller-0.4.0
 
 ---
 # Source: buildkit-controller/templates/configmap.yaml
@@ -43,8 +43,8 @@ metadata:
     app.kubernetes.io/name: buildkit-controller
     app.kubernetes.io/instance: bk
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.3.0"
-    helm.sh/chart: buildkit-controller-0.3.0
+    app.kubernetes.io/version: "0.4.0"
+    helm.sh/chart: buildkit-controller-0.4.0
 data:
   config.yaml: |
     api:
@@ -115,8 +115,8 @@ metadata:
     app.kubernetes.io/name: buildkit-controller
     app.kubernetes.io/instance: bk
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.3.0"
-    helm.sh/chart: buildkit-controller-0.3.0
+    app.kubernetes.io/version: "0.4.0"
+    helm.sh/chart: buildkit-controller-0.4.0
 rules:
   - apiGroups: [authentication.k8s.io]
     resources: [tokenreviews]
@@ -132,8 +132,8 @@ metadata:
     app.kubernetes.io/name: buildkit-controller
     app.kubernetes.io/instance: bk
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.3.0"
-    helm.sh/chart: buildkit-controller-0.3.0
+    app.kubernetes.io/version: "0.4.0"
+    helm.sh/chart: buildkit-controller-0.4.0
 rules:
   - apiGroups:
     - buildkit.smrt-devops.net
@@ -198,8 +198,8 @@ metadata:
     app.kubernetes.io/name: buildkit-controller
     app.kubernetes.io/instance: bk
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.3.0"
-    helm.sh/chart: buildkit-controller-0.3.0
+    app.kubernetes.io/version: "0.4.0"
+    helm.sh/chart: buildkit-controller-0.4.0
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: buildkit-controller-buildkit-system-tokenreview}
 subjects:
   - kind: ServiceAccount
@@ -216,8 +216,8 @@ metadata:
     app.kubernetes.io/name: buildkit-controller
     app.kubernetes.io/instance: bk
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.3.0"
-    helm.sh/chart: buildkit-controller-0.3.0
+    app.kubernetes.io/version: "0.4.0"
+    helm.sh/chart: buildkit-controller-0.4.0
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: buildkit-controller-buildkit-system-workload}
 subjects:
   - kind: ServiceAccount
@@ -235,8 +235,8 @@ metadata:
     app.kubernetes.io/name: buildkit-controller
     app.kubernetes.io/instance: bk
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.3.0"
-    helm.sh/chart: buildkit-controller-0.3.0
+    app.kubernetes.io/version: "0.4.0"
+    helm.sh/chart: buildkit-controller-0.4.0
 rules:
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
@@ -281,8 +281,8 @@ metadata:
     app.kubernetes.io/name: buildkit-controller
     app.kubernetes.io/instance: bk
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.3.0"
-    helm.sh/chart: buildkit-controller-0.3.0
+    app.kubernetes.io/version: "0.4.0"
+    helm.sh/chart: buildkit-controller-0.4.0
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: buildkit-controller}
 subjects:
   - kind: ServiceAccount
@@ -300,8 +300,8 @@ metadata:
     app.kubernetes.io/name: buildkit-controller
     app.kubernetes.io/instance: bk
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.3.0"
-    helm.sh/chart: buildkit-controller-0.3.0
+    app.kubernetes.io/version: "0.4.0"
+    helm.sh/chart: buildkit-controller-0.4.0
 spec:
   type: ClusterIP
   selector:
@@ -326,8 +326,8 @@ metadata:
     app.kubernetes.io/name: buildkit-controller
     app.kubernetes.io/instance: bk
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.3.0"
-    helm.sh/chart: buildkit-controller-0.3.0
+    app.kubernetes.io/version: "0.4.0"
+    helm.sh/chart: buildkit-controller-0.4.0
     app.kubernetes.io/component: metrics
 spec:
   type: ClusterIP
@@ -348,8 +348,8 @@ metadata:
     app.kubernetes.io/name: buildkit-controller
     app.kubernetes.io/instance: bk
     app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.3.0"
-    helm.sh/chart: buildkit-controller-0.3.0
+    app.kubernetes.io/version: "0.4.0"
+    helm.sh/chart: buildkit-controller-0.4.0
 spec:
   replicas: 2
   selector:
@@ -362,8 +362,8 @@ spec:
         app.kubernetes.io/name: buildkit-controller
         app.kubernetes.io/instance: bk
         app.kubernetes.io/managed-by: Helm
-        app.kubernetes.io/version: "0.3.0"
-        helm.sh/chart: buildkit-controller-0.3.0
+        app.kubernetes.io/version: "0.4.0"
+        helm.sh/chart: buildkit-controller-0.4.0
       annotations:
         checksum/config: e08cc38cc13c21dea8d4aef2437417bc863d5183b8955bb1ac18726b3d3c76b1
     spec:
@@ -376,7 +376,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: controller
-          image: "ghcr.io/smrt-devops/buildkit-controller:0.3.0"
+          image: "ghcr.io/smrt-devops/buildkit-controller:0.4.0"
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

@@ -229,7 +229,7 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 
 | Value | Meaning |
 |---|---|
-| `image.repository`, `image.tag` | `ghcr.io/smrt-devops/buildkit-controller`, tag defaults to the chart appVersion. `0.3.0@sha256:<digest>` pins the digest |
+| `image.repository`, `image.tag` | `ghcr.io/smrt-devops/buildkit-controller`, tag defaults to the chart appVersion. `0.4.0@sha256:<digest>` pins the digest |
 | `replicaCount`, `autoscaling.*` | Deployment size; HPA on CPU (off by default) |
 | `resources` | 100m CPU and 128Mi memory requested, 1536Mi memory limit. Memory need is about 14 MiB plus `edge.maxConnections` times 460 KiB (200 KiB for a `tcp://` connection) plus `edge.maxHandshakes` times 280 KiB, about 1.16 GiB at the defaults, so the limit leaves about 344 MiB of margin. Lower `edge.maxConnections` or `edge.maxHandshakes`, or raise `resources.limits.memory` together with them |
 | `affinity`, `topologySpreadConstraints` | when both are empty, a soft hostname anti-affinity spreads replicas |
