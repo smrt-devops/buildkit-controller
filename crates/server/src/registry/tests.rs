@@ -25,15 +25,18 @@ fn worker(pod: &str) -> WorkerIdentity {
 }
 
 fn grants() -> StaticGrants {
-    let g = |repository: &str, push| Grant {
+    let g = |repository: &str, writes| Grant {
         repository: repository.to_owned(),
-        push,
+        writes,
     };
+    let branch = |b: &str| Writes::Branch(b.to_owned());
     StaticGrants::default()
-        .with("ns", "writer", g("ns/p/app", true))
-        .with("ns", "reader", g("ns/p/app", false))
-        .with("ns", "other", g("ns/p/other", true))
-        .with("ns", "wide", g("ns/p", true))
+        .with("ns", "writer", g("ns/p/app", Writes::Scope))
+        .with("ns", "reader", g("ns/p/app", Writes::Nothing))
+        .with("ns", "other", g("ns/p/other", Writes::Scope))
+        .with("ns", "wide", g("ns/p", Writes::Scope))
+        .with("ns", "branch", g("ns/p/app", branch("ns/p/br")))
+        .with("ns", "branch2", g("ns/p/app", branch("ns/p/br2")))
 }
 
 struct Fixture {
@@ -577,6 +580,236 @@ async fn blobs_are_per_repository_and_never_mount_across() {
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     let r = call(reg, "wide", Method::HEAD, &here, &[], b"").await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
+}
+
+/// The branch caches table: an untrusted worker pulls the trusted scope and
+/// pulls and pushes its own branch scope; a trusted worker never reaches a
+/// branch scope; one branch never reaches another's.
+#[tokio::test]
+async fn branch_scopes_follow_the_table() {
+    let f = fixture("branch");
+    let reg = &f.reg;
+    let shared = push_blob(reg, "writer", "ns/p/app", b"base layer").await;
+    assert_eq!(
+        put_index(reg, "writer", "ns/p/app", "main", &[&shared])
+            .await
+            .status,
+        StatusCode::CREATED
+    );
+    let status = |pod: &'static str, m: Method, uri: String| async move {
+        call(reg, pod, m, &uri, &[], b"").await.status
+    };
+    // Pull the trusted scope, either tier.
+    for pod in ["writer", "reader", "branch"] {
+        let s = status(pod, Method::GET, "/v2/ns/p/app/manifests/main".into()).await;
+        assert_eq!(s, StatusCode::OK, "{pod}");
+    }
+    // Push the trusted scope: trusted only.
+    for pod in ["reader", "branch"] {
+        let s = status(pod, Method::POST, "/v2/ns/p/app/blobs/uploads/".into()).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{pod}");
+        let r = put_index(reg, pod, "ns/p/app", "main", &[&shared]).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{pod}");
+    }
+    // Pull and push its own branch scope: untrusted, and only its own.
+    let own = push_blob(reg, "branch", "ns/p/br", b"branch layer").await;
+    let again = push_blob(reg, "branch", "ns/p/br", b"base layer").await;
+    assert_eq!(
+        put_index(reg, "branch", "ns/p/br", "main", &[&own, &again])
+            .await
+            .status,
+        StatusCode::CREATED
+    );
+    let s = status("branch", Method::GET, "/v2/ns/p/br/manifests/main".into()).await;
+    assert_eq!(s, StatusCode::OK);
+    for pod in ["writer", "reader", "branch2", "other", "wide"] {
+        for (m, uri) in [
+            (Method::GET, "/v2/ns/p/br/manifests/main".to_owned()),
+            (Method::HEAD, format!("/v2/ns/p/br/blobs/{own}")),
+            (Method::POST, "/v2/ns/p/br/blobs/uploads/".to_owned()),
+        ] {
+            assert_eq!(
+                status(pod, m.clone(), uri.clone()).await,
+                StatusCode::FORBIDDEN,
+                "{pod} {m} {uri}"
+            );
+        }
+        let r = put_index(reg, pod, "ns/p/br", "main", &[&shared]).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{pod}");
+    }
+    // A mount is a plain upload, and a branch manifest cannot reference a
+    // blob that only another branch holds.
+    let s = status(
+        "branch2",
+        Method::POST,
+        format!("/v2/ns/p/br2/blobs/uploads/?mount={own}&from=ns%2Fp%2Fbr"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    let r = put_index(reg, "branch2", "ns/p/br2", "main", &[&own]).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{:?}", r.body);
+    // The layer both scopes hold is stored once.
+    let files = std::fs::read_dir(f.dir.join("blobs/sha256"))
+        .unwrap()
+        .count();
+    assert_eq!(files, 4, "two layers and two manifests");
+}
+
+/// A read of a branch scope that lacks a manifest or blob is answered from
+/// the caller's trusted scope: HEAD and GET, tags and digests, ranges. Never
+/// from another branch or repository, never for a push, and it writes
+/// nothing into the branch scope.
+#[tokio::test]
+async fn a_branch_scope_reads_through_to_its_trusted_scope() {
+    let f = fixture("fallback");
+    let reg = &f.reg;
+    let shared = push_blob(reg, "writer", "ns/p/app", b"base layer").await;
+    let r = put_index(reg, "writer", "ns/p/app", "main", &[&shared]).await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    let index = r.header("docker-content-digest").to_owned();
+    let elsewhere = push_blob(reg, "other", "ns/p/other", b"other repository").await;
+    let theirs = push_blob(reg, "branch2", "ns/p/br2", b"other branch").await;
+    let get = |pod: &'static str,
+               m: Method,
+               uri: String,
+               h: &'static [(&'static str, &'static str)]| async move {
+        call(reg, pod, m, &uri, h, b"").await
+    };
+    for m in [Method::HEAD, Method::GET] {
+        for t in ["main", index.as_str()] {
+            let r = get(
+                "branch",
+                m.clone(),
+                format!("/v2/ns/p/br/manifests/{t}"),
+                &[],
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::OK, "{m} {t}");
+            assert_eq!(r.header("docker-content-digest"), index, "{m} {t}");
+        }
+        let r = get(
+            "branch",
+            m.clone(),
+            format!("/v2/ns/p/br/blobs/{shared}"),
+            &[],
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{m}");
+    }
+    let r = get(
+        "branch",
+        Method::GET,
+        format!("/v2/ns/p/br/blobs/{shared}"),
+        &[("range", "bytes=5-9")],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(&r.body[..], b"layer");
+    // Never another branch's or another repository's content.
+    for d in [&elsewhere, &theirs] {
+        let r = get("branch", Method::GET, format!("/v2/ns/p/br/blobs/{d}"), &[]).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{d}");
+    }
+    let r = put_index(reg, "branch2", "ns/p/br2", "main", &[&theirs]).await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    let r = get(
+        "branch",
+        Method::GET,
+        "/v2/ns/p/br/manifests/main".into(),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        r.header("docker-content-digest"),
+        index,
+        "not branch2's tag"
+    );
+    // A trusted or read-only worker gets no fallback, and a fallback read
+    // created nothing in the branch scope.
+    for pod in ["writer", "reader"] {
+        let r = get(pod, Method::GET, "/v2/ns/p/br/manifests/main".into(), &[]).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{pod}");
+    }
+    assert!(!f.dir.join("repos/ns/p/br").exists());
+    // A push names the branch scope only. A manifest may reference what the
+    // trusted scope holds, and the branch then links it itself.
+    let own = push_blob(reg, "branch", "ns/p/br", b"branch layer").await;
+    let r = put_index(reg, "branch", "ns/p/br", "main", &[&shared, &own]).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    let mine = r.header("docker-content-digest").to_owned();
+    assert_ne!(mine, index);
+    let r = get(
+        "branch",
+        Method::GET,
+        "/v2/ns/p/br/manifests/main".into(),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        r.header("docker-content-digest"),
+        mine,
+        "its own manifest wins"
+    );
+    let r = get(
+        "writer",
+        Method::HEAD,
+        format!("/v2/ns/p/app/blobs/{own}"),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::NOT_FOUND,
+        "nothing reached the trusted scope"
+    );
+}
+
+/// A branch manifest may reference a blob it has not uploaded only when the
+/// caller's own trusted scope holds it. A blob that only another repository,
+/// or another branch holds is refused, and a
+/// refused push links nothing, not even the references it could borrow.
+#[tokio::test]
+async fn a_branch_manifest_borrows_only_from_its_own_trusted_scope() {
+    let f = fixture("borrow");
+    let reg = &f.reg;
+    let shared = push_blob(reg, "writer", "ns/p/app", b"base layer").await;
+    let elsewhere = push_blob(reg, "other", "ns/p/other", b"other repository").await;
+    let theirs = push_blob(reg, "branch2", "ns/p/br2", b"other branch").await;
+    let link = |d: &Digest| f.dir.join("repos/ns/p/br/_links").join(d.hex());
+    for d in [&elsewhere, &theirs] {
+        for refs in [vec![d], vec![&shared, d]] {
+            let r = put_index(reg, "branch", "ns/p/br", "main", &refs).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{d}");
+            assert_eq!(r.code(), "MANIFEST_BLOB_UNKNOWN", "{d}");
+            assert!(!link(d).exists(), "{d}");
+            assert!(!link(&shared).exists(), "{d}");
+        }
+    }
+    let r = call(
+        reg,
+        "branch",
+        Method::GET,
+        "/v2/ns/p/br/manifests/main",
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::NOT_FOUND,
+        "no branch manifest was stored"
+    );
+    // Only the caller's own trusted scope lends; branch2 borrows the same
+    // layer from the same trusted scope into its own branch only.
+    let r = put_index(reg, "branch", "ns/p/br", "main", &[&shared]).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    assert!(link(&shared).exists());
+    assert!(
+        !f.dir
+            .join("repos/ns/p/br2/_links")
+            .join(shared.hex())
+            .exists()
+    );
 }
 
 #[tokio::test]

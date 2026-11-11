@@ -20,7 +20,8 @@ use super::pods::{ann, derived_alloc_id, parse_ts};
 use crate::auth::Identity;
 use crate::pki::AllocId;
 use crate::render::{
-    ANN_ALLOC, ANN_CLAIM, ANN_CLAIM_UID, ANN_EXPIRES_AT, ANN_OWNER, DRAINING, FREE,
+    ANN_ALLOC, ANN_BRANCH_SCOPE, ANN_CLAIM, ANN_CLAIM_UID, ANN_EXPIRES_AT, ANN_OWNER, DRAINING,
+    FREE,
 };
 
 /// `(namespace, name)` of a pool.
@@ -100,6 +101,8 @@ pub struct Caller {
     pub cache_scope: Option<String>,
     /// The cache tier the API wrote, for a claim the API wrote.
     pub cache_tier: Option<CacheTier>,
+    /// The `P branch-scope` annotation the API wrote, for a claim the API wrote.
+    pub branch_scope: Option<String>,
 }
 
 /// The claim's identity, from API-server-set metadata only.
@@ -125,6 +128,12 @@ pub fn caller(c: &BuildKitClaim, own: &str) -> Option<Caller> {
             identity: None,
             cache_scope: c.spec.cache_scope.clone(),
             cache_tier: c.spec.cache_tier,
+            branch_scope: c
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(ANN_BRANCH_SCOPE))
+                .cloned(),
         });
     }
     let id = identity(c)?;
@@ -133,6 +142,7 @@ pub fn caller(c: &BuildKitClaim, own: &str) -> Option<Caller> {
         identity: Some(id),
         cache_scope: None,
         cache_tier: None,
+        branch_scope: None,
     })
 }
 

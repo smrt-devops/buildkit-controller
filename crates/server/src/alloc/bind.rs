@@ -813,17 +813,32 @@ fn ask(
         .map(CacheKey::try_from)
         .transpose()
         .map_err(|e| e.to_string())?;
-    // A claim the API wrote carries the scope and tier the API derived from
-    // its caller; without a well-formed scope it gets no cache.
+    // A claim the API wrote carries the scope, tier and branch scope the API
+    // derived from its caller; without a well-formed scope it gets no cache.
+    // `plan` drops a branch scope from a trusted allocation.
     let who = match (&caller.identity, &caller.cache_scope) {
-        (Some(id), _) => Some((cache::scope(pool, id), cache::tier(pool, id))),
-        (None, Some(s)) if rnd::is_scope_id(s) => {
-            Some((s.clone(), caller.cache_tier.unwrap_or(CacheTier::Untrusted)))
-        }
+        (Some(id), _) => Some((
+            cache::scope(pool, id),
+            cache::tier(pool, id),
+            cache::branch_scope(pool, id),
+        )),
+        (None, Some(s)) if rnd::is_scope_id(s) => Some((
+            s.clone(),
+            caller.cache_tier.unwrap_or(CacheTier::Untrusted),
+            caller.branch_scope.clone(),
+        )),
         (None, _) => None,
     };
-    let plan = who.and_then(|(scope, tier)| {
-        cache::plan(registry_host, pool, key.as_ref(), c.spec.cache, scope, tier)
+    let plan = who.and_then(|(scope, tier, branch)| {
+        cache::plan(
+            registry_host,
+            pool,
+            key.as_ref(),
+            c.spec.cache,
+            scope,
+            tier,
+            branch,
+        )
     });
     Ok(Ask {
         deadline: claims::queue_deadline(c, qt),
