@@ -47,6 +47,9 @@ test('a path endpoint starts one forwarder and buildx gets a local port per pool
   assert.ok(f.docker().includes('buildx rm --force bk-id1a'));
   assert.deepEqual(deletes(f.calls).sort(), ['/v1/allocations/id1a', '/v1/allocations/id2b']);
   assert.ok(!p.out.includes('::warning::'), p.out);
+  assert.match(p.out, /::group::buildkit tunnel forwarder errors\n.* https:\/\/127\.0\.0\.1:\d+\/v1\/tunnel tunnel refused: HTTP 404\n::endgroup::/, 'the refusal shows in a collapsed group');
+  const group = p.out.split('::group::')[1].split('::endgroup::')[0];
+  assert.ok(!/oidc-token|CERT|bearer/.test(group), 'the group holds no token or certificate');
 });
 
 test('a tcp:// endpoint goes to buildx unchanged and no forwarder starts', { skip }, async (t) => {
@@ -73,6 +76,7 @@ test('post is quiet when the forwarder is already gone', { skip }, async (t) => 
   assert.equal(p.code, 0, p.out);
   assert.ok(!p.out.includes('::warning::'), p.out);
   assert.deepEqual(deletes(f.calls), ['/v1/allocations/id1a']);
+  assert.ok(!p.out.includes('::group::'), 'an empty forwarder log prints nothing');
 });
 
 test('a failed buildx create still leaves the forwarder pid for post to stop', { skip }, async (t) => {
@@ -87,4 +91,14 @@ test('a failed buildx create still leaves the forwarder pid for post to stop', {
   const end = Date.now() + 5000;
   while (alive(pid) && Date.now() < end) await sleep(20);
   assert.ok(!alive(pid));
+});
+
+test('an empty ca-cert falls back to the file in NODE_EXTRA_CA_CERTS, and a missing file fails naming it', { skip }, async (t) => {
+  const f = await fixture(t);
+  const m = await main({ ...f.env, 'INPUT_CA-CERT': '', NODE_EXTRA_CA_CERTS: f.caFile, INPUT_POOLS: 'ci/a' });
+  assert.equal(m.code, 0, m.out);
+  assert.equal(readState(f.env.GITHUB_STATE).ca, require('node:fs').readFileSync(f.caFile, 'utf8'));
+  const bad = await main({ ...f.env, 'INPUT_CA-CERT': '', SSL_CERT_FILE: '/nonexistent/ca.pem', INPUT_POOLS: 'ci/a' });
+  assert.equal(bad.code, 1);
+  assert.match(bad.out, /SSL_CERT_FILE names \/nonexistent\/ca\.pem/);
 });

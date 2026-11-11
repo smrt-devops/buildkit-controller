@@ -8,6 +8,27 @@ const os = require('node:os');
 const path = require('node:path');
 const L = require('../dist/lib');
 
+test('resolveCa: input, then NODE_EXTRA_CA_CERTS, then SSL_CERT_FILE, then none', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bk-ca-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const node = path.join(dir, 'node.pem');
+  const ssl = path.join(dir, 'ssl.pem');
+  fs.writeFileSync(node, 'NODE PEM');
+  fs.writeFileSync(ssl, 'SSL PEM');
+  assert.equal(L.resolveCa('INPUT PEM', { NODE_EXTRA_CA_CERTS: node, SSL_CERT_FILE: ssl }), 'INPUT PEM');
+  assert.equal(L.resolveCa('', { NODE_EXTRA_CA_CERTS: node, SSL_CERT_FILE: ssl }), 'NODE PEM');
+  assert.equal(L.resolveCa('', { SSL_CERT_FILE: ssl }), 'SSL PEM');
+  assert.equal(L.resolveCa('', { NODE_EXTRA_CA_CERTS: '', SSL_CERT_FILE: ssl }), 'SSL PEM');
+  assert.equal(L.resolveCa('', {}), undefined);
+});
+
+test('resolveCa: a named file that is missing is an error naming the variable', () => {
+  assert.throws(() => L.resolveCa('', { NODE_EXTRA_CA_CERTS: '/nonexistent/ca.pem' }), /NODE_EXTRA_CA_CERTS names \/nonexistent\/ca\.pem/);
+  assert.throws(() => L.resolveCa('', { SSL_CERT_FILE: '/nonexistent/ca.pem' }), /SSL_CERT_FILE/);
+  // The first variable that is set decides; a good second one does not paper over a bad first.
+  assert.throws(() => L.resolveCa('', { NODE_EXTRA_CA_CERTS: '/nonexistent/ca.pem', SSL_CERT_FILE: __filename }), /NODE_EXTRA_CA_CERTS/);
+});
+
 test('parseList splits commas and newlines', () => {
   assert.deepEqual(L.parseList('ci/a, ci/b\n\n ci/c\n'), ['ci/a', 'ci/b', 'ci/c']);
   assert.deepEqual(L.parseList(''), []);
@@ -48,7 +69,7 @@ test('validatePools: single pool needs no platforms', () => {
   assert.equal(r.length, 1);
 });
 
-test('validatePools rejects missing, unready, multi without allocation domain, empty or overlapping platforms', () => {
+test('validatePools rejects missing, unready, multi without per-allocation endpoints, empty or overlapping platforms', () => {
   const w = [{ namespace: 'ci', pool: 'a' }, { namespace: 'ci', pool: 'b' }];
   assert.throws(() => L.validatePools({ pools: [pool('a', ['linux/amd64'])] }, w), /not found/);
   assert.throws(() => L.validatePools({ pools: [pool('a', [], false)] }, [w[0]]), /not ready/);

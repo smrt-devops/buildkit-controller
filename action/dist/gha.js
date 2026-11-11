@@ -12,6 +12,7 @@ function getInput(name) {
 }
 function setSecret(v) { if (v) for (const l of String(v).split('\n')) if (l.trim()) out(`::add-mask::${esc(l.trim())}`); }
 const info = (m) => out(m);
+const group = (title, body) => { out(`::group::${esc(title)}`); out(body); out('::endgroup::'); };
 const warning = (m) => out(`::warning::${esc(m)}`);
 const error = (m) => out(`::error::${esc(m)}`);
 function fileCmd(env, key, value) {
@@ -24,4 +25,4 @@ const setOutput = (k, v) => fileCmd('GITHUB_OUTPUT', k, v);
 const saveState = (k, v) => fileCmd('GITHUB_STATE', k, v);
 const getState = (k) => process.env[`STATE_${k}`] || '';
 
-module.exports = { getInput, setSecret, info, warning, error, setOutput, saveState, getState };
+module.exports = { getInput, setSecret, info, group, warning, error, setOutput, saveState, getState };

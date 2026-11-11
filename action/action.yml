@@ -23,7 +23,7 @@ inputs:
     description: Name of the buildx builder (default bk-<first allocation id>).
     required: false
   ca-cert:
-    description: PEM CA certificate to trust for the API listener (default is system roots).
+    description: PEM CA certificate to trust for the API listener. When empty, the PEM file named by NODE_EXTRA_CA_CERTS, then SSL_CERT_FILE, is used for the API calls and the tunnel forwarder; a named file that is missing fails the step. With none of them, system roots.
     required: false
   cache:
     description: Whether to use the built-in build cache, auto or none (default auto).

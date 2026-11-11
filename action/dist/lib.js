@@ -128,7 +128,7 @@ function validatePools(resp, wanted) {
   });
   if (found.length > 1) {
     if (!resp.perAllocationEndpoints) {
-      throw new Error('multiple pools need edge.allocationDomain (perAllocationEndpoints is false)');
+      throw new Error('multiple pools need per-allocation endpoints: an empty edge.endpoint (tunnel) or edge.allocationDomain (perAllocationEndpoints is false)');
     }
     const seen = new Map();
     for (const p of found) {
@@ -424,6 +424,21 @@ async function allocate(api, { what, ca, getToken, attemptOpts, budgetMs, queueS
   }
 }
 
+/**
+ * The CA bundle (PEM text) to trust for the API and the forwarder: the ca-cert input, else the file
+ * named by NODE_EXTRA_CA_CERTS, else the one named by SSL_CERT_FILE, else undefined (system roots).
+ * A named file that cannot be read is an error naming its variable.
+ */
+function resolveCa(input, env = process.env) {
+  if (input) return input;
+  for (const name of ['NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE']) {
+    const file = env[name];
+    if (!file) continue;
+    try { return fs.readFileSync(file, 'utf8'); } catch (e) { throw new Error(`${name} names ${file}, which cannot be read (${e.code || e.message}); set ca-cert or fix ${name}`); }
+  }
+  return undefined;
+}
+
 /** Release allocation `id`. 404 counts as released. Own short retry budget: a down API must not hold the job. */
 async function releaseAllocation({ api, ca, getToken, id, log, ...inject }) {
   const res = await requestWithRetry(`${api}/v1/allocations/${id}`, { method: 'DELETE', ca, timeoutMs: 30000 },
@@ -431,7 +446,7 @@ async function releaseAllocation({ api, ca, getToken, id, log, ...inject }) {
   if (res.status !== 204 && res.status !== 404) throw apiError(`release ${id}`, res);
 }
 
-/** An allocation `endpoint` that starts with "/" is a path on the API base URL: the tunnel (edge.md section 10). */
+/** An allocation `endpoint` that starts with "/" is a path on the API base URL: the tunnel. */
 function isTunnelEndpoint(endpoint) {
   return typeof endpoint === 'string' && endpoint.startsWith('/');
 }
@@ -443,14 +458,15 @@ function tunnelUrl(api, endpoint) {
 
 /**
  * Start dist/tunnel.js detached (it outlives this step) with one listener per URL. The child gets
- * no token or key, only the CA bundle for the WebSocket. Resolves {pid, ports} once it has printed
+ * no token or key, only the CA bundle for the WebSocket and the path of its error log. Resolves {pid, ports} once it has printed
  * its ports; on any failure the child is killed.
  */
-function startForwarder({ urls, ca, timeoutMs = 10000, script = path.join(__dirname, 'tunnel.js') }) {
+function startForwarder({ urls, ca, logFile, timeoutMs = 10000, script = path.join(__dirname, 'tunnel.js') }) {
   return new Promise((resolve, reject) => {
     const args = [script, ...urls.flatMap((u) => ['--url', u])];
     // The tracking id is not a secret; a self-hosted runner's orphan cleanup finds the process by it.
     const env = { BUILDKIT_TUNNEL_CA: ca || '' };
+    if (logFile) env.BUILDKIT_TUNNEL_LOG = logFile;
     if (process.env.RUNNER_TRACKING_ID) env.RUNNER_TRACKING_ID = process.env.RUNNER_TRACKING_ID;
     const child = spawn(process.execPath, args, { detached: true, stdio: ['ignore', 'pipe', 'pipe'], env });
     let out = '';
@@ -501,11 +517,11 @@ function stopForwarder(pid) {
  * and no process starts when there is no tunnel node. `onStarted(pid)` fires as soon as the
  * forwarder is up, so the caller can record the pid for the post step.
  */
-async function useTunnels(nodes, { api, ca, start = startForwarder, onStarted = () => {} }) {
+async function useTunnels(nodes, { api, ca, logFile, start = startForwarder, onStarted = () => {} }) {
   const idx = nodes.flatMap((n, i) => (isTunnelEndpoint(n.endpoint) ? [i] : []));
   if (idx.length === 0) return nodes;
   const urls = idx.map((i) => tunnelUrl(api, nodes[i].endpoint));
-  const { pid, ports } = await start({ urls, ca });
+  const { pid, ports } = await start({ urls, ca, logFile });
   onStarted(pid);
   const out = nodes.slice();
   idx.forEach((i, k) => { out[i] = { ...nodes[i], endpoint: `tcp://127.0.0.1:${ports[k]}` }; });
@@ -553,6 +569,6 @@ async function fetchOidcToken(audience, setSecret) {
 module.exports = {
   parseList, parsePool, REQUEST_TIMEOUT_MS, postTimeoutMs, isCurrentServer, cachedToken, jwtExpiryMs, FAST_POLL_MS, pollAllocation, allocate, errorCode, parseDuration, generateKey, allocationBody,
   validatePools, buildxCommands, parseCacheInputs, cacheFlags, checkAllocationId, createBuilder, writeMaterial, request, apiError,
-  isTunnelEndpoint, tunnelUrl, startForwarder, stopForwarder, useTunnels,
+  resolveCa, isTunnelEndpoint, tunnelUrl, startForwarder, stopForwarder, useTunnels,
   effectiveQueueTimeout, retryBudgetMs, SHORT_BUDGET_MS, releaseAllocation, queueTimeoutFor, retryAfterMs, requestWithRetry, fetchOidcToken,
 };

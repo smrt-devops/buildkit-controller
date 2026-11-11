@@ -29,7 +29,7 @@ use super::plan::{PlanConfig, REAPPLY_AFTER};
 use super::pods::WorkerPod;
 use super::registry_tls;
 use crate::alloc::claims;
-use crate::config::ElectionTiming;
+use crate::config::{Config, ElectionTiming};
 use crate::pki::LoadOutcome;
 use crate::render::LABEL_POOL;
 use crate::runtime::AppContext;
@@ -152,18 +152,24 @@ pub(super) fn term_hosts(resolver: &Arc<dyn Resolve>) -> Arc<Hosts> {
     Arc::new(Hosts::new(Arc::clone(resolver)))
 }
 
-fn settings(ctx: &AppContext) -> Settings {
-    let c = ctx.config();
+/// The planner's settings from the config. `status.endpoint` is the endpoint
+/// the API returns, so it is the tunnel path when `edge.endpoint` is empty.
+fn plan_config(c: &Config) -> PlanConfig {
     let mut plan = PlanConfig {
-        endpoint: c.edge.endpoint.clone(),
+        endpoint: c.edge.client_endpoint().to_owned(),
         server_name: c.edge.server_name.clone(),
         ..PlanConfig::default()
     };
     if let Some((_, min_left)) = c.test_worker_thresholds() {
         plan.worker_cert_min_left = SignedDuration::from_secs(min_left.whole_seconds());
     }
+    plan
+}
+
+fn settings(ctx: &AppContext) -> Settings {
+    let c = ctx.config();
     Settings {
-        plan,
+        plan: plan_config(c),
         worker_cert_validity: c.leaf_validity().worker_serving,
         render: c.render_config(ctx.namespace()),
         ca_secret_name: c.pki.ca_secret_name.clone(),
@@ -519,4 +525,20 @@ pub(super) fn all_keys<'a>(
     keys.extend(remembered.cloned());
     keys.insert(ca_key());
     keys.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_endpoint_is_the_client_endpoint() {
+        let tunnel = Config::from_yaml("edge:\n  serverName: bk.example.com\n").unwrap();
+        assert_eq!(plan_config(&tunnel).endpoint, "/v1/tunnel");
+        let tcp = Config::from_yaml(
+            "edge:\n  endpoint: tcp://bk.example.com:8444\n  serverName: bk.example.com\n",
+        )
+        .unwrap();
+        assert_eq!(plan_config(&tcp).endpoint, "tcp://bk.example.com:8444");
+    }
 }

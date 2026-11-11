@@ -245,7 +245,7 @@ fn accept_for(key: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(digest)
 }
 
-/// The two forms of edge.md §10: an HTTP/1.1 upgrade answered `101`, and the
+/// The two forms of the tunnel: an HTTP/1.1 upgrade answered `101`, and the
 /// HTTP/2 extended `CONNECT` answered `200` that a gateway speaking HTTP/2 to
 /// the API sends.
 #[derive(Clone, Copy, Debug)]
@@ -424,16 +424,21 @@ async fn a_valid_cert_is_delivered_through_the_tunnel() {
 
 /// Several HTTP/2 tunnels share one API connection, each its own stream.
 /// Tunnels the edge does not read fill only their own stream windows, so the
-/// others on the connection keep moving; then they drain in full.
+/// others on the connection keep moving, even when more of them stall than
+/// 16 stream windows (the old connection window) hold; then they drain in full.
 #[tokio::test]
 async fn h2_tunnels_share_one_connection() {
-    const BIG: usize = 4 << 20;
-    let mut r = start(Knobs::default()).await;
+    const BIG: usize = 1 << 20;
+    const STALLED: usize = 20;
+    // A pool namespace may hold a quarter of the edge's connections.
+    let mut knobs = Knobs::default();
+    knobs.edge.max_connections = 128;
+    let mut r = start(knobs).await;
     let mut send = h2_conn(&r).await;
-    // Two tunnels get 4 MiB each, more than a stream's flow-control window,
-    // while the edge side reads none of it.
+    // Each stalled tunnel gets 1 MiB, more than a stream's flow-control
+    // window, while the edge side reads none of it.
     let mut stalled = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..STALLED {
         let mut a = tls_in(&r, h2_websocket(&mut send).await, valid_leaf(&r.bundle))
             .await
             .unwrap();

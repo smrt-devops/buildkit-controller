@@ -80,6 +80,15 @@ fn secs(d: &CrdDuration, key: &str) -> anyhow::Result<Duration> {
     Ok(Duration::from_secs(s))
 }
 
+/// The tunnel queue, once: the edge has one run, and a second would leave every
+/// tunnel waiting on a queue nobody reads.
+fn take_tunnels(slot: &std::sync::Mutex<Option<TunnelQueue>>) -> anyhow::Result<TunnelQueue> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .context("the edge's tunnel queue was already taken: the edge component ran twice")
+}
+
 impl Component for EdgeComponent {
     fn name(&self) -> &'static str {
         "edge"
@@ -87,12 +96,10 @@ impl Component for EdgeComponent {
 
     fn run(&self, ctx: AppContext, shutdown: CancellationToken) -> BoxResult {
         let certs = self.material.clone();
-        let tunnels = self
-            .tunnels
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        // Taken here, so a second run fails at once instead of serving without tunnels.
+        let tunnels = take_tunnels(&self.tunnels);
         Box::pin(async move {
+            let tunnels = tunnels?;
             let ready = ctx.readiness().register("edge_listener");
             let metrics = EdgeMetrics::register(ctx.metrics());
             let edge = &ctx.config().edge;
@@ -154,10 +161,7 @@ impl Component for EdgeComponent {
                 options,
                 ready,
             };
-            match tunnels {
-                Some(t) => serve_with_tunnels(listener, s, proxy_protocol, t, shutdown).await,
-                None => serve_with_proxy(listener, s, proxy_protocol, shutdown).await,
-            }
+            serve_with_tunnels(listener, s, proxy_protocol, tunnels, shutdown).await;
             material_stop.cancel();
             let _ = material.await;
             revoke_stop.cancel();
@@ -165,5 +169,19 @@ impl Component for EdgeComponent {
             let _ = recorder.await;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_tunnel_queue_is_taken_once() {
+        let (_door, queue) = tunnel_channel();
+        let slot = std::sync::Mutex::new(Some(queue));
+        assert!(take_tunnels(&slot).is_ok());
+        let err = take_tunnels(&slot).err().map(|e| e.to_string());
+        assert!(err.is_some_and(|m| m.contains("already taken")));
     }
 }

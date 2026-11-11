@@ -317,7 +317,7 @@ impl Handshakes {
     }
 }
 
-/// A tunnel the API listener hands to the edge (edge.md §10).
+/// A tunnel the API listener hands to the edge (see docs/architecture.md).
 pub struct Arrival {
     /// The client address of the API connection that carries the tunnel
     /// (the PROXY source behind a trusted gateway).

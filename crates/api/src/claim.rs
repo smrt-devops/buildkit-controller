@@ -180,7 +180,9 @@ pub struct BuildKitClaimStatus {
     /// Allocation id (set once bound).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocation_id: Option<String>,
-    /// Edge endpoint, for example `tcp://bk.example.com:8444`.
+    /// Edge endpoint, for example `tcp://bk.example.com:8444`, or `/v1/tunnel` (a path on the
+    /// API base URL) when `edge.endpoint` is unset and clients tunnel through the API. A claim
+    /// outside the controller's namespace gets the edge Service's `tcp://` address in that case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     /// TLS server name of the edge.

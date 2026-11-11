@@ -1,5 +1,5 @@
 'use strict';
-// Local forwarder for the tunnel transport (edge.md section 10). buildx dials only tcp://, so this
+// Local forwarder for the tunnel transport. buildx dials only tcp://, so this
 // process listens on 127.0.0.1, opens one WebSocket per accepted connection and copies bytes both
 // ways. Node built-ins only, with its own RFC 6455 framing. It holds no tokens or keys: the one
 // secret-free input is the CA bundle for the WebSocket, in BUILDKIT_TUNNEL_CA.
@@ -9,6 +9,7 @@
 // One listener per --url. It prints one JSON line, {"ports":[...]}, once every listener is up, and
 // exits on SIGTERM or SIGINT.
 const crypto = require('node:crypto');
+const fs = require('node:fs');
 const http = require('node:http');
 const https = require('node:https');
 const net = require('node:net');
@@ -235,9 +236,10 @@ function bridge(local, { socket, head }, { closeGraceMs = CLOSE_GRACE_MS } = {})
 
 /**
  * Start one listener per target URL on `host` (port picked by the kernel). Resolves
- * {ports, close()}; `close` stops the listeners and drops every connection.
+ * {ports, close()}; `close` stops the listeners and drops every connection. `log(url, err)` hears
+ * each failed WebSocket open.
  */
-async function serve(urls, { ca, host = '127.0.0.1', closeGraceMs } = {}) {
+async function serve(urls, { ca, host = '127.0.0.1', closeGraceMs, log = () => {} } = {}) {
   const conns = new Set();
   const track = (s) => { conns.add(s); s.once('close', () => conns.delete(s)); };
   const servers = urls.map((url) => net.createServer({ allowHalfOpen: true, pauseOnConnect: true }, (local) => {
@@ -249,7 +251,7 @@ async function serve(urls, { ca, host = '127.0.0.1', closeGraceMs } = {}) {
       track(ws.socket);
       if (local.destroyed) { ws.socket.destroy(); return; }
       bridge(local, ws, { closeGraceMs });
-    }, () => local.destroy());
+    }, (e) => { log(url, e); local.destroy(); });
   }));
   const ports = await Promise.all(servers.map((s) => new Promise((resolve, reject) => {
     s.once('error', reject);
@@ -274,7 +276,15 @@ function main(argv) {
   // The parent drops its end of these pipes after the first line; a later write must not kill us.
   process.stdout.on('error', () => {});
   process.stderr.on('error', () => {});
-  return serve(urls, { ca: process.env.BUILDKIT_TUNNEL_CA || undefined }).then((s) => {
+  // One line per failed WebSocket open: time, target URL, HTTP status or error code. The file is the
+  // only record, because the parent closes this process's stderr. Nothing secret reaches it.
+  const logFile = process.env.BUILDKIT_TUNNEL_LOG;
+  const log = (url, e) => {
+    if (!logFile) return;
+    const what = String((e && e.message) || e).replace(/\s+/g, ' ');
+    try { fs.appendFileSync(logFile, `${new Date().toISOString()} ${url} ${e && e.code ? `${e.code} ` : ''}${what}\n`, { mode: 0o600 }); } catch { /* the log is best effort */ }
+  };
+  return serve(urls, { ca: process.env.BUILDKIT_TUNNEL_CA || undefined, log }).then((s) => {
     const stop = () => { s.close(); process.exit(0); };
     process.on('SIGTERM', stop);
     process.on('SIGINT', stop);
