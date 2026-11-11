@@ -113,6 +113,32 @@ function cacheFlags(allocs, { mode, from: extra = [] } = {}) {
   return { to, from, args };
 }
 
+/**
+ * What one allocation may do with the cache, for the log line: 'trusted' writes
+ * the shared cache, 'branch' writes its branch's cache and reads the shared one
+ * last, 'read-only' only reads. `null` without registry flags.
+ */
+function cacheAccess(alloc) {
+  const reg = alloc && alloc.cache && alloc.cache.registry;
+  if (!reg) return null;
+  if (!reg.to) return 'read-only';
+  const ref = (flag) => (String(flag).split(',').find((p) => p.startsWith('ref=')) || '').slice(4);
+  const from = reg.from || [];
+  return from.length > 1 && ref(reg.to) !== ref(from[from.length - 1]) ? 'branch' : 'trusted';
+}
+
+const CACHE_NOTES = {
+  trusted: 'writes the shared cache',
+  branch: "writes this branch's own cache, reads it first and the shared cache after",
+  'read-only': 'read only for this build',
+};
+
+/** The log line for `alloc`'s cache, or `null` without registry flags. */
+function cacheNote(alloc) {
+  const access = cacheAccess(alloc);
+  return access && `${alloc.namespace}/${alloc.pool}: cache key ${alloc.cache.key}, ${CACHE_NOTES[access]}`;
+}
+
 
 /**
  * Check the GET /v1/pools answer against the wanted pools (api.md, Clients).
@@ -552,7 +578,7 @@ async function fetchOidcToken(audience, setSecret) {
 
 module.exports = {
   parseList, parsePool, REQUEST_TIMEOUT_MS, postTimeoutMs, isCurrentServer, cachedToken, jwtExpiryMs, FAST_POLL_MS, pollAllocation, allocate, errorCode, parseDuration, generateKey, allocationBody,
-  validatePools, buildxCommands, parseCacheInputs, cacheFlags, checkAllocationId, createBuilder, writeMaterial, request, apiError,
+  validatePools, buildxCommands, parseCacheInputs, cacheFlags, cacheAccess, cacheNote, checkAllocationId, createBuilder, writeMaterial, request, apiError,
   isTunnelEndpoint, tunnelUrl, startForwarder, stopForwarder, useTunnels,
   effectiveQueueTimeout, retryBudgetMs, SHORT_BUDGET_MS, releaseAllocation, queueTimeoutFor, retryAfterMs, requestWithRetry, fetchOidcToken,
 };

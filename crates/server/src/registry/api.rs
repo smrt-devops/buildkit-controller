@@ -8,9 +8,11 @@
 //! - `HEAD`/`GET`/`PUT /v2/<name>/manifests/<reference>`
 //!
 //! Everything else gets 405 or 404 `UNSUPPORTED`. Every route checks the
-//! caller's grant first: pull for reads, push for writes. A grant covers one
-//! repository, so a cross-repository mount (`?mount=&from=`) is never allowed
-//! and falls back to a plain upload, as in the reference registry.
+//! caller's grant first: pull for reads, push for writes. A cross-repository
+//! mount (`?mount=&from=`) is never performed, even between the scope and the
+//! branch scope of one grant, and falls back to a plain upload, as in the
+//! reference registry: a blob becomes readable in a repository only by an
+//! upload into it.
 
 use std::collections::HashMap;
 use std::io::SeekFrom;

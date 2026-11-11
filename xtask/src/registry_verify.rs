@@ -1,5 +1,5 @@
 //! `cargo xtask registry-verify` runs the cache registry role in a throwaway
-//! kind cluster against two real rootless buildkitd pods that talk to it with
+//! kind cluster against five real rootless buildkitd pods that talk to it with
 //! internal-CA client certs:
 //!
 //! a. `trusted` (a push grant) builds and exports `--cache-to
@@ -10,6 +10,9 @@
 //! c. The same `reader` build also exports to another tag; the registry
 //!    refuses the push, `ignore-error` keeps the build green, and no manifest
 //!    lands.
+//! e to h. Branch caches: an untrusted worker exports to its branch scope and a
+//!    fresh worker of the same branch hits it, another branch and a trusted
+//!    worker are refused it (see [`branch_scenarios`]).
 //!
 //! The registry's grants come from its static grants file, its certs from a
 //! test CA made here. Every kind and kubectl call gets the private kubeconfig
@@ -43,6 +46,17 @@ fn repo() -> String {
     format!("{HOST}/{NS}/{POOL}/app")
 }
 
+/// Branch scopes of two branches. The controller writes hash ids; the static
+/// grants take any repository name.
+const BRANCH_A: &str = "branch-a";
+const BRANCH_B: &str = "branch-b";
+/// The workers: one trusted, one read-only, two of branch a, one of branch b.
+const PODS: [&str; 5] = ["trusted", "reader", "branch-a", "branch-a2", "branch-b"];
+
+fn branch_repo(scope: &str) -> String {
+    format!("{HOST}/{NS}/{POOL}/{scope}")
+}
+
 /// The registry: Deployment, Service, grants and buildkitd config.
 fn manifests() -> String {
     format!(
@@ -54,6 +68,9 @@ data:
   grants.yaml: |
     - {{namespace: {NS}, pod: trusted, repository: {NS}/{POOL}/app, push: true}}
     - {{namespace: {NS}, pod: reader, repository: {NS}/{POOL}/app, push: false}}
+    - {{namespace: {NS}, pod: branch-a, repository: {NS}/{POOL}/app, branch: {NS}/{POOL}/{BRANCH_A}}}
+    - {{namespace: {NS}, pod: branch-a2, repository: {NS}/{POOL}/app, branch: {NS}/{POOL}/{BRANCH_A}}}
+    - {{namespace: {NS}, pod: branch-b, repository: {NS}/{POOL}/app, branch: {NS}/{POOL}/{BRANCH_B}}}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -160,12 +177,15 @@ spec:
 }
 
 /// The same context in every pod: busybox and its loader, two COPY steps and
-/// a RUN, so a cache hit shows as `CACHED` lines.
+/// a RUN, so a cache hit shows as `CACHED` lines. `/work/br` holds the
+/// Dockerfile of a branch build: the same steps and one more of its own.
 const PREPARE: &str = r#"set -e
 mkdir -p /work/ctx/bin /work/ctx/lib
 cp /bin/busybox /work/ctx/bin/
 cp -L /lib/ld-musl-*.so.1 /lib/libc.musl-*.so.1 /work/ctx/lib/
 printf 'FROM scratch\nCOPY lib/ /lib/\nCOPY bin/ /bin/\nRUN ["/bin/busybox", "sh", "-c", "/bin/busybox echo registry-cache-step > /step"]\n' > /work/ctx/Dockerfile
+mkdir -p /work/br
+printf 'FROM scratch\nCOPY lib/ /lib/\nCOPY bin/ /bin/\nRUN ["/bin/busybox", "sh", "-c", "/bin/busybox echo registry-cache-step > /step"]\nRUN ["/bin/busybox", "sh", "-c", "/bin/busybox echo branch-only-step > /branch"]\n' > /work/br/Dockerfile
 "#;
 
 /// A test CA and the leaves the suite needs, as PEM.
@@ -208,9 +228,15 @@ fn secret(env: &Cluster, dir: &Path, name: &str, files: &[(&str, &str)]) -> Resu
     env.kubectl(&args).map(drop)
 }
 
-/// Runs `script` in pod `pod`; returns (success, stdout and stderr).
+/// Runs `script` in pod `pod`, for 90 s at most; returns (success, stdout and
+/// stderr).
 fn exec(env: &Cluster, pod: &str, script: &str) -> Result<(bool, String)> {
-    let out = env.kubectl_raw(&["-n", NS, "exec", pod, "--", "sh", "-c", script], None)?;
+    let out = env.kubectl_raw(
+        &[
+            "-n", NS, "exec", pod, "--", "timeout", "90", "sh", "-c", script,
+        ],
+        None,
+    )?;
     Ok((
         out.status.success(),
         format!(
@@ -247,6 +273,33 @@ fn export_to(tag: &str) -> String {
         "--export-cache type=registry,ref={}:{tag},mode=max,ignore-error=true,oci-mediatypes=true",
         repo()
     )
+}
+
+/// A branch build of the `/work/br` Dockerfile with `cache_flags`.
+fn build_branch(cache_flags: &str) -> String {
+    format!(
+        "buildctl --addr {SOCKET} build --progress=plain --frontend dockerfile.v0 \
+         --local context=/work/ctx --local dockerfile=/work/br {cache_flags}"
+    )
+}
+
+/// The flags the controller gives a build of branch `scope`: import the branch
+/// cache, then the trusted one, and export to the branch cache.
+fn branch_flags(scope: &str) -> String {
+    format!(
+        "--import-cache type=registry,ref={b}:main --import-cache type=registry,ref={t}:main \
+         --export-cache type=registry,ref={b}:main,mode=max,ignore-error=true,oci-mediatypes=true",
+        b = branch_repo(scope),
+        t = repo()
+    )
+}
+
+/// Whether the step whose command contains `marker` shows `CACHED`.
+fn step_cached(log: &str, marker: &str) -> bool {
+    log.lines()
+        .filter(|l| l.starts_with('#') && l.contains(marker) && l.contains(" RUN "))
+        .filter_map(|l| l.split_whitespace().next())
+        .any(|id| log.lines().any(|l| l.trim_end() == format!("{id} CACHED")))
 }
 
 /// Dumps state on a failed run; the cluster it holds is deleted after that.
@@ -369,6 +422,7 @@ pub(crate) fn registry_verify() -> Result<()> {
     if r.failed > 0 {
         println!("{log}");
     }
+    branch_scenarios(env, &mut r, &pushed)?;
     let refused = metric(env, "buildkit_registry_connections_refused_total", &[])?;
     r.check(
         "d/no connection refused at TLS",
@@ -384,7 +438,100 @@ pub(crate) fn registry_verify() -> Result<()> {
     Ok(())
 }
 
-/// Certs, the registry, and the two buildkitd pods with their contexts.
+/// Branch caches, with the flags the controller gives each tier:
+///
+/// e. `branch-a` (untrusted, branch scope a) builds the branch Dockerfile:
+///    the shared steps hit the trusted cache, and it exports to its branch.
+/// f. `branch-a2`, a fresh worker of the same branch, hits the branch's own
+///    step from the branch cache.
+/// g. `branch-b` (branch scope b) also asks for branch a's cache and gets
+///    refused: its branch step runs again.
+/// h. `trusted` asks for both branch caches and gets refused.
+fn branch_scenarios(
+    env: &Cluster,
+    r: &mut Report,
+    pushed: &dyn Fn(&Cluster) -> Result<f64>,
+) -> Result<()> {
+    let denied = |env: &Cluster, action: &str| {
+        metric(
+            env,
+            "buildkit_registry_denied_total",
+            &[&format!("action=\"{action}\"")],
+        )
+    };
+    const STEP: &str = "branch-only-step";
+
+    // e.
+    let (before, denied_push) = (pushed(env)?, denied(env, "push")?);
+    let (ok, log) = exec(env, "branch-a", &build_branch(&branch_flags(BRANCH_A)))?;
+    let (cached, own) = (cached_steps(&log), step_cached(&log, STEP));
+    let after = pushed(env)?;
+    r.check(
+        "e/branch build reads the trusted cache and exports its own",
+        ok && cached >= 3
+            && !own
+            && after - before >= 1.0
+            && (denied(env, "push")? - denied_push).abs() < f64::EPSILON,
+        &format!("build ok={ok}, {cached} CACHED, branch step cached={own}, manifest pushes {before}->{after}"),
+    );
+    if !ok {
+        println!("{log}");
+    }
+
+    // f.
+    let (ok, log) = exec(env, "branch-a2", &build_branch(&branch_flags(BRANCH_A)))?;
+    let own = step_cached(&log, STEP);
+    r.check(
+        "f/second build of the branch hits its own branch cache",
+        ok && own,
+        &format!(
+            "build ok={ok}, {} CACHED, branch step cached={own}",
+            cached_steps(&log)
+        ),
+    );
+    if !(ok && own) {
+        println!("{log}");
+    }
+
+    // g.
+    let denied_pull = denied(env, "pull")?;
+    let flags = format!(
+        "--import-cache type=registry,ref={}:main {}",
+        branch_repo(BRANCH_A),
+        branch_flags(BRANCH_B)
+    );
+    let (ok, log) = exec(env, "branch-b", &build_branch(&flags))?;
+    let (own, pulls) = (step_cached(&log, STEP), denied(env, "pull")? - denied_pull);
+    r.check(
+        "g/another branch cannot read the first branch's cache",
+        ok && !own && pulls >= 1.0,
+        &format!("build ok={ok}, branch step cached={own}, pull denials +{pulls}"),
+    );
+    if !ok || own {
+        println!("{log}");
+    }
+
+    // h.
+    let denied_pull = denied(env, "pull")?;
+    let flags = format!(
+        "--import-cache type=registry,ref={}:main --import-cache type=registry,ref={}:main",
+        branch_repo(BRANCH_A),
+        branch_repo(BRANCH_B)
+    );
+    let (ok, log) = exec(env, "trusted", &build_branch(&flags))?;
+    let (own, pulls) = (step_cached(&log, STEP), denied(env, "pull")? - denied_pull);
+    r.check(
+        "h/a trusted build sees no branch cache",
+        ok && !own && pulls >= 2.0,
+        &format!("build ok={ok}, branch step cached={own}, pull denials +{pulls}"),
+    );
+    if !ok || own {
+        println!("{log}");
+    }
+    Ok(())
+}
+
+/// Certs, the registry, and the buildkitd pods with their contexts.
 fn deploy(env: &Cluster, work: &Path) -> Result<()> {
     env.kubectl(&["create", "namespace", NS])?;
     env.kubectl(&[
@@ -407,7 +554,7 @@ fn deploy(env: &Cluster, work: &Path) -> Result<()> {
         "cache-tls",
         &[("tls.crt", &crt), ("tls.key", &key), ("ca.crt", &ca)],
     )?;
-    for pod in ["trusted", "reader"] {
+    for pod in PODS {
         let name = format!("{NONCE}.{pod}.{POOL}.{NS}.worker.buildkit.internal");
         let (crt, key) = pki.leaf(&[name], ExtendedKeyUsagePurpose::ClientAuth)?;
         secret(
@@ -418,8 +565,9 @@ fn deploy(env: &Cluster, work: &Path) -> Result<()> {
         )?;
     }
     env.apply(&manifests())?;
-    env.apply(&buildkitd("trusted"))?;
-    env.apply(&buildkitd("reader"))?;
+    for pod in PODS {
+        env.apply(&buildkitd(pod))?;
+    }
     env.kubectl(&[
         "-n",
         NS,
@@ -428,7 +576,7 @@ fn deploy(env: &Cluster, work: &Path) -> Result<()> {
         "deploy/buildkit-cache",
         "--timeout=120s",
     ])?;
-    for pod in ["trusted", "reader"] {
+    for pod in PODS {
         env.kubectl(&[
             "-n",
             NS,
@@ -475,5 +623,17 @@ buildkit_registry_requests_total{route=\"blob\",method=\"PUT\",status=\"201\"} 7
         let log =
             "#5 [2/3] COPY lib/ /lib/\n#5 CACHED\n\n#6 [3/3] RUN x\n#6 CACHED \n#7 exporting\n";
         assert_eq!(cached_steps(log), 2);
+    }
+
+    #[test]
+    fn one_step_is_found_by_its_command() {
+        let log = "#6 [4/5] RUN [\"sh\", \"-c\", \"echo shared\"]\n#6 CACHED\n\
+                   #7 [5/5] RUN [\"sh\", \"-c\", \"echo branch-only-step\"]\n#7 0.1 done\n";
+        assert!(step_cached(log, "shared"));
+        assert!(!step_cached(log, "branch-only-step"));
+        assert!(step_cached(
+            &log.replace("#7 0.1 done", "#7 CACHED"),
+            "branch-only-step"
+        ));
     }
 }

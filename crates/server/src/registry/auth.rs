@@ -15,15 +15,30 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::pki::{WorkerIdentity, is_worker_nonce};
 
-/// What a worker may do: pull from `repository`, and push there too when
-/// `push` is set. Nothing else, not even a repository nested below it, so one
-/// allocation's cache is one repository.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+/// What a worker may do with the cache. It may pull `repository`, the scope
+/// of its allocation, and push there only when [`Writes::Scope`]. An
+/// untrusted allocation may also pull and push its own branch scope
+/// ([`Writes::Branch`]). A trusted allocation has no branch scope, so it never
+/// reads what an untrusted build wrote. Nothing else, not even a repository
+/// nested below one of these.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grant {
     /// `<pool-namespace>/<pool>/<scope>`.
     pub repository: String,
-    /// Trusted allocations only.
-    pub push: bool,
+    /// Where the worker may push.
+    pub writes: Writes,
+}
+
+/// Where a [`Grant`] may push.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Writes {
+    /// Nowhere: an untrusted allocation without a branch scope.
+    Nothing,
+    /// The scope itself: a trusted allocation.
+    Scope,
+    /// Its own branch scope `<pool-namespace>/<pool>/<branch-scope>`, which
+    /// it may also pull: an untrusted allocation.
+    Branch(String),
 }
 
 /// Pull or push.
@@ -48,7 +63,12 @@ impl Grant {
     /// Whether this grant allows `action` on `repository`.
     #[must_use]
     pub fn allows(&self, repository: &str, action: Action) -> bool {
-        repository == self.repository && (action == Action::Pull || self.push)
+        let scope = repository == self.repository;
+        match &self.writes {
+            Writes::Nothing => scope && action == Action::Pull,
+            Writes::Scope => scope,
+            Writes::Branch(b) => repository == b || (scope && action == Action::Pull),
+        }
     }
 }
 
@@ -69,6 +89,7 @@ struct Entry {
     repository: String,
     #[serde(default)]
     push: bool,
+    branch: Option<String>,
 }
 
 impl StaticGrants {
@@ -79,22 +100,35 @@ impl StaticGrants {
         self
     }
 
-    /// Reads a YAML list of `{namespace, pod, repository, push}`.
+    /// Reads a YAML list of `{namespace, pod, repository, push, branch}`: `push`
+    /// lets the pod push `repository`, `branch` names a branch repository it
+    /// may pull and push. An entry cannot have both.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
         let entries: Vec<Entry> = serde_saphyr::from_str(&text)
             .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
-        Ok(entries.into_iter().fold(Self::default(), |g, e| {
-            g.with(
+        entries.into_iter().try_fold(Self::default(), |g, e| {
+            let writes = match (e.push, e.branch) {
+                (false, None) => Writes::Nothing,
+                (true, None) => Writes::Scope,
+                (false, Some(b)) => Writes::Branch(b),
+                (true, Some(_)) => anyhow::bail!(
+                    "{}: grant of {}/{} has both push and branch",
+                    path.display(),
+                    e.namespace,
+                    e.pod
+                ),
+            };
+            Ok(g.with(
                 &e.namespace,
                 &e.pod,
                 Grant {
                     repository: e.repository,
-                    push: e.push,
+                    writes,
                 },
-            )
-        }))
+            ))
+        })
     }
 }
 
@@ -184,16 +218,38 @@ mod tests {
     fn grants_cover_exactly_the_repository() {
         let g = Grant {
             repository: "ns/pool/app".into(),
-            push: false,
+            writes: Writes::Nothing,
         };
         assert!(g.allows("ns/pool/app", Action::Pull));
         assert!(!g.allows("ns/pool/app/sub", Action::Pull));
         assert!(!g.allows("ns/pool/apple", Action::Pull));
         assert!(!g.allows("ns/pool", Action::Pull));
         assert!(!g.allows("ns/pool/app", Action::Push));
-        let w = Grant { push: true, ..g };
+        let w = Grant {
+            writes: Writes::Scope,
+            ..g
+        };
         assert!(w.allows("ns/pool/app", Action::Push));
         assert!(!w.allows("ns/other/app", Action::Push));
+        assert!(!w.allows("ns/pool/app/sub", Action::Push));
+    }
+
+    /// An untrusted grant with a branch: pull and push the branch, pull the
+    /// scope, nothing else.
+    #[test]
+    fn a_branch_grant_pushes_only_its_branch() {
+        let g = Grant {
+            repository: "ns/pool/app".into(),
+            writes: Writes::Branch("ns/pool/br".into()),
+        };
+        assert!(g.allows("ns/pool/br", Action::Pull));
+        assert!(g.allows("ns/pool/br", Action::Push));
+        assert!(g.allows("ns/pool/app", Action::Pull));
+        assert!(!g.allows("ns/pool/app", Action::Push));
+        for other in ["ns/pool/other", "ns/pool/br/sub", "ns/pool/brx", "ns/pool"] {
+            assert!(!g.allows(other, Action::Pull), "{other}");
+            assert!(!g.allows(other, Action::Push), "{other}");
+        }
     }
 
     #[test]
@@ -221,16 +277,24 @@ mod tests {
         let f = dir.join("grants.yaml");
         std::fs::write(
             &f,
-            "- {namespace: ns, pod: a, repository: ns/p/a, push: true}\n- {namespace: ns, pod: b, repository: ns/p/a}\n",
+            "- {namespace: ns, pod: a, repository: ns/p/a, push: true}\n- {namespace: ns, pod: b, repository: ns/p/a}\n- {namespace: ns, pod: c, repository: ns/p/a, branch: ns/p/b}\n",
         )
         .unwrap();
         let g = StaticGrants::load(&f).unwrap();
         let id = |pod: &str| {
             parse_worker_name(&format!("0123456789abcdef.{pod}.p.ns{WORKER_SUFFIX}")).unwrap()
         };
-        assert!(g.grant(&id("a")).unwrap().push);
-        assert!(!g.grant(&id("b")).unwrap().push);
-        assert!(g.grant(&id("c")).is_none());
+        let writes = |pod: &str| g.grant(&id(pod)).map(|g| g.writes);
+        assert_eq!(writes("a"), Some(Writes::Scope));
+        assert_eq!(writes("b"), Some(Writes::Nothing));
+        assert_eq!(writes("c"), Some(Writes::Branch("ns/p/b".into())));
+        assert!(g.grant(&id("d")).is_none());
+        std::fs::write(
+            &f,
+            "- {namespace: ns, pod: a, repository: ns/p/a, push: true, branch: ns/p/b}\n",
+        )
+        .unwrap();
+        assert!(StaticGrants::load(&f).is_err(), "a trusted branch grant");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -106,12 +106,22 @@ The owner is per run attempt, not per job. All jobs of one attempt, such as the 
 
 Builds get a cache from the cache registry, a built-in role of the controller binary. It runs as a one-replica StatefulSet `<fullname>-registry` with one volume, and the chart turns it on by default (`cache.enabled`). It serves the part of the OCI distribution API that BuildKit's registry cache exporter and importer use: blob upload, blob and manifest read, and manifest write. It serves nothing else, and it verifies each blob against its digest as the blob streams in.
 
-The allocation response carries the cache flags, and the client passes them to buildx:
+The allocation response carries the cache flags, and the client passes them to buildx. A trusted build gets:
 
 ```
 --cache-from type=registry,ref=<registry>/<namespace>/<pool>/<scope>:<tag>
 --cache-to   type=registry,ref=<registry>/<namespace>/<pool>/<scope>:<tag>,mode=max,ignore-error=true,oci-mediatypes=true
 ```
+
+An untrusted build with a branch scope (see [Scope and trust tiers](#scope-and-trust-tiers)) gets its branch cache first and the shared one second, and exports to its branch cache:
+
+```
+--cache-from type=registry,ref=<registry>/<namespace>/<pool>/<branch-scope>:<tag>
+--cache-from type=registry,ref=<registry>/<namespace>/<pool>/<scope>:<tag>
+--cache-to   type=registry,ref=<registry>/<namespace>/<pool>/<branch-scope>:<tag>,mode=max,ignore-error=true,oci-mediatypes=true
+```
+
+Any other untrusted build gets the first `--cache-from` of the trusted form and no `--cache-to`.
 
 `<tag>` is the request's `cacheKey`, or the pool name when there is none. `ignore-error=true` covers the export: a cache that cannot take the export never fails the build. The import is different. BuildKit reads the cache manifest at the start and fetches the layers it matched later, so a registry that restarts, or garbage collection that removes those layers, during the build can fail it. A client that does not pass the flags builds without a cache. A request that sets `cache: none` gets no flags.
 
@@ -119,29 +129,35 @@ The allocation response carries the cache flags, and the client passes them to b
 
 Only worker pods can, and mTLS is the boundary: the registry accepts a connection only with a valid worker client certificate, and a NetworkPolicy that admits worker pods to its port is an extra layer, not the check. Each worker has two certificates. Its serving certificate comes from the internal CA and is for serverAuth only, so it cannot be used as a client. A second leaf, issued by the client CA for the worker's DNS name and valid for clientAuth only, is the one the worker's `buildkitd.toml` presents to the registry. buildkitd trusts the internal CA alone and the edge wants an allocation URI, so no certificate a worker holds opens any buildkitd or the edge. The registry's serving certificate is from the internal CA and its trust anchor for clients is the client CA; the leader reissues the serving certificate when either CA changes. There are no credentials for a build to steal or an operator to manage.
 
-The registry identifies the worker by its certificate and finds the pod in its watch cache, as the edge does. It reads the pod's live allocation: the pool, the caller's cache scope and the trust tier, which the leader wrote on the pod as the annotations `buildkit.smrt-devops.net/scope` and `buildkit.smrt-devops.net/tier`. It then allows:
+The registry identifies the worker by its certificate and finds the pod in its watch cache, as the edge does. It reads the pod's live allocation: the pool, the caller's cache scope, the trust tier and, for an untrusted allocation, its branch scope. The leader wrote them on the pod as the annotations `buildkit.smrt-devops.net/scope`, `buildkit.smrt-devops.net/tier` and `buildkit.smrt-devops.net/branch-scope`. It then allows:
 
 | Action | Allowed when |
 |---|---|
-| Pull from `<namespace>/<pool>/<scope>` | the pod holds a live allocation of that pool and scope |
+| Pull from `<namespace>/<pool>/<scope>` | the pod holds a live allocation of that pool and scope, either tier |
 | Push to it | the same, and the allocation's tier is `trusted` |
+| Pull from or push to `<namespace>/<pool>/<branch-scope>` | the pod's allocation is untrusted and that branch scope is its own |
 
-A worker with no live allocation gets nothing. A build cannot read or write another scope's cache, whatever `--cache-to` it passes. The registry trusts the annotations on the pod, so anyone who may patch pods in a pool namespace can write any cache of that pool. Grant `pods/patch` there only to cluster admins.
+A trusted allocation never gets a branch scope, even when its pod carries the annotation. A worker with no live allocation gets nothing. A build cannot read or write another scope's or another branch's cache, whatever `--cache-to` it passes. The registry never mounts a blob from one repository into another, so a layer reaches a cache only by an upload into it. It stores each layer once on the volume, however many caches link it. The registry trusts the annotations on the pod, so anyone who may patch pods in a pool namespace can write any cache of that pool. Grant `pods/patch` there only to cluster admins.
 
 ### Scope and trust tiers
 
 The scope says whose cache it is. `spec.workers.cache.scope` sets how scopes are drawn:
 
-- `identity`, the default, gives each caller its own scope. An OIDC token with a `repository_id` claim (GitHub Actions) is scoped to that repository id, one with only a `repository` claim to that name, and any other OIDC token to its `sub`. The token's issuer is always part of the scope. A ServiceAccount is scoped to its namespace and name, and a `BuildKitClaim` to its namespace. Every run, branch and pull request of one repository shares that repository's scope.
+- `identity`, the default, gives each caller its own scope. An OIDC token with a `repository_id` claim (GitHub Actions) is scoped to that repository id, one with only a `repository` claim to that name, and any other OIDC token to its `sub`. The token's issuer is always part of the scope. A ServiceAccount is scoped to its namespace and name, and a `BuildKitClaim` to its namespace. Every run, branch and pull request of one repository shares that repository's scope. An untrusted one also has a branch scope of its own (below).
 - `pool` puts every caller the pool admits in one scope. Use it only when the pool's access rules admit a single trust domain.
 
-The tier says whether the caller may write. `spec.workers.cache.writers` lists the callers that may, in the syntax of `access.rules`. Everyone else reads only.
+The tier says whether the caller may write the scope's shared cache. `spec.workers.cache.writers` lists the callers that may, in the syntax of `access.rules`.
 
-- Unset, a GitHub Actions caller is trusted when its `event_name` claim is `push`, `schedule` or `workflow_dispatch` and its `ref_protected` claim is `true`. Every branch shares the repository's scope, so an unprotected branch that anyone with push access can write must not feed the protected branch's builds. `merge_group` is not trusted by default, because its queue ref is never protected. Every ServiceAccount and `BuildKitClaim` caller is trusted. A pull request is not, so a fork build starts warm from its own repository's cache and cannot change it. A caller whose token has no `event_name` claim, such as a GitLab job, reads only until you list it in `writers`.
-- Builds from `pull_request`, `pull_request_target`, `workflow_run`, `issue_comment`, `pull_request_review`, `pull_request_review_comment`, `deployment` and `deployment_status` events are always read-only, whatever `writers` says, and so are GitLab pipelines whose `pipeline_source` is `merge_request_event`, `external_pull_request_event` or `parent_pipeline`.
+- Unset, a GitHub Actions caller is trusted when its `event_name` claim is `push`, `schedule` or `workflow_dispatch` and its `ref_protected` claim is `true`. Every branch shares the repository's scope, so an unprotected branch that anyone with push access can write must not feed the protected branch's builds. `merge_group` is not trusted by default, because its queue ref is never protected. Every ServiceAccount and `BuildKitClaim` caller is trusted. A pull request is not, so a fork build starts warm from its own repository's cache and cannot change it. A caller whose token has no `event_name` claim, such as a GitLab job, is untrusted until you list it in `writers`.
+- Builds from `pull_request`, `pull_request_target`, `workflow_run`, `issue_comment`, `pull_request_review`, `pull_request_review_comment`, `deployment` and `deployment_status` events are always untrusted, whatever `writers` says, and so are GitLab pipelines whose `pipeline_source` is `merge_request_event`, `external_pull_request_event` or `parent_pipeline`.
 - Pin `event_name` and `ref_protected` in every `writers` rule. A rule without them lets any branch write the cache that the protected branch reads.
 - `writers: []` trusts nobody.
-- A trusted allocation gets `--cache-to` and `--cache-from`. An untrusted one gets `--cache-from` only, and the Action logs that the cache is read only for the build.
+
+An untrusted OIDC caller whose token has a `ref` claim (`refs/heads/<branch>`, `refs/pull/<n>/merge`, a GitLab ref) also has a branch scope: the first 32 hex characters of the SHA-256 of the scope's name, the caller's repository identity and the ref, each prefixed with its length, so no crafted ref or repository value can reach another caller's branch scope. Every branch and every pull request has its own. An untrusted caller without a `ref` claim has none.
+
+- A trusted allocation gets `--cache-to` and `--cache-from` for its scope. The Action logs that it writes the shared cache.
+- An untrusted allocation with a branch scope gets `--cache-to` for the branch scope and `--cache-from` for the branch scope, then the scope, so its own layers win. The Action logs that it writes the branch's own cache.
+- An untrusted allocation without one gets `--cache-from` for its scope only, and the Action logs that the cache is read only for the build.
 
 ### Limits and garbage collection
 

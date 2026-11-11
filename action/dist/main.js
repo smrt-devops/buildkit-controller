@@ -99,7 +99,7 @@ async function run() {
   gha.setOutput('cache-to', flags.to.join('\n'));
   gha.setOutput('cache-from', flags.from.join('\n'));
   gha.setOutput('cache-args', flags.args.join(' '));
-  for (const a of allocs) if (a.cache && a.cache.registry && !a.cache.registry.to) gha.info(`${a.namespace}/${a.pool}: cache key ${a.cache.key}, read only for this build`);
+  for (const a of allocs) { const note = L.cacheNote(a); if (note) gha.info(note); }
   gha.setOutput('platforms', [...new Set(nodes.flatMap((n) => n.platforms))].join(','));
   gha.info(`builder ${builder} ready with ${ids.length} node(s)`);
 }

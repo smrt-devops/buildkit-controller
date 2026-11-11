@@ -25,15 +25,18 @@ fn worker(pod: &str) -> WorkerIdentity {
 }
 
 fn grants() -> StaticGrants {
-    let g = |repository: &str, push| Grant {
+    let g = |repository: &str, writes| Grant {
         repository: repository.to_owned(),
-        push,
+        writes,
     };
+    let branch = |b: &str| Writes::Branch(b.to_owned());
     StaticGrants::default()
-        .with("ns", "writer", g("ns/p/app", true))
-        .with("ns", "reader", g("ns/p/app", false))
-        .with("ns", "other", g("ns/p/other", true))
-        .with("ns", "wide", g("ns/p", true))
+        .with("ns", "writer", g("ns/p/app", Writes::Scope))
+        .with("ns", "reader", g("ns/p/app", Writes::Nothing))
+        .with("ns", "other", g("ns/p/other", Writes::Scope))
+        .with("ns", "wide", g("ns/p", Writes::Scope))
+        .with("ns", "branch", g("ns/p/app", branch("ns/p/br")))
+        .with("ns", "branch2", g("ns/p/app", branch("ns/p/br2")))
 }
 
 struct Fixture {
@@ -577,6 +580,79 @@ async fn blobs_are_per_repository_and_never_mount_across() {
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     let r = call(reg, "wide", Method::HEAD, &here, &[], b"").await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
+}
+
+/// The branch caches table: an untrusted worker pulls the trusted scope and
+/// pulls and pushes its own branch scope; a trusted worker never reaches a
+/// branch scope; one branch never reaches another's.
+#[tokio::test]
+async fn branch_scopes_follow_the_table() {
+    let f = fixture("branch");
+    let reg = &f.reg;
+    let shared = push_blob(reg, "writer", "ns/p/app", b"base layer").await;
+    assert_eq!(
+        put_index(reg, "writer", "ns/p/app", "main", &[&shared])
+            .await
+            .status,
+        StatusCode::CREATED
+    );
+    let status = |pod: &'static str, m: Method, uri: String| async move {
+        call(reg, pod, m, &uri, &[], b"").await.status
+    };
+    // Pull the trusted scope, either tier.
+    for pod in ["writer", "reader", "branch"] {
+        let s = status(pod, Method::GET, "/v2/ns/p/app/manifests/main".into()).await;
+        assert_eq!(s, StatusCode::OK, "{pod}");
+    }
+    // Push the trusted scope: trusted only.
+    for pod in ["reader", "branch"] {
+        let s = status(pod, Method::POST, "/v2/ns/p/app/blobs/uploads/".into()).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{pod}");
+        let r = put_index(reg, pod, "ns/p/app", "main", &[&shared]).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{pod}");
+    }
+    // Pull and push its own branch scope: untrusted, and only its own.
+    let own = push_blob(reg, "branch", "ns/p/br", b"branch layer").await;
+    let again = push_blob(reg, "branch", "ns/p/br", b"base layer").await;
+    assert_eq!(
+        put_index(reg, "branch", "ns/p/br", "main", &[&own, &again])
+            .await
+            .status,
+        StatusCode::CREATED
+    );
+    let s = status("branch", Method::GET, "/v2/ns/p/br/manifests/main".into()).await;
+    assert_eq!(s, StatusCode::OK);
+    for pod in ["writer", "reader", "branch2", "other", "wide"] {
+        for (m, uri) in [
+            (Method::GET, "/v2/ns/p/br/manifests/main".to_owned()),
+            (Method::HEAD, format!("/v2/ns/p/br/blobs/{own}")),
+            (Method::POST, "/v2/ns/p/br/blobs/uploads/".to_owned()),
+        ] {
+            assert_eq!(
+                status(pod, m.clone(), uri.clone()).await,
+                StatusCode::FORBIDDEN,
+                "{pod} {m} {uri}"
+            );
+        }
+        let r = put_index(reg, pod, "ns/p/br", "main", &[&shared]).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{pod}");
+    }
+    // A mount from the trusted scope is a plain upload: a manifest of the
+    // branch cannot reference a blob that was never uploaded into it.
+    let s = status(
+        "branch2",
+        Method::POST,
+        format!("/v2/ns/p/br2/blobs/uploads/?mount={shared}&from=ns%2Fp%2Fapp"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    let r = put_index(reg, "branch2", "ns/p/br2", "main", &[&shared]).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{:?}", r.body);
+    // The layer both scopes hold is stored once.
+    let files = std::fs::read_dir(f.dir.join("blobs/sha256"))
+        .unwrap()
+        .count();
+    assert_eq!(files, 4, "two layers and two manifests");
 }
 
 #[tokio::test]

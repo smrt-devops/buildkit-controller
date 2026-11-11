@@ -7,12 +7,12 @@ use kube::runtime::reflector::{ObjectRef, Store};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::auth::{Authorizer, Grant};
+use super::auth::{Authorizer, Grant, Writes};
 use super::gc::Budgets;
 use crate::pki::WorkerIdentity;
 use crate::render::{
-    ANN_ALLOC, ANN_EXPIRES_AT, ANN_SCOPE, ANN_TIER, ANN_WORKER_NONCE, CONTROLLER, DRAINING, FREE,
-    LABEL_MANAGED_BY, LABEL_POOL, is_scope_id, quantity_bytes,
+    ANN_ALLOC, ANN_BRANCH_SCOPE, ANN_EXPIRES_AT, ANN_SCOPE, ANN_TIER, ANN_WORKER_NONCE, CONTROLLER,
+    DRAINING, FREE, LABEL_MANAGED_BY, LABEL_POOL, is_scope_id, quantity_bytes,
 };
 use crate::runtime::stores::StoreFreshness;
 
@@ -47,7 +47,9 @@ impl Authorizer for PodGrants {
 /// incarnation of a worker of the pool with uid `pool_uid` (labels, controller
 /// ownerReference, `P worker-nonce`), it is not terminating, and it holds an
 /// allocation that has not expired and carries a scope. Pull from
-/// `<namespace>/<pool>/<scope>`; push too when `P tier` is `trusted`.
+/// `<namespace>/<pool>/<scope>`; push too when `P tier` is `trusted`. Any
+/// other tier pulls and pushes `<namespace>/<pool>/<branch-scope>` when the
+/// pod carries a well-formed `P branch-scope`.
 #[must_use]
 pub fn grant_of(
     pod: &Pod,
@@ -72,9 +74,16 @@ pub fn grant_of(
             .and_then(|t| OffsetDateTime::parse(t, &Rfc3339).ok())
             .is_some_and(|t| t > now);
     let scope = ann(ANN_SCOPE).filter(|s| is_scope_id(s))?;
+    let repository = |s: &str| format!("{}/{}/{s}", peer.namespace, peer.pool);
+    // A trusted allocation never gets the branch scope, whatever the pod says.
+    let writes = match (ann(ANN_TIER), ann(ANN_BRANCH_SCOPE)) {
+        (Some("trusted"), _) => Writes::Scope,
+        (_, Some(b)) if is_scope_id(b) && b != scope => Writes::Branch(repository(b)),
+        _ => Writes::Nothing,
+    };
     (ours && allocated).then(|| Grant {
-        repository: format!("{}/{}/{scope}", peer.namespace, peer.pool),
-        push: ann(ANN_TIER) == Some("trusted"),
+        repository: repository(scope),
+        writes,
     })
 }
 
@@ -133,6 +142,7 @@ mod tests {
     use crate::render::fixtures;
 
     const SCOPE: &str = "0123456789abcdef0123456789abcdef";
+    const BRANCH: &str = "fedcba9876543210fedcba9876543210";
     const NONCE: &str = "00000000000000aa";
     const UID: &str = "2f6c1f4e-3b0a-4c43-9a55-5d4f0c7b1a10";
 
@@ -194,8 +204,57 @@ mod tests {
                 }
             })
             .unwrap();
-            assert!(!g.push, "{tier:?}");
+            assert_eq!(g.writes, Writes::Nothing, "{tier:?}");
             assert!(g.allows(&format!("ci/p/{SCOPE}"), Action::Pull));
+        }
+    }
+
+    /// Sets `P tier` to `tier` and `P branch-scope` to `branch`.
+    fn branch_pod(tier: &str, branch: &str) -> impl FnOnce(&mut serde_json::Value) {
+        let (tier, branch) = (tier.to_owned(), branch.to_owned());
+        move |v| {
+            let a = v["metadata"]["annotations"].as_object_mut().unwrap();
+            a.insert("buildkit.smrt-devops.net/tier".into(), json!(tier));
+            a.insert(
+                "buildkit.smrt-devops.net/branch-scope".into(),
+                json!(branch),
+            );
+        }
+    }
+
+    /// Pull from or push to a branch scope: the allocation is untrusted and
+    /// the branch scope is its own. It still pulls, and never pushes, the
+    /// trusted scope.
+    #[test]
+    fn an_untrusted_allocation_pushes_its_own_branch_scope() {
+        let g = grant(branch_pod("untrusted", BRANCH)).unwrap();
+        let (scope, branch) = (format!("ci/p/{SCOPE}"), format!("ci/p/{BRANCH}"));
+        assert_eq!(g.writes, Writes::Branch(branch.clone()));
+        assert!(g.allows(&branch, Action::Pull) && g.allows(&branch, Action::Push));
+        assert!(g.allows(&scope, Action::Pull) && !g.allows(&scope, Action::Push));
+        let another = "ci/p/ffffffffffffffffffffffffffffffff";
+        assert!(!g.allows(another, Action::Pull) && !g.allows(another, Action::Push));
+        // The branch scope lives in the worker's own pool, like the scope.
+        assert!(!g.allows(&format!("ci/q/{BRANCH}"), Action::Pull));
+    }
+
+    /// A trusted allocation is refused a branch scope even when its pod
+    /// carries one, so nothing an untrusted build wrote reaches it.
+    #[test]
+    fn a_trusted_allocation_never_gets_a_branch_scope() {
+        let g = grant(branch_pod("trusted", BRANCH)).unwrap();
+        assert_eq!(g.writes, Writes::Scope);
+        let branch = format!("ci/p/{BRANCH}");
+        assert!(!g.allows(&branch, Action::Pull) && !g.allows(&branch, Action::Push));
+    }
+
+    /// A malformed branch scope, or one equal to the scope, grants no push.
+    #[test]
+    fn a_malformed_branch_scope_only_pulls() {
+        for bad in ["../../x", "", SCOPE, "0123456789ABCDEF0123456789ABCDEF"] {
+            let g = grant(branch_pod("untrusted", bad)).unwrap();
+            assert_eq!(g.writes, Writes::Nothing, "{bad}");
+            assert!(!g.allows(&format!("ci/p/{SCOPE}"), Action::Push), "{bad}");
         }
     }
 

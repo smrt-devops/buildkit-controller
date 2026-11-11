@@ -23,7 +23,7 @@ use std::fmt;
 use buildkit_controller_api::v1alpha1::{BuildKitPool, GROUP, VERSION};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 
-pub use config::{buildkitd_config, is_scope_id, quantity_bytes, scope_id};
+pub use config::{branch_scope_id, buildkitd_config, is_scope_id, quantity_bytes, scope_id};
 pub use hash::{config_hash, template_hash};
 pub use objects::{ca_bundle_config_map, network_policy, service_account, worker_secret};
 pub use pod::{pod_spec, worker_pod};
@@ -79,6 +79,10 @@ pub const DRAINING: &str = "draining";
 pub const ANN_SCOPE: &str = "buildkit.smrt-devops.net/scope";
 /// `P tier`: `trusted` or `untrusted`, whether that allocation may write the cache.
 pub const ANN_TIER: &str = "buildkit.smrt-devops.net/tier";
+/// `P branch-scope`: the branch scope id of an untrusted allocation, which it
+/// may pull and push. The API writes it on the claims it creates in the
+/// controller's namespace, and the bind copies it to the pod.
+pub const ANN_BRANCH_SCOPE: &str = "buildkit.smrt-devops.net/branch-scope";
 /// Value of [`LABEL_NAME`] on the built-in cache registry pod; workers may reach it.
 pub const REGISTRY_NAME: &str = "buildkit-registry";
 
