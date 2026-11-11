@@ -16,12 +16,16 @@
 //!    hashes match. The edge byte counters with `transport="tunnel"` carry at
 //!    least 100 MiB each way.
 //! b. A TLS connection through the forwarder that reaches the worker and then
-//!    sends nothing stays open for `--idle-secs` (10 minutes by default) and
+//!    sends nothing stays open for `--idle-secs` (75 s by default: past the
+//!    `HTTPRoute`'s 60 s timeouts and three of the server's 20 s pings) and
 //!    still answers an HTTP/2 PING. The next build on the same builder works.
 //! c. Releasing the allocation closes that connection within [`RELEASE_BOUND`].
 //! d. A builder with one node per pool, each its own forwarder port, builds for
 //!    both pools' platforms without `edge.allocationDomain`.
 //! e. A client certificate from another CA is refused through the tunnel.
+//!    Then the Action's real post step, `action/dist/post.js`, removes that
+//!    builder, stops its forwarder and releases both allocations through the
+//!    Gateway with the CA from its state (its OIDC token from a loopback stub).
 //! f. Every edge connection of the run is labelled `transport="tunnel"`; the
 //!    TCP listener saw none.
 //!
@@ -308,6 +312,8 @@ struct Api {
     ca: PathBuf,
     /// The `Authorization` header in a file, so the token stays off curl's argv.
     auth: PathBuf,
+    /// The same token, for the Action's post step (scenario d).
+    token: String,
     work: PathBuf,
     made: AtomicUsize,
 }
@@ -338,6 +344,7 @@ impl Api {
         Ok(Self {
             ca,
             auth,
+            token: token.trim().to_owned(),
             work: work.to_path_buf(),
             made: AtomicUsize::new(0),
         })
@@ -392,7 +399,7 @@ impl Api {
                 let url = format!("{}/v1/allocations/{id}?wait=25s", *API);
                 until(
                     &format!("allocation {id} bound"),
-                    Duration::from_mins(5),
+                    Duration::from_mins(2),
                     || Ok((self.curl(&resp, &[&url])? == "200").then_some(())),
                 )?;
             }
@@ -435,6 +442,8 @@ fn field(path: &Path, key: &str) -> Result<String> {
 struct Builder {
     name: String,
     ports: Vec<u16>,
+    /// The forwarder's pid, as the Action saves it in its state.
+    forwarder: u64,
     stdin: Option<ChildStdin>,
     client: Spawned,
 }
@@ -484,9 +493,11 @@ impl Builder {
             ports.len(),
             nodes.len()
         );
+        let forwarder = v["pid"].as_u64().context("no forwarder pid")?;
         Ok(Self {
             name: name.to_owned(),
             ports,
+            forwarder,
             stdin,
             client,
         })
@@ -519,6 +530,101 @@ impl Drop for Builder {
             || Ok(self.client.try_wait()?.map(drop)),
         );
     }
+}
+
+/// A stand-in for the runner's OIDC token endpoint on loopback: every request
+/// that names `bearer` gets `{"value": token}`, others a 401. It stops when dropped.
+struct OidcStub {
+    url: String,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    served: Arc<AtomicUsize>,
+}
+
+impl OidcStub {
+    fn start(token: &str, bearer: &str) -> Result<Self> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let url = format!("http://{}/token", listener.local_addr()?);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let served = Arc::new(AtomicUsize::new(0));
+        let body = serde_json::json!({ "value": token }).to_string();
+        let want = format!("authorization: bearer {bearer}");
+        let (stop_t, served_t) = (Arc::clone(&stop), Arc::clone(&served));
+        std::thread::spawn(move || {
+            while !stop_t.load(Ordering::Relaxed) {
+                let Ok((mut s, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                };
+                let _ = s.set_nonblocking(false);
+                let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf) {
+                        Ok(n) if n > 0 => req.extend_from_slice(&buf[..n]),
+                        _ => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&req).to_lowercase();
+                let reply = if head.lines().any(|l| l.trim() == want) {
+                    served_t.fetch_add(1, Ordering::Relaxed);
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_owned()
+                };
+                let _ = s.write_all(reply.as_bytes());
+            }
+        });
+        Ok(Self { url, stop, served })
+    }
+}
+
+impl Drop for OidcStub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Runs the Action's real post step, `action/dist/post.js`, with the state the
+/// main step saves for `builder`: it removes the builder, stops the forwarder
+/// and releases `allocs` through the Gateway with the saved CA. Its OIDC token
+/// comes from [`OidcStub`], so the release authenticates as the `ServiceAccount`.
+/// Returns the step's output.
+fn post_step(api: &Api, builder: &Builder, allocs: &[&Alloc]) -> Result<String> {
+    let mut nonce = [0u8; 16];
+    ring::rand::SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| anyhow::anyhow!("random bytes"))?;
+    let bearer = hex(&nonce);
+    let stub = OidcStub::start(&api.token, &bearer)?;
+    let ca = std::fs::read_to_string(&api.ca)?;
+    let join =
+        |f: &dyn Fn(&Alloc) -> String| allocs.iter().map(|a| f(a)).collect::<Vec<_>>().join(",");
+    let out = output(
+        Command::new("node")
+            .arg(root().join("action/dist/post.js"))
+            .env("STATE_api", API.as_str())
+            .env("STATE_ca", ca)
+            .env("STATE_ids", join(&|a| a.id.clone()))
+            .env("STATE_dirs", join(&|a| a.material().display().to_string()))
+            .env("STATE_builder", &builder.name)
+            .env("STATE_forwarder", builder.forwarder.to_string())
+            .env("STATE_audience", AUD)
+            .env("ACTIONS_ID_TOKEN_REQUEST_URL", &stub.url)
+            .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", &bearer)
+            .stdin(Stdio::null()),
+    )?;
+    ensure!(
+        stub.served.load(Ordering::Relaxed) >= 1,
+        "the post step never fetched its token:\n{out}"
+    );
+    ensure!(!out.contains("::warning::"), "the post step warned:\n{out}");
+    Ok(out)
 }
 
 /// The port of a `tcp://127.0.0.1:<port>` endpoint, the only kind the forwarder hands out.
@@ -590,7 +696,7 @@ impl Held {
         let mut held = Self { child, stdin, got };
         poll(
             "the worker's HTTP/2 SETTINGS through the tunnel",
-            Duration::from_secs(30),
+            Duration::from_secs(10),
             Duration::from_millis(100),
             || {
                 ensure!(held.alive()?, "the held connection closed at once");
@@ -615,7 +721,7 @@ impl Held {
         self.stdin.flush()?;
         poll(
             "the worker's PING ACK",
-            Duration::from_secs(30),
+            Duration::from_secs(10),
             Duration::from_millis(100),
             || Ok((self.received() >= before + H2_PING.len()).then_some(())),
         )
@@ -638,7 +744,9 @@ fn sample_sum(text: &str, name: &str, labels: &[(&str, &str)]) -> f64 {
                     .all(|(k, v)| have.contains(&format!("{k}=\"{v}\"").as_str())))
             .then(|| value.parse::<f64>().ok())?
         })
-        .sum()
+        .sum::<f64>()
+        // An empty sum is -0.0, which prints as "-0".
+        + 0.0
 }
 
 fn metric(env: &Cluster, name: &str, labels: &[(&str, &str)]) -> Result<f64> {
@@ -797,7 +905,7 @@ fn run(env: &Cluster, work: &Path, idle: Duration) -> Result<()> {
             "the idle connection closed after {}s",
             start.elapsed().as_secs()
         );
-        std::thread::sleep(Duration::from_secs(10).min(idle.saturating_sub(start.elapsed())));
+        std::thread::sleep(Duration::from_secs(5).min(idle.saturating_sub(start.elapsed())));
     }
     ensure!(held.alive()?, "the idle connection closed");
     held.ping()?;
@@ -816,7 +924,7 @@ fn run(env: &Cluster, work: &Path, idle: Duration) -> Result<()> {
     api.release(&a)?;
     let cut = poll(
         "the released connection to close",
-        Duration::from_secs(30),
+        Duration::from_secs(10),
         Duration::from_millis(50),
         || Ok((!held.alive()?).then(|| start.elapsed())),
     )?;
@@ -905,7 +1013,7 @@ fn run(env: &Cluster, work: &Path, idle: Duration) -> Result<()> {
     )?;
     let exited = poll(
         "the wrong-CA client to be refused",
-        Duration::from_secs(30),
+        Duration::from_secs(10),
         Duration::from_millis(100),
         || probe.try_wait(),
     );
@@ -933,9 +1041,35 @@ fn run(env: &Cluster, work: &Path, idle: Duration) -> Result<()> {
     println!(
         "PASS e: a client certificate from another CA is refused through the tunnel: {alert}; connections{{result=tls_error,transport=tunnel}} {refused_before} -> {refused_after}"
     );
+
+    // The Action's post step cleans up: builder, forwarder, and both releases
+    // through the Gateway with the CA from its state.
+    let said = post_step(&api, &multi, &[&pa, &pb])?;
+    let forwarder_gone = i32::try_from(multi.forwarder)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .is_none_or(|p| rustix::process::test_kill_process(p).is_err());
+    let builder_gone = !Command::new("docker")
+        .args(["buildx", "inspect", &multi.name])
+        .output()?
+        .status
+        .success();
+    let mut gone = Vec::new();
+    for a in [&pa, &pb] {
+        let code = api.curl(
+            &a.dir.join("release-again.json"),
+            &["-X", "DELETE", &format!("{}/v1/allocations/{}", *API, a.id)],
+        )?;
+        gone.push(code);
+    }
+    ensure!(
+        forwarder_gone && builder_gone && gone.iter().all(|c| c == "404"),
+        "after post.js: forwarder gone {forwarder_gone}, builder gone {builder_gone}, release again {gone:?}:\n{said}"
+    );
+    println!(
+        "PASS post: action/dist/post.js removed the builder, stopped the forwarder and released both allocations through the Gateway with the saved CA (a second DELETE answers {gone:?})"
+    );
     drop(multi);
-    api.release(&pa)?;
-    api.release(&pb)?;
 
     // f. The transport label: tunnel for every connection above, none over TCP.
     let tunnel_ok = metric(

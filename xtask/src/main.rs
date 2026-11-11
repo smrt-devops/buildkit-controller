@@ -126,10 +126,10 @@ enum Task {
     ProxyVerify,
     /// Run the end-to-end suite on a kind cluster, exposed through Envoy Gateway. Covers chart install, the Gateway API routes, OIDC and `TokenReview`, builds, an external registry cache, the built-in cache registry for trusted and untrusted callers, the v0.1.0 volume sweep, queueing, a long poll, multi-platform builds and the Envoy extras.
     E2e,
-    /// Install the chart with an empty edge.endpoint behind an Envoy Gateway whose only listener terminates TLS, on a throwaway kind cluster, and build through the tunnel with the Action's forwarder: 100 MiB each way, a two-pool builder, a tunnel idle for 10 minutes, release and wrong-CA refusal, and the transport label of the edge metrics.
+    /// Install the chart with an empty edge.endpoint behind an Envoy Gateway whose only listener terminates TLS, on a throwaway kind cluster, and build through the tunnel with the Action's forwarder: 100 MiB each way, a two-pool builder, a tunnel idle past the gateway's timeouts, release and wrong-CA refusal, and the transport label of the edge metrics.
     TunnelVerify {
-        /// How long the tunnel stays idle before the next build, in seconds. Shorten it only while iterating.
-        #[arg(long, default_value_t = 600)]
+        /// How long the tunnel stays idle before the next build, in seconds. The default, 75, is past the `HTTPRoute`'s 60 s timeouts and three 20 s server pings; kind-all and the checks use it.
+        #[arg(long, default_value_t = 75)]
         idle_secs: u64,
     },
     /// Run every kind suite but soak and perf in one go: build once, two shared clusters, suites side by side. `--only soak,perf` runs those two, each on its own cluster. Logs go to target/kind-all/<suite>.log.
@@ -461,5 +461,10 @@ not json
         assert!(Cli::try_parse_from(["xtask", "drain-verify"]).is_ok());
         assert!(Cli::try_parse_from(["xtask", "proxy-verify"]).is_ok());
         assert!(Cli::try_parse_from(["xtask", "perf", "--idle-secs", "60"]).is_ok());
+        // kind-all runs tunnel-verify with no flags: its idle window stays short.
+        match Cli::try_parse_from(["xtask", "tunnel-verify"]).map(|c| c.command) {
+            Ok(Task::TunnelVerify { idle_secs }) => assert_eq!(idle_secs, 75),
+            other => panic!("{other:?}"),
+        }
     }
 }
