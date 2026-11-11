@@ -193,6 +193,12 @@ fn the_accept_key_follows_rfc_6455() {
         header::SEC_WEBSOCKET_KEY,
         HeaderValue::from_str(&key).unwrap(),
     );
+    let accept_key =
+        |method: &Method, version: Version, h: &HeaderMap| match form(method, version, h, None) {
+            Some(Form::Upgrade(a)) => Some(a),
+            Some(f) => panic!("{f:?}"),
+            None => None,
+        };
     assert_eq!(
         accept_key(&Method::GET, Version::HTTP_11, &h).unwrap(),
         accept_for(&key).as_str()
@@ -232,6 +238,58 @@ fn the_accept_key_follows_rfc_6455() {
     assert!(accept_key(&Method::GET, Version::HTTP_11, &two).is_none());
 }
 
+/// RFC 8441: an HTTP/2 `CONNECT` with `:protocol` `websocket` and version 13.
+/// A key is optional, and answered when sent.
+#[test]
+fn the_extended_connect_follows_rfc_8441() {
+    let ws = Protocol::from_static("websocket");
+    let mut h = HeaderMap::new();
+    h.insert(
+        header::SEC_WEBSOCKET_VERSION,
+        HeaderValue::from_static("13"),
+    );
+    let connect =
+        |h: &HeaderMap, p: Option<&Protocol>| form(&Method::CONNECT, Version::HTTP_2, h, p);
+    assert_eq!(connect(&h, Some(&ws)), Some(Form::Connect(None)));
+    assert_eq!(
+        connect(&h, Some(&Protocol::from_static("WebSocket"))),
+        Some(Form::Connect(None))
+    );
+    assert_eq!(connect(&h, None), None, "a plain CONNECT");
+    assert_eq!(
+        connect(&h, Some(&Protocol::from_static("connect-udp"))),
+        None,
+        "another :protocol"
+    );
+    assert_eq!(
+        form(&Method::CONNECT, Version::HTTP_11, &h, Some(&ws)),
+        None
+    );
+    assert_eq!(form(&Method::GET, Version::HTTP_2, &h, Some(&ws)), None);
+    let mut v8 = h.clone();
+    v8.insert(header::SEC_WEBSOCKET_VERSION, HeaderValue::from_static("8"));
+    assert_eq!(connect(&v8, Some(&ws)), None);
+    assert_eq!(connect(&HeaderMap::new(), Some(&ws)), None, "no version");
+
+    let key = fresh_key();
+    let mut keyed = h.clone();
+    keyed.insert(
+        header::SEC_WEBSOCKET_KEY,
+        HeaderValue::from_str(&key).unwrap(),
+    );
+    assert_eq!(
+        connect(&keyed, Some(&ws)),
+        Some(Form::Connect(Some(
+            HeaderValue::from_str(&accept_for(&key)).unwrap()
+        )))
+    );
+    keyed.insert(
+        header::SEC_WEBSOCKET_KEY,
+        HeaderValue::from_str(&BASE64.encode([0u8; 15])).unwrap(),
+    );
+    assert_eq!(connect(&keyed, Some(&ws)), None, "a malformed key");
+}
+
 /// A new `Sec-WebSocket-Key`: 16 random bytes, base64.
 fn fresh_key() -> String {
     let mut nonce = [0u8; 16];
@@ -261,6 +319,52 @@ fn upgrade_request(method: Method, key: &str) -> HttpRequest<Body> {
     let peer: SocketAddr = ([192, 0, 2, 7], 1000).into();
     r.extensions_mut().insert(Peer(peer));
     r
+}
+
+/// An HTTP/2 extended `CONNECT` to the tunnel path, as Envoy sends it: the
+/// client's key forwarded when `key` is set.
+fn connect_request(protocol: &'static str, key: Option<&str>) -> HttpRequest<Body> {
+    let mut b = HttpRequest::builder()
+        .method(Method::CONNECT)
+        .version(Version::HTTP_2)
+        .uri(format!("https://api.test{TUNNEL_PATH}"))
+        .header(header::SEC_WEBSOCKET_VERSION, "13")
+        .extension(Protocol::from_static(protocol));
+    if let Some(k) = key {
+        b = b.header(header::SEC_WEBSOCKET_KEY, k);
+    }
+    let mut r = b.body(Body::empty()).unwrap();
+    let peer: SocketAddr = ([192, 0, 2, 7], 1000).into();
+    r.extensions_mut().insert(Peer(peer));
+    r
+}
+
+/// Over HTTP/2 another `:protocol` is 426 (with no connection-specific
+/// headers), and a valid `CONNECT` is 503 `not_ready` while no edge takes
+/// tunnels (no serving cert yet).
+#[tokio::test]
+async fn the_route_answers_an_h2_connect_with_426_or_503_without_an_edge() {
+    let app: Router = router(Tunnels::new(tunnel_channel().0));
+    let r = app
+        .clone()
+        .oneshot(connect_request("connect-udp", None))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UPGRADE_REQUIRED);
+    assert!(r.headers().get(header::UPGRADE).is_none());
+    assert!(r.headers().get(header::CONNECTION).is_none());
+    let r = app
+        .oneshot(connect_request("websocket", None))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+    assert!(
+        std::str::from_utf8(&body)
+            .unwrap()
+            .contains(r#""code":"not_ready""#),
+        "{body:?}"
+    );
 }
 
 /// Any request but a WebSocket upgrade gets 426, and a valid one gets 503
@@ -307,6 +411,25 @@ async fn the_101_waits_for_the_edge_to_take_the_tunnel() {
         r.headers()[header::SEC_WEBSOCKET_ACCEPT],
         accept_for(&key).as_str()
     );
+    // The HTTP/2 form: `200`, with the accept for a forwarded key.
+    for key in [None, Some(fresh_key())] {
+        let mut answer = tokio::spawn(
+            app.clone()
+                .oneshot(connect_request("websocket", key.as_deref())),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!answer.is_finished(), "no answer before the edge took it");
+        queue.take_for_test().await;
+        let r = (&mut answer).await.unwrap().unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(r.headers().get(header::UPGRADE).is_none());
+        assert_eq!(
+            r.headers()
+                .get(header::SEC_WEBSOCKET_ACCEPT)
+                .map(|v| v.to_str().unwrap().to_owned()),
+            key.as_deref().map(accept_for)
+        );
+    }
     drop(queue);
     let r = app
         .oneshot(upgrade_request(Method::GET, &fresh_key()))
