@@ -125,13 +125,17 @@ For passthrough instead, add `endpoint: "tcp://bk.example.com:8444"` under `edge
 The API URL is then `https://bk.example.com`. `cargo xtask e2e` runs this setup
 (Envoy Gateway v1.9.3, Gateway API v1.6.1 standard channel) on kind.
 
-Implementations whose Gateway API v1.5 or v1.6 conformance reports pass the
-`GATEWAY-TLS` profile, which is TLSRoute passthrough: agentgateway, Calico, Cilium,
-Envoy Gateway, Istio, kgateway, Kong Operator, NGINX Gateway Fabric, Portus and
-Traefik. Kong Operator does not report BackendTLSPolicy, and NGINX Gateway Fabric and
-Traefik do not report HTTPRoute request timeouts; on those, use
-`gateway.api.mode: passthrough`. GKE's managed Gateway and the AWS Load Balancer
-Controller report no TLSRoute support, so on them use the LoadBalancer Service. The
+What the default (tunnel, `terminate` mode) needs from a gateway: HTTPRoute v1 and
+BackendTLSPolicy v1, WebSocket upgrades on the route, and a request timeout of `0s` that
+it honours or ignores (the chart sets it on the `/v1/tunnel` rule). Envoy Gateway is the
+tested one. The repo has no test for other products, so check yours against the Gateway
+API conformance reports for those features. Kong Operator does not report
+BackendTLSPolicy, and NGINX Gateway Fabric and Traefik do not report HTTPRoute request
+timeouts; on those, use `gateway.api.mode: passthrough`. A `tcp://` endpoint also needs
+TLSRoute passthrough, the `GATEWAY-TLS` conformance profile, which agentgateway, Calico,
+Cilium, Envoy Gateway, Istio, kgateway, Kong Operator, NGINX Gateway Fabric, Portus and
+Traefik report in v1.5 or v1.6. Where the gateway fits neither, use the LoadBalancer
+Service. The
 reports are under
 [conformance/reports](https://github.com/kubernetes-sigs/gateway-api/tree/main/conformance/reports)
 in the Gateway API repository.

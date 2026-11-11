@@ -72,7 +72,7 @@ kubectl get httproute -n buildkit-system
 
 Behind a gateway every client reaches the controller from the gateway's addresses. The chart then turns off `edge.maxHandshakesPerIp`, because a tunnel handshake counts against the gateway's address, but `api.maxConnectionsPerIp` and `auth.serviceAccount.maxReviewsPerIp` apply to all clients together. Raise them or set them to 0 before many jobs start at once, or turn on PROXY protocol (see [operations.md](operations.md#exposure)).
 
-Without a Gateway, use a load balancer instead (the tunnel needs no TLS passthrough, so the managed gateway of GKE or the AWS Load Balancer Controller also works as a plain HTTPS route): replace the `parentRefs` flag with `--set service.type=LoadBalancer`, point the DNS name at the Service address from `kubectl get svc -n buildkit-system`, and use `https://bk.example.com:8443` as the API URL. Some load balancers need a higher idle timeout. See [the chart README](../helm/buildkit-controller/README.md#load-balancer-idle-timeout).
+Without a Gateway, use a load balancer instead: replace the `parentRefs` flag with `--set service.type=LoadBalancer`, point the DNS name at the Service address from `kubectl get svc -n buildkit-system`, and use `https://bk.example.com:8443` as the API URL. Some load balancers need a higher idle timeout. See [the chart README](../helm/buildkit-controller/README.md#load-balancer-idle-timeout).
 
 ### On kind
 
