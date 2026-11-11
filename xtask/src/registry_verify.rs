@@ -5,14 +5,19 @@
 //! a. `trusted` (a push grant) builds and exports `--cache-to
 //!    type=registry,...,mode=max,ignore-error=true,oci-mediatypes=true`.
 //! b. `reader` (a pull-only grant, a fresh daemon with no local cache) builds
-//!    the same context with `--cache-from` that ref and shows the steps
-//!    `CACHED`.
+//!    the same context with `--cache-from` that ref, and its RUN step does
+//!    not run.
 //! c. The same `reader` build also exports to another tag; the registry
 //!    refuses the push, `ignore-error` keeps the build green, and no manifest
 //!    lands.
-//! e to h. Branch caches: an untrusted worker exports to its branch scope and a
-//!    fresh worker of the same branch hits it, another branch and a trusted
-//!    worker are refused it (see [`branch_scenarios`]).
+//! e to h. Branch caches: an untrusted worker reads the trusted cache through
+//!    its branch scope and exports to it, a fresh worker of the same branch hits
+//!    it, another branch and a trusted worker are refused it (see
+//!    [`branch_scenarios`]).
+//!
+//! A hit is a step that did not run: every RUN step prints `ran-1-<name>`,
+//! and its command spells that as `ran-$((1))-<name>`, so only the step's
+//! output carries the marker.
 //!
 //! The registry's grants come from its static grants file, its certs from a
 //! test CA made here. Every kind and kubectl call gets the private kubeconfig
@@ -37,6 +42,9 @@ const NS: &str = "bk-registry";
 /// The pool the worker certs name; repositories live under `<NS>/<POOL>/`.
 const POOL: &str = "cache";
 const NONCE: &str = "0123456789abcdef";
+/// The RUN step every Dockerfile has, and the one only the branch build has.
+const SHARED: &str = "registry-cache-step";
+const STEP: &str = "branch-only-step";
 use crate::image::CONTROLLER_IMAGE;
 const HOST: &str = "buildkit-cache.bk-registry.svc:5000";
 const METRICS: &str = "http://buildkit-cache.bk-registry.svc:8080/metrics";
@@ -177,15 +185,22 @@ spec:
 }
 
 /// The same context in every pod: busybox and its loader, two COPY steps and
-/// a RUN, so a cache hit shows as `CACHED` lines. `/work/br` holds the
-/// Dockerfile of a branch build: the same steps and one more of its own.
+/// a RUN that prints its marker when it runs. `/work/br` holds the Dockerfile
+/// of a branch build: the same steps and one more of its own.
 const PREPARE: &str = r#"set -e
-mkdir -p /work/ctx/bin /work/ctx/lib
+mkdir -p /work/ctx/bin /work/ctx/lib /work/br
 cp /bin/busybox /work/ctx/bin/
 cp -L /lib/ld-musl-*.so.1 /lib/libc.musl-*.so.1 /work/ctx/lib/
-printf 'FROM scratch\nCOPY lib/ /lib/\nCOPY bin/ /bin/\nRUN ["/bin/busybox", "sh", "-c", "/bin/busybox echo registry-cache-step > /step"]\n' > /work/ctx/Dockerfile
-mkdir -p /work/br
-printf 'FROM scratch\nCOPY lib/ /lib/\nCOPY bin/ /bin/\nRUN ["/bin/busybox", "sh", "-c", "/bin/busybox echo registry-cache-step > /step"]\nRUN ["/bin/busybox", "sh", "-c", "/bin/busybox echo branch-only-step > /branch"]\n' > /work/br/Dockerfile
+cat > /work/ctx/Dockerfile <<'DOCKERFILE'
+FROM scratch
+COPY lib/ /lib/
+COPY bin/ /bin/
+RUN ["/bin/busybox", "sh", "-c", "/bin/busybox echo ran-$((1))-registry-cache-step | /bin/busybox tee /step"]
+DOCKERFILE
+cp /work/ctx/Dockerfile /work/br/Dockerfile
+cat >> /work/br/Dockerfile <<'DOCKERFILE'
+RUN ["/bin/busybox", "sh", "-c", "/bin/busybox echo ran-$((1))-branch-only-step | /bin/busybox tee /branch"]
+DOCKERFILE
 "#;
 
 /// A test CA and the leaves the suite needs, as PEM.
@@ -283,23 +298,21 @@ fn build_branch(cache_flags: &str) -> String {
     )
 }
 
-/// The flags the controller gives a build of branch `scope`: import the branch
-/// cache, then the trusted one, and export to the branch cache.
+/// The flags the controller gives a build of branch `scope`: import and
+/// export the branch cache only. The registry answers what it lacks from the
+/// trusted cache.
 fn branch_flags(scope: &str) -> String {
     format!(
-        "--import-cache type=registry,ref={b}:main --import-cache type=registry,ref={t}:main \
+        "--import-cache type=registry,ref={b}:main \
          --export-cache type=registry,ref={b}:main,mode=max,ignore-error=true,oci-mediatypes=true",
-        b = branch_repo(scope),
-        t = repo()
+        b = branch_repo(scope)
     )
 }
 
-/// Whether the step whose command contains `marker` shows `CACHED`.
-fn step_cached(log: &str, marker: &str) -> bool {
-    log.lines()
-        .filter(|l| l.starts_with('#') && l.contains(marker) && l.contains(" RUN "))
-        .filter_map(|l| l.split_whitespace().next())
-        .any(|id| log.lines().any(|l| l.trim_end() == format!("{id} CACHED")))
+/// Whether the RUN step `name` ran in the build that logged `log`, by the
+/// marker it prints.
+fn ran(log: &str, name: &str) -> bool {
+    log.contains(&format!("ran-1-{name}"))
 }
 
 /// Dumps state on a failed run; the cluster it holds is deleted after that.
@@ -342,13 +355,6 @@ impl Report {
     }
 }
 
-/// The `CACHED` step lines of a plain-progress build log.
-fn cached_steps(log: &str) -> usize {
-    log.lines()
-        .filter(|l| l.starts_with('#') && l.trim_end().ends_with(" CACHED"))
-        .count()
-}
-
 pub(crate) fn registry_verify() -> Result<()> {
     let work = root().join("target/registry-verify");
     std::fs::create_dir_all(&work)?;
@@ -380,10 +386,11 @@ pub(crate) fn registry_verify() -> Result<()> {
     // a.
     let (ok, log) = exec(env, "trusted", &build(&export_to("main")))?;
     let manifests = pushed(env)?;
+    let built = ran(&log, SHARED);
     r.check(
         "a/trusted build exports the cache",
-        ok && manifests >= 1.0 && denied_push(env)? == 0.0,
-        &format!("build ok={ok}, manifest pushes {manifests}"),
+        ok && built && manifests >= 1.0 && denied_push(env)? == 0.0,
+        &format!("build ok={ok}, RUN step ran={built}, manifest pushes {manifests}"),
     );
     if !ok {
         println!("{log}");
@@ -401,7 +408,7 @@ pub(crate) fn registry_verify() -> Result<()> {
         export_to("pr")
     );
     let (ok, log) = exec(env, "reader", &build(&flags))?;
-    let cached = cached_steps(&log);
+    let hit = !ran(&log, SHARED);
     let pulls = metric(
         env,
         "buildkit_registry_requests_total",
@@ -409,8 +416,8 @@ pub(crate) fn registry_verify() -> Result<()> {
     )? - pulls_before;
     r.check(
         "b/fresh reader imports the cache and hits",
-        ok && cached >= 3 && pulls >= 1.0,
-        &format!("build ok={ok}, {cached} CACHED steps, {pulls} manifest pulls"),
+        ok && hit && pulls >= 1.0,
+        &format!("build ok={ok}, RUN step hit={hit}, {pulls} manifest pulls"),
     );
     let denied = denied_push(env)?;
     let after = pushed(env)?;
@@ -441,7 +448,8 @@ pub(crate) fn registry_verify() -> Result<()> {
 /// Branch caches, with the flags the controller gives each tier:
 ///
 /// e. `branch-a` (untrusted, branch scope a) builds the branch Dockerfile:
-///    the shared RUN step hits the trusted cache, and it exports to its branch.
+///    the shared RUN step hits the trusted cache through the branch scope,
+///    and the export to the branch links the trusted layers it reuses.
 /// f. `branch-a2`, a fresh worker of the same branch, hits the branch's own
 ///    step from the branch cache.
 /// g. `branch-b` (branch scope b) also asks for branch a's cache and gets
@@ -452,7 +460,6 @@ fn branch_scenarios(
     r: &mut Report,
     pushed: &dyn Fn(&Cluster) -> Result<f64>,
 ) -> Result<()> {
-    const STEP: &str = "branch-only-step";
     let denied = |env: &Cluster, action: &str| {
         metric(
             env,
@@ -463,10 +470,7 @@ fn branch_scenarios(
     // e.
     let (before, denied_push) = (pushed(env)?, denied(env, "push")?);
     let (ok, log) = exec(env, "branch-a", &build_branch(&branch_flags(BRANCH_A)))?;
-    let (shared, own) = (
-        step_cached(&log, "registry-cache-step"),
-        step_cached(&log, STEP),
-    );
+    let (shared, own) = (!ran(&log, SHARED), !ran(&log, STEP));
     let after = pushed(env)?;
     let pass = ok
         && shared
@@ -476,7 +480,7 @@ fn branch_scenarios(
     r.check(
         "e/branch build reads the trusted cache and exports its own",
         pass,
-        &format!("build ok={ok}, shared step cached={shared}, branch step cached={own}, manifest pushes {before}->{after}"),
+        &format!("build ok={ok}, shared step hit={shared}, branch step hit={own}, manifest pushes {before}->{after}"),
     );
     if !pass {
         println!("{log}");
@@ -484,14 +488,11 @@ fn branch_scenarios(
 
     // f.
     let (ok, log) = exec(env, "branch-a2", &build_branch(&branch_flags(BRANCH_A)))?;
-    let own = step_cached(&log, STEP);
+    let own = !ran(&log, STEP);
     r.check(
         "f/second build of the branch hits its own branch cache",
         ok && own,
-        &format!(
-            "build ok={ok}, {} CACHED, branch step cached={own}",
-            cached_steps(&log)
-        ),
+        &format!("build ok={ok}, branch step hit={own}"),
     );
     if !(ok && own) {
         println!("{log}");
@@ -505,11 +506,11 @@ fn branch_scenarios(
         branch_flags(BRANCH_B)
     );
     let (ok, log) = exec(env, "branch-b", &build_branch(&flags))?;
-    let (own, pulls) = (step_cached(&log, STEP), denied(env, "pull")? - denied_pull);
+    let (own, pulls) = (!ran(&log, STEP), denied(env, "pull")? - denied_pull);
     r.check(
         "g/another branch cannot read the first branch's cache",
         ok && !own && pulls >= 1.0,
-        &format!("build ok={ok}, branch step cached={own}, pull denials +{pulls}"),
+        &format!("build ok={ok}, branch step hit={own}, pull denials +{pulls}"),
     );
     if !ok || own {
         println!("{log}");
@@ -523,11 +524,11 @@ fn branch_scenarios(
         branch_repo(BRANCH_B)
     );
     let (ok, log) = exec(env, "trusted", &build_branch(&flags))?;
-    let (own, pulls) = (step_cached(&log, STEP), denied(env, "pull")? - denied_pull);
+    let (own, pulls) = (!ran(&log, STEP), denied(env, "pull")? - denied_pull);
     r.check(
         "h/a trusted build sees no branch cache",
         ok && !own && pulls >= 2.0,
-        &format!("build ok={ok}, branch step cached={own}, pull denials +{pulls}"),
+        &format!("build ok={ok}, branch step hit={own}, pull denials +{pulls}"),
     );
     if !ok || own {
         println!("{log}");
@@ -623,21 +624,14 @@ buildkit_registry_requests_total{route=\"blob\",method=\"PUT\",status=\"201\"} 7
     }
 
     #[test]
-    fn cached_lines_are_counted() {
-        let log =
-            "#5 [2/3] COPY lib/ /lib/\n#5 CACHED\n\n#6 [3/3] RUN x\n#6 CACHED \n#7 exporting\n";
-        assert_eq!(cached_steps(log), 2);
-    }
-
-    #[test]
-    fn one_step_is_found_by_its_command() {
-        let log = "#6 [4/5] RUN [\"sh\", \"-c\", \"echo shared\"]\n#6 CACHED\n\
-                   #7 [5/5] RUN [\"sh\", \"-c\", \"echo branch-only-step\"]\n#7 0.1 done\n";
-        assert!(step_cached(log, "shared"));
-        assert!(!step_cached(log, "branch-only-step"));
-        assert!(step_cached(
-            &log.replace("#7 0.1 done", "#7 CACHED"),
-            "branch-only-step"
-        ));
+    fn a_step_ran_only_when_its_output_has_the_marker() {
+        let step = |n: &str| {
+            format!("#7 [5/5] RUN [\"sh\", \"-c\", \"echo ran-$((1))-{n} | tee /branch\"]\n")
+        };
+        let hit = format!("{}#7 CACHED\n", step(STEP));
+        let miss = format!("{}#7 0.104 ran-1-{STEP}\n#7 DONE 0.1s\n", step(STEP));
+        assert!(!ran(&hit, STEP), "the command text is not the marker");
+        assert!(ran(&miss, STEP));
+        assert!(!ran(&miss, SHARED));
     }
 }
