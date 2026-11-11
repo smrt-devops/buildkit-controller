@@ -4,6 +4,7 @@
 
 pub mod driver;
 pub mod exec;
+pub mod hosts;
 pub mod metrics;
 pub mod ops;
 pub mod pass;
@@ -25,7 +26,7 @@ mod tests_spawn;
 
 pub use driver::Reconciler;
 pub use plan::{
-    Action, BackoffSignal, CaEvent, CreateOutcome, CreateResult, Observed, Plan, PlanConfig,
-    Requeue, RetireReason, TemplateCheck, ca_warning_at, plan,
+    Action, BackoffSignal, CaEvent, CreateOutcome, CreateResult, HostProblem, Observed, Plan,
+    PlanConfig, Requeue, RetireReason, TemplateCheck, ca_warning_at, plan,
 };
 pub use pods::{Alloc, Phase, WorkerPod, foreign_pod_name};

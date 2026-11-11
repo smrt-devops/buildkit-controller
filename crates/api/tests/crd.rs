@@ -423,3 +423,60 @@ fn list_and_time_bounds_are_in_the_schema() {
     );
     assert_eq!(spec["access"]["properties"]["rules"]["maxItems"], 64);
 }
+
+#[test]
+fn allow_hosts_parse_as_the_crd_pattern_admits() {
+    use buildkit_controller_api::v1alpha1::{AllowHost, parse_allow_host};
+    let h = |name, port| Some(AllowHost { name, port });
+    assert_eq!(
+        parse_allow_host("reg.example.com"),
+        h("reg.example.com", 443)
+    );
+    assert_eq!(
+        parse_allow_host("reg.example.com:5000"),
+        h("reg.example.com", 5000)
+    );
+    assert_eq!(parse_allow_host("registry:1"), h("registry", 1));
+    assert_eq!(parse_allow_host("a-1.b2.svc:65535"), h("a-1.b2.svc", 65535));
+    let long = format!("{}.example.com", "a".repeat(63));
+    assert!(parse_allow_host(&long).is_some());
+    for bad in [
+        "",
+        "*.example.com",
+        "Reg.example.com",
+        "reg.example.com.",
+        "reg..example.com",
+        "-reg.example.com",
+        "reg-.example.com",
+        "10.0.0.1",
+        "10.0.0.1:443",
+        "[::1]:443",
+        "fd00::1",
+        "reg.example.com:0",
+        "reg.example.com:65536",
+        "reg.example.com:0443",
+        "reg.example.com:",
+        "reg.example.com:+1",
+        "reg.example.com:443:1",
+        "reg_x.example.com",
+        "reg.example.1com",
+    ] {
+        assert!(parse_allow_host(bad).is_none(), "{bad}");
+    }
+    assert!(parse_allow_host(&format!("{}.com", "a".repeat(64))).is_none());
+    assert!(parse_allow_host(&format!("{}com", "a.".repeat(126))).is_none());
+}
+
+#[test]
+fn allow_hosts_schema_is_a_pattern_not_cel() {
+    let crd = serde_json::to_value(crd()).unwrap();
+    let s = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+        ["network"]["properties"]["egress"]["properties"]["allowHosts"];
+    assert_eq!(s["maxItems"], 16);
+    assert_eq!(s["items"]["maxLength"], 253);
+    assert_eq!(
+        s["items"]["pattern"],
+        buildkit_controller_api::v1alpha1::ALLOW_HOST_PATTERN
+    );
+    assert!(s.get("x-kubernetes-validations").is_none());
+}

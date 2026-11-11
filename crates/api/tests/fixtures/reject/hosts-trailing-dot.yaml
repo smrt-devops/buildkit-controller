@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: hosts-trailing-dot, namespace: default}
+spec:
+  network: {egress: {allowHosts: ["registry.example.com."]}}

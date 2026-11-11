@@ -1,0 +1,8 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: allow-hosts, namespace: default}
+spec:
+  network:
+    egress:
+      internet: Deny
+      allowHosts: [registry.example.com, "mirror.corp.internal:5000", "proxy:3128", "a.b:65535", "x.y:1"]
