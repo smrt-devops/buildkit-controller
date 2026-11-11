@@ -31,6 +31,11 @@ pub fn rules(list: &[crd::AccessRule]) -> Option<AccessRules> {
                     .iter()
                     .map(|(k, v)| (k.clone(), v.0.clone()))
                     .collect(),
+                exclude: o
+                    .exclude
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.iter().map(|p| p.0.clone()).collect()))
+                    .collect(),
             }),
             (None, Some(s), None) => Some(AccessRule::ServiceAccount {
                 namespace: s.namespace.clone(),

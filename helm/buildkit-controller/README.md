@@ -256,6 +256,10 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 | `claims.namespaces` | namespaces where pipelines create their own `BuildKitClaim`s, `[]` by default. The claim CRD is always installed, because every allocation is a claim. The controller serves claims from these namespaces only and gets Secret get, create and delete there only. With `edge.endpoint` empty, in-cluster claims dial the edge Service port, so `service.ports.edge` must stay 8444 (the chart fails otherwise). See [operations.md](../../docs/operations.md#in-cluster-claims) |
 | `pools` | list of `{name, namespace, spec}`, one BuildKitPool each; `namespace` is required unless `watchNamespaces` has one entry, must be in `watchNamespaces` when that is set, and must not be the release namespace (the chart fails to render otherwise); namespaces are not created |
 
+## Access rules
+
+An `oidc` rule may require that a claim is present without naming its value: a value made only of `*` matches a non-empty string claim, or an array claim holding one, and never a missing or empty claim. Such a rule needs another claim with a real value, such as `repository_owner_id`, so it is always pinned. `exclude` maps a claim name to patterns, and a token that matches any of them does not match that rule, so `claims: {repository_owner_id: "146818127", repo_property_domain: "*"}` with `exclude: {repo_property_domain: [pci]}` admits every domain of one organisation except `pci`, provided no other rule in the list admits it (add the same `exclude` to those rules). `exclude` never admits a caller on its own, and a value made only of `*` is refused in it. Both work in `spec.workers.cache.writers` too. See `examples/pool-github-oidc.yaml`.
+
 ## Build cache
 
 `cache.enabled` (on by default) runs the cache registry, a one-replica
