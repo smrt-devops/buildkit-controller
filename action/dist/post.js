@@ -4,6 +4,16 @@ const { spawnSync } = require('node:child_process');
 const gha = require('./gha');
 const L = require('./lib');
 
+/** The forwarder's error log, as a collapsed group, when it holds anything. */
+function printForwarderLog(file) {
+  if (!file) return;
+  try {
+    const text = fs.readFileSync(file, 'utf8');
+    if (text.trim()) gha.group('buildkit tunnel forwarder errors', text.trimEnd());
+    fs.rmSync(file, { force: true });
+  } catch { /* no log, nothing to print */ }
+}
+
 async function run() {
   const ids = L.parseList(gha.getState('ids'));
   const dirs = L.parseList(gha.getState('dirs'));
@@ -14,6 +24,7 @@ async function run() {
   try {
     if (builder) spawnSync('docker', ['buildx', 'rm', '--force', builder], { encoding: 'utf8' });
     try { L.stopForwarder(gha.getState('forwarder')); } catch (e) { gha.warning(`tunnel forwarder: ${e.message}`); }
+    printForwarderLog(gha.getState('forwarder-log'));
     if (ids.length) {
       const aud = gha.getState('audience');
       const getToken = L.cachedToken(() => L.fetchOidcToken(aud, gha.setSecret));

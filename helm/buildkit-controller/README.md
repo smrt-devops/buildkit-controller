@@ -73,8 +73,8 @@ The API has two modes:
   `caCertificateRefs`.
 - `passthrough`. A TLSRoute on a passthrough listener; clients see the controller's
   serving certificate, as with a LoadBalancer. Use it where the implementation lacks
-  BackendTLSPolicy or HTTPRoute timeouts. The API TLSRoute and the edge TLSRoute
-  match the same SNI, so give them different listeners with `gateway.api.parentRefs`
+  BackendTLSPolicy or HTTPRoute timeouts. With a `tcp://` endpoint, the API TLSRoute
+  and the edge TLSRoute match the same SNI, so give them different listeners with `gateway.api.parentRefs`
   and `gateway.edge.parentRefs` (`sectionName`).
 
 Give each route its listener with `sectionName`: `gateway.api.parentRefs` for the
@@ -83,7 +83,7 @@ parentRef without `sectionName` (or `port`) attaches the HTTPRoute to every HTTP
 HTTPS listener of that Gateway that admits it. On a shared Gateway with a plain HTTP
 listener, the API, and the bearer tokens clients send it, would then also be served in
 cleartext, so NOTES.txt warns about it. `gateway.parentRefs` is the default for both
-routes when the per-route lists are empty. In passthrough mode the chart fails to
+routes when the per-route lists are empty. With a `tcp://` endpoint in passthrough mode, the chart fails to
 render when both TLSRoutes could match the same SNI on the same listener.
 
 An Envoy Gateway example. The API is on 443 with a publicly trusted certificate. The `edge`
@@ -122,8 +122,8 @@ gateway:
 For passthrough instead, add `endpoint: "tcp://bk.example.com:8444"` under `edge` and
 `edge: {parentRefs: [{name: bk, namespace: gateway-system, sectionName: edge}]}` under `gateway`.
 
-The API URL is then `https://bk.example.com`. `cargo xtask e2e` runs this setup
-(Envoy Gateway v1.9.3, Gateway API v1.6.1 standard channel) on kind.
+The API URL is then `https://bk.example.com`. `cargo xtask tunnel-verify` runs the default setup on kind, and `cargo xtask e2e` runs the
+`tcp://` variant of it (Envoy Gateway v1.9.3, Gateway API v1.6.1 standard channel).
 
 What the default (tunnel, `terminate` mode) needs from a gateway: HTTPRoute v1 and
 BackendTLSPolicy v1, WebSocket upgrades on the route, and a request timeout of `0s` that
@@ -192,8 +192,8 @@ Each entry is an object or a string, and both go through `tpl`.
 ### LoadBalancer
 
 Set `service.type: LoadBalancer` to expose both ports on the Service directly, with
-no Gateway and no `gateway.parentRefs`. Use it where the managed gateway has no TLS
-passthrough. The controller then serves its own certificate on the API too, so
+no Gateway and no `gateway.parentRefs`. Use it where there is no Gateway API
+implementation. The edge port is needed only with a `tcp://` endpoint. The controller then serves its own certificate on the API too, so
 clients need its CA unless `edge.tls.secretName` is publicly trusted.
 `externalTrafficPolicy: Local` (the default) keeps client addresses, which the
 per-address caps count. Raise the load balancer's idle timeout as described in

@@ -18,7 +18,7 @@ fn seconds() -> Histogram {
 }
 
 /// How a client connection reached the edge: the `transport` label and log
-/// field (edge.md §10).
+/// field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Transport {
     /// The edge's own TCP listener.
@@ -102,12 +102,6 @@ impl EdgeMetrics {
             transport,
             ..self.clone()
         }
-    }
-
-    /// The `transport` this handle labels with.
-    #[must_use]
-    pub fn transport(&self) -> Transport {
-        self.transport
     }
 
     fn with_transport(&self, mut labels: Labels) -> Labels {

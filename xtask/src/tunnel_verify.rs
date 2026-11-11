@@ -1,4 +1,4 @@
-//! `cargo xtask tunnel-verify` proves the tunnel transport (edge.md §10) end to
+//! `cargo xtask tunnel-verify` proves the tunnel transport end to
 //! end on a kind cluster `bk-tunnel-verify`, behind a gateway that terminates TLS.
 //!
 //! The Gateway ([`crate::gateway::TUNNEL`]) has one listener, HTTPS with

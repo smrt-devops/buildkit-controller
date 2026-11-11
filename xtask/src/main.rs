@@ -273,6 +273,40 @@ pub(crate) fn yaml_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(v)
 }
 
+/// Server-side dry run of the files the README tells users to apply
+/// (`examples/pool-*.yaml`, `claim-pod.yaml`), as CI's examples job does.
+/// Returns the count that passed and the failures.
+fn examples_dry_run(cluster: &kube::Cluster, root: &Path) -> Result<(usize, Vec<String>)> {
+    for ns in ["ci", "apps"] {
+        cluster.namespace(ns)?;
+    }
+    let (mut passed, mut failed) = (0usize, Vec::new());
+    let files = yaml_files(&root.join("examples"))?.into_iter().filter(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("pool-") || n == "claim-pod.yaml")
+    });
+    for file in files {
+        let arg = file.to_string_lossy().into_owned();
+        let name = file
+            .file_name()
+            .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+        let out = cluster.kubectl_raw(
+            &["apply", "--dry-run=server", "--validate=strict", "-f", &arg],
+            None,
+        )?;
+        if out.status.success() {
+            println!("PASS examples/{name} -> admitted");
+            passed += 1;
+        } else {
+            let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+            println!("FAIL examples/{name} -> rejected: {why}");
+            failed.push(format!("examples/{name}: {why}"));
+        }
+    }
+    Ok((passed, failed))
+}
+
 /// Apply the generated CRD to a throwaway kind cluster and server-side dry-run
 /// every fixture. The API server must admit `accept/*.yaml` and refuse `reject/*.yaml`.
 fn crd_verify() -> Result<()> {
@@ -340,6 +374,9 @@ fn crd_verify() -> Result<()> {
         println!("FAIL {HOSTS_POLICY} -> rejected: {why}");
         failed.push(format!("{HOSTS_POLICY}: {why}"));
     }
+    let (ok, bad) = examples_dry_run(&cluster, &root)?;
+    passed += ok;
+    failed.extend(bad);
     println!("crd-verify: {passed} passed, {} failed", failed.len());
     if !failed.is_empty() {
         bail!(
@@ -479,7 +516,7 @@ not json
         assert!(Cli::try_parse_from(["xtask", "drain-verify"]).is_ok());
         assert!(Cli::try_parse_from(["xtask", "proxy-verify"]).is_ok());
         assert!(Cli::try_parse_from(["xtask", "perf", "--idle-secs", "60"]).is_ok());
-        // kind-all runs tunnel-verify with no flags: its idle window stays short.
+        // kind-all runs tunnel-verify with no flags: its idle window is the default 75 s.
         match Cli::try_parse_from(["xtask", "tunnel-verify"]).map(|c| c.command) {
             Ok(Task::TunnelVerify { idle_secs }) => assert_eq!(idle_secs, 75),
             other => panic!("{other:?}"),
