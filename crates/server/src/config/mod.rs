@@ -317,7 +317,7 @@ impl Default for Pki {
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct Edge {
     /// `tcp://host:port` returned to clients, or empty: clients then tunnel
-    /// through the API (edge.md §10). See [`Edge::client_endpoint`].
+    /// through the API (see docs/architecture.md). See [`Edge::client_endpoint`].
     pub endpoint: String,
     /// DNS name returned as serverName (required).
     pub server_name: String,
@@ -906,7 +906,7 @@ impl Config {
 
     /// `tcp://<edge.serviceName>.<namespace>.svc:<listen.edge port>`: the edge
     /// Service, which in-cluster claims dial when `edge.endpoint` is unset
-    /// (edge.md §10). The serving cert holds that name as a SAN.
+    /// (see docs/architecture.md). The serving cert holds that name as a SAN.
     #[must_use]
     pub fn edge_service_endpoint(&self, namespace: &str) -> String {
         format!(

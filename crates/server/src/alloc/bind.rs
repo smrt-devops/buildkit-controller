@@ -47,7 +47,7 @@ pub struct BindConfig {
     /// `edge.endpoint`; empty when clients tunnel through the API.
     pub endpoint: String,
     /// `tcp://<edge.serviceName>.<namespace>.svc:<edge port>`: what an
-    /// in-cluster claim dials when `endpoint` is empty (edge.md §10).
+    /// in-cluster claim dials when `endpoint` is empty (see docs/architecture.md, `BuildKitClaim`).
     pub service_endpoint: String,
     /// `edge.serverName`.
     pub server_name: String,

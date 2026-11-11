@@ -1,4 +1,4 @@
-//! `/v1/tunnel` (edge.md §10): the edge byte stream inside a WebSocket on the
+//! `/v1/tunnel`: the edge byte stream inside a WebSocket on the
 //! API listener, for gateways that terminate TLS and so never forward a client
 //! certificate.
 //!
@@ -43,7 +43,10 @@ use super::listener::{Active, KeepOpen};
 use crate::edge::{Arrival, BoxIo, TunnelDoor};
 
 /// The server pings every tunnel this often, so idle timers in gateways and
-/// load balancers never cut a quiet build.
+/// load balancers never cut a quiet build. The pings go out only from
+/// `poll_read`, so none is sent after the edge stops reading from the client
+/// (its read side has ended), and a tunnel the edge is not polling for reads is
+/// not pinged either.
 pub const PING_EVERY: Duration = Duration::from_secs(20);
 /// A tunnel that leaves this many pings in a row unanswered is closed.
 const MISSED_PINGS: u32 = 2;
@@ -51,7 +54,7 @@ const MISSED_PINGS: u32 = 2;
 /// fragments; a larger one closes the tunnel. tungstenite buffers a whole
 /// message, so this bounds what an unauthenticated tunnel can pin.
 ///
-/// The worst case per tunnel is about 400-460 KiB, reached by a client that
+/// The worst case per tunnel is about 460 KiB, reached by a client that
 /// sends into a stalled worker and never reads: the TCP edge part (two 64 KiB
 /// copy buffers and two TLS sessions, about 200 KiB), the 64 KiB HTTP/2 stream
 /// window, the 64-128 KiB read side (input buffer plus the pending message)

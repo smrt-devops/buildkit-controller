@@ -840,7 +840,7 @@ pub struct BuildKitPoolStatus {
     /// Platforms from `spec.platforms`, or derived from the template's arch selector.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub platforms: Vec<String>,
-    /// Edge endpoint.
+    /// Edge endpoint: `edge.endpoint`, or `/v1/tunnel` when it is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     /// TLS server name.

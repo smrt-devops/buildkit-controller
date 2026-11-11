@@ -2278,7 +2278,7 @@ spec:
                 nullable: true
                 type: integer
               endpoint:
-                description: Edge endpoint.
+                description: "Edge endpoint: `edge.endpoint`, or `/v1/tunnel` when it is unset."
                 nullable: true
                 type: string
               observedGeneration:

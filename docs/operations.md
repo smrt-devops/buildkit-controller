@@ -385,6 +385,13 @@ Errors the API returns to clients, and the usual cause:
 
 A client that cannot connect to the edge usually has a certificate problem. Check `buildkit_edge_connections_total` for `tls_error`, `bad_san` and `expired`, and set `--set logLevel=debug` on the chart to see handshake failures. The curl recipe can use `API_CA` to trust a self-issued certificate.
 
+A build that stalls or times out in `docker buildx` with the default tunnel usually means the WebSocket never opened. The Action's forwarder writes one line per failed open (time, URL, HTTP status or error code) to a log file, and the post step prints it as the collapsed group "buildkit tunnel forwarder errors" at the end of the job. Read it first:
+
+- 426 on `/v1/tunnel`. The request reached the controller as a plain request, not a WebSocket upgrade, so a gateway or proxy in front of it has no WebSocket support or drops the `Upgrade` headers. Use an implementation that passes upgrades (Envoy Gateway is the tested one), or set `edge.endpoint` to a `tcp://` address.
+- 503 `not_ready`. The edge on that replica has no serving certificate yet, or it is stopping. Retry after the replica is ready; `kubectl get pods` and the readiness of the `edge_listener` check show which.
+- A TLS error or a connection error code instead of a status. The Action does not trust the API's certificate (set `ca-cert`, or point `NODE_EXTRA_CA_CERTS` or `SSL_CERT_FILE` at the CA file), or the gateway is unreachable from the runner.
+- No log lines and no tunnel traffic. Check `buildkit_edge_connections_total{transport="tunnel"}`: it counts the connections that came through `/v1/tunnel` and their outcomes (`tls_error`, `expired`, and the rest), while `transport="tcp"` counts the edge port. A build that shows only `tcp` is not tunnelling.
+
 ## Multi-pool builders and allocation domain
 
 A builder that combines several pools, which is what the GitHub Action does with more than one `pools` entry, needs one endpoint per allocation. With the default tunnel there is nothing to set: each allocation gets its own local port. With a `tcp://` `edge.endpoint`, set `edge.allocationDomain` (for example `alloc.bk.example.com`) and create a wildcard DNS record `*.alloc.bk.example.com` that points at the edge address. Endpoints then become `tcp://<alloc-id>.alloc.bk.example.com:8444`. The pools must declare distinct `platforms`. With a single pool you can leave the domain empty. Setting it with an empty `edge.endpoint` fails the render.
