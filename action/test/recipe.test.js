@@ -293,3 +293,14 @@ test('no fresh POST is sent once the queue timeout it would carry is 0', { skip,
   assert.equal(r.code, 1);
   assert.ok(f.calls.filter(isPost).length <= 3, `${f.calls.filter(isPost).length} POSTs`);
 });
+
+test('a tunnel endpoint is refused with a clear message and the worker is released', { skip }, async (t) => {
+  const f = await fixture(t, {
+    override: (rec) => (rec.method === 'POST'
+      ? { status: 201, body: JSON.stringify({ id: 'id1a', clientCert: 'C', endpoint: '/v1/tunnel', serverName: 'e' }) } : undefined),
+  });
+  const r = await sh(f, ['true']);
+  assert.equal(r.code, 1);
+  assert.match(r.out, /tunnel endpoint \/v1\/tunnel.*needs a tcp:\/\/ edge\.endpoint/);
+  assert.deepEqual(deletes(f.calls), ['/v1/allocations/id1a']);
+});

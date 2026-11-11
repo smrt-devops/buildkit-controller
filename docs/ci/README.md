@@ -13,7 +13,7 @@ See `action/`. The job needs `permissions: id-token: write`. Pin the Action to a
     # ca-cert: ${{ vars.BK_CA }}   # see "Trusting the API" below
     pools: |
       ci/amd64
-      ci/arm64        # more than one pool needs edge.allocationDomain and distinct pool platforms
+      ci/arm64        # more than one pool needs distinct pool platforms (and edge.allocationDomain with a tcp:// endpoint)
 - run: docker buildx build --platform linux/amd64,linux/arm64 .
 ```
 
@@ -26,7 +26,7 @@ The post step removes the builder and releases every allocation, even when the j
 - Behind a Gateway with `gateway.api.mode: terminate` (the chart's default), the Gateway's own certificate. With a publicly trusted one, leave `ca-cert` out. With a private CA, pass that CA.
 - With `service.type: LoadBalancer` or `gateway.api.mode: passthrough`, the controller's serving certificate. Pass the controller's CA from the `buildkit-controller-ca-bundle` ConfigMap (key `ca.crt`), unless `edge.tls.secretName` holds a publicly trusted certificate.
 
-The edge needs no input: each allocation response carries the CA for the edge, and the Action uses it.
+The build connection needs no input. By default the Action runs a local forwarder that tunnels it through the API route (`/v1/tunnel`), so one hostname and one HTTPS route are enough behind any gateway, including ones that terminate TLS, and each allocation response carries the CA for the build connection. A controller with a `tcp://` `edge.endpoint` makes the Action dial the edge port instead, with no input either. Action versions before the tunnel cannot use a tunnel endpoint: `buildx create` refuses the path. Upgrade the Action before you drop `edge.endpoint` on an install that clients already use.
 
 ### How an allocation completes
 
@@ -118,6 +118,8 @@ export TOKEN=...   # OIDC token or service-account token with the controller aud
                    # kubectl create token builder --audience buildkit-controller (or TOKEN_FILE, below)
 sh docs/ci/buildkit-allocate.sh sh -c 'docker buildx build --builder "$BUILDER" .'
 ```
+
+The script has no tunnel client yet, so it works only when the controller returns a `tcp://` endpoint (`edge.endpoint` set). Against a tunnel endpoint (a path such as `/v1/tunnel`) it releases the allocation and stops with a clear message.
 
 Optional variables are `TTL` and `QUEUE_TIMEOUT` (seconds), `API_CA` (PEM file for the API listener, needed under the same conditions as the Action's `ca-cert`),
 `CACHE_KEY` and `CACHE` (the Action's `cache-key` and `cache` inputs). The script retries the allocation

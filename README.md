@@ -25,7 +25,7 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 
 ## Quickstart
 
-You need a cluster that meets the requirements above, `helm`, and a GitHub repository that can run Actions. The chart exposes the controller through a Gateway API Gateway you run: an HTTPS listener for the API and a TLS passthrough listener for the edge, with the Gateway API v1.5.0 or later CRDs ([the chart README](helm/buildkit-controller/README.md#exposure) has an example and the implementations that support it). Without one, replace the two `parentRefs` flags with `--set service.type=LoadBalancer`. [docs/quickstart.md](docs/quickstart.md) has the kind version.
+You need a cluster that meets the requirements above, `helm`, and a GitHub repository that can run Actions. The chart exposes the controller through a Gateway API Gateway you run. One hostname and one HTTPS listener are enough, behind any gateway, including ones that terminate TLS: builds tunnel through the API route, and the Action runs a local forwarder with no new inputs. You need the Gateway API v1.4.0 or later CRDs ([the chart README](helm/buildkit-controller/README.md#exposure) has an example and the implementations that support it). Without a Gateway, replace the `parentRefs` flag with `--set service.type=LoadBalancer`. Installs that want to skip the extra hop can set `edge.endpoint` to a `tcp://` address and add a TLS passthrough listener for the edge. [docs/quickstart.md](docs/quickstart.md) has the kind version.
 
 ```sh
 # 1. Create the pool namespace, then install the controller and its CRD, attached to the Gateway bk in gateway-system.
@@ -33,9 +33,8 @@ You need a cluster that meets the requirements above, `helm`, and a GitHub repos
 kubectl create namespace ci
 kubectl label namespace ci pod-security.kubernetes.io/enforce=privileged
 helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
-  --set edge.endpoint=tcp://bk.example.com:8444 --set edge.serverName=bk.example.com \
+  --set edge.serverName=bk.example.com \
   --set-json 'gateway.api.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"api"}]' \
-  --set-json 'gateway.edge.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"edge"}]' \
   --set 'watchNamespaces={ci}' \
   --set 'auth.oidc[0].url=https://token.actions.githubusercontent.com' \
   --set 'auth.oidc[0].audiences={buildkit-controller}'
@@ -71,7 +70,7 @@ jobs:
 
 Pin the Action to a release tag such as `@v0.3.0`, or to a commit SHA. The `@v0` tag moves to each new 0.x release.
 
-Replace `bk.example.com` with a DNS name that points at the Gateway, and use the port of its HTTPS listener in `url` if it is not 443. The Gateway terminates the API's TLS with its own certificate, so with a publicly trusted one the Action needs no `ca-cert`. The edge passes through to the controller, and the Action takes its CA from each allocation.
+Replace `bk.example.com` with a DNS name that points at the Gateway, and use the port of its HTTPS listener in `url` if it is not 443. The Gateway terminates the API's TLS with its own certificate, so with a publicly trusted one the Action needs no `ca-cert`. The Action takes the CA for the build connection from each allocation.
 
 With `service.type=LoadBalancer`, the API URL is `https://bk.example.com:8443` and the controller serves its own certificate on it. Unless you give it a certificate from a public CA (`edge.tls.secretName`), the Action must trust the controller's CA through `ca-cert: ${{ vars.BK_CA }}`. Store it in a repository or organization variable named `BK_CA`:
 
@@ -86,7 +85,7 @@ kubectl -n buildkit-system get configmap buildkit-controller-ca-bundle -o 'jsonp
 - Every allocation gets a client certificate valid for at most `maxTTL` (24 hours by default). The client generates the key and sends only the public half, so the private key never leaves the CI job. A BuildKitClaim is the exception: the controller generates its key and writes it to the claim's Secret in the claim's namespace.
 - Each allocation gets its own pod. The pod runs rootless BuildKit behind a deny-by-default NetworkPolicy (enforced only by a NetworkPolicy-aware CNI), and the controller retires it when the allocation ends. Nothing of the pod outlives it: workers have no volumes. The pod runs with seccomp and AppArmor Unconfined, so for untrusted code such as fork pull requests use a dedicated node pool or a sandboxed runtime class ([Running untrusted builds](docs/operations.md#running-untrusted-builds)).
 - The build cache lives in a registry that only worker pods reach, over mTLS, with a client certificate that only the registry accepts. The registry reads the calling pod's live allocation and allows a pull from that caller's own cache and a push only when the pool trusts the caller. A build cannot read or write another repository's cache whatever `--cache-to` it passes. A fork pull request reads the cache and cannot write it. A pool decides who may write with `spec.workers.cache.writers`.
-- All traffic to a worker goes through the mTLS edge. The edge checks the client certificate, finds the pod in its watch cache, and opens a second mTLS connection to buildkitd, which only trusts the controller's internal CA.
+- All traffic to a worker goes through the mTLS edge. The edge checks the client certificate, finds the pod in its watch cache, and opens a second mTLS connection to buildkitd, which only trusts the controller's internal CA. By default the client reaches the edge through a WebSocket tunnel on the API route, so a gateway that terminates TLS never sees the client certificate or the build bytes in the clear.
 - The controller makes and repairs its own CAs. If the CA Secret goes missing or is corrupted, the leader saves a copy, creates a new one, and the pools recover without operator action.
 
 ## Documentation

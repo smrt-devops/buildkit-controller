@@ -9,13 +9,13 @@ The `buildkit-controller` binary (`crates/server`) runs as one Deployment with t
 | Role | Port | Job | Runs on |
 |---|---|---|---|
 | API | 8443 (HTTPS) | Authenticates callers, creates and reads allocation claims, answers with the certificate once a claim is bound | every replica |
-| Edge | 8444 (mTLS) | Proxies a build connection to its worker | every replica |
+| Edge | 8444 (mTLS); also reached through the API port by the tunnel (`/v1/tunnel`) | Proxies a build connection to its worker | every replica |
 | Reconciler and allocator | none | Keeps warm pods, binds queued claims to pods, signs allocation certificates, retires expired pods, manages CAs and worker certificates, writes status | the Lease holder only |
 | Registry (`buildkit-controller registry`) | 5000 (mTLS), 8080 (ops) | Stores BuildKit cache for the workers | one StatefulSet pod |
 
 Two names stay apart in this project. "Cache" is the user feature: the Helm values `cache.*`, the pool field `spec.workers.cache` and the `cache` field of an allocation. "Registry" is the component that stores it: the `registry` role, the `<fullname>-registry` objects and the `buildkit_registry_*` metrics.
 
-Clients reach the API and edge ports through a Gateway by default: the API through an HTTPRoute, where the gateway terminates TLS and re-encrypts to the controller, and the edge through a TLS passthrough TLSRoute, so that the edge itself checks the client certificate. A LoadBalancer Service is the alternative. See [Exposure](operations.md#exposure).
+Clients reach the controller through a Gateway by default, through one HTTPRoute for the API, where the gateway terminates TLS and re-encrypts to the controller. Builds ride a WebSocket tunnel on that route (`/v1/tunnel`), so the edge still checks the client certificate and the gateway sees only ciphertext. One hostname and one HTTPS route are enough behind any gateway. With a `tcp://` `edge.endpoint`, clients dial the edge port instead, through a TLS passthrough TLSRoute or a load balancer. A LoadBalancer Service is the alternative to a Gateway. See [Exposure](operations.md#exposure).
 
 A separate ops port (8080, plain HTTP, on its own ClusterIP Service) serves `/healthz`, `/readyz` and `/metrics`. All replicas share in-memory watch caches of pools, claims and pods, so the API and edge read from memory. The API replicas hold no queue. They authenticate the caller, check the pool's access rules, and write or read a claim. Every replica loads both CA keys, because each issues its own serving certificate and edge client certificate, so a compromise of any replica exposes both CAs.
 
@@ -72,7 +72,7 @@ sequenceDiagram
     API->>K: create BuildKitClaim
     L->>K: bind a free pod, write certificate to claim status
     API-->>CI: 201, or 202 then GET ?wait=25s until 200
-    CI->>Edge: buildx remote driver, mTLS with allocation certificate
+    CI->>Edge: buildx remote driver, mTLS with allocation certificate (default: inside a WebSocket on API :8443 /v1/tunnel, through a local forwarder)
     Edge->>Edge: verify certificate chain and URI SAN, look up pod in cache
     Edge->>W: mTLS with edge client certificate (internal CA)
     CI-->>W: build traffic, copied in both directions
@@ -82,6 +82,8 @@ sequenceDiagram
 ```
 
 The allocation certificate's URI SAN names the pod, the allocation and the pool. The edge reads those fields and finds the pod in its watch cache, so it needs no database and no per-request call to Kubernetes. When the allocation is released, expires, or the pod disappears, the edge closes its connections.
+
+By default the build connection reaches the edge as a WebSocket upgrade on the API listener. The edge then treats the upgraded stream as an accepted connection, so the handshake, the certificate checks and everything after them are the same as over TCP. The Action runs a local forwarder on `127.0.0.1` that copies bytes between buildx and the tunnel. It holds no credentials.
 
 Behind a gateway, the API and edge connections come from the gateway. With PROXY protocol on for a listener, the gateway prefixes each connection with the client's address, the controller reads that header before TLS from trusted gateway addresses only, and the per-address caps and logs use the client's address. See [PROXY protocol](operations.md#proxy-protocol).
 
@@ -169,7 +171,7 @@ spec:
 
 The spec is immutable, so a different builder is a different claim. The leader binds both kinds through the same queue. `kubectl get bkc -A` shows the pool, the phase, the Secret and the expiry; sorted by creation time it lists the queue in order. An in-cluster claim must be admitted by a pool access rule `claims: {namespaces: [...]}`. A claim's identity is its namespace, name and UID, which the API server sets, so a tenant cannot forge another namespace. A claim for a pool that is missing or does not admit its namespace fails with reason `PoolNotFound`. A claim under 30 seconds old stays Pending with that reason first, so a pool that is created together with the claim has time to appear.
 
-When the worker is ready the controller creates a Secret `<claim>-buildkit` owned by the claim with `tls.crt`, `tls.key`, `ca.crt` (omitted when the edge uses public roots), `endpoint` and `server-name`, and sets `status.phase` to `Bound`. A claim ends as `Expired` at `status.expiresAt` or `Lost` if its worker pod disappears (the controller does not rebind it). A claim that cannot be served is `Failed`. All three are final: delete the claim and create a new one. Deleting a claim deletes its Secret, and the controller releases the worker within a few seconds.
+When the worker is ready the controller creates a Secret `<claim>-buildkit` owned by the claim with `tls.crt`, `tls.key`, `ca.crt` (omitted when the edge uses public roots), `endpoint` and `server-name`, and sets `status.phase` to `Bound`. With `edge.endpoint` empty, the Secret's `endpoint` is `tcp://<edge.serviceName>.<controller namespace>.svc:<edge port>`, never the tunnel path. A claim ends as `Expired` at `status.expiresAt` or `Lost` if its worker pod disappears (the controller does not rebind it). A claim that cannot be served is `Failed`. All three are final: delete the claim and create a new one. Deleting a claim deletes its Secret, and the controller releases the worker within a few seconds.
 
 ## Failure handling
 

@@ -12,22 +12,30 @@ This chart installs:
 `values.yaml` documents every value. The operator guide is [docs/operations.md](../../docs/operations.md).
 ```
 helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
-  --set edge.endpoint=tcp://bk.example.com:8444 --set edge.serverName=bk.example.com \
+  --set edge.serverName=bk.example.com \
   --set-json 'gateway.api.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"api"}]' \
-  --set-json 'gateway.edge.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"edge"}]' \
   --set 'auth.oidc[0].url=https://token.actions.githubusercontent.com' \
   --set 'auth.oidc[0].audiences={buildkit-controller}'
 ```
 
-`edge.endpoint` and `edge.serverName` are required, and so is `gateway.parentRefs`
-unless `service.type` is `LoadBalancer` or `gateway.enabled` is `false`. The chart ships no OIDC issuer, so without `auth.oidc` only ServiceAccount tokens
+`edge.serverName` is required, and so is `gateway.api.parentRefs` (or `gateway.parentRefs`)
+unless `service.type` is `LoadBalancer` or `gateway.enabled` is `false`. `edge.endpoint` is optional: empty (the default) means clients tunnel through the API, and a `tcp://` address means they dial the edge port. The chart ships no OIDC issuer, so without `auth.oidc` only ServiceAccount tokens
 authenticate. `values.schema.json` validates values and rejects keys it does not know, so a misspelled key fails `helm install` instead of being ignored.
 
 ## Exposure
 
-Clients reach two ports: the API (HTTPS, 8443 on the Service) and the edge (mTLS,
-8444). The chart exposes them through a Gateway by default. A LoadBalancer Service
-is the alternative.
+By default clients reach the controller on one port: the API (HTTPS, 8443 on the Service).
+The build connection runs inside a WebSocket on the API route (`/v1/tunnel`), so one hostname
+and one HTTPS route are enough behind any gateway, including ones that terminate TLS. The
+Action runs a local forwarder and needs no extra input. The Service keeps its edge port (mTLS,
+8444) for in-cluster clients.
+
+Set `edge.endpoint` to a `tcp://` address to skip the extra hop instead: clients then dial
+the edge port directly, which needs a TLS passthrough route or a LoadBalancer Service. The
+rest of this section marks what applies to each.
+
+The chart exposes the controller through a Gateway by default. A LoadBalancer Service is the
+alternative.
 
 ### Gateway API (default)
 
@@ -38,14 +46,14 @@ It renders upstream `gateway.networking.k8s.io/v1` kinds only:
 |---|---|---|---|
 | API, `gateway.api.mode: terminate` (default) | `HTTPRoute` and `BackendTLSPolicy` | `HTTPS`, `tls.mode: Terminate` | HTTPRoute v1.0.0, BackendTLSPolicy v1.4.0 |
 | API, `gateway.api.mode: passthrough` | `TLSRoute` | `TLS`, `tls.mode: Passthrough` | v1.5.0 |
-| Edge | `TLSRoute` | `TLS`, `tls.mode: Passthrough` | v1.5.0 |
+| Edge, only with a `tcp://` `edge.endpoint` | `TLSRoute` | `TLS`, `tls.mode: Passthrough` | v1.5.0 |
 
-So the default needs the Gateway API v1.5.0 or later standard-channel CRDs and an
-implementation that supports both kinds. The chart renders the routes without checking which Gateway API kinds the cluster serves,
+The default (tunnel, `terminate` mode) needs the Gateway API v1.4.0 or later standard-channel CRDs and an
+implementation that supports HTTPRoute and BackendTLSPolicy. A `tcp://` endpoint also needs v1.5.0 for the TLSRoute. The chart renders the routes without checking which Gateway API kinds the cluster serves,
 so `helm template` needs no extra flags. `helm install` fails at apply time when a CRD is
 missing. Install the Gateway API CRDs first.
 
-The edge is always TLS passthrough. The controller authenticates each build by its
+With a `tcp://` endpoint the edge route is TLS passthrough. The controller authenticates each build by its
 client certificate, which a gateway that terminates TLS would never forward, so the
 chart has no option to terminate the edge. The TLSRoute matches the SNI
 `edge.serverName`, plus `*.<edge.allocationDomain>` when that is set. Point those DNS
@@ -70,7 +78,7 @@ The API has two modes:
   and `gateway.edge.parentRefs` (`sectionName`).
 
 Give each route its listener with `sectionName`: `gateway.api.parentRefs` for the
-HTTPS listener and `gateway.edge.parentRefs` for the TLS passthrough listener. A
+HTTPS listener and, with a `tcp://` endpoint, `gateway.edge.parentRefs` for the TLS passthrough listener. With the default empty endpoint there is no edge route, so `gateway.api.parentRefs` is all a Gateway needs. A
 parentRef without `sectionName` (or `port`) attaches the HTTPRoute to every HTTP and
 HTTPS listener of that Gateway that admits it. On a shared Gateway with a plain HTTP
 listener, the API, and the bearer tokens clients send it, would then also be served in
@@ -78,8 +86,8 @@ cleartext, so NOTES.txt warns about it. `gateway.parentRefs` is the default for 
 routes when the per-route lists are empty. In passthrough mode the chart fails to
 render when both TLSRoutes could match the same SNI on the same listener.
 
-An Envoy Gateway example. The API is on 443 with a publicly trusted certificate, and
-the edge on 8444:
+An Envoy Gateway example. The API is on 443 with a publicly trusted certificate. The `edge`
+listener is only for a `tcp://` endpoint:
 
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1
@@ -105,23 +113,29 @@ spec:
 ```
 
 ```yaml
-edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+edge: {serverName: bk.example.com}
 gateway:
   api: {parentRefs: [{name: bk, namespace: gateway-system, sectionName: api}]}
-  edge: {parentRefs: [{name: bk, namespace: gateway-system, sectionName: edge}]}
   envoy: {enabled: true}   # optional, see below
 ```
+
+For passthrough instead, add `endpoint: "tcp://bk.example.com:8444"` under `edge` and
+`edge: {parentRefs: [{name: bk, namespace: gateway-system, sectionName: edge}]}` under `gateway`.
 
 The API URL is then `https://bk.example.com`. `cargo xtask e2e` runs this setup
 (Envoy Gateway v1.9.3, Gateway API v1.6.1 standard channel) on kind.
 
-Implementations whose Gateway API v1.5 or v1.6 conformance reports pass the
-`GATEWAY-TLS` profile, which is TLSRoute passthrough: agentgateway, Calico, Cilium,
-Envoy Gateway, Istio, kgateway, Kong Operator, NGINX Gateway Fabric, Portus and
-Traefik. Kong Operator does not report BackendTLSPolicy, and NGINX Gateway Fabric and
-Traefik do not report HTTPRoute request timeouts; on those, use
-`gateway.api.mode: passthrough`. GKE's managed Gateway and the AWS Load Balancer
-Controller report no TLSRoute support, so on them use the LoadBalancer Service. The
+What the default (tunnel, `terminate` mode) needs from a gateway: HTTPRoute v1 and
+BackendTLSPolicy v1, WebSocket upgrades on the route, and a request timeout of `0s` that
+it honours or ignores (the chart sets it on the `/v1/tunnel` rule). Envoy Gateway is the
+tested one. The repo has no test for other products, so check yours against the Gateway
+API conformance reports for those features. Kong Operator does not report
+BackendTLSPolicy, and NGINX Gateway Fabric and Traefik do not report HTTPRoute request
+timeouts; on those, use `gateway.api.mode: passthrough`. A `tcp://` endpoint also needs
+TLSRoute passthrough, the `GATEWAY-TLS` conformance profile, which agentgateway, Calico,
+Cilium, Envoy Gateway, Istio, kgateway, Kong Operator, NGINX Gateway Fabric, Portus and
+Traefik report in v1.5 or v1.6. Where the gateway fits neither, use the LoadBalancer
+Service. The
 reports are under
 [conformance/reports](https://github.com/kubernetes-sigs/gateway-api/tree/main/conformance/reports)
 in the Gateway API repository.
@@ -132,10 +146,16 @@ No API request waits for a worker longer than 25 s: a queued allocation is a
 claim that the client polls (`POST /v1/allocations` answers within about 20 s, and
 `GET /v1/allocations/{id}?wait=25s` within 25 s). The HTTPRoute sets `timeouts.request`
 and `timeouts.backendRequest` to `gateway.api.timeouts` (60s), above that, so the
-queue needs no tuning. Check the Gateway's own idle timeouts for long builds
-too. Envoy Gateway derives the route's idle timeout from the request
+queue needs no tuning.
+
+The tunnel is the exception. A build can last for hours, so with an empty `edge.endpoint`
+the HTTPRoute carries a second rule for the exact path `/v1/tunnel` with both timeouts at
+`0s` (none), and the other paths keep `gateway.api.timeouts`. The controller pings a tunnel
+every 20 s, so a gateway or load balancer idle timeout above 30 s never cuts a quiet build. In
+`passthrough` API mode the chart renders no timeouts and nothing changes. Check the
+Gateway's own idle timeouts for long builds too. Envoy Gateway derives the route's idle timeout from the request
 timeout unless a ClientTrafficPolicy on the Gateway sets `streamIdleTimeout`;
-`gateway.envoy.enabled` covers that case. TLSRoutes carry no timeout fields: the
+`gateway.envoy.enabled` covers that case, and the tunnel pings stay under it. TLSRoutes carry no timeout fields: the
 gateway's TCP idle timeout applies, which in Envoy is 1 hour by default, and the
 controller's TCP keepalives (after 30 s idle, then every 10 s) keep the connection
 active on paths that count them.
@@ -143,11 +163,13 @@ active on paths that count them.
 #### Per-address caps behind a gateway
 
 The controller caps work per client address: `edge.maxHandshakesPerIp` (32 TLS
-handshakes in progress), `api.maxConnectionsPerIp` (128 open API connections) and
+handshakes in progress, tunnel handshakes included), `api.maxConnectionsPerIp` (128 open API connections) and
 `auth.serviceAccount.maxReviewsPerIp` (4 TokenReviews in flight). Behind a gateway
 the controller sees the gateway's pod addresses, not the clients', so all clients
-share each cap. The edge cap closes the oldest handshake of an address to make room,
-so behind a Gateway without `edge.proxyProtocol` the chart renders it as 0. Turn on PROXY protocol so the controller reads the client address
+share each cap. The handshake cap closes the oldest handshake of an address to make room,
+so the chart renders it as 0 behind a Gateway when the address it sees would be the gateway's:
+with an edge route and no `edge.proxyProtocol`, or with a tunnel and no `api.proxyProtocol`
+(a tunnel handshake counts against the API connection's address). Turn on PROXY protocol so the controller reads the client address
 from the gateway: `api.proxyProtocol` and `edge.proxyProtocol` with `trustedCIDRs` set
 to the gateway's source addresses (the gateway pods as /32s, or a range only the
 gateway uses, never the pod CIDR), plus `gateway.envoy.proxyProtocol: true` on Envoy
@@ -163,7 +185,7 @@ turn them off, and enforce per-client limits at the gateway instead.
 route: TCP keepalive and a connect timeout, and on the HTTPRoute a `streamIdleTimeout`
 equal to `gateway.api.timeouts.request`. With `gateway.envoy.proxyProtocol: true` it
 also sets `proxyProtocol: {version: V2}` on the route of each listener whose
-`proxyProtocol` is enabled. It needs the `gateway.envoyproxy.io/v1alpha1` CRDs.
+`proxyProtocol` is enabled. The edge route exists only with a `tcp://` `edge.endpoint`. It needs the `gateway.envoyproxy.io/v1alpha1` CRDs.
 For other implementations, put their policy objects in `gateway.extraManifests`.
 Each entry is an object or a string, and both go through `tpl`.
 
@@ -213,7 +235,7 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 | `affinity`, `topologySpreadConstraints` | when both are empty, a soft hostname anti-affinity spreads replicas |
 | `podDisruptionBudget.*` | rendered only when replicas exceed `minAvailable` |
 | `watchNamespaces` | namespaces whose pools the controller serves; recommended. The chart renders a Role and RoleBinding in each for pods, Secrets, ServiceAccounts, NetworkPolicies and PVCs (PVCs: `list` and `delete`, only for the one-time sweep of v0.1.0 cache volumes), and only TokenReview stays cluster-wide. Every namespace listed must exist before `helm install`, because the chart creates a Role and RoleBinding in it; the chart does not create namespaces. The list may not include the release namespace (the chart fails to render). The Role in each namespace is named `<fullname>-<release namespace>-workload` and grants `create` on Secrets only; Kubernetes garbage collection deletes a worker Secret with its pod. Pools elsewhere are ignored. `[]` (the default) = every namespace through a ClusterRole that can create pods and Secrets in any namespace, kube-system included; NOTES.txt warns about it |
-| `edge.*` | `endpoint`, `serverName`, `allocationDomain`, `extraNames`, `tls.secretName` (user serving cert, a `kubernetes.io/tls` Secret in the release namespace), `handshakeTimeout` (10s), `maxConnections` (2000 established, sized to the 512Mi memory limit), `maxHandshakes` (1024), `maxHandshakesPerIp` (32; 0 = no cap; rendered as 0 when the edge route is on a Gateway and `edge.proxyProtocol` is off), `proxyProtocol.enabled` (false), `.trustedCIDRs` (required when enabled), `.headerTimeout` (5s) |
+| `edge.*` | `endpoint` (empty = tunnel through the API, the default; `tcp://host:port` = clients dial the edge port), `serverName`, `allocationDomain` (needs a `tcp://` endpoint; setting it with an empty endpoint fails the render), `extraNames`, `tls.secretName` (user serving cert, a `kubernetes.io/tls` Secret in the release namespace), `handshakeTimeout` (10s), `maxConnections` (2000 established, sized to the 512Mi memory limit), `maxHandshakes` (1024), `maxHandshakesPerIp` (32; 0 = no cap; rendered as 0 behind a Gateway when the matching PROXY protocol is off: `edge.proxyProtocol` with an edge route, `api.proxyProtocol` with a tunnel), `proxyProtocol.enabled` (false), `.trustedCIDRs` (required when enabled), `.headerTimeout` (5s) |
 | `api.*` | `maxConnections` (4096), `maxConnectionsPerIp` (128; 0 = no cap), `proxyProtocol` (as `edge.proxyProtocol`) |
 | `auth.oidc[]` | `url`, `audiences`, `jwksUrl`, and at most one of `caBundle` (inline PEM), `caBundleFile` (path), `caBundleConfigMap: {name, key}` (mounted, sets the file) |
 | `auth.serviceAccount` | `enabled`, `audiences` (never the API server audience), `maxConcurrentReviews` (32), `maxReviewsPerIp` (4; 0 = no cap) |
@@ -221,7 +243,7 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 | `service.type`, `.annotations`, `.ports`, `.nodePorts` | `ClusterIP` (default, behind a Gateway), `NodePort` or `LoadBalancer`; `loadBalancerClass` only for LoadBalancer, `externalTrafficPolicy` for NodePort and LoadBalancer (default `Local`, which keeps the client address the per-address caps count) |
 | `gateway.enabled`, `gateway.parentRefs` | Gateway API exposure, on by default; `parentRefs` (`{name, namespace, sectionName}`) is required unless `service.type` is `LoadBalancer` or `enabled` is false. See [Exposure](#exposure) |
 | `gateway.api.*` | `mode` (`terminate`: HTTPRoute and BackendTLSPolicy; `passthrough`: TLSRoute), `parentRefs`, `hostnames` (default `[edge.serverName]`), `timeouts.request` and `.backendRequest` (60s), `backendTLS.hostname` (default `edge.serverName`), `backendTLS.caCertificateRefs` (default the `<fullname>-ca-bundle` ConfigMap) or `backendTLS.wellKnownCACertificates: System` |
-| `gateway.edge.parentRefs` | listeners of the edge TLSRoute (TLS passthrough only) |
+| `gateway.edge.parentRefs` | listeners of the edge TLSRoute (TLS passthrough only; only with a `tcp://` endpoint) |
 | `gateway.annotations`, `gateway.labels` | added to every Gateway API object |
 | `gateway.envoy.*` | `enabled` (false), `connectTimeout`, `tcpKeepalive`, `proxyProtocol` (false; PROXY protocol v2 to the listeners that read it): Envoy Gateway BackendTrafficPolicies |
 | `gateway.extraManifests` | extra objects (or `tpl` strings) for other implementations |
@@ -250,7 +272,8 @@ needs room for `cache.maxSize` plus `cache.maxUploadSize`.
 
 This applies to `service.type: LoadBalancer`, and to the load balancer in front of a
 Gateway. Queued allocations are short polls and need no tuning, but builds can be
-quiet for long steps on the edge connection. TCP keepalive keeps most
+quiet for long steps on the edge connection (with a tunnel, the pings every 20 s already keep
+it active, so only an idle timeout under 30 s matters). TCP keepalive keeps most
 paths open. For a load balancer that ignores keepalives, raise its idle timeout
 above your longest quiet step, with `service.annotations` for the chart's Service or on the
 Gateway's own Service.

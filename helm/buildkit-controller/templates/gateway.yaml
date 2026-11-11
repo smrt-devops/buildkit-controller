@@ -15,6 +15,14 @@ spec:
   parentRefs: {{- toYaml . | nindent 4 }}
   hostnames: {{- toYaml $plan.apiHostnames | nindent 4 }}
   rules:
+    {{- if $plan.tunnel }}
+    {{- /* The tunnel lasts as long as a build, so no gateway timeout may end it. The server pings
+           every 20 s, which keeps idle timers from cutting a quiet build. */}}
+    - matches: [{path: {type: Exact, value: /v1/tunnel}}]
+      backendRefs:
+        - {name: {{ $fn }}, port: {{ $.Values.service.ports.api }}}
+      timeouts: {request: 0s, backendRequest: 0s}
+    {{- end }}
     - backendRefs:
         - {name: {{ $fn }}, port: {{ $.Values.service.ports.api }}}
       {{- with $gw.api.timeouts }}

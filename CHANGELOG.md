@@ -2,6 +2,22 @@
 
 All notable changes are listed here, newest first.
 
+## Unreleased
+
+The tunnel is now the default way to reach the controller. Builds run inside a WebSocket on the API route (`/v1/tunnel`), so one hostname and one HTTPS route are enough behind any gateway, including ones that terminate TLS.
+
+### Changed
+
+- `edge.endpoint` is optional and empty by default. Empty means clients tunnel through the API: the chart renders no edge TLSRoute, needs only `gateway.api.parentRefs` (or a LoadBalancer Service), and keeps the edge port on the Service for in-cluster clients. A `tcp://` endpoint renders as before. Installs that set `edge.endpoint` keep working with no change. `edge.allocationDomain` with an empty endpoint fails the render, because each tunnelled allocation gets its own local port.
+- The API HTTPRoute (terminate mode, empty `edge.endpoint`) gets a separate rule for the exact path `/v1/tunnel` with `timeouts.request` and `timeouts.backendRequest` of `0s`, so no gateway cuts a long build. Other paths keep `gateway.api.timeouts`. Passthrough API mode is unchanged.
+- With a tunnel behind a Gateway, the chart renders `edge.maxHandshakesPerIp` as 0 unless `api.proxyProtocol` is on, because a tunnel handshake counts against the API connection's address. NOTES.txt describes the tunnel and its per-address caps.
+- The Action runs a local forwarder when the allocation endpoint is a path and needs no new inputs. The shell recipe (`docs/ci/buildkit-allocate.sh`) works only with a `tcp://` endpoint until a client binary ships, and it now stops with a clear message, after releasing the allocation, when the endpoint starts with `/`.
+- The examples use the tunnel default. `examples/helm-values-tcp.yaml` keeps a TCP passthrough install.
+
+### Compatibility
+
+- Action versions before this one cannot use a tunnel endpoint: `buildx create` refuses the path. Upgrade the Action before you drop `edge.endpoint` on an install that clients already use.
+
 ## 0.3.0
 
 0.3.0 frees the worker of a client that died after it received its allocation. Upgrade from 0.2.0 only; clients from 0.2.0 keep working.
