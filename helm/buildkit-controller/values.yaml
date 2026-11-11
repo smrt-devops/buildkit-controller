@@ -19,12 +19,16 @@ podDisruptionBudget:
   enabled: true
   minAvailable: 1
 
-# Each proxied edge connection holds two 64 KiB copy buffers and two TLS sessions, about
-# 200 KiB, and an idle replica uses about 14 MiB, so 512Mi holds roughly 2300 connections.
-# edge.maxConnections (2000) is sized to this limit: raise one only with the other.
+# Memory limit = baseline + edge.maxConnections x per-connection cost. The baseline of an idle
+# replica is about 14 MiB. A tcp:// edge connection costs about 200 KiB (two 64 KiB copy buffers
+# and two TLS sessions). A tunnelled connection costs about 460 KiB at worst (the 200 KiB of a
+# TCP edge connection, a 64 KiB HTTP/2 stream window, up to 128 KiB of WebSocket read buffer and
+# message, and one 65 KiB outgoing frame). At the default edge.maxConnections of 2000, tunnels
+# need about 900 MiB, so 1Gi holds them. To lower the limit, lower edge.maxConnections; to raise
+# edge.maxConnections, raise the limit together with it.
 resources:
   requests: {cpu: 100m, memory: 128Mi}
-  limits: {memory: 512Mi}
+  limits: {memory: 1Gi}
 
 logLevel: info
 logFormat: json
