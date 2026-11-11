@@ -1,3 +1,5 @@
+# It has no access rules, so it admits nobody until you add some (see
+# pool-github-oidc.yaml).
 # Workers with no internet egress that pull from and push to a private registry
 # by name. The leader resolves each name every 30 seconds and keeps the pool's
 # NetworkPolicy pointed at its current addresses, TCP on the given port only.

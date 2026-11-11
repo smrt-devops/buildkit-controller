@@ -16,7 +16,7 @@ async function run() {
   if (!api || pools.length === 0) throw new Error('url and pools are required');
   const ttl = L.parseDuration(gha.getInput('ttl'));
   const qt = L.parseDuration(gha.getInput('queue-timeout'));
-  const ca = gha.getInput('ca-cert') || undefined;
+  const ca = L.resolveCa(gha.getInput('ca-cert'));
   const cache = L.parseCacheInputs({
     cache: gha.getInput('cache'), cacheKey: gha.getInput('cache-key'),
     cacheMode: gha.getInput('cache-mode'), cacheFrom: gha.getInput('cache-from'),
@@ -89,8 +89,12 @@ async function run() {
     const m = L.writeMaterial(dirs[i], a, keys[i].privateKey);
     return { ...m, endpoint: a.endpoint, serverName: a.serverName, platforms: found[i].platforms || [] };
   });
-  // A path endpoint is the tunnel (edge.md section 10): one detached forwarder, one local port per allocation.
-  const nodes = await L.useTunnels(direct, { api, ca, onStarted: (pid) => gha.saveState('forwarder', String(pid)) });
+  // A path endpoint is the tunnel: one detached forwarder, one local port per allocation.
+  const logFile = path.join(root, `buildkit-tunnel-${ids[0]}.log`);
+  const nodes = await L.useTunnels(direct, {
+    api, ca, logFile,
+    onStarted: (pid) => { gha.saveState('forwarder', String(pid)); gha.saveState('forwarder-log', logFile); },
+  });
   L.createBuilder(builder, nodes, docker, () => gha.saveState('builder', builder));
 
   gha.setOutput('builder', builder);

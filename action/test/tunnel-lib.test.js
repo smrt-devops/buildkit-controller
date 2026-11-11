@@ -46,11 +46,11 @@ test('useTunnels gives each tunnel node its own local port and leaves tcp nodes 
   ];
   const started = [];
   const out = await L.useTunnels(nodes, {
-    api: 'https://bk.example.com', ca: 'PEM',
+    api: 'https://bk.example.com', ca: 'PEM', logFile: '/x/fwd.log',
     start: async (a) => { started.push(a); return { pid: 4242, ports: [5001, 5002] }; },
     onStarted: (pid) => started.push(pid),
   });
-  assert.deepEqual(started, [{ urls: ['https://bk.example.com/v1/tunnel', 'https://bk.example.com/v1/tunnel'], ca: 'PEM' }, 4242]);
+  assert.deepEqual(started, [{ urls: ['https://bk.example.com/v1/tunnel', 'https://bk.example.com/v1/tunnel'], ca: 'PEM', logFile: '/x/fwd.log' }, 4242]);
   assert.deepEqual(out.map((n) => n.endpoint), ['tcp://127.0.0.1:5001', 'tcp://x.example:1', 'tcp://127.0.0.1:5002']);
   assert.deepEqual(out[0].platforms, ['linux/a']);
   assert.equal(nodes[0].endpoint, '/v1/tunnel', 'input is not modified');
@@ -140,4 +140,19 @@ test('startForwarder fails with the child output when it exits early, prints jun
   const silent = fakeScript(t, `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`);
   await assert.rejects(L.startForwarder({ urls: ['https://a/x'], script: silent, timeoutMs: 300 }), /did not start in time/);
   assert.ok(await waitDead(Number(fs.readFileSync(pidFile, 'utf8'))), 'the child that never answered is killed');
+});
+
+test('the forwarder appends one line per failed open to its log file: time, URL, error', async (t) => {
+  const logFile = path.join(scratch(t), 'fwd.log');
+  const url = 'http://127.0.0.1:1/v1/tunnel';
+  const f = await L.startForwarder({ urls: [url], logFile });
+  t.after(() => L.stopForwarder(f.pid));
+  assert.ok(!fs.existsSync(logFile), 'nothing is written before a failure');
+  const s = net.connect({ port: f.ports[0], host: '127.0.0.1' });
+  s.on('error', () => {});
+  for (let i = 0; i < 200 && !fs.existsSync(logFile); i++) await sleep(20);
+  s.destroy();
+  const lines = fs.readFileSync(logFile, 'utf8').trimEnd().split('\n');
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], new RegExp(`^\\d{4}-\\d\\d-\\d\\dT[\\d:.]+Z ${url.replace(/[./]/g, '\\$&')} ECONNREFUSED`));
 });
