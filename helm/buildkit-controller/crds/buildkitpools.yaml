@@ -81,15 +81,33 @@ spec:
                           properties:
                             claims:
                               additionalProperties:
-                                description: >-
-                                  A claim pattern. `*` matches any run of characters, and the pattern needs at
-                                  least one character that is not `*`.
+                                description: |-
+                                  A claim pattern, 1 to 256 characters. `*` matches any run of characters, the empty run included.
+                                  A value made only of `*` means the claim is present (a non-empty string, or an array holding one),
+                                  and is accepted only beside another claim whose value has a character other than `*`.
                                 maxLength: 256
-                                pattern: ^.*[^*].*$
+                                minLength: 1
                                 type: string
                               description: Claims that must all match.
                               maxProperties: 16
                               minProperties: 1
+                              type: object
+                            exclude:
+                              additionalProperties:
+                                items:
+                                  description: "A pattern in `exclude`: like a claim pattern, but never made only of `*`."
+                                  maxLength: 256
+                                  minLength: 1
+                                  pattern: ^.*[^*].*$
+                                  type: string
+                                maxItems: 16
+                                minItems: 1
+                                type: array
+                              description: |-
+                                Claim name to patterns. The rule does not match a token when any listed claim matches any
+                                of its patterns (an array claim: any element). It never admits a caller on its own.
+                                A value made only of `*` is refused.
+                              maxProperties: 16
                               type: object
                             issuer:
                               description: Issuer URL. It must equal a configured issuer byte for byte.
@@ -100,6 +118,9 @@ spec:
                           - claims
                           - issuer
                           type: object
+                          x-kubernetes-validations:
+                          - message: at least one claim value must contain a character other than *
+                            rule: self.claims.exists(k, self.claims[k].matches('[^*]'))
                         serviceAccount:
                           description: Match a Kubernetes service account.
                           properties:
@@ -2149,15 +2170,33 @@ spec:
                               properties:
                                 claims:
                                   additionalProperties:
-                                    description: >-
-                                      A claim pattern. `*` matches any run of characters, and the pattern needs at
-                                      least one character that is not `*`.
+                                    description: |-
+                                      A claim pattern, 1 to 256 characters. `*` matches any run of characters, the empty run included.
+                                      A value made only of `*` means the claim is present (a non-empty string, or an array holding one),
+                                      and is accepted only beside another claim whose value has a character other than `*`.
                                     maxLength: 256
-                                    pattern: ^.*[^*].*$
+                                    minLength: 1
                                     type: string
                                   description: Claims that must all match.
                                   maxProperties: 16
                                   minProperties: 1
+                                  type: object
+                                exclude:
+                                  additionalProperties:
+                                    items:
+                                      description: "A pattern in `exclude`: like a claim pattern, but never made only of `*`."
+                                      maxLength: 256
+                                      minLength: 1
+                                      pattern: ^.*[^*].*$
+                                      type: string
+                                    maxItems: 16
+                                    minItems: 1
+                                    type: array
+                                  description: |-
+                                    Claim name to patterns. The rule does not match a token when any listed claim matches any
+                                    of its patterns (an array claim: any element). It never admits a caller on its own.
+                                    A value made only of `*` is refused.
+                                  maxProperties: 16
                                   type: object
                                 issuer:
                                   description: Issuer URL. It must equal a configured issuer byte for byte.
@@ -2168,6 +2207,9 @@ spec:
                               - claims
                               - issuer
                               type: object
+                              x-kubernetes-validations:
+                              - message: at least one claim value must contain a character other than *
+                                rule: self.claims.exists(k, self.claims[k].matches('[^*]'))
                             serviceAccount:
                               description: Match a Kubernetes service account.
                               properties:

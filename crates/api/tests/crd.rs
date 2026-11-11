@@ -164,6 +164,7 @@ fn generated_crd_has_columns_names_and_cel() {
         "self.min <= self.max",
         "self.schedule.all(w, w.min <= self.max)",
         "self.start != self.end",
+        "self.claims.exists(k, self.claims[k].matches('[^*]'))",
         "[has(self.oidc), has(self.serviceAccount), has(self.claims)].filter(x, x).size() == 1",
         "duration(self.defaultTTL) <= duration(self.maxTTL)",
         "duration(self.queueTimeout) <= duration(self.maxQueueTimeout)",

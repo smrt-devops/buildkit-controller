@@ -1,0 +1,7 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: cache-writer-star-only, namespace: default}
+spec:
+  access:
+    rules: [{serviceAccount: {}}]
+  workers: {cache: {writers: [{oidc: {issuer: "https://a", claims: {a: "*"}}}]}}

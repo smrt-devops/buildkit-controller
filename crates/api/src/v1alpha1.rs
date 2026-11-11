@@ -743,15 +743,24 @@ pub struct ClaimsRule {
     pub namespaces: Vec<String>,
 }
 
-/// A claim pattern. `*` matches any run of characters, and the pattern needs at least one character that is not `*`.
+/// A claim pattern, 1 to 256 characters. `*` matches any run of characters, the empty run included.
+/// A value made only of `*` means the claim is present (a non-empty string, or an array holding one),
+/// and is accepted only beside another claim whose value has a character other than `*`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
-#[schemars(extend("maxLength" = 256, "pattern" = r"^.*[^*].*$"))]
+#[schemars(extend("minLength" = 1, "maxLength" = 256))]
 pub struct ClaimPattern(pub String);
+
+/// A pattern in `exclude`: like a claim pattern, but never made only of `*`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(extend("minLength" = 1, "maxLength" = 256, "pattern" = r"^.*[^*].*$"))]
+pub struct ExcludePattern(pub String);
 
 /// OIDC rule.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(extend("x-kubernetes-validations" = [{"rule": "self.claims.exists(k, self.claims[k].matches('[^*]'))", "message": "at least one claim value must contain a character other than *"}]))]
 pub struct OidcRule {
     /// Issuer URL. It must equal a configured issuer byte for byte.
     #[schemars(length(max = 512), regex(pattern = r"^https://"))]
@@ -759,6 +768,21 @@ pub struct OidcRule {
     /// Claims that must all match.
     #[schemars(extend("minProperties" = 1, "maxProperties" = 16))]
     pub claims: BTreeMap<String, ClaimPattern>,
+    /// Claim name to patterns. The rule does not match a token when any listed claim matches any
+    /// of its patterns (an array claim: any element). It never admits a caller on its own.
+    /// A value made only of `*` is refused.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(schema_with = "exclude_schema")]
+    pub exclude: BTreeMap<String, Vec<ExcludePattern>>,
+}
+
+fn exclude_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let item = generator.subschema_for::<ExcludePattern>();
+    schemars::json_schema!({
+        "type": "object",
+        "maxProperties": 16,
+        "additionalProperties": {"type": "array", "minItems": 1, "maxItems": 16, "items": item}
+    })
 }
 
 /// Service-account rule.
