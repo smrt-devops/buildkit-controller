@@ -452,6 +452,7 @@ fn branch_scenarios(
     r: &mut Report,
     pushed: &dyn Fn(&Cluster) -> Result<f64>,
 ) -> Result<()> {
+    const STEP: &str = "branch-only-step";
     let denied = |env: &Cluster, action: &str| {
         metric(
             env,
@@ -459,8 +460,6 @@ fn branch_scenarios(
             &[&format!("action=\"{action}\"")],
         )
     };
-    const STEP: &str = "branch-only-step";
-
     // e.
     let (before, denied_push) = (pushed(env)?, denied(env, "push")?);
     let (ok, log) = exec(env, "branch-a", &build_branch(&branch_flags(BRANCH_A)))?;
