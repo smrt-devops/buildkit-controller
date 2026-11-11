@@ -263,8 +263,8 @@ StatefulSet with one volume (`cache.persistence`) that only worker pods reach,
 over mTLS with the internal CA. Allocations carry `--cache-to` and
 `--cache-from` flags for it. A caller that a pool's `spec.workers.cache.writers`
 rules do not trust never writes the shared cache. With a `ref` claim it writes a
-cache of its own branch or pull request and reads that before the shared one;
-without one it gets `--cache-from` only. By default pushes, schedules and
+cache of its own branch or pull request, and the registry answers what that
+lacks from the shared one; without one it gets `--cache-from` only. By default pushes, schedules and
 `workflow_dispatch` runs on a protected ref and in-cluster callers write the
 shared cache. Each repository has its own cache unless the pool sets
 `spec.workers.cache.scope: pool`. `cache.maxSize` bounds the volume and

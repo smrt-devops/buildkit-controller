@@ -113,13 +113,14 @@ The allocation response carries the cache flags, and the client passes them to b
 --cache-to   type=registry,ref=<registry>/<namespace>/<pool>/<scope>:<tag>,mode=max,ignore-error=true,oci-mediatypes=true
 ```
 
-An untrusted build with a branch scope (see [Scope and trust tiers](#scope-and-trust-tiers)) gets its branch cache first and the shared one second, and exports to its branch cache:
+An untrusted build with a branch scope (see [Scope and trust tiers](#scope-and-trust-tiers)) reads and exports its branch cache only:
 
 ```
 --cache-from type=registry,ref=<registry>/<namespace>/<pool>/<branch-scope>:<tag>
---cache-from type=registry,ref=<registry>/<namespace>/<pool>/<scope>:<tag>
 --cache-to   type=registry,ref=<registry>/<namespace>/<pool>/<branch-scope>:<tag>,mode=max,ignore-error=true,oci-mediatypes=true
 ```
+
+When the branch cache lacks a manifest or a layer, the registry answers the read from the caller's shared cache, so a branch's first run starts warm. There is one source, not two, because BuildKit does not reliably follow cached steps across two cache imports. Once a branch has its own cache manifest, it sees newer shared entries only for the steps it rebuilds.
 
 Any other untrusted build gets the first `--cache-from` of the trusted form and no `--cache-to`.
 
@@ -137,7 +138,9 @@ The registry identifies the worker by its certificate and finds the pod in its w
 | Push to it | the same, and the allocation's tier is `trusted` |
 | Pull from or push to `<namespace>/<pool>/<branch-scope>` | the pod's allocation is untrusted and that branch scope is its own |
 
-A trusted allocation never gets a branch scope, even when its pod carries the annotation. A worker with no live allocation gets nothing. A build cannot read or write another scope's or another branch's cache, whatever `--cache-to` it passes. The registry never mounts a blob from one repository into another, so a layer reaches a cache only by an upload into it. It stores each layer once on the volume, however many caches link it. The registry trusts the annotations on the pod, so anyone who may patch pods in a pool namespace can write any cache of that pool. Grant `pods/patch` there only to cluster admins.
+A pull from the branch scope that finds nothing there is answered from the allocation's own scope, for HEAD and GET, by tag or digest, with ranges. Pushes never fall back, and nothing else does: a trusted or read-only worker, another branch's scope and another repository are never read this way.
+
+A trusted allocation never gets a branch scope, even when its pod carries the annotation. A worker with no live allocation gets nothing. A build cannot read or write another scope's or another branch's cache, whatever `--cache-to` it passes. The registry never mounts a blob from one repository into another. A layer reaches a cache by an upload into it, with one exception. A manifest pushed to a branch scope may reference a layer that the allocation's own scope holds, and the registry then links that layer into the branch scope. BuildKit needs this, because its HEAD for the layer succeeds through the fallback and it skips the upload. The branch could already read that layer, so the link exposes nothing. The registry refuses a layer that only another repository or another branch holds. It stores each layer once on the volume, however many caches link it. The registry trusts the annotations on the pod, so anyone who may patch pods in a pool namespace can write any cache of that pool. Grant `pods/patch` there only to cluster admins.
 
 ### Scope and trust tiers
 
@@ -153,16 +156,16 @@ The tier says whether the caller may write the scope's shared cache. `spec.worke
 - Pin `event_name` and `ref_protected` in every `writers` rule. A rule without them lets any branch write the cache that the protected branch reads.
 - `writers: []` trusts nobody.
 
-An untrusted OIDC caller whose token has a `ref` claim (`refs/heads/<branch>`, `refs/pull/<n>/merge`, a GitLab ref) also has a branch scope: the first 32 hex characters of the SHA-256 of the scope's name, the caller's repository identity and the ref, each prefixed with its length, so no crafted ref or repository value can reach another caller's branch scope. Every branch and every pull request has its own. An untrusted caller without a `ref` claim has none.
+An untrusted OIDC caller whose token has a `ref` claim (`refs/heads/<branch>`, `refs/pull/<n>/merge`, a GitLab ref) also has a branch scope: the first 32 hex characters of the SHA-256 of the scope's name, the caller's repository identity, the ref and, for an event that can run code from forks (the events and GitLab pipeline sources listed above), the event, each prefixed with its length, so no crafted ref or repository value can reach another caller's branch scope. Every branch and every pull request has its own, and a `pull_request_target` or `workflow_run` build does not share one with a push to its base ref. An untrusted caller without a `ref` claim has none.
 
-- A trusted allocation gets `--cache-to` and `--cache-from` for its scope. The Action logs that it writes the shared cache.
-- An untrusted allocation with a branch scope gets `--cache-to` for the branch scope and `--cache-from` for the branch scope, then the scope, so its own layers win. The Action logs that it writes the branch's own cache.
+- A trusted allocation gets `--cache-to` and `--cache-from` for its scope.
+- An untrusted allocation with a branch scope gets `--cache-to` and `--cache-from` for the branch scope, and the registry falls back to the scope for what the branch lacks. The response has the same shape as a trusted one, so the Action logs the same line for both.
 - An untrusted allocation without one gets `--cache-from` for its scope only, and the Action logs that the cache is read only for the build.
 
 ### Limits and garbage collection
 
 - `spec.workers.cache.maxSize` caps what a pool's caches hold together. A pool without it gets the chart's `cache.poolMaxSize`. The chart's `cache.maxSize` caps the whole volume.
-- Every manifest records its last pull or push time. Garbage collection (`cache.gcInterval`, 10 minutes by default) keeps the newest first while they fit the budget: manifests by last use, and blobs of uploads that no manifest references yet by upload time, which count against the budget too. An item that does not fit is removed and the scan goes on, so one oversized push cannot empty a pool. A mark and sweep then deletes the blobs that nothing references. While the registry cannot list pools, it evicts nothing for a pool budget.
+- Every manifest records its last pull or push time. A pull that a branch scope falls back for records the use on the shared manifest and layers it read, and creates nothing in the branch scope. Garbage collection (`cache.gcInterval`, 10 minutes by default) keeps the newest first while they fit the budget: manifests by last use, and blobs of uploads that no manifest references yet by upload time, which count against the budget too. An item that does not fit is removed and the scan goes on, so one oversized push cannot empty a pool. A mark and sweep then deletes the blobs that nothing references. While the registry cannot list pools, it evicts nothing for a pool budget.
 - A blob over `cache.maxBlobSize` is refused. Upload sessions expire after 1 hour idle. `cache.maxUploadSize` bounds the bytes that uploads in progress hold together, so size the volume to `cache.maxSize` plus `cache.maxUploadSize` ([sizing](operations.md#sizing)).
 - One replica means one volume. Builds that start while the cache pod restarts run uncached, and a build that imported from it before the restart can fail when it fetches a layer. The cache is an accelerator, so the allocation does not wait for it.
 
