@@ -770,6 +770,54 @@ async fn a_branch_scope_reads_through_to_its_trusted_scope() {
     );
 }
 
+/// A branch manifest may reference a blob it has not uploaded only when the
+/// caller's own trusted scope holds it. A blob that only another repository,
+/// or another branch holds is refused, and a
+/// refused push links nothing, not even the references it could borrow.
+#[tokio::test]
+async fn a_branch_manifest_borrows_only_from_its_own_trusted_scope() {
+    let f = fixture("borrow");
+    let reg = &f.reg;
+    let shared = push_blob(reg, "writer", "ns/p/app", b"base layer").await;
+    let elsewhere = push_blob(reg, "other", "ns/p/other", b"other repository").await;
+    let theirs = push_blob(reg, "branch2", "ns/p/br2", b"other branch").await;
+    let link = |d: &Digest| f.dir.join("repos/ns/p/br/_links").join(d.hex());
+    for d in [&elsewhere, &theirs] {
+        for refs in [vec![d], vec![&shared, d]] {
+            let r = put_index(reg, "branch", "ns/p/br", "main", &refs).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{d}");
+            assert_eq!(r.code(), "MANIFEST_BLOB_UNKNOWN", "{d}");
+            assert!(!link(d).exists(), "{d}");
+            assert!(!link(&shared).exists(), "{d}");
+        }
+    }
+    let r = call(
+        reg,
+        "branch",
+        Method::GET,
+        "/v2/ns/p/br/manifests/main",
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::NOT_FOUND,
+        "no branch manifest was stored"
+    );
+    // Only the caller's own trusted scope lends; branch2 borrows the same
+    // layer from the same trusted scope into its own branch only.
+    let r = put_index(reg, "branch", "ns/p/br", "main", &[&shared]).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    assert!(link(&shared).exists());
+    assert!(
+        !f.dir
+            .join("repos/ns/p/br2/_links")
+            .join(shared.hex())
+            .exists()
+    );
+}
+
 #[tokio::test]
 async fn names_and_routes_outside_the_subset_are_refused() {
     let f = fixture("routes");
