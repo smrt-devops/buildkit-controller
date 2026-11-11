@@ -30,6 +30,9 @@ fn snapshots_every_scenario_and_object() {
             });
         }
     }
+    insta::with_settings!({prepend_module_to_snapshot => false}, {
+        assert_snapshot!("egress-hosts.networkpolicy", super::fixtures::hosts_policy().unwrap());
+    });
 }
 
 #[test]
@@ -549,12 +552,12 @@ fn internet_blocks(
 fn ipv6_internet_stays_closed_until_cluster_ranges_are_named() {
     let p = pool("p", json!({}));
     let mut cfg = default_config();
-    let blocks = internet_blocks(&network_policy(&p, &cfg).unwrap());
+    let blocks = internet_blocks(&network_policy(&p, &cfg, &HostAddrs::new()).unwrap());
     assert_eq!(blocks.len(), 1, "{blocks:?}");
     assert_eq!(blocks[0].0, "0.0.0.0/0");
 
     cfg.worker_network.cluster_cidrs = vec!["34.118.224.0/20".into(), "2600:1f18::/40".into()];
-    let blocks = internet_blocks(&network_policy(&p, &cfg).unwrap());
+    let blocks = internet_blocks(&network_policy(&p, &cfg, &HostAddrs::new()).unwrap());
     let v4 = &blocks.iter().find(|b| b.0 == "0.0.0.0/0").unwrap().1;
     let v6 = &blocks.iter().find(|b| b.0 == "::/0").unwrap().1;
     assert!(v4.contains(&"34.118.224.0/20".to_owned()) && !v4.iter().any(|c| c.contains(':')));
@@ -693,7 +696,7 @@ fn workers_may_reach_the_cache_registry_and_nothing_else_new() {
     let p = pool("p", json!({"network": {"egress": {"internet": "Deny"}}}));
     let mut cfg = default_config();
     let rules = |cfg: &RenderConfig| {
-        network_policy(&p, cfg)
+        network_policy(&p, cfg, &HostAddrs::new())
             .unwrap()
             .spec
             .unwrap()
@@ -918,7 +921,7 @@ fn network_policy_leaves_out_refused_entries() {
             "allowCIDRs": ["192.0.2.10/32", "169.254.169.254/32", "10.244.0.0/24"]}}}),
     );
     let opened = |cfg: &RenderConfig| -> Vec<String> {
-        network_policy(&p, cfg)
+        network_policy(&p, cfg, &HostAddrs::new())
             .unwrap()
             .spec
             .and_then(|s| s.egress)
@@ -1043,4 +1046,175 @@ fn startup_is_probed_fast_and_readiness_slowly() {
     assert!(budget > 30 * 60, "{budget}");
     assert_eq!(ready.period_seconds, Some(10));
     assert_eq!(c.image_pull_policy.as_deref(), Some("IfNotPresent"));
+}
+
+fn ips(v: &[&str]) -> Vec<std::net::IpAddr> {
+    v.iter().map(|s| s.parse().unwrap()).collect()
+}
+
+/// The egress rules `allowHosts` adds to the policy of `spec` under `cfg`.
+fn host_rules_of(
+    spec: Value,
+    cfg: &RenderConfig,
+    hosts: &HostAddrs,
+) -> Vec<k8s_openapi::api::networking::v1::NetworkPolicyEgressRule> {
+    let base = network_policy(&pool("p", spec.clone()), cfg, &HostAddrs::new())
+        .unwrap()
+        .spec
+        .unwrap()
+        .egress
+        .unwrap();
+    let all = network_policy(&pool("p", spec), cfg, hosts)
+        .unwrap()
+        .spec
+        .unwrap()
+        .egress
+        .unwrap();
+    all.into_iter().skip(base.len()).collect()
+}
+
+fn cidrs(r: &k8s_openapi::api::networking::v1::NetworkPolicyEgressRule) -> Vec<String> {
+    r.to.iter()
+        .flatten()
+        .map(|p| p.ip_block.as_ref().unwrap().cidr.clone())
+        .collect()
+}
+
+#[test]
+fn an_allow_host_rule_opens_its_addresses_on_its_port_only() {
+    let mut cfg = default_config();
+    cfg.worker_network.cluster_cidrs = vec!["10.96.0.0/12".into(), "fd00:10:96::/108".into()];
+    let spec = json!({"network": {"egress": {"internet": "Deny",
+        "allowHosts": ["reg.example.com", "proxy.example.com:3128", "gone.example.com"]}}});
+    let hosts = HostAddrs::from([
+        (
+            "reg.example.com".into(),
+            ips(&["2001:db8::1", "203.0.113.9", "198.51.100.1"]),
+        ),
+        ("proxy.example.com".into(), ips(&["192.0.2.80"])),
+    ]);
+    let rules = host_rules_of(spec, &cfg, &hosts);
+    // A name with no known address gets no rule: an egress rule with no peers
+    // would match every destination.
+    assert_eq!(rules.len(), 2);
+    assert_eq!(
+        cidrs(&rules[0]),
+        ["198.51.100.1/32", "203.0.113.9/32", "2001:db8::1/128"]
+    );
+    assert_eq!(rules[1].ports.as_ref().unwrap().len(), 1);
+    let p = &rules[1].ports.as_ref().unwrap()[0];
+    assert_eq!(
+        (p.protocol.as_deref(), p.port.clone()),
+        (
+            Some("TCP"),
+            Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(3128))
+        )
+    );
+    assert_eq!(
+        rules[0].ports.as_ref().unwrap()[0].port,
+        Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(443))
+    );
+}
+
+#[test]
+fn a_name_with_only_refused_addresses_gets_no_rule() {
+    let mut cfg = default_config();
+    cfg.worker_network.cluster_cidrs = vec!["10.96.0.0/12".into()];
+    // permittedHosts never reopens a protected address.
+    cfg.worker_network.permitted_hosts = vec!["meta.example.com".into()];
+    let spec = json!({"network": {"egress": {"allowHosts": ["meta.example.com"]}}});
+    let hosts = HostAddrs::from([(
+        "meta.example.com".into(),
+        ips(&["169.254.169.254", "::ffff:127.0.0.1", "0.0.0.0"]),
+    )]);
+    assert!(host_rules_of(spec, &cfg, &hosts).is_empty());
+}
+
+#[test]
+fn allow_host_addresses_are_permitted_or_refused_as_the_operator_says() {
+    let mut net = WorkerNetwork {
+        cluster_cidrs: vec!["10.96.0.0/12".into()],
+        extra_denied_cidrs: vec!["203.0.113.0/24".into()],
+        ..WorkerNetwork::default()
+    };
+    let refused =
+        |n: &WorkerNetwork, name: &str, ip: &str| refused_host_addr(name, ip.parse().unwrap(), n);
+    // Protected: always refused, whatever permittedHosts says.
+    net.permitted_hosts = vec!["h".into()];
+    for ip in [
+        "169.254.169.254",
+        "127.0.0.1",
+        "::1",
+        "fe80::1",
+        "168.63.129.16",
+        "100.100.100.200",
+        "fd00:ec2::254",
+        "64:ff9b:1::1",
+        "::ffff:169.254.169.254",
+        "64:ff9b::a9fe:a9fe",
+        "0.0.0.0",
+        "::",
+    ] {
+        assert!(refused(&net, "h", ip).is_some(), "{ip}");
+    }
+    // Cluster, extra denied, and (no IPv6 cluster range) IPv6: only with permittedHosts.
+    for ip in [
+        "10.96.0.1",
+        "::ffff:10.96.0.1",
+        "203.0.113.5",
+        "2001:db8::1",
+    ] {
+        assert!(refused(&net, "h", ip).is_none(), "{ip} permitted for h");
+        let why = refused(&net, "other", ip).unwrap();
+        assert!(why.contains("workerNetwork.permittedHosts"), "{ip}: {why}");
+    }
+    // Outside every denied range: no permission needed.
+    assert_eq!(refused(&net, "other", "198.51.100.1"), None);
+    // A private address outside the cluster ranges, once IPv4 cluster ranges are set.
+    assert_eq!(refused(&net, "other", "192.168.1.1"), None);
+    // Without IPv4 cluster ranges, a private IPv4 address needs permission.
+    net.cluster_cidrs = vec!["fd00:10:96::/108".into()];
+    assert!(
+        refused(&net, "other", "192.168.1.1")
+            .unwrap()
+            .contains("clusterCIDRs holds no range")
+    );
+    assert_eq!(refused(&net, "other", "2001:db8::1"), None);
+    assert!(refused(&net, "h", "192.168.1.1").is_none());
+}
+
+#[test]
+fn allow_host_addresses_are_sorted_deduplicated_and_capped_at_16() {
+    let net = WorkerNetwork::default();
+    let mut addrs: Vec<std::net::IpAddr> = (1..=20u8)
+        .rev()
+        .map(|i| std::net::IpAddr::from([198, 51, 100, i]))
+        .collect();
+    addrs.push("::ffff:198.51.100.3".parse().unwrap());
+    let c = check_host("h", &addrs, &net);
+    assert_eq!(c.permitted.len(), MAX_HOST_ADDRS);
+    let want: Vec<std::net::IpAddr> = (1..=16u8)
+        .map(|i| std::net::IpAddr::from([198, 51, 100, i]))
+        .collect();
+    assert_eq!(c.permitted, want);
+    // Answer order does not change the result.
+    addrs.reverse();
+    assert_eq!(check_host("h", &addrs, &net), c);
+}
+
+#[test]
+fn a_malformed_allow_host_entry_is_refused_and_not_rendered() {
+    let p = pool(
+        "p",
+        json!({"network": {"egress": {"allowHosts": ["ok.example.com", "*.example.com", "10.0.0.1"]}}}),
+    );
+    let r = refused_allow_cidrs(&p.spec, &WorkerNetwork::default());
+    let fields: Vec<&str> = r.iter().map(|c| c.field.as_str()).collect();
+    assert_eq!(
+        fields,
+        [
+            "spec.network.egress.allowHosts[1]",
+            "spec.network.egress.allowHosts[2]"
+        ]
+    );
 }

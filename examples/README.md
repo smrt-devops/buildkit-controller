@@ -10,6 +10,7 @@ Every pool example uses the `ci` namespace, which you create first and label for
 | [pool-github-oidc.yaml](pool-github-oidc.yaml) | Access rules for GitHub OIDC claims and a ServiceAccount. |
 | [pool-gitlab-oidc.yaml](pool-gitlab-oidc.yaml) | Access rules for a GitLab or other generic OIDC issuer. |
 | [pool-cache.yaml](pool-cache.yaml) | Cache settings of a pool: who may write the built-in cache (here only pushes to main), and its size. |
+| [pool-private-registry.yaml](pool-private-registry.yaml) | No internet egress, with a private registry and a mirror reached by name through `allowHosts`. |
 | [helm-values.yaml](helm-values.yaml) | Chart values with an OIDC issuer, the API route on a Gateway (or a LoadBalancer Service) and a pool. Builds tunnel through the API, so one hostname and one HTTPS route are enough. |
 | [helm-values-tcp.yaml](helm-values-tcp.yaml) | The same install with a `tcp://` `edge.endpoint`: TLS passthrough for the edge instead of the tunnel, and the only mode the curl recipe supports. |
 | [claim-pod.yaml](claim-pod.yaml) | A `BuildKitClaim` and a pod that runs `buildctl` with the Secret it gets, both in the namespace `apps`. Needs `apps` in `claims.namespaces` and a pool rule `claims: {namespaces: [apps]}`. |

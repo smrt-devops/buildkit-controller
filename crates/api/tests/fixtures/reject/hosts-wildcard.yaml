@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: hosts-wildcard, namespace: default}
+spec:
+  network: {egress: {allowHosts: ["*.example.com"]}}

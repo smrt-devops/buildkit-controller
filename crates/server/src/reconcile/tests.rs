@@ -67,6 +67,7 @@ pub(super) struct Fx {
     pub slot_holds: std::collections::BTreeMap<u32, Timestamp>,
     pub became_ready: std::collections::BTreeSet<String>,
     pub waiting: i32,
+    pub host_problems: Vec<super::plan::HostProblem>,
 }
 
 /// Steady state with min 0, max 10, CA valid, sandbox applied, worker Secret current
@@ -93,6 +94,7 @@ pub(super) fn fx() -> Fx {
         slot_holds: std::collections::BTreeMap::new(),
         became_ready: std::collections::BTreeSet::new(),
         waiting: 0,
+        host_problems: Vec::new(),
     }
 }
 
@@ -145,6 +147,7 @@ impl Fx {
             recent_creates: self.creates.clone(),
             create_backoff_until: self.backoff,
             unknown_issuer: None,
+            host_problems: self.host_problems.clone(),
             foreign_pods: self.foreign.clone(),
             slot_holds: self.slot_holds.clone(),
             became_ready: self.became_ready.clone(),

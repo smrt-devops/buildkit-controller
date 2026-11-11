@@ -1,0 +1,5 @@
+# expect: at '/workerNetwork/permittedHosts/0'
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+workerNetwork:
+  permittedHosts: ["registry.example.com:443"]
+gateway: {enabled: false}

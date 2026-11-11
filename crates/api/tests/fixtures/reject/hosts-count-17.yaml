@@ -1,0 +1,5 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: hosts-count-17, namespace: default}
+spec:
+  network: {egress: {allowHosts: ["h1.example.com", "h2.example.com", "h3.example.com", "h4.example.com", "h5.example.com", "h6.example.com", "h7.example.com", "h8.example.com", "h9.example.com", "h10.example.com", "h11.example.com", "h12.example.com", "h13.example.com", "h14.example.com", "h15.example.com", "h16.example.com", "h17.example.com"]}}

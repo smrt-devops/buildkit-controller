@@ -12,13 +12,15 @@ use k8s_openapi::jiff::{SignedDuration, Timestamp};
 use kube::ResourceExt;
 
 use super::exec::{CaGuard, Env, Report, execute, odt};
+use super::hosts::HostView;
 use super::ops::KubeOps;
 use super::plan::{
-    BackoffSignal, CreateOutcome, Observed, Plan, PlanConfig, Requeue, TemplateCheck, plan,
+    BackoffSignal, CreateOutcome, HostProblem, Observed, Plan, PlanConfig, Requeue, TemplateCheck,
+    plan,
 };
 use super::pods::{WorkerPod, foreign_pod_name};
 use crate::pki::{CaBundle, LoadOutcome};
-use crate::render::{self, RenderConfig};
+use crate::render::{self, HostAddrs, RenderConfig, WorkerNetwork};
 
 /// First create backoff.
 const CREATE_BACKOFF_MIN: SignedDuration = SignedDuration::from_secs(10);
@@ -40,6 +42,8 @@ pub struct PoolMemory {
     recent_creates: Vec<CreateOutcome>,
     /// Generation and time of the last successful sandbox apply.
     sandbox_applied: Option<(i64, Timestamp)>,
+    /// The `allowHosts` addresses that apply rendered. Others apply the sandbox again.
+    applied_hosts: Option<HostAddrs>,
     create_backoff: Option<(Timestamp, SignedDuration)>,
     ready: BTreeSet<String>,
     /// Uids seen up (see [`WorkerPod::up`]) in this term.
@@ -157,6 +161,7 @@ pub async fn ca_pass<O: KubeOps>(
         ca_epoch: ca.epoch,
         ca_secret_name: &settings.ca_secret_name,
         render: &settings.render,
+        hosts: &HostAddrs::new(),
         worker_cert_validity: settings.worker_cert_validity,
         replica: &settings.replica,
         now,
@@ -170,7 +175,8 @@ pub async fn ca_pass<O: KubeOps>(
     execute(ops, guard, &env, &plan).await
 }
 
-/// Runs one pass of `pool`, which has `waiting` pending claims.
+/// Runs one pass of `pool`, which has `waiting` pending claims and whose
+/// `allowHosts` names resolved as `hosts` says.
 #[allow(clippy::too_many_arguments, reason = "the pass's whole input")]
 pub async fn run<O: KubeOps>(
     ops: &O,
@@ -181,6 +187,7 @@ pub async fn run<O: KubeOps>(
     ca: &CaView,
     mem: &mut PoolMemory,
     waiting: i32,
+    hosts: &HostView,
     now: Timestamp,
 ) -> Outcome {
     let loaded = load_ca(ca, now);
@@ -226,10 +233,14 @@ pub async fn run<O: KubeOps>(
         ca: &loaded,
         ca_bundle_current: guard.bundle_current(ca.epoch, now),
         pods,
-        sandbox_applied: mem.sandbox_applied,
+        // Addresses that changed since the last apply apply the policy again.
+        sandbox_applied: mem
+            .sandbox_applied
+            .filter(|_| mem.applied_hosts.as_ref() == Some(&hosts.addrs)),
         recent_creates: std::mem::take(&mut mem.recent_creates),
         create_backoff_until: mem.create_backoff.map(|(t, _)| t),
         unknown_issuer: unknown_issuer(pool, &settings.issuers),
+        host_problems: host_problems(pool, &settings.render.worker_network, hosts),
         foreign_pods: store_pods
             .iter()
             .filter_map(|p| foreign_pod_name(p, &ns, &name, &uid))
@@ -247,11 +258,15 @@ pub async fn run<O: KubeOps>(
         ca_epoch: ca.epoch,
         ca_secret_name: &settings.ca_secret_name,
         render: &settings.render,
+        hosts: &hosts.addrs,
         worker_cert_validity: settings.worker_cert_validity,
         replica: &settings.replica,
         now,
     };
     let report = execute(ops, guard, &env, &plan).await;
+    if report.sandbox_applied {
+        mem.applied_hosts = Some(hosts.addrs.clone());
+    }
     let requeue = remember(mem, pool, &plan, &report, ready_now, now);
     Outcome { report, requeue }
 }
@@ -347,6 +362,30 @@ fn platforms(pool: &BuildKitPool) -> Vec<String> {
         .get("kubernetes.io/arch")
         .map(|a| vec![format!("linux/{a}")])
         .unwrap_or_default()
+}
+
+/// The `allowHosts` names of `pool` that did not resolve, and those whose known
+/// addresses are all refused, in that order.
+fn host_problems(pool: &BuildKitPool, net: &WorkerNetwork, hosts: &HostView) -> Vec<HostProblem> {
+    let names = super::hosts::names(pool);
+    let unresolved = names.iter().filter_map(|n| {
+        hosts.unresolved.get(n).map(|e| HostProblem::Unresolved {
+            name: n.clone(),
+            error: e.clone(),
+        })
+    });
+    let refused = names.iter().filter_map(|n| {
+        let check = render::check_host(n, hosts.addrs.get(n)?, net);
+        let (ip, why) = check
+            .refused
+            .first()
+            .filter(|_| check.permitted.is_empty())?;
+        Some(HostProblem::NotPermitted {
+            name: n.clone(),
+            why: format!("{ip} {why}"),
+        })
+    });
+    unresolved.chain(refused).collect()
 }
 
 fn unknown_issuer(pool: &BuildKitPool, issuers: &[String]) -> Option<String> {

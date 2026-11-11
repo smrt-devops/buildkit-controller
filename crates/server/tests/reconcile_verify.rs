@@ -641,7 +641,9 @@ buildctl --addr unix:///run/user/1000/buildkit/buildkitd.sock build --frontend d
         .await
         .unwrap();
     let want_sa = serde_json::to_value(render::service_account(&p).unwrap()).unwrap();
-    let want_np = serde_json::to_value(render::network_policy(&p, &rc).unwrap()).unwrap();
+    let want_np =
+        serde_json::to_value(render::network_policy(&p, &rc, &render::HostAddrs::new()).unwrap())
+            .unwrap();
     subset(&want_sa, &serde_json::to_value(&sa).unwrap(), "sa").unwrap();
     let have_np = serde_json::to_value(&np).unwrap();
     subset(&want_np, &have_np, "np").unwrap();

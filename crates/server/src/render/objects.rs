@@ -13,12 +13,12 @@ use k8s_openapi::api::networking::v1::{
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
-use buildkit_controller_api::v1alpha1::Internet;
+use buildkit_controller_api::v1alpha1::{Internet, parse_allow_host};
 
 use super::{
-    BUILDKIT_PORT, CONTROLLER, LABEL_MANAGED_BY, LABEL_NAME, LABEL_POOL, PodInputs, REGISTRY_NAME,
-    RenderConfig, RenderError, WorkerNetwork, WorkerTlsPem, owner_ref, pool_identity,
-    worker_object_name, worker_pod_name, worker_secret_name,
+    BUILDKIT_PORT, CONTROLLER, HostAddrs, LABEL_MANAGED_BY, LABEL_NAME, LABEL_POOL, PodInputs,
+    REGISTRY_NAME, RenderConfig, RenderError, WorkerNetwork, WorkerTlsPem, owner_ref,
+    pool_identity, worker_object_name, worker_pod_name, worker_secret_name,
 };
 
 fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -163,15 +163,44 @@ fn cache_rule(cfg: &RenderConfig) -> Option<NetworkPolicyEgressRule> {
     ))
 }
 
+/// One rule per `allowHosts` entry: TCP on its port to the addresses of its name in
+/// `hosts` that [`super::check_host`] permits, each as a `/32` or `/128`. An entry
+/// with no permitted address gets no rule, because a rule with no peers would match
+/// every destination.
+fn host_rules(
+    spec: &buildkit_controller_api::v1alpha1::Egress,
+    net: &WorkerNetwork,
+    hosts: &HostAddrs,
+) -> Vec<NetworkPolicyEgressRule> {
+    spec.allow_hosts
+        .iter()
+        .filter_map(|h| parse_allow_host(h))
+        .filter_map(|h| {
+            let addrs = hosts.get(h.name)?;
+            let permitted = super::check_host(h.name, addrs, net).permitted;
+            let peers: Vec<NetworkPolicyPeer> = permitted
+                .iter()
+                .map(|ip| {
+                    let bits = if ip.is_ipv4() { 32 } else { 128 };
+                    block(&format!("{ip}/{bits}"), None)
+                })
+                .collect();
+            (!peers.is_empty()).then(|| to(peers, Some(vec![port("TCP", i32::from(h.port))])))
+        })
+        .collect()
+}
+
 /// `NetworkPolicy` `<pool>-buildkit-worker`.
 ///
 /// Leaves out every `allowCIDRs` entry [`super::refused_allow_cidr`] refuses, so the
 /// policy never reopens a link-local, metadata, loopback, cluster or extra denied
 /// range. Applied while the pool is `InvalidSpec`, it narrows the policy of
 /// pods that run under an older, wider one.
+/// `hosts` holds the last known addresses of the `allowHosts` names ([`host_rules`]).
 pub fn network_policy(
     pool: &BuildKitPool,
     cfg: &RenderConfig,
+    hosts: &HostAddrs,
 ) -> Result<NetworkPolicy, RenderError> {
     let (name, _, _) = pool_identity(pool)?;
     let net = &cfg.worker_network;
@@ -199,6 +228,7 @@ pub fn network_policy(
             .filter(|c| super::refused_allow_cidr(c, net).is_none())
             .map(|c| to(vec![block(c, None)], None)),
     );
+    egress.extend(host_rules(spec, net, hosts));
 
     Ok(NetworkPolicy {
         metadata: pool_meta(pool)?,

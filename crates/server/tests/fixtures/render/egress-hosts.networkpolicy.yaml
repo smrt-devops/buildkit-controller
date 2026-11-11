@@ -1,0 +1,62 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: buildkit-controller
+    buildkit.smrt-devops.net/pool: egress-hosts
+  name: egress-hosts-buildkit-worker
+  namespace: render-verify
+  ownerReferences:
+  - apiVersion: buildkit.smrt-devops.net/v1alpha1
+    controller: true
+    kind: BuildKitPool
+    name: egress-hosts
+    uid: 2f6c1f4e-3b0a-4c43-9a55-5d4f0c7b1a10
+spec:
+  egress:
+  - ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+    to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+  - ports:
+    - port: 443
+      protocol: TCP
+    to:
+    - ipBlock:
+        cidr: 198.51.100.7/32
+    - ipBlock:
+        cidr: 203.0.113.20/32
+    - ipBlock:
+        cidr: 2001:db8::20/128
+  - ports:
+    - port: 5000
+      protocol: TCP
+    to:
+    - ipBlock:
+        cidr: 10.96.4.2/32
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: buildkit-system
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: buildkit-controller
+    ports:
+    - port: 1234
+      protocol: TCP
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: buildkit-controller
+      buildkit.smrt-devops.net/pool: egress-hosts
+  policyTypes:
+  - Ingress
+  - Egress
