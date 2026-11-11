@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 const https = require('node:https');
+const tls = require('node:tls');
 const { spawn } = require('node:child_process');
 
 /** Split a comma/newline list, trim, drop empties. */
@@ -201,7 +202,7 @@ function request(url, { method = 'GET', headers = {}, body, ca, timeoutMs = 9000
     const lib = u.protocol === 'http:' ? http : https;
     const data = body === undefined ? undefined : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
     const opts = { method, headers: { ...headers }, timeout: timeoutMs };
-    if (ca) opts.ca = ca;
+    if (ca) opts.ca = caOption(ca);
     if (data) opts.headers['Content-Length'] = data.length;
     const req = lib.request(u, opts, (res) => {
       const chunks = [];
@@ -424,17 +425,29 @@ async function allocate(api, { what, ca, getToken, attemptOpts, budgetMs, queueS
   }
 }
 
+/** Marks a CA text that adds to Node's built-in roots instead of replacing them. */
+const WITH_ROOTS = '# with built-in roots\n';
+
+/** The `ca` option for https: a marked text is Node's built-in roots plus the text; any other text replaces the roots. */
+function caOption(ca) {
+  return ca.startsWith(WITH_ROOTS) ? [...tls.rootCertificates, ca] : ca;
+}
+
 /**
- * The CA bundle (PEM text) to trust for the API and the forwarder: the ca-cert input, else the file
- * named by NODE_EXTRA_CA_CERTS, else the one named by SSL_CERT_FILE, else undefined (system roots).
- * A named file that cannot be read is an error naming its variable.
+ * The CA text to trust for the API and the forwarder: the ca-cert input, else the file named by
+ * NODE_EXTRA_CA_CERTS, else the one named by SSL_CERT_FILE, else undefined (system roots). The input
+ * and SSL_CERT_FILE replace the roots; NODE_EXTRA_CA_CERTS adds to them, as it does for Node itself
+ * (the text is marked, see `caOption`). A named file that cannot be read is an error naming its variable.
  */
 function resolveCa(input, env = process.env) {
   if (input) return input;
   for (const name of ['NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE']) {
     const file = env[name];
     if (!file) continue;
-    try { return fs.readFileSync(file, 'utf8'); } catch (e) { throw new Error(`${name} names ${file}, which cannot be read (${e.code || e.message}); set ca-cert or fix ${name}`); }
+    try {
+      const pem = fs.readFileSync(file, 'utf8');
+      return name === 'NODE_EXTRA_CA_CERTS' ? WITH_ROOTS + pem : pem;
+    } catch (e) { throw new Error(`${name} names ${file}, which cannot be read (${e.code || e.message}); set ca-cert or fix ${name}`); }
   }
   return undefined;
 }
@@ -569,6 +582,6 @@ async function fetchOidcToken(audience, setSecret) {
 module.exports = {
   parseList, parsePool, REQUEST_TIMEOUT_MS, postTimeoutMs, isCurrentServer, cachedToken, jwtExpiryMs, FAST_POLL_MS, pollAllocation, allocate, errorCode, parseDuration, generateKey, allocationBody,
   validatePools, buildxCommands, parseCacheInputs, cacheFlags, checkAllocationId, createBuilder, writeMaterial, request, apiError,
-  resolveCa, isTunnelEndpoint, tunnelUrl, startForwarder, stopForwarder, useTunnels,
+  resolveCa, caOption, isTunnelEndpoint, tunnelUrl, startForwarder, stopForwarder, useTunnels,
   effectiveQueueTimeout, retryBudgetMs, SHORT_BUDGET_MS, releaseAllocation, queueTimeoutFor, retryAfterMs, requestWithRetry, fetchOidcToken,
 };

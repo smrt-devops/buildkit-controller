@@ -97,7 +97,7 @@ test('an empty ca-cert falls back to the file in NODE_EXTRA_CA_CERTS, and a miss
   const f = await fixture(t);
   const m = await main({ ...f.env, 'INPUT_CA-CERT': '', NODE_EXTRA_CA_CERTS: f.caFile, INPUT_POOLS: 'ci/a' });
   assert.equal(m.code, 0, m.out);
-  assert.equal(readState(f.env.GITHUB_STATE).ca, require('node:fs').readFileSync(f.caFile, 'utf8'));
+  assert.equal(readState(f.env.GITHUB_STATE).ca, `# with built-in roots\n${require('node:fs').readFileSync(f.caFile, 'utf8')}`);
   const bad = await main({ ...f.env, 'INPUT_CA-CERT': '', SSL_CERT_FILE: '/nonexistent/ca.pem', INPUT_POOLS: 'ci/a' });
   assert.equal(bad.code, 1);
   assert.match(bad.out, /SSL_CERT_FILE names \/nonexistent\/ca\.pem/);

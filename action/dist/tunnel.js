@@ -13,6 +13,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const https = require('node:https');
 const net = require('node:net');
+const { caOption } = require('./lib');
 
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const OP = { CONT: 0, TEXT: 1, BIN: 2, CLOSE: 8, PING: 9, PONG: 10 };
@@ -149,7 +150,7 @@ function openWebSocket(url, { ca, signal, timeoutMs = CONNECT_TIMEOUT_MS } = {})
       timeout: timeoutMs,
       headers: { Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Key': key },
     };
-    if (ca) opts.ca = ca;
+    if (ca) opts.ca = caOption(ca);
     if (signal) opts.signal = signal;
     const req = (secure ? https : http).request(opts);
     req.on('upgrade', (res, socket, head) => {

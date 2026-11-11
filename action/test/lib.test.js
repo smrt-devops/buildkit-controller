@@ -16,10 +16,19 @@ test('resolveCa: input, then NODE_EXTRA_CA_CERTS, then SSL_CERT_FILE, then none'
   fs.writeFileSync(node, 'NODE PEM');
   fs.writeFileSync(ssl, 'SSL PEM');
   assert.equal(L.resolveCa('INPUT PEM', { NODE_EXTRA_CA_CERTS: node, SSL_CERT_FILE: ssl }), 'INPUT PEM');
-  assert.equal(L.resolveCa('', { NODE_EXTRA_CA_CERTS: node, SSL_CERT_FILE: ssl }), 'NODE PEM');
+  assert.equal(L.resolveCa('', { NODE_EXTRA_CA_CERTS: node, SSL_CERT_FILE: ssl }), '# with built-in roots\nNODE PEM');
   assert.equal(L.resolveCa('', { SSL_CERT_FILE: ssl }), 'SSL PEM');
   assert.equal(L.resolveCa('', { NODE_EXTRA_CA_CERTS: '', SSL_CERT_FILE: ssl }), 'SSL PEM');
   assert.equal(L.resolveCa('', {}), undefined);
+});
+
+test('caOption: NODE_EXTRA_CA_CERTS text adds to the built-in roots, other text replaces them', () => {
+  const tls = require('node:tls');
+  assert.equal(L.caOption('INPUT PEM'), 'INPUT PEM');
+  const withRoots = L.caOption(L.resolveCa('', { NODE_EXTRA_CA_CERTS: __filename }));
+  assert.ok(Array.isArray(withRoots));
+  assert.equal(withRoots.length, tls.rootCertificates.length + 1);
+  assert.deepEqual(withRoots.slice(0, -1), tls.rootCertificates, 'public roots stay trusted, so a publicly trusted server still verifies');
 });
 
 test('resolveCa: a named file that is missing is an error naming the variable', () => {
