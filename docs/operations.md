@@ -53,9 +53,9 @@ List the pod, service and node ranges of the cluster in `workerNetwork.clusterCI
 
 ### Named hosts
 
-A pool's `spec.network.egress.allowHosts` lists hosts its workers may reach by name, each `<dns-name>` or `<dns-name>:<port>` (port 443 when left out), at most 16. Use it for a private registry or proxy whose addresses you cannot pin, such as a VPC endpoint or a load balancer. Names are lowercase, with no wildcard and no IP address.
+A pool's `spec.network.egress.allowHosts` lists hosts its workers may reach by name, each `<dns-name>` or `<dns-name>:<port>` (port 443 when left out), at most 16. Use it for a private registry or proxy whose addresses you cannot pin, such as a VPC endpoint or a load balancer. Names are lowercase, with no wildcard and no IP address. The controller looks each name up as an absolute name, so the controller pod's DNS search path never applies: `registry.corp` means that name, never `registry.corp.svc.cluster.local`. Write an in-cluster Service with its full name, such as `registry.corp.svc.cluster.local`.
 
-The leader resolves every name of every pool with the controller pod's resolver every 30 seconds and in each pass of the pool. Each name gets one egress rule: TCP on its port to at most 16 of its addresses, as `/32` and `/128` blocks, sorted. A change of address reaches the policy within 30 seconds, and NetworkPolicy applies to running pods at once. A name behind a large or fast-rotating set of addresses, such as a public object store, does not fit. Its traffic leaves through the internet rule instead.
+The leader resolves every name of every pool with the controller pod's resolver every 30 seconds and in each pass of the pool. Each name gets one egress rule: TCP on its port to at most 16 of its addresses, as `/32` and `/128` blocks, sorted. A change of address reaches the policy of every pool that lists the name within 30 seconds, whichever pool's pass noticed it first, and NetworkPolicy applies to running pods at once. A name behind a large or fast-rotating set of addresses, such as a public object store, does not fit. Its traffic leaves through the internet rule instead.
 
 The controller checks each address the way it checks an `allowCIDRs` entry, with one difference: the operator's consent is per name, in `workerNetwork.permittedHosts`, not per range.
 
@@ -66,7 +66,7 @@ The controller checks each address the way it checks an `allowCIDRs` entry, with
 
 An IPv4-mapped address counts as the IPv4 address. `permittedCIDRs` does not apply to `allowHosts`.
 
-A name that fails to resolve keeps its last known addresses in the policy, and the pool reports `Degraded=True/UnresolvedHost`. A name whose known addresses are all refused gets no rule, and the pool reports `Degraded=True/HostNotPermitted`. In both cases the pool stays Ready. A new leader knows no addresses, so a name that does not resolve after a restart or failover has no rule until it does.
+A name that fails to resolve keeps its last known addresses in the policy, and the pool reports `Degraded=True/UnresolvedHost`. A name whose known addresses are all refused gets no rule, and the pool reports `Degraded=True/HostNotPermitted`. In both cases the pool stays Ready. Known addresses belong to one leadership term. Each term starts with none, after a restart or failover and also when a replica leads again, so a name that does not resolve at the start of a term has no rule until it does. A replica never applies addresses it learnt in an earlier term.
 
 ### Who may write a pool
 

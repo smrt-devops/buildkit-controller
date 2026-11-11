@@ -21,7 +21,7 @@ use tokio::time::Instant;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use super::exec::CaGuard;
-use super::hosts::{self, Hosts, RESOLVE_EVERY, SystemResolver};
+use super::hosts::{self, Hosts, RESOLVE_EVERY, Resolve, SystemResolver};
 use super::metrics::{PodCounts, ReconcileMetrics, TermGauges};
 use super::ops::{KubeClient, Timed};
 use super::pass::{self, CaView, PoolMemory, Settings};
@@ -118,8 +118,8 @@ pub struct Reconciler {
     /// The v0.1.0 cache volumes are gone ([`super::sweep`]). v0.1.0 upgrade
     /// shim: remove in the release after 0.2.0.
     swept: Arc<AtomicBool>,
-    /// Last known `allowHosts` addresses, kept across terms of this process.
-    hosts: Arc<Hosts>,
+    /// Resolves `allowHosts` names. Each term builds its own [`Hosts`] from it.
+    resolver: Arc<dyn Resolve>,
 }
 
 impl Reconciler {
@@ -130,7 +130,7 @@ impl Reconciler {
             metrics: ReconcileMetrics::register(ctx.metrics()),
             ctx: ctx.clone(),
             swept: Arc::default(),
-            hosts: Arc::new(Hosts::new(Arc::new(SystemResolver))),
+            resolver: Arc::new(SystemResolver),
         }
     }
 }
@@ -140,10 +140,16 @@ impl LeaderWork for Reconciler {
         let (ctx, metrics) = (self.ctx.clone(), self.metrics.clone());
         let side = side_work(ctx.clone(), Arc::clone(&self.swept));
         Box::pin(
-            run_term(ctx, metrics, Arc::clone(&self.hosts), side)
+            run_term(ctx, metrics, term_hosts(&self.resolver), side)
                 .instrument(info_span!("reconcile", term)),
         )
     }
+}
+
+/// The `allowHosts` cache of a new leadership term: no addresses, so a replica
+/// that leads again never applies addresses from an earlier term.
+pub(super) fn term_hosts(resolver: &Arc<dyn Resolve>) -> Arc<Hosts> {
+    Arc::new(Hosts::new(Arc::clone(resolver)))
 }
 
 fn settings(ctx: &AppContext) -> Settings {
@@ -303,9 +309,10 @@ async fn run_term(
 }
 
 /// Every [`RESOLVE_EVERY`], resolves the `allowHosts` names of every pool in
-/// the store, forgets names no pool uses, and passes each pool whose names
-/// changed address or resolution state. The lookups run inside the stream, so
-/// passes go on while they wait.
+/// the store and passes each pool whose view differs from the one its latest
+/// pass used ([`Hosts::due`]), so a change another pool's pass noticed first
+/// still reaches every pool that lists the name. The lookups run inside the
+/// stream, so passes go on while they wait.
 fn host_triggers(term: Arc<Term>) -> impl Stream<Item = Trigger> {
     let mut tick = tokio::time::interval(RESOLVE_EVERY);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -326,12 +333,12 @@ fn host_triggers(term: Arc<Term>) -> impl Stream<Item = Trigger> {
             .iter()
             .flat_map(|(_, n)| n.iter().cloned())
             .collect();
-        let changed = term.hosts.refresh(&all).await;
-        term.hosts.retain(&all);
-        let due: Vec<Trigger> = per_pool
+        term.hosts.refresh(&all).await;
+        let due: Vec<Trigger> = term
+            .hosts
+            .due(&per_pool)
             .into_iter()
-            .filter(|(_, n)| !n.is_disjoint(&changed))
-            .map(|(k, _)| Trigger::Pool(k))
+            .map(Trigger::Pool)
             .collect();
         Some((stream::iter(due), (tick, term)))
     })
@@ -393,6 +400,7 @@ async fn pass_once(term: &Term, key: &PoolKey) -> Option<Duration> {
         let names = hosts::names(&pool);
         term.hosts.refresh(&names).await;
         let view = term.hosts.view(&names);
+        term.hosts.passed(key, view.clone());
         let mut mem = lock(&term.memory).remove(key).unwrap_or_default();
         let ca = lock(&term.ca).clone();
         let pods = term.ctx.pods().state();

@@ -65,11 +65,17 @@ pub struct HostView {
     pub unresolved: BTreeMap<String, String>,
 }
 
-/// Last known addresses of every name the leader resolves.
+/// `(namespace, name)` of a pool.
+pub type PoolKey = (String, String);
+
+/// Last known addresses of every name the leader resolves in one leadership
+/// term. A term builds its own, so it starts with no addresses.
 pub struct Hosts {
     resolver: Arc<dyn Resolve>,
     permits: Arc<Semaphore>,
     known: Mutex<BTreeMap<String, Known>>,
+    /// The view each pool's latest pass used.
+    passed: Mutex<BTreeMap<PoolKey, HostView>>,
 }
 
 impl Hosts {
@@ -80,17 +86,17 @@ impl Hosts {
             resolver,
             permits: Arc::new(Semaphore::new(MAX_LOOKUPS)),
             known: Mutex::new(BTreeMap::new()),
+            passed: Mutex::new(BTreeMap::new()),
         }
     }
 
     fn known(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Known>> {
-        self.known.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.known)
     }
 
     /// Resolves each of `names` at once and records the result. A failed lookup
-    /// keeps the name's last known addresses. Returns the names whose addresses
-    /// or failed state changed.
-    pub async fn refresh(&self, names: &BTreeSet<String>) -> BTreeSet<String> {
+    /// keeps the name's last known addresses.
+    pub async fn refresh(&self, names: &BTreeSet<String>) {
         let results = join_all(
             names
                 .iter()
@@ -98,7 +104,6 @@ impl Hosts {
         )
         .await;
         let mut known = self.known();
-        let mut changed = BTreeSet::new();
         for (name, res) in results {
             let old = known.get(name).cloned().unwrap_or_default();
             let new = match res {
@@ -116,11 +121,9 @@ impl Hosts {
             };
             if new.addrs != old.addrs || new.failed.is_some() != old.failed.is_some() {
                 debug!(host = %name, addrs = ?new.addrs, "allowHosts addresses changed");
-                changed.insert(name.clone());
             }
             known.insert(name.clone(), new);
         }
-        changed
     }
 
     /// One lookup, bounded by [`RESOLVE_TIMEOUT`] and [`MAX_LOOKUPS`].
@@ -131,7 +134,8 @@ impl Hosts {
             .await
             .map_err(|_| timeout())?
             .map_err(|e| e.to_string())?;
-        let fut = self.resolver.lookup(name);
+        // Absolute: the controller pod's search path never applies.
+        let fut = self.resolver.lookup(&format!("{name}."));
         // The task keeps the permit until the lookup returns, even past the wait.
         let task = tokio::spawn(async move {
             let res = fut.await;
@@ -171,10 +175,29 @@ impl Hosts {
         v
     }
 
-    /// Forgets every name not in `names`.
-    pub fn retain(&self, names: &BTreeSet<String>) {
-        self.known().retain(|n, _| names.contains(n));
+    /// Records the view the pass of `pool` used.
+    pub fn passed(&self, pool: &PoolKey, view: HostView) {
+        lock(&self.passed).insert(pool.clone(), view);
     }
+
+    /// The pools of `pools` (key and `allowHosts` names) whose view differs from
+    /// the one their latest pass used, whichever pass or tick changed it. Forgets
+    /// the names and pools not in `pools`.
+    pub fn due(&self, pools: &[(PoolKey, BTreeSet<String>)]) -> Vec<PoolKey> {
+        let names: BTreeSet<&String> = pools.iter().flat_map(|(_, n)| n).collect();
+        self.known().retain(|n, _| names.contains(n));
+        let mut passed = lock(&self.passed);
+        passed.retain(|k, _| pools.iter().any(|(p, _)| p == k));
+        pools
+            .iter()
+            .filter(|(k, n)| passed.get(k) != Some(&self.view(n)))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The names of the pool's `allowHosts` entries that parse.
@@ -200,10 +223,12 @@ pub(crate) mod tests {
 
     use super::{Hosts, MAX_LOOKUPS, RESOLVE_TIMEOUT, Resolve};
 
-    /// Answers from a table a test edits; a missing name never answers.
+    /// Answers absolute names from a table a test edits; any other query never
+    /// answers. Records every query.
     #[derive(Default)]
     pub(crate) struct FakeResolver {
         pub answers: Mutex<HashMap<String, Result<Vec<IpAddr>, String>>>,
+        pub queries: Mutex<Vec<String>>,
     }
 
     impl FakeResolver {
@@ -211,13 +236,14 @@ pub(crate) mod tests {
             let a = answer
                 .map(|v| v.iter().map(|s| s.parse().unwrap()).collect())
                 .map_err(str::to_owned);
-            self.answers.lock().unwrap().insert(name.into(), a);
+            self.answers.lock().unwrap().insert(format!("{name}."), a);
         }
     }
 
     impl Resolve for FakeResolver {
         fn lookup(&self, name: &str) -> BoxFuture<'static, std::io::Result<Vec<IpAddr>>> {
             let a = self.answers.lock().unwrap().get(name).cloned();
+            self.queries.lock().unwrap().push(name.to_owned());
             Box::pin(async move {
                 match a {
                     Some(Ok(v)) => Ok(v),
@@ -245,7 +271,7 @@ pub(crate) mod tests {
             "reg.example.com",
             Ok(&["203.0.113.9", "::ffff:203.0.113.9", "2001:db8::9"]),
         );
-        assert_eq!(hosts.refresh(&n).await, n);
+        hosts.refresh(&n).await;
         let v = hosts.view(&n);
         // IPv4-mapped answers fold into their IPv4 address.
         assert_eq!(
@@ -253,11 +279,9 @@ pub(crate) mod tests {
             ips(&["203.0.113.9", "2001:db8::9"])
         );
         assert!(v.unresolved.is_empty());
-        // Unchanged: nothing to report.
-        assert!(hosts.refresh(&n).await.is_empty());
 
         r.set("reg.example.com", Err("NXDOMAIN"));
-        assert_eq!(hosts.refresh(&n).await, n, "turning unresolved is a change");
+        hosts.refresh(&n).await;
         let v = hosts.view(&n);
         assert_eq!(
             v.addrs["reg.example.com"],
@@ -266,16 +290,16 @@ pub(crate) mod tests {
         assert!(v.unresolved["reg.example.com"].contains("NXDOMAIN"));
         // An empty answer is a failure too, and keeps the addresses.
         r.set("reg.example.com", Ok(&[]));
-        assert!(hosts.refresh(&n).await.is_empty());
+        hosts.refresh(&n).await;
         assert_eq!(hosts.view(&n).unresolved["reg.example.com"], "no addresses");
 
         r.set("reg.example.com", Ok(&["203.0.113.10"]));
-        assert_eq!(hosts.refresh(&n).await, n);
+        hosts.refresh(&n).await;
         let v = hosts.view(&n);
         assert_eq!(v.addrs["reg.example.com"], ips(&["203.0.113.10"]));
         assert!(v.unresolved.is_empty());
 
-        hosts.retain(&BTreeSet::new());
+        hosts.due(&[]);
         assert_eq!(hosts.view(&n), super::HostView::default());
     }
 
@@ -301,5 +325,74 @@ pub(crate) mod tests {
         let n = set(&["ok.example.com"]);
         hosts.refresh(&n).await;
         assert!(hosts.view(&n).unresolved["ok.example.com"].contains("timed out"));
+    }
+
+    /// Names go to the resolver as absolute names, so the controller pod's
+    /// search path (`<ns>.svc.cluster.local`, ndots:5) never applies.
+    #[tokio::test]
+    async fn names_are_looked_up_as_absolute() {
+        let r = Arc::new(FakeResolver::default());
+        let hosts = Hosts::new(r.clone());
+        r.set("registry.corp", Ok(&["203.0.113.9"]));
+        let n = set(&["registry.corp"]);
+        hosts.refresh(&n).await;
+        assert_eq!(*r.queries.lock().unwrap(), ["registry.corp."]);
+        assert_eq!(hosts.view(&n).addrs["registry.corp"], ips(&["203.0.113.9"]));
+    }
+
+    /// Pools A and B list one name. A's pass sees the new addresses first; the
+    /// next tick still finds B due, because B's last pass used the old view.
+    #[tokio::test]
+    async fn a_change_another_pool_noticed_first_still_makes_every_pool_due() {
+        let r = Arc::new(FakeResolver::default());
+        let hosts = Hosts::new(r.clone());
+        let n = set(&["reg.example.com"]);
+        let (a, b) = (
+            ("ns".to_owned(), "a".to_owned()),
+            ("ns".to_owned(), "b".to_owned()),
+        );
+        let pools = [(a.clone(), n.clone()), (b.clone(), n.clone())];
+        r.set("reg.example.com", Ok(&["203.0.113.9"]));
+        hosts.refresh(&n).await;
+        hosts.passed(&a, hosts.view(&n));
+        hosts.passed(&b, hosts.view(&n));
+        assert!(hosts.due(&pools).is_empty());
+
+        // A's pass resolves the new address and uses it.
+        r.set("reg.example.com", Ok(&["203.0.113.10"]));
+        hosts.refresh(&n).await;
+        hosts.passed(&a, hosts.view(&n));
+        // The tick resolves again and sees no new change, yet B is due.
+        hosts.refresh(&n).await;
+        assert_eq!(hosts.due(&pools), [b.clone()]);
+        hosts.passed(&b, hosts.view(&n));
+        assert!(hosts.due(&pools).is_empty());
+
+        // A failure another pass noticed first makes B due too.
+        r.set("reg.example.com", Err("SERVFAIL"));
+        hosts.refresh(&n).await;
+        hosts.passed(&a, hosts.view(&n));
+        assert_eq!(hosts.due(&pools), [b]);
+    }
+
+    /// A new leadership term starts with no addresses, whatever an earlier
+    /// term of the same process learnt, even while DNS fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_term_starts_with_no_addresses() {
+        let r = Arc::new(FakeResolver::default());
+        let resolver: Arc<dyn Resolve> = r.clone();
+        let n = set(&["reg.example.com"]);
+        r.set("reg.example.com", Ok(&["203.0.113.9"]));
+        let first = crate::reconcile::driver::term_hosts(&resolver);
+        first.refresh(&n).await;
+        assert!(!first.view(&n).addrs.is_empty());
+        drop(first);
+
+        r.answers.lock().unwrap().clear();
+        let second = crate::reconcile::driver::term_hosts(&resolver);
+        second.refresh(&n).await;
+        let v = second.view(&n);
+        assert!(v.addrs.is_empty(), "{v:?}");
+        assert!(v.unresolved["reg.example.com"].contains("timed out"));
     }
 }

@@ -215,18 +215,7 @@ spec:
                           rule: self.all(c, isCIDR(c) && cidr(c) == cidr(c).masked())
                       allowHosts:
                         default: []
-                        description: >-
-                          Hosts the workers may reach by name, each `<dns-name>` or `<dns-name>:<port>`
-                          (port 443 when left out), for example a private registry behind addresses that
-                          change. The leader resolves each name every 30 seconds and opens TCP on the entry's
-                          port to at most 16 of its addresses. It never opens a link-local, loopback, cloud
-                          metadata or NAT64 local-use address. It opens an address inside
-                          `workerNetwork.clusterCIDRs` or `workerNetwork.extraDeniedCIDRs`, or one the controller cannot
-                          tell from a cluster address while `clusterCIDRs` holds no range of its family, only
-                          when the operator lists the name in `workerNetwork.permittedHosts`. A name that
-                          stops resolving keeps its last known addresses and makes the pool
-                          `Degraded=True/UnresolvedHost`; one that resolves only to refused addresses makes it
-                          `Degraded=True/HostNotPermitted`. Lowercase names only, no wildcard, no IP address.
+                        description: "Hosts the workers may reach by name, each `<dns-name>` or `<dns-name>:<port>` (port 443 when left out), for example a private registry behind addresses that change. The leader resolves each name every 30 seconds and opens TCP on the entry's port to at most 16 of its addresses. It never opens a link-local, loopback, cloud metadata or NAT64 local-use address. It opens an address inside `workerNetwork.clusterCIDRs` or `workerNetwork.extraDeniedCIDRs`, or one the controller cannot tell from a cluster address while `clusterCIDRs` holds no range of its family, only when the operator lists the name in `workerNetwork.permittedHosts`. A name that stops resolving keeps its last known addresses and makes the pool `Degraded=True/UnresolvedHost`; one that resolves only to refused addresses makes it `Degraded=True/HostNotPermitted`. Lowercase names only, no wildcard, no IP address. Each name is looked up as an absolute name, so the controller's DNS search path never applies: write an in-cluster Service with its full name."
                         items:
                           maxLength: 253
                           pattern: >-
