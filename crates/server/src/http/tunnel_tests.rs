@@ -89,7 +89,7 @@ async fn a_text_frame_fails_the_stream() {
 }
 
 #[tokio::test]
-async fn a_message_over_256_kib_fails_the_stream() {
+async fn a_message_over_64_kib_fails_the_stream() {
     let (mut server, mut client) = pair(HOUR).await;
     client
         .send(Message::Binary(Bytes::from(vec![0u8; MAX_MESSAGE])))
@@ -99,7 +99,7 @@ async fn a_message_over_256_kib_fails_the_stream() {
     server
         .read_exact(&mut buf)
         .await
-        .expect("256 KiB is allowed");
+        .expect("64 KiB is allowed");
     client
         .send(Message::Binary(Bytes::from(vec![0u8; MAX_MESSAGE + 1])))
         .await
@@ -110,7 +110,7 @@ async fn a_message_over_256_kib_fails_the_stream() {
 /// The cap counts the fragments of one message together, though each
 /// fragment alone is small.
 #[tokio::test]
-async fn fragments_over_256_kib_in_all_fail_the_stream() {
+async fn fragments_over_64_kib_in_all_fail_the_stream() {
     use tokio_tungstenite::tungstenite::protocol::frame::Frame;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
     let (mut server, mut client) = pair(HOUR).await;

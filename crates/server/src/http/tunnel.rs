@@ -50,11 +50,18 @@ const MISSED_PINGS: u32 = 2;
 /// The largest binary message a client may send, one frame or the sum of its
 /// fragments; a larger one closes the tunnel. tungstenite buffers a whole
 /// message, so this bounds what an unauthenticated tunnel can pin.
-pub const MAX_MESSAGE: usize = 256 * 1024;
+///
+/// A tunnel costs about 200 KiB at worst: the 64 KiB HTTP/2 stream window
+/// (HTTP/1 has the socket buffer instead), one message, and the edge's 64 KiB
+/// copy buffer.
+pub const MAX_MESSAGE: usize = 64 * 1024;
 /// The largest frame the server sends (clients send at most this much too).
 const WRITE_CHUNK: usize = 64 * 1024;
 /// Socket read size, the size of the edge's own copy buffers.
 const READ_BUFFER: usize = 64 * 1024;
+/// What the write buffer holds beyond one full frame: its header (at most 14
+/// bytes) and control frames queued behind it (a ping or pong is under 130).
+const WRITE_SLACK: usize = 1024;
 /// RFC 6455 §1.3.
 const ACCEPT_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -130,11 +137,12 @@ async fn upgrade(State(t): State<Tunnels>, mut req: Request) -> Response {
 
 fn ws_config() -> WebSocketConfig {
     // Writes go out at once; what waits for a slow peer is at most one
-    // `WRITE_CHUNK` frame and control frames, far under the write cap.
+    // `WRITE_CHUNK` frame and control frames. The buffer counts headers, so the
+    // cap is one full frame plus [`WRITE_SLACK`].
     WebSocketConfig::default()
         .read_buffer_size(READ_BUFFER)
         .write_buffer_size(0)
-        .max_write_buffer_size(MAX_MESSAGE)
+        .max_write_buffer_size(WRITE_CHUNK + WRITE_SLACK)
         .max_frame_size(Some(MAX_MESSAGE))
         .max_message_size(Some(MAX_MESSAGE))
 }
