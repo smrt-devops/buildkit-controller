@@ -17,12 +17,8 @@ function listen(srv) {
   return new Promise((r) => srv.listen(0, '127.0.0.1', () => r(srv.address().port)));
 }
 
-/**
- * Controller + OIDC servers. `deny` pools answer 403, `deleteStatus` is the release answer,
- * `dockerFails` makes `docker buildx create` fail, and `override(rec)` may answer a request itself
- * with `{status, headers, body}`, or cut the connection with `{reset: true}`. `calls` records every request.
- */
-async function fixture(t, { deny = [], deleteStatus = 204, dockerFails = false, override } = {}) {
+/** A temp dir (removed after the test) holding a self-signed certificate for 127.0.0.1: {dir, key, crt}. */
+function selfSigned(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bk-test-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const key = path.join(dir, 'k.pem');
@@ -30,6 +26,16 @@ async function fixture(t, { deny = [], deleteStatus = 204, dockerFails = false, 
   const gen = spawnSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
     '-keyout', key, '-out', crt, '-subj', '/CN=localhost', '-addext', 'subjectAltName=IP:127.0.0.1', '-days', '1']);
   assert.equal(gen.status, 0, String(gen.stderr));
+  return { dir, key, crt };
+}
+
+/**
+ * Controller + OIDC servers. `deny` pools answer 403, `deleteStatus` is the release answer,
+ * `dockerFails` makes `docker buildx create` fail, and `override(rec)` may answer a request itself
+ * with `{status, headers, body}`, or cut the connection with `{reset: true}`. `calls` records every request. `endpoint` is what allocations report (a `/` path is the tunnel).
+ */
+async function fixture(t, { deny = [], deleteStatus = 204, dockerFails = false, override, endpoint = 'tcp://e.example:8444' } = {}) {
+  const { dir, key, crt } = selfSigned(t);
   const calls = [];
   let n = 0;
   const api = https.createServer({ key: fs.readFileSync(key), cert: fs.readFileSync(crt) }, (req, res) => {
@@ -56,7 +62,7 @@ async function fixture(t, { deny = [], deleteStatus = 204, dockerFails = false, 
         if (deny.includes(rec.body.pool)) return reply(403, { error: { code: 'forbidden', message: 'no' } });
         n += 1;
         return reply(201, {
-          id: `id${n}${rec.body.pool}`, namespace: 'ci', pool: rec.body.pool, clientCert: 'CERT', endpoint: 'tcp://e.example:8444', serverName: 'e.example',
+          id: `id${n}${rec.body.pool}`, namespace: 'ci', pool: rec.body.pool, clientCert: 'CERT', endpoint, serverName: 'e.example',
         });
       }
       if (req.method === 'DELETE') {
@@ -119,4 +125,4 @@ function readState(file) {
 const deletes = (calls) => calls.filter((c) => c.method === 'DELETE').map((c) => c.url);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-module.exports = { fixture, run, readState, deletes, sleep, skipNoOpenssl, have };
+module.exports = { selfSigned, fixture, run, readState, deletes, sleep, skipNoOpenssl, have };

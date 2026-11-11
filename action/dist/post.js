@@ -13,6 +13,7 @@ async function run() {
   let failed = false;
   try {
     if (builder) spawnSync('docker', ['buildx', 'rm', '--force', builder], { encoding: 'utf8' });
+    try { L.stopForwarder(gha.getState('forwarder')); } catch (e) { gha.warning(`tunnel forwarder: ${e.message}`); }
     if (ids.length) {
       const aud = gha.getState('audience');
       const getToken = L.cachedToken(() => L.fetchOidcToken(aud, gha.setSecret));
