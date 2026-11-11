@@ -675,11 +675,15 @@ impl Store {
     }
 
     /// Stores a manifest and, for a tag, points the tag at it. Every blob it
-    /// references must already be linked in `repo`. The files are written and
-    /// synced before the index lock and only renamed under it.
+    /// references must already be linked in `repo`, or in `fallback`, the
+    /// trusted repository that a branch repository reads through: such a blob
+    /// is then linked into `repo` too, so the branch cache holds everything it
+    /// references. The files are written and synced before the index lock and
+    /// only renamed under it.
     pub async fn put_manifest(
         &self,
         repo: &str,
+        fallback: Option<&str>,
         reference: &Reference,
         media_type: Option<&str>,
         body: &[u8],
@@ -714,14 +718,26 @@ impl Store {
                 places.push(dir.join("_tags").join(t));
             }
             let mut idx = self.index.lock().await;
-            let existing = idx.repos.get(repo);
+            let linked = |idx: &Index, name: Option<&str>, r: &Digest| {
+                name.and_then(|n| idx.repos.get(n))
+                    .is_some_and(|x| x.links.contains_key(r))
+            };
             if let Some(r) = refs.iter().find(|r| {
-                !idx.blobs.contains_key(*r) || !existing.is_some_and(|x| x.links.contains_key(*r))
+                !idx.blobs.contains_key(*r)
+                    || !(linked(&idx, Some(repo), r) || linked(&idx, fallback, r))
             }) {
                 return Err(StoreError::ManifestBlobUnknown(r.clone()));
             }
+            let borrowed: Vec<Digest> = refs
+                .iter()
+                .filter(|r| !linked(&idx, Some(repo), r))
+                .cloned()
+                .collect();
             self.commit(&mut idx, repo, &tmps[0], &d, body.len() as u64)
                 .await?;
+            for r in &borrowed {
+                self.link(&mut idx, repo, r).await?;
+            }
             for (tmp, path) in tmps[1..].iter().zip(&places) {
                 if let Some(parent) = path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
@@ -920,7 +936,7 @@ mod tests {
         let body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
         let tag = Reference::Tag("t".into());
         let d = store
-            .put_manifest("ns/p/app", &tag, None, body)
+            .put_manifest("ns/p/app", None, &tag, None, body)
             .await
             .unwrap();
         store

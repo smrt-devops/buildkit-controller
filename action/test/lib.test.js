@@ -189,6 +189,31 @@ test('cacheFlags: registry flags from responses, mode override, extra refs, dedu
   assert.deepEqual(L.cacheFlags([{}], { from: ['type=gha'] }).args, ['--cache-from=type=gha']);
 });
 
+test('cacheFlags: to and every from entry pass through in order', () => {
+  const br = 'type=registry,ref=h/ns/p/bbbb:app';
+  const sh = 'type=registry,ref=h/ns/p/ssss:app';
+  const to = 'type=registry,ref=h/ns/p/bbbb:app,mode=max,ignore-error=true,oci-mediatypes=true';
+  const a = { cache: { key: 'app', registry: { to, from: [br, sh] } } };
+  assert.deepEqual(L.cacheFlags([a], {}), { to: [to], from: [br, sh], args: [`--cache-from=${br}`, `--cache-from=${sh}`, `--cache-to=${to}`] });
+});
+
+test('cacheNote: a build that writes and a read-only build each say what they may do', () => {
+  const sh = 'type=registry,ref=h/ns/p/ssss:app';
+  const br = 'type=registry,ref=h/ns/p/bbbb:app';
+  const alloc = (registry) => ({ namespace: 'ns', pool: 'p', cache: { key: 'app', registry } });
+  const trusted = alloc({ to: `${sh},mode=max,ignore-error=true,oci-mediatypes=true`, from: [sh] });
+  const branch = alloc({ to: `${br},mode=max,ignore-error=true,oci-mediatypes=true`, from: [br] });
+  const ro = alloc({ from: [sh] });
+  for (const a of [trusted, branch]) {
+    assert.equal(L.cacheAccess(a), 'writes');
+    assert.equal(L.cacheNote(a), "ns/p: cache key app, reads and writes the shared cache if the pool trusts this build, else this branch's own");
+  }
+  assert.equal(L.cacheAccess(ro), 'read-only');
+  assert.equal(L.cacheAccess({}), null);
+  assert.equal(L.cacheNote(ro), 'ns/p: cache key app, read only for this build');
+  assert.equal(L.cacheNote({ namespace: 'ns', pool: 'p' }), null);
+});
+
 test('the current server gets a 40 s POST timeout, v0.1.0 keeps the whole budget', () => {
   const budget = L.retryBudgetMs(300);
   assert.equal(L.isCurrentServer({ queueTimeoutSeconds: 300 }), true);

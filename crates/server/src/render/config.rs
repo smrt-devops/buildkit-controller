@@ -79,6 +79,35 @@ pub fn scope_id(name: &str) -> String {
     sha256_hex(name.as_bytes())[..32].to_owned()
 }
 
+/// The branch scope id of a caller with `git_ref` in the trusted scope named
+/// `trusted`, whose repository identity is `repository`: the first 32 hex
+/// chars of the SHA-256 of a tag and the parts, each prefixed with its length
+/// as 8 big-endian bytes. A caller whose event can run code from forks adds
+/// the event name (`fork_event`) as a last part, under another tag, so it
+/// never shares a branch scope with a build of the same ref from another
+/// event. A part cannot run into the next, and the tags differ in length, so
+/// no ref, repository or event value yields another caller's input. The input
+/// starts with a zero byte and [`scope_id`] hashes JSON text, so the two never
+/// share an input.
+#[must_use]
+pub fn branch_scope_id(
+    trusted: &str,
+    repository: &str,
+    git_ref: &str,
+    fork_event: Option<&str>,
+) -> String {
+    let parts = match fork_event {
+        None => vec!["branch", trusted, repository, git_ref],
+        Some(e) => vec!["fork-branch", trusted, repository, git_ref, e],
+    };
+    let mut input = Vec::new();
+    for part in parts {
+        input.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        input.extend_from_slice(part.as_bytes());
+    }
+    sha256_hex(&input)[..32].to_owned()
+}
+
 /// Whether `s` is a scope id [`scope_id`] could have made: 32 lowercase hex characters.
 #[must_use]
 pub fn is_scope_id(s: &str) -> bool {

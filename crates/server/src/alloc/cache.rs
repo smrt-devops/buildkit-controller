@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use super::pods::ptr;
 use super::pool::rules;
 use crate::auth::Identity;
-use crate::render::{self, ANN_SCOPE, ANN_TIER};
+use crate::render::{self, ANN_BRANCH_SCOPE, ANN_SCOPE, ANN_TIER};
 
 /// GitHub Actions events whose builds may write the cache by default, when
 /// the token's `ref_protected` claim is also true. Not `merge_group`: its
@@ -45,18 +45,23 @@ pub const READ_ONLY_PIPELINE_SOURCES: [&str; 3] = [
 /// The cache of one allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Plan {
-    /// `<host>/<pool-namespace>/<pool>/<scope>`.
-    pub repository: String,
+    /// `<host>/<pool-namespace>/<pool>`.
+    pub base: String,
     /// The tag: the request's `cacheKey`, else the pool name.
     pub key: String,
-    /// The caller's scope id.
+    /// The caller's scope id: every allocation pulls it, a trusted one pushes it.
     pub scope: String,
-    /// Whether the allocation may push.
+    /// Whether the allocation may push its scope.
     pub tier: CacheTier,
+    /// The untrusted caller's own branch scope id, which it pulls first and
+    /// pushes. Never set for a trusted allocation.
+    pub branch: Option<String>,
 }
 
 /// The cache of a claim on `pool`, or `None` when the controller runs no
-/// cache registry (`host`) or the request asked for none.
+/// cache registry (`host`) or the request asked for none. `branch` is kept
+/// only for an untrusted allocation and only when it is a well-formed scope
+/// id other than `scope`.
 pub(super) fn plan(
     host: Option<&str>,
     pool: &BuildKitPool,
@@ -64,47 +69,61 @@ pub(super) fn plan(
     choice: Option<CacheChoice>,
     scope: String,
     tier: CacheTier,
+    branch: Option<String>,
 ) -> Option<Plan> {
     let host = host?;
     if choice == Some(CacheChoice::None) {
         return None;
     }
     let name = pool.name_any();
+    let branch =
+        branch.filter(|b| tier == CacheTier::Untrusted && render::is_scope_id(b) && *b != scope);
     Some(Plan {
-        repository: format!(
-            "{host}/{}/{name}/{scope}",
-            pool.namespace().unwrap_or_default()
-        ),
+        base: format!("{host}/{}/{name}", pool.namespace().unwrap_or_default()),
         key: key.map_or_else(|| name.clone(), |k| k.as_str().to_owned()),
         scope,
         tier,
+        branch,
     })
 }
 
 impl Plan {
-    /// The `201` response's `cache`: `--cache-from` always, `--cache-to` only
-    /// for a trusted allocation. A failed export never fails the build.
+    /// The `201` response's `cache`. Trusted: `--cache-to` and `--cache-from`
+    /// name the scope. Untrusted with a branch scope: both name the branch,
+    /// one source only, because `BuildKit` does not reliably follow cached steps
+    /// across two; the registry answers a read the branch cannot from the
+    /// scope. Untrusted without one: `--cache-from` the scope only. A failed
+    /// export never fails the build.
     pub(super) fn response(&self) -> CacheResponse {
-        let r = format!("{}:{}", self.repository, self.key);
+        let r = |scope: &str| format!("{}/{scope}:{}", self.base, self.key);
+        let to = |r: String| {
+            format!("type=registry,ref={r},mode=max,ignore-error=true,oci-mediatypes=true")
+        };
+        let from = |r: String| format!("type=registry,ref={r}");
+        let (to, from) = match (self.tier, &self.branch) {
+            (CacheTier::Trusted, _) => (Some(to(r(&self.scope))), vec![from(r(&self.scope))]),
+            (CacheTier::Untrusted, Some(b)) => (Some(to(r(b))), vec![from(r(b))]),
+            (CacheTier::Untrusted, None) => (None, vec![from(r(&self.scope))]),
+        };
         CacheResponse {
             key: self.key.clone(),
-            registry: Some(RegistryCacheFlags {
-                to: (self.tier == CacheTier::Trusted).then(|| {
-                    format!("type=registry,ref={r},mode=max,ignore-error=true,oci-mediatypes=true")
-                }),
-                from: vec![format!("type=registry,ref={r}")],
-            }),
+            registry: Some(RegistryCacheFlags { to, from }),
         }
     }
 
-    /// Add `P scope` and `P tier` to a claim patch: the registry reads the
-    /// allocation's rights from the pod.
+    /// Add `P scope`, `P tier` and, with a branch scope, `P branch-scope` to a
+    /// claim patch: the registry reads the allocation's rights from the pod.
     pub(super) fn claim_ops(&self, patch: &mut Value) {
         if let Value::Array(ops) = patch {
             ops.push(
                 json!({"op": "add", "path": ptr("annotations", ANN_SCOPE), "value": self.scope}),
             );
             ops.push(json!({"op": "add", "path": ptr("annotations", ANN_TIER), "value": self.tier.as_str()}));
+            if let Some(b) = &self.branch {
+                ops.push(
+                    json!({"op": "add", "path": ptr("annotations", ANN_BRANCH_SCOPE), "value": b}),
+                );
+            }
         }
     }
 }
@@ -167,6 +186,44 @@ pub fn scope(pool: &BuildKitPool, who: &Identity) -> String {
     render::scope_id(&scope_name(pool.spec.workers.cache.scope, who))
 }
 
+/// The branch scope id of `who` in `pool`: only for an untrusted OIDC caller
+/// with a `ref` claim (`refs/heads/<branch>`, `refs/pull/<n>/merge`, a GitLab
+/// ref), from the pool's scope name, the caller's repository identity (its
+/// scope name under `scope: identity`, so a shared pool scope still keeps
+/// repositories apart), the ref and, for an event that can run code from
+/// forks, the event. Every other caller has none.
+#[must_use]
+pub fn branch_scope(pool: &BuildKitPool, who: &Identity) -> Option<String> {
+    let Identity::Oidc { claims, .. } = who else {
+        return None;
+    };
+    if tier(pool, who) == CacheTier::Trusted {
+        return None;
+    }
+    let git_ref = match claims.get("ref") {
+        Some(Value::String(s)) if !s.is_empty() => s,
+        _ => return None,
+    };
+    Some(render::branch_scope_id(
+        &scope_name(pool.spec.workers.cache.scope, who),
+        &scope_name(CacheScope::Identity, who),
+        git_ref,
+        fork_event(claims).as_deref(),
+    ))
+}
+
+/// The `event_name` in [`READ_ONLY_EVENTS`], or the `pipeline_source` in
+/// [`READ_ONLY_PIPELINE_SOURCES`], of a token whose job can run code from
+/// forks or unreviewed refs.
+fn fork_event(claims: &serde_json::Map<String, Value>) -> Option<String> {
+    claim(claims, "event_name")
+        .filter(|e| READ_ONLY_EVENTS.contains(&e.as_str()))
+        .or_else(|| {
+            claim(claims, "pipeline_source")
+                .filter(|s| READ_ONLY_PIPELINE_SOURCES.contains(&s.as_str()))
+        })
+}
+
 /// Whether `who` may write the cache of `pool`. An OIDC caller whose
 /// `event_name` is one of [`READ_ONLY_EVENTS`], or whose `pipeline_source` is
 /// one of [`READ_ONLY_PIPELINE_SOURCES`], never may. Otherwise, with
@@ -178,10 +235,7 @@ pub fn scope(pool: &BuildKitPool, who: &Identity) -> String {
 /// branch's builds.
 #[must_use]
 pub fn tier(pool: &BuildKitPool, who: &Identity) -> CacheTier {
-    let read_only = matches!(who, Identity::Oidc { claims, .. }
-        if claim(claims, "event_name").is_some_and(|e| READ_ONLY_EVENTS.contains(&e.as_str()))
-            || claim(claims, "pipeline_source")
-                .is_some_and(|s| READ_ONLY_PIPELINE_SOURCES.contains(&s.as_str())));
+    let read_only = matches!(who, Identity::Oidc { claims, .. } if fork_event(claims).is_some());
     let trusted = !read_only
         && match &pool.spec.workers.cache.writers {
             Some(w) => {

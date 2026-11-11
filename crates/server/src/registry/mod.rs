@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 pub use api::{MAX_MANIFEST, Registry, handle};
-pub use auth::{Action, Authorizer, Grant, PeerError, StaticGrants, peer_identity};
+pub use auth::{Action, Authorizer, Grant, PeerError, StaticGrants, Writes, peer_identity};
 pub use config::{RegistryArgs, parse_duration, parse_size};
 pub use gc::{Budgets, FixedBudgets, Reason};
 pub use listener::{Limits, server_config};
