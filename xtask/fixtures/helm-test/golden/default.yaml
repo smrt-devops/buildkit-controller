@@ -109,7 +109,7 @@ data:
       namespaces: []
     edge:
       allocationDomain: ""
-      endpoint: tcp://bk.example.com:8444
+      endpoint: ""
       extraNames: []
       handshakeTimeout: 10s
       maxConnections: 2000
@@ -491,7 +491,7 @@ spec:
         app.kubernetes.io/version: "0.3.0"
         helm.sh/chart: buildkit-controller-0.3.0
       annotations:
-        checksum/config: 2b6883ee0c0a3d939012842603ca8d338b0d2193261f1df5489114e2bf8e3b31
+        checksum/config: d0c97616694ebb6bf8d68120d4f6ef69477d02045a35dd0d7ed14a66a62dab05
     spec:
       serviceAccountName: buildkit-controller
       terminationGracePeriodSeconds: 86715
@@ -686,32 +686,12 @@ spec:
   hostnames:
     - bk.example.com
   rules:
+    - matches: [{path: {type: Exact, value: /v1/tunnel}}]
+      backendRefs:
+        - {name: buildkit-controller, port: 8443}
+      timeouts: {request: 0s, backendRequest: 0s}
     - backendRefs:
         - {name: buildkit-controller, port: 8443}
       timeouts:
         backendRequest: 60s
         request: 60s
-
----
-# Source: buildkit-controller/templates/gateway.yaml
-# The edge is TLS passthrough only: the controller authenticates the client certificate.
-apiVersion: gateway.networking.k8s.io/v1
-kind: TLSRoute
-metadata:
-  name: buildkit-controller-edge
-  namespace: buildkit-system
-  labels:
-    app.kubernetes.io/name: buildkit-controller
-    app.kubernetes.io/instance: bk
-    app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/version: "0.3.0"
-    helm.sh/chart: buildkit-controller-0.3.0
-spec:
-  parentRefs:
-    - name: shared
-      namespace: gateway-system
-  hostnames:
-    - bk.example.com
-  rules:
-    - backendRefs:
-        - {name: buildkit-controller, port: 8444}

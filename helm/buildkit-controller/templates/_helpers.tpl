@@ -35,17 +35,23 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
   {{- $issuers = append $issuers $c -}}
 {{- end -}}
 {{- $fn := include "bkc.fullname" . -}}
-{{- /* Behind a Gateway without PROXY protocol every edge connection comes from the
-       gateway's address, so a per-address handshake cap would evict other clients'
-       handshakes. The chart turns it off. */ -}}
+{{- if and .Values.edge.allocationDomain (empty .Values.edge.endpoint) -}}
+{{- fail "edge.allocationDomain needs a tcp:// edge.endpoint: with an empty endpoint clients tunnel through the API and each allocation gets its own local port, so there is no per-allocation hostname. Unset edge.allocationDomain, or set edge.endpoint to the edge address." -}}
+{{- end -}}
+{{- /* Behind a Gateway without PROXY protocol every connection comes from the gateway's
+       address, so a per-address handshake cap would evict other clients' handshakes. The
+       chart turns it off. The edge route carries edge connections. A tunnel handshake
+       counts against the API connection's address, so with a tunnel the API route and
+       api.proxyProtocol decide. */ -}}
+{{- $plan := include "bkc.gateway" . | fromJson -}}
 {{- $perIp := int .Values.edge.maxHandshakesPerIp -}}
-{{- if and (include "bkc.gateway" . | fromJson).edgeRefs (not .Values.edge.proxyProtocol.enabled) }}{{ $perIp = 0 }}{{ end -}}
+{{- if or (and $plan.edgeRefs (not .Values.edge.proxyProtocol.enabled)) (and $plan.tunnel $plan.apiRefs (not .Values.api.proxyProtocol.enabled)) }}{{ $perIp = 0 }}{{ end -}}
 {{- $cfg := dict
   "listen" (dict "api" "0.0.0.0:8443" "edge" "0.0.0.0:8444" "ops" (printf "0.0.0.0:%d" (int .Values.metrics.port)))
   "pki" (dict "caSecretName" (printf "%s-ca" $fn))
   "leaderElection" (dict "leaseName" (printf "%s-leader" $fn))
   "edge" (dict
-    "endpoint" (required "edge.endpoint is required" .Values.edge.endpoint)
+    "endpoint" .Values.edge.endpoint
     "serverName" (required "edge.serverName is required" .Values.edge.serverName)
     "allocationDomain" .Values.edge.allocationDomain
     "extraNames" .Values.edge.extraNames

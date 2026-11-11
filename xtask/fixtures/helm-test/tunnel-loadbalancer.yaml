@@ -1,0 +1,6 @@
+# A tunnel on a LoadBalancer Service: no route is rendered, and the per-address
+# handshake cap stays on because the load balancer keeps client addresses.
+edge:
+  serverName: bk.example.com
+service:
+  type: LoadBalancer

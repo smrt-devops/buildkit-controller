@@ -300,8 +300,17 @@ jq -r '.caCert // empty' "$D/alloc.json" > "$D/ca.pem"
 OPTS="cert=$D/cert.pem,key=$D/key.pem,servername=$(jq -r .serverName "$D/alloc.json")"
 [ ! -s "$D/ca.pem" ] || OPTS="cacert=$D/ca.pem,$OPTS"
 
+ENDPOINT=$(jq -r .endpoint "$D/alloc.json")
+# A path means the controller serves a tunnel (edge.endpoint empty). buildx dials only tcp:// and
+# unix://, and this script has no forwarder, so stop here; the exit trap releases the allocation.
+case $ENDPOINT in
+  /*)
+    echo "this controller returns the tunnel endpoint $ENDPOINT, which this script cannot use: it needs a tcp:// edge.endpoint until a client binary ships. Use the GitHub Action, or set edge.endpoint on the controller." >&2
+    exit 1 ;;
+esac
+
 docker buildx create --name "$BUILDER" --driver remote --driver-opt "$OPTS" \
-  "$(jq -r .endpoint "$D/alloc.json")" >/dev/null
+  "$ENDPOINT" >/dev/null
 # Cache values hold no spaces, so an unquoted $CACHE_ARGS splits into one word per flag.
 CACHE_ARGS=$(jq -r '[(.cache.registry.from // [])[] | "--cache-from=\(.)"]
   + [.cache.registry.to // empty | "--cache-to=\(.)"] | join(" ")' "$D/alloc.json")

@@ -1,0 +1,4 @@
+# expect: edge.allocationDomain needs a tcp:// edge.endpoint
+# A tunnel gives each allocation its own local port, so a per-allocation domain has no use.
+edge: {serverName: bk.example.com, allocationDomain: alloc.bk.example.com}
+gateway: {parentRefs: [{name: shared, namespace: gateway-system}]}

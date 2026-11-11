@@ -34,10 +34,10 @@
     },
     "edge": {
       "type": "object",
-      "required": ["endpoint", "serverName"],
+      "required": ["serverName"],
       "additionalProperties": false,
       "properties": {
-        "endpoint": {"type": "string", "pattern": "^tcp://(\\[[0-9A-Fa-f:.]+\\]|[^/:\\[\\]]+):[0-9]+$"},
+        "endpoint": {"type": "string", "pattern": "^(tcp://(\\[[0-9A-Fa-f:.]+\\]|[^/:\\[\\]]+):[0-9]+)?$"},
         "serverName": {"type": "string", "pattern": "^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$"},
         "allocationDomain": {"type": "string"},
         "extraNames": {"type": "array", "items": {"type": "string"}},

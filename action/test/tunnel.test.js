@@ -239,7 +239,7 @@ test('an EOF from the server without a close frame ends the local connection', a
   assert.equal(got().toString(), 'bye');
 });
 
-test('local bytes written after the server closed do not cut the tail still queued for the client', async (t) => {
+test('an 8 MiB tail arrives intact under backpressure while the client writes', async (t) => {
   // 8 MiB tail plus a close frame; the client is paused so the tail queues in the forwarder's
   // write buffer, then the client writes after the close has ended the local side.
   const tail = crypto.randomBytes(8 * 1024 * 1024);

@@ -1,13 +1,14 @@
 # Values for: helm install bk helm/buildkit-controller -n buildkit-system -f helm-values.yaml
 replicaCount: 2
 
-# The edge endpoint is the Gateway's TLS passthrough listener.
+# edge.endpoint is empty, so builds tunnel through the API route: one hostname and one HTTPS
+# route are enough. For TLS passthrough instead, see helm-values-tcp.yaml.
 edge:
-  endpoint: tcp://bk.example.com:8444
   serverName: bk.example.com
-  # Behind a gateway every client shares the gateway's addresses, so the per-address
-  # caps apply to all CI jobs together. Size them for the jobs that start at once.
-  maxHandshakesPerIp: 256
+
+# Behind a gateway every client shares the gateway's addresses, so the per-address caps apply
+# to all CI jobs together. Size them for the jobs that start at once. The chart renders
+# edge.maxHandshakesPerIp as 0 here, because a tunnel handshake counts against that address.
 api:
   maxConnectionsPerIp: 1024
 
@@ -24,26 +25,21 @@ auth:
     audiences: [buildkit-controller]
     maxReviewsPerIp: 32
 
-# Routes on the Gateway bk (namespace gateway-system): the API on its HTTPS listener,
-# where the Gateway's certificate is publicly trusted, and the edge on its TLS
-# passthrough listener. See helm/buildkit-controller/README.md#exposure for a Gateway to match.
+# The API route on the Gateway bk (namespace gateway-system), on its HTTPS listener, where
+# the Gateway's certificate is publicly trusted. See helm/buildkit-controller/README.md#exposure
+# for a Gateway to match.
 gateway:
   api:
     parentRefs: [{name: bk, namespace: gateway-system, sectionName: api}]
-  edge:
-    parentRefs: [{name: bk, namespace: gateway-system, sectionName: edge}]
   # envoy: {enabled: true}   # Envoy Gateway only: keepalive and timeout policies
 
-# Without a Gateway with TLS passthrough (GKE's managed Gateway, the AWS Load Balancer
-# Controller), expose the Service instead: drop the gateway block, restore the
-# per-address caps above, and use
+# Without a Gateway, expose the Service instead: drop the gateway block and use
 #
 #   service:
 #     type: LoadBalancer
 #     annotations:
-#       # AWS NLB: keep idle connections open longer than your longest quiet build step.
+#       # AWS NLB: the tunnel pings every 20 s, so any idle timeout above 30 s is enough.
 #       service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-8443: tcp.idle_timeout.seconds=900
-#       service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-8444: tcp.idle_timeout.seconds=900
 
 metrics:
   serviceMonitor:

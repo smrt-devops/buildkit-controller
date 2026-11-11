@@ -1,7 +1,6 @@
-# The default exposure: an HTTPRoute with BackendTLSPolicy for the API and a
-# TLSRoute for the edge, attached to one shared Gateway.
+# The default exposure: an empty edge.endpoint, so clients tunnel through the API.
+# One HTTPRoute with BackendTLSPolicy attached to one shared Gateway, and no edge TLSRoute.
 edge:
-  endpoint: tcp://bk.example.com:8444
   serverName: bk.example.com
 gateway:
   parentRefs: [{name: shared, namespace: gateway-system}]

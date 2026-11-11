@@ -8,7 +8,7 @@
 //! `helm template` runs as if the cluster served the Envoy Gateway kind the chart
 //! renders only when it exists ([`API_VERSIONS`]), so the goldens show it. The
 //! Gateway API routes render with no API version, which the goldens pin too.
-//! It also renders `examples/helm-values.yaml` and checks the NOTES.txt lines in
+//! It also renders the files in [`EXAMPLES`] and checks the NOTES.txt lines in
 //! [`NOTES`].
 
 use std::path::Path;
@@ -19,11 +19,15 @@ use crate::{root, yaml_files};
 
 const CHART: &str = "helm/buildkit-controller";
 const FIXTURES: &str = "xtask/fixtures/helm-test";
+/// Example values files that must render.
+const EXAMPLES: [&str; 2] = ["examples/helm-values.yaml", "examples/helm-values-tcp.yaml"];
 /// Kinds the chart renders only when the cluster serves them.
 const API_VERSIONS: [&str; 1] = ["gateway.envoyproxy.io/v1alpha1/BackendTrafficPolicy"];
 
 /// A NOTES.txt line, whether the install notes of the fixture must show it, and the fixture.
-const NOTES: [(&str, bool, &str); 2] = [
+const NOTES: [(&str, bool, &str); 4] = [
+    ("Builds tunnel through the API", true, "default"),
+    ("Builds tunnel through the API", false, "gateway-tcp-edge"),
     ("workerNetwork.clusterCIDRs is empty", true, "default"),
     ("workerNetwork.clusterCIDRs is empty", false, "all-options"),
 ];
@@ -120,16 +124,17 @@ pub(crate) fn helm_test(update: bool) -> Result<()> {
             passed += 1;
         }
     }
-    let example = root.join("examples/helm-values.yaml");
-    let out = helm(&root, "template", &example)?;
-    if out.status.success() {
-        println!("PASS examples/helm-values");
-        passed += 1;
-    } else {
-        failures.push(format!(
-            "examples/helm-values.yaml: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
+    for example in EXAMPLES {
+        let out = helm(&root, "template", &root.join(example))?;
+        if out.status.success() {
+            println!("PASS {}", example.trim_end_matches(".yaml"));
+            passed += 1;
+        } else {
+            failures.push(format!(
+                "{example}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
     }
     for values in yaml_files(&dir.join("invalid"))? {
         let name = values
