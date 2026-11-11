@@ -114,6 +114,30 @@ function cacheFlags(allocs, { mode, from: extra = [] } = {}) {
   return { to, from, args };
 }
 
+/**
+ * What one allocation may do with the cache, for the log line: 'writes' reads and
+ * writes one cache, which is the shared cache for a trusted build and the branch's
+ * own for any other (the response looks the same for both; the registry reads the
+ * shared cache for a branch that lacks a step), 'read-only' only reads. `null`
+ * without registry flags.
+ */
+function cacheAccess(alloc) {
+  const reg = alloc && alloc.cache && alloc.cache.registry;
+  if (!reg) return null;
+  return reg.to ? 'writes' : 'read-only';
+}
+
+const CACHE_NOTES = {
+  writes: "reads and writes the shared cache if the pool trusts this build, else this branch's own",
+  'read-only': 'read only for this build',
+};
+
+/** The log line for `alloc`'s cache, or `null` without registry flags. */
+function cacheNote(alloc) {
+  const access = cacheAccess(alloc);
+  return access && `${alloc.namespace}/${alloc.pool}: cache key ${alloc.cache.key}, ${CACHE_NOTES[access]}`;
+}
+
 
 /**
  * Check the GET /v1/pools answer against the wanted pools (api.md, Clients).
@@ -581,7 +605,7 @@ async function fetchOidcToken(audience, setSecret) {
 
 module.exports = {
   parseList, parsePool, REQUEST_TIMEOUT_MS, postTimeoutMs, isCurrentServer, cachedToken, jwtExpiryMs, FAST_POLL_MS, pollAllocation, allocate, errorCode, parseDuration, generateKey, allocationBody,
-  validatePools, buildxCommands, parseCacheInputs, cacheFlags, checkAllocationId, createBuilder, writeMaterial, request, apiError,
+  validatePools, buildxCommands, parseCacheInputs, cacheFlags, cacheAccess, cacheNote, checkAllocationId, createBuilder, writeMaterial, request, apiError,
   resolveCa, caOption, isTunnelEndpoint, tunnelUrl, startForwarder, stopForwarder, useTunnels,
   effectiveQueueTimeout, retryBudgetMs, SHORT_BUDGET_MS, releaseAllocation, queueTimeoutFor, retryAfterMs, requestWithRetry, fetchOidcToken,
 };

@@ -18,9 +18,10 @@ spec:
           claims:
             namespace_id: "1234"   # the group's numeric id
             ref_protected: "true"
-  # A GitLab token has no event_name, so no GitLab job writes the cache until a
-  # writers rule matches it. Merge request, external pull request and child
-  # pipelines only read, whatever these rules say.
+  # A GitLab token has no event_name, so no GitLab job writes the shared cache
+  # until a writers rule matches it. Merge request, external pull request and
+  # child pipelines never write it, whatever these rules say. A job that does
+  # not write it writes the cache of its own ref instead.
   workers:
     cache:
       writers:

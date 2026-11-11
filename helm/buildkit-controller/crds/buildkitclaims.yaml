@@ -155,7 +155,9 @@ spec:
                           type: string
                         type: array
                       to:
-                        description: "`--cache-to` value. Absent when the caller may only read the cache."
+                        description: |-
+                          `--cache-to` value: the shared cache for a trusted caller, else its branch
+                          cache. Absent when the caller may only read the cache.
                         nullable: true
                         type: string
                     required:

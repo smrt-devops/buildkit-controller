@@ -484,15 +484,17 @@ pub struct Cache {
     /// namespace. `pool` gives every caller the pool admits one cache, so use it only
     /// when they are one trust domain.
     pub scope: CacheScope,
-    /// Callers whose builds may write the cache, in the syntax of `access.rules`; the
-    /// rest only read it. Unset trusts every `ServiceAccount` and `BuildKitClaim` caller,
+    /// Callers whose builds may write the scope's shared cache, in the syntax of
+    /// `access.rules`. The others read it. An OIDC caller among them whose token has a
+    /// `ref` claim also reads and writes a cache of its own ref (and, for the events
+    /// below, its event), and reads the shared cache for what that one lacks. Unset trusts every `ServiceAccount` and `BuildKitClaim` caller,
     /// and OIDC tokens whose `event_name` claim is `push`, `schedule` or
     /// `workflow_dispatch` and whose `ref_protected` claim is `true`. `[]` trusts nobody.
     /// A token whose `event_name` is `pull_request`, `pull_request_target`,
     /// `workflow_run`, `issue_comment`, `pull_request_review`,
     /// `pull_request_review_comment`, `deployment` or `deployment_status`, or whose GitLab
     /// `pipeline_source` is `merge_request_event`, `external_pull_request_event` or
-    /// `parent_pipeline`, only reads, whatever these rules say, since those jobs can run
+    /// `parent_pipeline`, never writes the shared cache, whatever these rules say, since those jobs can run
     /// code from forks or unreviewed refs. Pin `event_name` and `ref_protected: "true"` in
     /// OIDC rules here (GitLab: `ref_protected` and `pipeline_source`) rather than
     /// matching on the repository alone.

@@ -67,7 +67,8 @@ pub struct CacheResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RegistryCacheFlags {
-    /// `--cache-to` value. Absent when the caller may only read the cache.
+    /// `--cache-to` value: the shared cache for a trusted caller, else its branch
+    /// cache. Absent when the caller may only read the cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
     /// `--cache-from` values, in order.
