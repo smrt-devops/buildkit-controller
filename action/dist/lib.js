@@ -449,7 +449,10 @@ function tunnelUrl(api, endpoint) {
 function startForwarder({ urls, ca, timeoutMs = 10000, script = path.join(__dirname, 'tunnel.js') }) {
   return new Promise((resolve, reject) => {
     const args = [script, ...urls.flatMap((u) => ['--url', u])];
-    const child = spawn(process.execPath, args, { detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { BUILDKIT_TUNNEL_CA: ca || '' } });
+    // The tracking id is not a secret; a self-hosted runner's orphan cleanup finds the process by it.
+    const env = { BUILDKIT_TUNNEL_CA: ca || '' };
+    if (process.env.RUNNER_TRACKING_ID) env.RUNNER_TRACKING_ID = process.env.RUNNER_TRACKING_ID;
+    const child = spawn(process.execPath, args, { detached: true, stdio: ['ignore', 'pipe', 'pipe'], env });
     let out = '';
     let err = '';
     let settled = false;
