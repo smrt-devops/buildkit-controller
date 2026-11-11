@@ -364,7 +364,7 @@ pub(crate) mod tests {
         hosts.passed(&a, hosts.view(&n));
         // The tick resolves again and sees no new change, yet B is due.
         hosts.refresh(&n).await;
-        assert_eq!(hosts.due(&pools), [b.clone()]);
+        assert_eq!(hosts.due(&pools), std::slice::from_ref(&b));
         hosts.passed(&b, hosts.view(&n));
         assert!(hosts.due(&pools).is_empty());
 
