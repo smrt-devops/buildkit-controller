@@ -1,0 +1,5 @@
+# expect: service.ports.edge must be 8444
+edge: {serverName: bk.example.com}
+service: {ports: {edge: 9444}}
+claims: {namespaces: [ci]}
+gateway: {enabled: false}
