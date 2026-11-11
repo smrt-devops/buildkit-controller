@@ -252,6 +252,8 @@ fn write_or_check(rel: &str, want: &str, check: bool) -> Result<()> {
 
 /// Repository-relative directory of the `crd-verify` fixtures.
 const FIXTURES: &str = "crates/api/tests/fixtures";
+/// The rendered `NetworkPolicy` of the render scenario with `allowHosts`.
+const HOSTS_POLICY: &str = "crates/server/tests/fixtures/render/egress-hosts.networkpolicy.yaml";
 
 pub(crate) fn yaml_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -313,6 +315,22 @@ fn crd_verify() -> Result<()> {
                 failed.push(format!("{dir}/{name}: {why}"));
             }
         }
+    }
+    // The rendered policy of a pool with `allowHosts` (one rule of /32 and /128
+    // ipBlocks per name), which a unit test keeps equal to the renderer's output.
+    cluster.namespace(buildkit_controller::render::fixtures::POOL_NAMESPACE)?;
+    let np = root.join(HOSTS_POLICY).to_string_lossy().into_owned();
+    let out = cluster.kubectl_raw(
+        &["apply", "--dry-run=server", "--validate=strict", "-f", &np],
+        None,
+    )?;
+    if out.status.success() {
+        println!("PASS {HOSTS_POLICY} -> admitted");
+        passed += 1;
+    } else {
+        let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        println!("FAIL {HOSTS_POLICY} -> rejected: {why}");
+        failed.push(format!("{HOSTS_POLICY}: {why}"));
     }
     println!("crd-verify: {passed} passed, {} failed", failed.len());
     if !failed.is_empty() {

@@ -107,6 +107,10 @@ workerNetwork:
   # loopback, clusterCIDRs or extraDeniedCIDRs. An allowCIDRs entry passes only
   # inside one of these. Never 0.0.0.0/0 or ::/0.
   permittedCIDRs: []
+  # Names a pool's allowHosts may resolve into clusterCIDRs or extraDeniedCIDRs (or into
+  # a family clusterCIDRs does not cover). Exact lowercase names, no port. Link-local,
+  # loopback, metadata and NAT64 local-use addresses stay closed whatever this says.
+  permittedHosts: []
   dns:
     namespace: kube-system
     podLabels: {k8s-app: kube-dns}

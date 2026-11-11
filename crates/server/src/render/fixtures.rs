@@ -7,8 +7,8 @@ use buildkit_controller_api::v1alpha1::{BuildKitPool, BuildKitPoolSpec};
 use serde_json::{Value, json};
 
 use super::{
-    PodInputs, RenderConfig, RenderError, WorkerNetwork, WorkerTlsPem, ca_bundle_config_map,
-    network_policy, service_account, worker_pod, worker_secret,
+    HostAddrs, PodInputs, RenderConfig, RenderError, WorkerNetwork, WorkerTlsPem,
+    ca_bundle_config_map, network_policy, service_account, worker_pod, worker_secret,
 };
 
 /// Namespace the pools of every scenario live in.
@@ -46,6 +46,8 @@ pub struct Scenario {
     pub inputs: PodInputs,
     /// Controller settings.
     pub config: RenderConfig,
+    /// Last known addresses of the `allowHosts` names.
+    pub hosts: HostAddrs,
 }
 
 /// A pool named `name` in [`POOL_NAMESPACE`] with the given spec fields.
@@ -88,6 +90,7 @@ fn scenario(name: &'static str, spec: Value) -> Result<Scenario, FixtureError> {
         pool: pool(name, spec)?,
         inputs: default_inputs(),
         config: default_config(),
+        hosts: HostAddrs::new(),
     })
 }
 
@@ -243,7 +246,10 @@ pub fn render_scenario(s: &Scenario) -> Result<Vec<(&'static str, String)>, Fixt
             )?)?,
         ),
         ("serviceaccount", yaml(&service_account(&s.pool)?)?),
-        ("networkpolicy", yaml(&network_policy(&s.pool, &s.config)?)?),
+        (
+            "networkpolicy",
+            yaml(&network_policy(&s.pool, &s.config, &s.hosts)?)?,
+        ),
     ])
 }
 
@@ -255,6 +261,7 @@ pub fn render_all() -> Result<BTreeMap<String, String>, FixtureError> {
             out.insert(format!("{}.{kind}.yaml", s.name), y);
         }
     }
+    out.insert(HOSTS_POLICY_FIXTURE.into(), hosts_policy()?);
     out.insert(
         "ca-bundle.configmap.yaml".into(),
         yaml(&ca_bundle_config_map(
@@ -264,4 +271,42 @@ pub fn render_all() -> Result<BTreeMap<String, String>, FixtureError> {
         ))?,
     );
     Ok(out)
+}
+
+/// Name of the [`hosts_policy`] fixture.
+pub const HOSTS_POLICY_FIXTURE: &str = "egress-hosts.networkpolicy.yaml";
+
+/// The `NetworkPolicy` of a pool with `allowHosts`, the only object those
+/// change: one public name on the default port, and one private name the
+/// operator permits, on its own port, whose IPv4-mapped duplicate and metadata
+/// address are rendered neither twice nor at all.
+pub fn hosts_policy() -> Result<String, FixtureError> {
+    let mut s = scenario(
+        "egress-hosts",
+        json!({"network": {"egress": {"internet": "Deny",
+            "allowHosts": ["registry.example.com", "mirror.corp.internal:5000"]}}}),
+    )?;
+    s.config.worker_network.cluster_cidrs = vec!["10.96.0.0/12".into(), "fd00:10:96::/108".into()];
+    s.config.worker_network.permitted_hosts = vec!["mirror.corp.internal".into()];
+    let v4 = |a: [u8; 4]| std::net::IpAddr::from(a);
+    let mirror = std::net::Ipv4Addr::new(10, 96, 4, 2);
+    s.hosts = HostAddrs::from([
+        (
+            "registry.example.com".into(),
+            vec![
+                v4([203, 0, 113, 20]),
+                std::net::IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x20]),
+                v4([198, 51, 100, 7]),
+            ],
+        ),
+        (
+            "mirror.corp.internal".into(),
+            vec![
+                mirror.into(),
+                mirror.to_ipv6_mapped().into(),
+                v4([169, 254, 169, 254]),
+            ],
+        ),
+    ]);
+    yaml(&network_policy(&s.pool, &s.config, &s.hosts)?)
 }

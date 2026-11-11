@@ -352,6 +352,27 @@ fn worker_network_cidrs_must_be_canonical_strict_subsets() {
 }
 
 #[test]
+fn permitted_hosts_must_be_plain_dns_names() {
+    let v = errs(&format!(
+        "{MIN}workerNetwork:\n  permittedHosts: ['Reg.example.com', 'reg.example.com:443', '*.example.com', '10.0.0.1']\n"
+    ));
+    assert_eq!(v.len(), 4, "{v:?}");
+    assert!(
+        v.iter()
+            .all(|m| m.starts_with("workerNetwork.permittedHosts: ")),
+        "{v:?}"
+    );
+    let ok = Config::from_yaml(&format!(
+        "{MIN}workerNetwork:\n  permittedHosts: [mirror.corp.internal]\n"
+    ))
+    .unwrap();
+    assert_eq!(
+        ok.render_config("ns").worker_network.permitted_hosts,
+        vec!["mirror.corp.internal"]
+    );
+}
+
+#[test]
 fn permitted_cidrs_must_be_canonical_and_not_a_whole_family() {
     let v = errs(&format!(
         "{MIN}workerNetwork:\n  permittedCIDRs: ['10.0.0.1/8', '0.0.0.0/0', '::/0']\n"

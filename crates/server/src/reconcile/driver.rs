@@ -21,6 +21,7 @@ use tokio::time::Instant;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use super::exec::CaGuard;
+use super::hosts::{self, Hosts, RESOLVE_EVERY, SystemResolver};
 use super::metrics::{PodCounts, ReconcileMetrics, TermGauges};
 use super::ops::{KubeClient, Timed};
 use super::pass::{self, CaView, PoolMemory, Settings};
@@ -117,6 +118,8 @@ pub struct Reconciler {
     /// The v0.1.0 cache volumes are gone ([`super::sweep`]). v0.1.0 upgrade
     /// shim: remove in the release after 0.2.0.
     swept: Arc<AtomicBool>,
+    /// Last known `allowHosts` addresses, kept across terms of this process.
+    hosts: Arc<Hosts>,
 }
 
 impl Reconciler {
@@ -127,6 +130,7 @@ impl Reconciler {
             metrics: ReconcileMetrics::register(ctx.metrics()),
             ctx: ctx.clone(),
             swept: Arc::default(),
+            hosts: Arc::new(Hosts::new(Arc::new(SystemResolver))),
         }
     }
 }
@@ -135,7 +139,10 @@ impl LeaderWork for Reconciler {
     fn run(&self, term: u64) -> BoxFut {
         let (ctx, metrics) = (self.ctx.clone(), self.metrics.clone());
         let side = side_work(ctx.clone(), Arc::clone(&self.swept));
-        Box::pin(run_term(ctx, metrics, side).instrument(info_span!("reconcile", term)))
+        Box::pin(
+            run_term(ctx, metrics, Arc::clone(&self.hosts), side)
+                .instrument(info_span!("reconcile", term)),
+        )
     }
 }
 
@@ -171,13 +178,20 @@ struct Term {
     metrics: ReconcileMetrics,
     /// Namespaces whose claims are served.
     served: HashSet<String>,
+    /// `allowHosts` addresses.
+    hosts: Arc<Hosts>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-async fn run_term(ctx: AppContext, metrics: ReconcileMetrics, side: impl Future<Output = ()>) {
+async fn run_term(
+    ctx: AppContext,
+    metrics: ReconcileMetrics,
+    hosts: Arc<Hosts>,
+    side: impl Future<Output = ()>,
+) {
     info!("reconciler started");
     let _gauges = TermGauges(metrics.clone());
     let client: Client = ctx.client();
@@ -249,6 +263,7 @@ async fn run_term(ctx: AppContext, metrics: ReconcileMetrics, side: impl Future<
         memory: Mutex::new(HashMap::new()),
         metrics,
         served: ctx.config().served_claim_namespaces(ctx.namespace()),
+        hosts,
         ctx: ctx.clone(),
     });
     let ca_triggers = stream::unfold((ca_rx, Arc::clone(&term)), |(mut rx, term)| async move {
@@ -262,10 +277,11 @@ async fn run_term(ctx: AppContext, metrics: ReconcileMetrics, side: impl Future<
         Some((Trigger::All, (rx, term)))
     });
 
+    let host_triggers = host_triggers(Arc::clone(&term));
     // The CA pass runs once at leadership start, then with every `All`.
     let triggers = stream::once(std::future::ready(Trigger::Pool(ca_key()))).chain(stream::select(
         stream::select(pool_triggers, pod_triggers),
-        stream::select(ca_triggers, claim_triggers),
+        stream::select(ca_triggers, stream::select(claim_triggers, host_triggers)),
     ));
     let all = {
         let term = Arc::clone(&term);
@@ -284,6 +300,42 @@ async fn run_term(ctx: AppContext, metrics: ReconcileMetrics, side: impl Future<
         () = side => {}
     }
     info!("reconciler stopped: watches ended");
+}
+
+/// Every [`RESOLVE_EVERY`], resolves the `allowHosts` names of every pool in
+/// the store, forgets names no pool uses, and passes each pool whose names
+/// changed address or resolution state. The lookups run inside the stream, so
+/// passes go on while they wait.
+fn host_triggers(term: Arc<Term>) -> impl Stream<Item = Trigger> {
+    let mut tick = tokio::time::interval(RESOLVE_EVERY);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    stream::unfold((tick, term), |(mut tick, term)| async move {
+        tick.tick().await;
+        let pools = term.pools.state();
+        let per_pool: Vec<(PoolKey, BTreeSet<String>)> = pools
+            .iter()
+            .map(|p| {
+                (
+                    (p.namespace().unwrap_or_default(), p.name_any()),
+                    hosts::names(p),
+                )
+            })
+            .filter(|(_, n)| !n.is_empty())
+            .collect();
+        let all: BTreeSet<String> = per_pool
+            .iter()
+            .flat_map(|(_, n)| n.iter().cloned())
+            .collect();
+        let changed = term.hosts.refresh(&all).await;
+        term.hosts.retain(&all);
+        let due: Vec<Trigger> = per_pool
+            .into_iter()
+            .filter(|(_, n)| !n.is_disjoint(&changed))
+            .map(|(k, _)| Trigger::Pool(k))
+            .collect();
+        Some((stream::iter(due), (tick, term)))
+    })
+    .flatten()
 }
 
 /// Leader work beside the passes: the sweep of v0.1.0 cache volumes, once per
@@ -338,6 +390,9 @@ async fn pass_once(term: &Term, key: &PoolKey) -> Option<Duration> {
     let span = info_span!("reconcile", namespace = %key.0, pool = %key.1);
     async {
         let started = std::time::Instant::now();
+        let names = hosts::names(&pool);
+        term.hosts.refresh(&names).await;
+        let view = term.hosts.view(&names);
         let mut mem = lock(&term.memory).remove(key).unwrap_or_default();
         let ca = lock(&term.ca).clone();
         let pods = term.ctx.pods().state();
@@ -354,6 +409,7 @@ async fn pass_once(term: &Term, key: &PoolKey) -> Option<Duration> {
             &ca,
             &mut mem,
             waiting,
+            &view,
             Timestamp::now(),
         ))
         .await;

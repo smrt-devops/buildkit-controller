@@ -51,6 +51,23 @@ A refused entry makes the pool report `Ready=False/InvalidSpec` naming the entry
 
 List the pod, service and node ranges of the cluster in `workerNetwork.clusterCIDRs` so no pool can open them. To let pools open one of these ranges anyway, for example a NodeLocal DNSCache address or an in-cluster proxy's service IP, list it in `workerNetwork.permittedCIDRs`. An entry passes only when one permitted range holds all of it, so permit the narrowest range that works. `permittedCIDRs` never permits 0.0.0.0/0 or ::/0, and the controller refuses to start with either in the list.
 
+### Named hosts
+
+A pool's `spec.network.egress.allowHosts` lists hosts its workers may reach by name, each `<dns-name>` or `<dns-name>:<port>` (port 443 when left out), at most 16. Use it for a private registry or proxy whose addresses you cannot pin, such as a VPC endpoint or a load balancer. Names are lowercase, with no wildcard and no IP address.
+
+The leader resolves every name of every pool with the controller pod's resolver every 30 seconds and in each pass of the pool. Each name gets one egress rule: TCP on its port to at most 16 of its addresses, as `/32` and `/128` blocks, sorted. A change of address reaches the policy within 30 seconds, and NetworkPolicy applies to running pods at once. A name behind a large or fast-rotating set of addresses, such as a public object store, does not fit. Its traffic leaves through the internet rule instead.
+
+The controller checks each address the way it checks an `allowCIDRs` entry, with one difference: the operator's consent is per name, in `workerNetwork.permittedHosts`, not per range.
+
+- A link-local, loopback, metadata, NAT64 local-use or unspecified address is never opened, whatever `permittedHosts` says.
+- An address inside `workerNetwork.clusterCIDRs` or `workerNetwork.extraDeniedCIDRs` is opened only when `permittedHosts` lists the name exactly. Without that check a pool could name the API server's Service.
+- While `clusterCIDRs` holds no range of an address's family, an IPv6 address, or an IPv4 address inside `deniedCIDRs`, also needs the name in `permittedHosts`.
+- Other addresses need no permission.
+
+An IPv4-mapped address counts as the IPv4 address. `permittedCIDRs` does not apply to `allowHosts`.
+
+A name that fails to resolve keeps its last known addresses in the policy, and the pool reports `Degraded=True/UnresolvedHost`. A name whose known addresses are all refused gets no rule, and the pool reports `Degraded=True/HostNotPermitted`. In both cases the pool stays Ready. A new leader knows no addresses, so a name that does not resolve after a restart or failover has no rule until it does.
+
 ### Who may write a pool
 
 A pool author is as trusted as anyone who can create pods in the pool's namespace. The pod template reaches past the controller in three ways:
@@ -341,6 +358,8 @@ kubectl get bkp -n ci <pool> -o jsonpath='{range .status.conditions[*]}{.type}={
 | `Degraded=True/PodStartTimeout` | A pod that never became Ready was not Ready within `workers.startTimeout`. | Check scheduling, image pull and node resources. Raise `startTimeout` for slow image pulls. A free pod that was Ready and then stayed unready for `startTimeout` is replaced without `Degraded`. |
 | `Degraded=True/PodFailed` | A pod ended in phase `Failed` or `Succeeded`. | Read the pod's logs. |
 | `Degraded=True/UnknownIssuer` | An `oidc` rule names an issuer that is not in `auth.oidc`. | Match `issuer` to the Helm `auth.oidc[].url` byte for byte, or add the issuer. The rule never matches until you do. |
+| `Degraded=True/HostNotPermitted` | Every known address of an `allowHosts` name is refused ([Named hosts](#named-hosts)). The pool stays Ready. | Point the name at an allowed address, or have the operator list it in `workerNetwork.permittedHosts`. |
+| `Degraded=True/UnresolvedHost` | An `allowHosts` name did not resolve in the leader's latest lookup. Its last known addresses stay in the policy. The pool stays Ready. | Check the name and the controller's DNS. It clears on the next lookup that succeeds, within 30 seconds. |
 | `Degraded=True/SlotTaken` | A pod named `<pool>-<n>` exists that the pool does not own. | Delete or rename it. |
 | `Degraded=True/CAReplaced` | The CA was replaced and old pods remain. | Clears when the old pods retire. |
 | `CAExpiringSoon=True` | A CA expires within a year. | Rotate as described above. |

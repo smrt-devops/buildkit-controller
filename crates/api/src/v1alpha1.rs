@@ -559,6 +559,69 @@ pub struct Egress {
         inner(length(max = 64))
     )]
     pub allow_cidrs: Vec<String>,
+    /// Hosts the workers may reach by name, each `<dns-name>` or `<dns-name>:<port>` (port 443 when left out), for example a private registry behind addresses that change. The leader resolves each name every 30 seconds and opens TCP on the entry's port to at most 16 of its addresses. It never opens a link-local, loopback, cloud metadata or NAT64 local-use address. It opens an address inside `workerNetwork.clusterCIDRs` or `workerNetwork.extraDeniedCIDRs`, or one the controller cannot tell from a cluster address while `clusterCIDRs` holds no range of its family, only when the operator lists the name in `workerNetwork.permittedHosts`. A name that stops resolving keeps its last known addresses and makes the pool `Degraded=True/UnresolvedHost`; one that resolves only to refused addresses makes it `Degraded=True/HostNotPermitted`. Lowercase names only, no wildcard, no IP address.
+    #[schemars(
+        length(max = 16),
+        inner(length(max = 253), regex(pattern = ALLOW_HOST_PATTERN))
+    )]
+    pub allow_hosts: Vec<String>,
+}
+
+/// The CRD pattern of a `spec.network.egress.allowHosts` entry: lowercase DNS
+/// labels of at most 63 characters, the last starting with a letter (so no
+/// IPv4 address matches), then an optional `:<port>` from 1 to 65535.
+/// [`parse_allow_host`] is the controller-side check of the same form.
+pub const ALLOW_HOST_PATTERN: &str = r"^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\.)*[a-z]([-a-z0-9]{0,61}[a-z0-9])?(:(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}))?$";
+
+/// Port of an `allowHosts` entry that names none.
+pub const DEFAULT_HOST_PORT: u16 = 443;
+
+/// One parsed `spec.network.egress.allowHosts` entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllowHost<'a> {
+    /// The DNS name, as written.
+    pub name: &'a str,
+    /// The TCP port, [`DEFAULT_HOST_PORT`] when the entry names none.
+    pub port: u16,
+}
+
+/// A lowercase DNS name of at most 253 characters whose labels have at most 63
+/// characters, no leading or trailing hyphen, and whose last label starts with
+/// a letter. No trailing dot, no wildcard, and so never an IP address.
+#[must_use]
+pub fn is_host_name(s: &str) -> bool {
+    let label = |l: &str| {
+        (1..=63).contains(&l.len())
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    s.len() <= 253
+        && s.split('.').all(label)
+        && s.rsplit('.')
+            .next()
+            .is_some_and(|l| l.starts_with(|c: char| c.is_ascii_lowercase()))
+}
+
+/// Parses an `allowHosts` entry, `<dns-name>` or `<dns-name>:<port>`, the form
+/// [`ALLOW_HOST_PATTERN`] admits. `None` when it is not one.
+#[must_use]
+pub fn parse_allow_host(s: &str) -> Option<AllowHost<'_>> {
+    if s.len() > 253 {
+        return None;
+    }
+    let (name, port) = match s.split_once(':') {
+        None => (s, DEFAULT_HOST_PORT),
+        Some((name, p)) => {
+            let digits = !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+            if !digits || p.starts_with('0') {
+                return None;
+            }
+            (name, p.parse::<u16>().ok().filter(|n| *n > 0)?)
+        }
+    };
+    is_host_name(name).then_some(AllowHost { name, port })
 }
 
 /// `spec.network.egress.internet`.
@@ -819,6 +882,10 @@ pub mod reason {
     pub const POD_FAILED: &str = "PodFailed";
     /// An `oidc` rule names an unknown issuer.
     pub const UNKNOWN_ISSUER: &str = "UnknownIssuer";
+    /// An `allowHosts` name resolves only to refused addresses.
+    pub const HOST_NOT_PERMITTED: &str = "HostNotPermitted";
+    /// An `allowHosts` name failed to resolve.
+    pub const UNRESOLVED_HOST: &str = "UnresolvedHost";
     /// A slot name is held by a pod the pool does not own.
     pub const SLOT_TAKEN: &str = "SlotTaken";
     /// The CA Secret was hard-replaced and pods under the old CA remain.
