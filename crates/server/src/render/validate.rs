@@ -385,7 +385,16 @@ impl Net {
             return None;
         }
         let p: u32 = prefix.parse().ok()?;
-        match addr.parse::<std::net::IpAddr>().ok()? {
+        Self::new(addr.parse().ok()?, p)
+    }
+
+    /// The single address `ip`, read as [`Self::parse`] reads `ip/32` or `ip/128`.
+    fn host(ip: std::net::IpAddr) -> Option<Self> {
+        Self::new(ip, if ip.is_ipv4() { 32 } else { 128 })
+    }
+
+    fn new(ip: std::net::IpAddr, p: u32) -> Option<Self> {
+        match ip {
             std::net::IpAddr::V4(a) => (p <= 32).then(|| Self::V4(mask32(u32::from(a), p), p)),
             std::net::IpAddr::V6(a) => {
                 if p > 128 {
@@ -479,17 +488,7 @@ pub fn refused_allow_cidr(entry: &str, net: &WorkerNetwork) -> Option<String> {
     // Without a cluster range of the entry's family the controller cannot tell
     // cluster addresses from others: IPv4 clusters use the private ranges, and
     // IPv6 clusters often global unicast.
-    let family_known = net
-        .cluster_cidrs
-        .iter()
-        .filter_map(|c| Net::parse(c))
-        .any(|c| {
-            matches!(
-                (c, e),
-                (Net::V4(..), Net::V4(..)) | (Net::V6(..), Net::V6(..))
-            )
-        });
-    if family_known {
+    if family_known(net, e) {
         return None;
     }
     let unknown = "and workerNetwork.clusterCIDRs holds no range of its family to tell \
@@ -504,20 +503,118 @@ pub fn refused_allow_cidr(entry: &str, net: &WorkerNetwork) -> Option<String> {
     }
 }
 
-/// Every refused `spec.network.egress.allowCIDRs` entry, in spec order.
+/// Every refused `spec.network.egress.allowCIDRs` entry, in spec order, then
+/// every `allowHosts` entry that is not `<dns-name>[:<port>]` (only an older
+/// stored object or schema drift gets one past the CRD).
 /// Empty means every entry may be rendered.
 #[must_use]
 pub fn refused_allow_cidrs(spec: &BuildKitPoolSpec, net: &WorkerNetwork) -> Vec<Conflict> {
-    spec.network
-        .egress
-        .allow_cidrs
+    let egress = &spec.network.egress;
+    let cidrs = egress.allow_cidrs.iter().enumerate().filter_map(|(i, c)| {
+        refused_allow_cidr(c, net).map(|why| Conflict {
+            field: format!("spec.network.egress.allowCIDRs[{i}]"),
+            reason: format!("`{c}` {why}"),
+        })
+    });
+    let hosts = egress
+        .allow_hosts
         .iter()
         .enumerate()
-        .filter_map(|(i, c)| {
-            refused_allow_cidr(c, net).map(|why| Conflict {
-                field: format!("spec.network.egress.allowCIDRs[{i}]"),
-                reason: format!("`{c}` {why}"),
-            })
+        .filter(|(_, h)| buildkit_controller_api::v1alpha1::parse_allow_host(h).is_none())
+        .map(|(i, h)| Conflict {
+            field: format!("spec.network.egress.allowHosts[{i}]"),
+            reason: format!("`{h}` is not <dns-name> or <dns-name>:<port>"),
+        });
+    cidrs.chain(hosts).collect()
+}
+
+/// Most addresses one `allowHosts` entry opens.
+pub const MAX_HOST_ADDRS: usize = 16;
+
+/// Why the resolved address `ip` of the `allowHosts` name `name` is refused, or
+/// `None` when the worker `NetworkPolicy` may open it.
+///
+/// The unspecified address and a [`PROTECTED_CIDRS`] address are always
+/// refused. Unless `net.permitted_hosts` lists `name`, so is an address inside
+/// `net.cluster_cidrs` or `net.extra_denied_cidrs`, and, while
+/// `net.cluster_cidrs` holds no range of the address's family, an IPv6 address
+/// or an IPv4 address inside `net.denied_cidrs`: as for `allowCIDRs`, the
+/// controller cannot tell it from a cluster address. An IPv4-mapped address or
+/// one in the NAT64 well-known prefix is checked as the IPv4 address it reaches.
+#[must_use]
+pub fn refused_host_addr(name: &str, ip: std::net::IpAddr, net: &WorkerNetwork) -> Option<String> {
+    if ip.is_unspecified() {
+        return Some("is the unspecified address".into());
+    }
+    let Some(e) = Net::host(ip) else {
+        return Some("is not an address".into());
+    };
+    if let Some(c) = first_overlap(PROTECTED_CIDRS, e) {
+        return Some(format!(
+            "is in the link-local, metadata, loopback or NAT64 range {c}"
+        ));
+    }
+    if net.permitted_hosts.iter().any(|h| h == name) {
+        return None;
+    }
+    let permit = "an operator can permit the name in workerNetwork.permittedHosts";
+    if let Some(c) = first_overlap(net.cluster_cidrs.iter().map(String::as_str), e) {
+        return Some(format!("is in the cluster range {c}; {permit}"));
+    }
+    if let Some(c) = first_overlap(net.extra_denied_cidrs.iter().map(String::as_str), e) {
+        return Some(format!("is in the operator-denied range {c}; {permit}"));
+    }
+    if family_known(net, e) {
+        return None;
+    }
+    let unknown = format!(
+        "and workerNetwork.clusterCIDRs holds no range of its family to tell cluster \
+         addresses apart; {permit}"
+    );
+    let denied_v4 = net.denied_cidrs.iter().filter(|c| !c.contains(':'));
+    match e {
+        Net::V6(..) => Some(format!("is IPv6, {unknown}")),
+        Net::V4(..) => first_overlap(denied_v4.map(String::as_str), e)
+            .map(|c| format!("is in the denied range {c}, {unknown}")),
+    }
+}
+
+/// `net.cluster_cidrs` holds a range of the family of `e`.
+fn family_known(net: &WorkerNetwork, e: Net) -> bool {
+    net.cluster_cidrs
+        .iter()
+        .filter_map(|c| Net::parse(c))
+        .any(|c| {
+            matches!(
+                (c, e),
+                (Net::V4(..), Net::V4(..)) | (Net::V6(..), Net::V6(..))
+            )
         })
-        .collect()
+}
+
+/// The addresses of `name` split by [`refused_host_addr`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostCheck {
+    /// What the policy opens: IPv4-mapped addresses as IPv4, sorted, without
+    /// duplicates, at most [`MAX_HOST_ADDRS`].
+    pub permitted: Vec<std::net::IpAddr>,
+    /// Each refused address and why.
+    pub refused: Vec<(std::net::IpAddr, String)>,
+}
+
+/// Checks the last known addresses `addrs` of the `allowHosts` name `name`.
+#[must_use]
+pub fn check_host(name: &str, addrs: &[std::net::IpAddr], net: &WorkerNetwork) -> HostCheck {
+    let mut all: Vec<std::net::IpAddr> = addrs.iter().map(std::net::IpAddr::to_canonical).collect();
+    all.sort_unstable();
+    all.dedup();
+    let mut out = HostCheck::default();
+    for ip in all {
+        match refused_host_addr(name, ip, net) {
+            Some(why) => out.refused.push((ip, why)),
+            None => out.permitted.push(ip),
+        }
+    }
+    out.permitted.truncate(MAX_HOST_ADDRS);
+    out
 }

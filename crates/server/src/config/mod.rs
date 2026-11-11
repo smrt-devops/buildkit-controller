@@ -383,10 +383,10 @@ impl Edge {
     }
 }
 
-/// Default `edge.maxConnections`, the same as the chart. Sized to the chart's
-/// 512Mi memory limit: an established edge connection holds about 200 KiB and
-/// an idle replica about 14 MiB, so 2000 connections stay near 400 MiB.
-/// Raise it together with the memory limit.
+/// Default `edge.maxConnections`, the same as the chart. The chart sizes the memory limit
+/// as about 14 MiB + `edge.maxConnections` x 460 KiB (tunnels; 200 KiB for `tcp://`) +
+/// `edge.maxHandshakes` x 280 KiB, so 2000 connections need about 900 MiB of it. Raise it
+/// together with the memory limit.
 pub const EDGE_MAX_CONNECTIONS: u32 = 2000;
 
 /// `edge.tls`.
@@ -505,6 +505,9 @@ pub struct WorkerNetwork {
     /// metadata, loopback, cluster or extra denied ranges.
     #[serde(rename = "permittedCIDRs")]
     pub permitted_cidrs: Vec<String>,
+    /// `allowHosts` names whose addresses may lie in the cluster or extra denied
+    /// ranges (exact names).
+    pub permitted_hosts: Vec<String>,
     /// DNS allowance.
     pub dns: Dns,
 }
@@ -517,6 +520,7 @@ impl Default for WorkerNetwork {
             extra_denied_cidrs: d.extra_denied_cidrs,
             cluster_cidrs: d.cluster_cidrs,
             permitted_cidrs: d.permitted_cidrs,
+            permitted_hosts: d.permitted_hosts,
             dns: Dns {
                 namespace: d.dns.namespace,
                 pod_labels: d.dns.pod_labels,
@@ -1061,6 +1065,13 @@ impl Config {
                 }
             }
         }
+        for h in &n.permitted_hosts {
+            if !buildkit_controller_api::v1alpha1::is_host_name(h) {
+                p.push(format!(
+                    "workerNetwork.permittedHosts: `{h}` is not a lowercase DNS name (no port, no wildcard, no IP address)"
+                ));
+            }
+        }
         if n.dns.pod_labels.is_empty() && n.dns.cidrs.is_empty() {
             p.push("workerNetwork.dns needs non-empty podLabels or cidrs".into());
         }
@@ -1150,7 +1161,7 @@ impl Config {
             return false;
         }
         tracing::warn!(
-            "workerNetwork.clusterCIDRs is empty: allowCIDRs entries cannot be checked against the cluster's pod, service and node ranges, so a pool can open worker egress into the cluster; set clusterCIDRs"
+            "workerNetwork.clusterCIDRs is empty: allowCIDRs entries and allowHosts addresses cannot be checked against the cluster's pod, service and node ranges, so a pool can open worker egress into the cluster; set clusterCIDRs"
         );
         true
     }
@@ -1189,6 +1200,7 @@ impl Config {
                 extra_denied_cidrs: n.extra_denied_cidrs.clone(),
                 cluster_cidrs: n.cluster_cidrs.clone(),
                 permitted_cidrs: n.permitted_cidrs.clone(),
+                permitted_hosts: n.permitted_hosts.clone(),
                 dns: crate::render::WorkerDns {
                     namespace: n.dns.namespace.clone(),
                     pod_labels: n.dns.pod_labels.clone(),

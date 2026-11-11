@@ -182,6 +182,8 @@ data:
       - 203.0.113.0/24
       permittedCIDRs:
       - 169.254.20.10/32
+      permittedHosts:
+      - mirror.corp.internal
 
 ---
 # Source: buildkit-controller/templates/rbac.yaml
@@ -534,7 +536,7 @@ spec:
         helm.sh/chart: buildkit-controller-0.3.0
         team: ci
       annotations:
-        checksum/config: fc80d6d0020b65b2d05a7d32c5ad4a3b9ed2808447fca5eeac37ce042ac9e09c
+        checksum/config: eb4b1ad919b2605b4ecb1be330aafced87ed19833da34f3f32c1dca4b3387610
         example.com/x: "1"
     spec:
       serviceAccountName: bkc

@@ -57,11 +57,13 @@ const MESSAGE_MAX: usize = 1024;
 pub const REAPPLY_AFTER: SignedDuration = SignedDuration::from_mins(5);
 
 /// `Degraded=True` reasons by precedence.
-const DEGRADED_ORDER: [&str; 6] = [
+const DEGRADED_ORDER: [&str; 8] = [
     "PodCreateFailed",
     "PodStartTimeout",
     "PodFailed",
     "UnknownIssuer",
+    "HostNotPermitted",
+    "UnresolvedHost",
     "SlotTaken",
     "CAReplaced",
 ];
@@ -136,6 +138,50 @@ pub struct CreateOutcome {
     pub result: CreateResult,
 }
 
+/// Why an `allowHosts` name degrades the pool.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostProblem {
+    /// The latest lookup failed (`UnresolvedHost`); the policy keeps the last
+    /// known addresses.
+    Unresolved {
+        /// The name.
+        name: String,
+        /// Why the lookup failed.
+        error: String,
+    },
+    /// Every known address is refused (`HostNotPermitted`).
+    NotPermitted {
+        /// The name.
+        name: String,
+        /// The first refused address and why.
+        why: String,
+    },
+}
+
+impl HostProblem {
+    /// The `Degraded` reason.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Unresolved { .. } => "UnresolvedHost",
+            Self::NotPermitted { .. } => "HostNotPermitted",
+        }
+    }
+
+    /// The condition message, naming the host.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::Unresolved { name, error } => format!(
+                "allowHosts name `{name}` does not resolve ({error}); its last known addresses stay open"
+            ),
+            Self::NotPermitted { name, why } => {
+                format!("allowHosts name `{name}` resolves only to refused addresses: {why}")
+            }
+        }
+    }
+}
+
 /// Everything the planner reads for one pool.
 pub struct Observed<'a> {
     /// The cached pool (name, uid, generation, spec, status).
@@ -166,6 +212,9 @@ pub struct Observed<'a> {
     pub create_backoff_until: Option<Timestamp>,
     /// An `oidc` rule names an unknown issuer.
     pub unknown_issuer: Option<String>,
+    /// `allowHosts` names that failed to resolve or resolve only to refused
+    /// addresses. Each makes the pool `Degraded`; it stays Ready.
+    pub host_problems: Vec<HostProblem>,
     /// Names of pods in the pool's namespace whose `P pool` label is the pool's
     /// name and whose controller ownerReference uid is not the pool's uid; build
     /// it with [`super::pods::foreign_pod_name`]. Same-name pods of a pool in
@@ -1029,6 +1078,8 @@ impl<'a> Planner<'_, 'a> {
             self.degraded
                 .push(("UnknownIssuer", format!("unknown oidc issuer `{u}`")));
         }
+        self.degraded
+            .extend(o.host_problems.iter().map(|h| (h.reason(), h.message())));
         let first = DEGRADED_ORDER
             .iter()
             .find_map(|r| self.degraded.iter().find(|(d, _)| d == r))

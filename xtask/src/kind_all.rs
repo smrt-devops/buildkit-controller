@@ -32,6 +32,7 @@ use crate::proc::{Spawned, Timed, status};
 /// Suites on the shared cluster, longest first by measured time, so the slow ones
 /// start first when `--jobs` limits how many run at once.
 pub(crate) const SHARED: &[&str] = &[
+    "tunnel-verify",
     "reconcile-verify",
     "alloc-verify",
     "e2e",
@@ -242,10 +243,15 @@ fn create_main(main: &Cluster, work: &Path) -> Result<()> {
         policies.join("audit.yaml"),
         crate::reconcile_verify::AUDIT_POLICY,
     )?;
-    let (e2e, drain) = (*crate::e2e::PORTS, *crate::drain_verify::PORTS);
+    let (e2e, drain, tunnel) = (
+        *crate::e2e::PORTS,
+        *crate::drain_verify::PORTS,
+        *crate::tunnel_verify::PORTS,
+    );
     main.delete();
-    e2e.check_free(main.name())?;
-    drain.check_free(main.name())?;
+    for ports in [e2e, drain, tunnel] {
+        ports.check_free(main.name())?;
+    }
     let config = crate::fixture(
         "kind-all/kind.yaml",
         work,
@@ -254,6 +260,7 @@ fn create_main(main: &Cluster, work: &Path) -> Result<()> {
             ("E2E_EDGE", e2e.edge.to_string()),
             ("DRAIN_API", drain.api.to_string()),
             ("DRAIN_EDGE", drain.edge.to_string()),
+            ("TUNNEL_API", tunnel.api.to_string()),
             ("POLICY_DIR", policies.display().to_string()),
         ],
     )?;

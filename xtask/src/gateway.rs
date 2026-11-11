@@ -7,7 +7,8 @@
 //! archive is checked the same way, and its own CRDs come from that archive.
 //! Both images are pulled on the host by digest, tagged, and loaded with
 //! `kind load`, so the cluster pulls nothing. The Gateway and its listeners
-//! are in `xtask/fixtures/gateway/gateway.yaml`.
+//! are in `xtask/fixtures/gateway/gateway.yaml`, with the TLS passthrough
+//! listeners in `passthrough-listeners.yaml` beside it.
 
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader};
@@ -29,10 +30,12 @@ pub(crate) struct Gateway {
     pub(crate) name: &'static str,
     /// The `GatewayClass`, and the `EnvoyProxy` it points to.
     class: &'static str,
-    /// The `NodePorts` of the API and edge listeners, which the kind config
-    /// publishes on loopback. `None`: a `ClusterIP` Service, reached through
-    /// [`PortForward`].
-    node_ports: Option<(u16, u16)>,
+    /// `(listener port, NodePort)` of each listener the kind config publishes
+    /// on loopback. Empty: a `ClusterIP` Service, reached through [`PortForward`].
+    node_ports: &'static [(u16, u16)],
+    /// Whether the Gateway has the TLS passthrough listeners `edge` and
+    /// `api-passthrough` beside the HTTPS listener `api`.
+    passthrough: bool,
 }
 
 /// e2e's Gateway. Its `NodePorts` are below 30086, in the band the API server
@@ -41,7 +44,8 @@ pub(crate) const E2E: Gateway = Gateway {
     ns: "bk-gateway",
     name: "bk",
     class: "bk-e2e",
-    node_ports: Some((30080, 30081)),
+    node_ports: &[(8443, 30080), (8444, 30081)],
+    passthrough: true,
 };
 
 /// proxy-verify's Gateway.
@@ -49,7 +53,18 @@ pub(crate) const PROXY: Gateway = Gateway {
     ns: "bk-proxy-gateway",
     name: "bk",
     class: "bk-proxy",
-    node_ports: None,
+    node_ports: &[],
+    passthrough: true,
+};
+
+/// tunnel-verify's Gateway: one HTTPS listener that terminates TLS, and nothing
+/// that passes TLS through. Its `NodePort` is in e2e's band, after drain-verify's.
+pub(crate) const TUNNEL: Gateway = Gateway {
+    ns: "bk-tunnel-gateway",
+    name: "bk",
+    class: "bk-tunnel",
+    node_ports: &[(8443, 30084)],
+    passthrough: false,
 };
 
 const EG_NS: &str = "envoy-gateway-system";
@@ -232,17 +247,32 @@ impl Gateway {
         // Deployment does, the Gateway keeps no address and is never Programmed
         // (seen on the GitHub runner). Cluster gives it every node's address.
         // Nothing here reads the client address Local would keep.
-        let service = match self.node_ports {
-            Some((api, edge)) => format!(
-                "        type: NodePort\n        externalTrafficPolicy: Cluster\n        patch:\n          type: StrategicMerge\n          value:\n            spec:\n              ports:\n                - {{port: 8443, nodePort: {api}}}\n                - {{port: 8444, nodePort: {edge}}}"
-            ),
-            None => "        type: ClusterIP".to_owned(),
+        let service = if self.node_ports.is_empty() {
+            "        type: ClusterIP".to_owned()
+        } else {
+            let ports = self
+                .node_ports
+                .iter()
+                .fold(String::new(), |mut s, (port, node)| {
+                    let _ = write!(s, "\n                - {{port: {port}, nodePort: {node}}}");
+                    s
+                });
+            format!(
+                "        type: NodePort\n        externalTrafficPolicy: Cluster\n        patch:\n          type: StrategicMerge\n          value:\n            spec:\n              ports:{ports}"
+            )
+        };
+        let passthrough = if self.passthrough {
+            let src = root().join("xtask/fixtures/gateway/passthrough-listeners.yaml");
+            std::fs::read_to_string(&src).with_context(|| src.display().to_string())?
+        } else {
+            String::new()
         };
         let manifest = crate::fixture(
             "gateway/gateway.yaml",
             work,
             &[
                 ("ENVOY_SERVICE", service),
+                ("PASSTHROUGH_LISTENERS", passthrough),
                 ("GW_CLASS", self.class.to_owned()),
                 ("GW_NAME", self.name.to_owned()),
                 ("GW_NS", ns.to_owned()),

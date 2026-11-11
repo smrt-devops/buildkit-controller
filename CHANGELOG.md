@@ -8,11 +8,13 @@ The tunnel is now the default way to reach the controller. Builds run inside a W
 
 ### Changed
 
+- A pool can name hosts its workers may reach in `spec.network.egress.allowHosts` (`<dns-name>` or `<dns-name>:<port>`, port 443 by default, at most 16). The leader resolves each name every 30 seconds and in each pass, and the pool's NetworkPolicy opens TCP on that port to at most 16 of its addresses. Addresses inside `workerNetwork.clusterCIDRs` or `extraDeniedCIDRs` need the name in the new Helm value `workerNetwork.permittedHosts`, and protected addresses are never opened. A name that stops resolving keeps its last addresses (`Degraded=True/UnresolvedHost`), and one that resolves only to refused addresses gets no rule (`Degraded=True/HostNotPermitted`). See [Named hosts](docs/operations.md#named-hosts).
 - `edge.endpoint` is optional and empty by default. Empty means clients tunnel through the API: the chart renders no edge TLSRoute, needs only `gateway.api.parentRefs` (or a LoadBalancer Service), and keeps the edge port on the Service for in-cluster clients. A `tcp://` endpoint renders as before. Installs that set `edge.endpoint` keep working with no change. `edge.allocationDomain` with an empty endpoint fails the render, because each tunnelled allocation gets its own local port.
 - The API HTTPRoute (terminate mode, empty `edge.endpoint`) gets a separate rule for the exact path `/v1/tunnel` with `timeouts.request` and `timeouts.backendRequest` of `0s`, so no gateway cuts a long build. Other paths keep `gateway.api.timeouts`. Passthrough API mode is unchanged.
 - With a tunnel behind a Gateway, the chart renders `edge.maxHandshakesPerIp` as 0 unless `api.proxyProtocol` is on, because a tunnel handshake counts against the API connection's address. NOTES.txt describes the tunnel and its per-address caps.
 - The Action runs a local forwarder when the allocation endpoint is a path and needs no new inputs. The shell recipe (`docs/ci/buildkit-allocate.sh`) works only with a `tcp://` endpoint until a client binary ships, and it now stops with a clear message, after releasing the allocation, when the endpoint starts with `/`.
 - The examples use the tunnel default. `examples/helm-values-tcp.yaml` keeps a TCP passthrough install.
+- The controller memory limit rises from 512Mi to 1536Mi. The limit is about 14 MiB plus 460 KiB per established tunnelled connection (`edge.maxConnections`) plus 280 KiB per handshake in progress (`edge.maxHandshakes`), about 1.16 GiB at the defaults, so the limit leaves about 344 MiB of margin. Lower those caps or raise the limit together with them.
 
 ### Compatibility
 

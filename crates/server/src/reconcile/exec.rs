@@ -19,7 +19,7 @@ use super::ops::{KubeOps, OpError, OpResult};
 use super::plan::{Action, CaEvent, CreateOutcome, CreateResult, Plan, REAPPLY_AFTER};
 use super::spawn::{self, PodCreated, PodOutcome};
 use crate::pki::{CaBundle, LoadOutcome};
-use crate::render::{self, CONTROLLER, LABEL_MANAGED_BY, RenderConfig};
+use crate::render::{self, CONTROLLER, HostAddrs, LABEL_MANAGED_BY, RenderConfig};
 
 /// Term-wide CA bookkeeping. CA actions run once per CA Secret version
 /// (`epoch`, bumped on every CA Secret watch change), not once per pool.
@@ -134,6 +134,8 @@ pub struct Env<'a> {
     pub ca_secret_name: &'a str,
     /// Render settings (controller namespace, worker network).
     pub render: &'a RenderConfig,
+    /// Last known addresses of the pool's `allowHosts` names.
+    pub hosts: &'a HostAddrs,
     /// Worker serving cert validity.
     pub worker_cert_validity: time::Duration,
     /// `POD_NAME`, the Event `reportingInstance`.
@@ -216,7 +218,7 @@ pub async fn execute<O: KubeOps>(ops: &O, guard: &CaGuard, env: &Env<'_>, plan: 
             }
             Action::ApplyNetworkPolicy => {
                 r.trace.push("apply_network_policy".into());
-                let res = match render::network_policy(env.pool, env.render) {
+                let res = match render::network_policy(env.pool, env.render, env.hosts) {
                     Ok(np) => ops.apply(&np).await.map_err(|e| e.to_string()),
                     Err(e) => Err(e.to_string()),
                 };
