@@ -344,7 +344,11 @@ async fn setup(issuer: &Issuer, stop: &CancellationToken) -> (H, SocketAddr, Arc
     );
     let certs = Certs::new();
     let svc = AllocService::new(certs.subscribe());
-    let http = HttpComponent::new(svc.clone(), certs.subscribe());
+    let http = HttpComponent::new(
+        svc.clone(),
+        certs.subscribe(),
+        buildkit_controller::edge::tunnel_channel().0,
+    );
     let components: [Arc<dyn Component>; 4] = [
         Arc::new(certs),
         Arc::new(svc.clone()),

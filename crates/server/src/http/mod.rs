@@ -11,6 +11,7 @@ pub mod listener;
 pub mod metrics;
 #[cfg(test)]
 mod tests;
+pub mod tunnel;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -23,12 +24,14 @@ use tracing::info;
 pub use api::{Allocator, ApiState, Authenticate, EdgeInfo, router};
 pub use listener::{Limits, ServingCerts, serve, serve_with_proxy, server_config};
 pub use metrics::HttpMetrics;
+pub use tunnel::{MAX_MESSAGE, PING_EVERY, Tunnels, WsBytes};
 
 use crate::alloc::AllocService;
 use crate::auth::{
     AuthConfig, Authenticator, KubeTokenReviewer, OidcIssuer, https_client, public_roots,
 };
 use crate::certs::CertMaterial;
+use crate::edge::TunnelDoor;
 use crate::net::ProxyProtocol;
 use crate::runtime::AppContext;
 use crate::runtime::hooks::{BoxResult, Component};
@@ -37,14 +40,24 @@ use crate::runtime::hooks::{BoxResult, Component};
 pub struct HttpComponent {
     alloc: AllocService,
     certs: watch::Receiver<CertMaterial>,
+    tunnels: TunnelDoor,
 }
 
 impl HttpComponent {
     /// `certs` is the certs component's channel ([`crate::certs::Certs::subscribe`]):
     /// the API serves the same cert as the edge, swapped per connection.
+    /// `tunnels` hands `/v1/tunnel` connections to the edge.
     #[must_use]
-    pub fn new(alloc: AllocService, certs: watch::Receiver<CertMaterial>) -> Self {
-        Self { alloc, certs }
+    pub fn new(
+        alloc: AllocService,
+        certs: watch::Receiver<CertMaterial>,
+        tunnels: TunnelDoor,
+    ) -> Self {
+        Self {
+            alloc,
+            certs,
+            tunnels,
+        }
     }
 }
 
@@ -56,6 +69,7 @@ impl Component for HttpComponent {
     fn run(&self, ctx: AppContext, shutdown: CancellationToken) -> BoxResult {
         let alloc = self.alloc.clone();
         let material = self.certs.clone();
+        let tunnels = Tunnels::new(self.tunnels.clone());
         Box::pin(async move {
             let ready = ctx.readiness().register("api_listener");
             let metrics = HttpMetrics::register(ctx.metrics());
@@ -101,12 +115,13 @@ impl Component for HttpComponent {
                 service_accounts: sa.enabled,
                 pools: ctx.pools(),
                 edge: EdgeInfo {
-                    endpoint: c.edge.endpoint.clone(),
+                    endpoint: c.edge.client_endpoint().to_owned(),
                     server_name: c.edge.server_name.clone(),
-                    per_allocation_endpoints: !c.edge.allocation_domain.is_empty(),
+                    per_allocation_endpoints: c.edge.per_allocation_endpoints(),
                 },
                 metrics,
                 refusals: api::LogSampler::default(),
+                tunnels,
             });
             let follower = CancellationToken::new();
             let certs = serving_of(material, follower.clone());

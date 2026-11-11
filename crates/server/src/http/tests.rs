@@ -323,6 +323,8 @@ fn state_with<A: Allocator>(
         },
         metrics: HttpMetrics::register(metrics),
         refusals: super::api::LogSampler::default(),
+        // No edge behind it: a valid upgrade gets 503.
+        tunnels: super::Tunnels::new(crate::edge::tunnel_channel().0),
     })
 }
 

@@ -44,8 +44,11 @@ const RETRY: Duration = Duration::from_secs(1);
 /// Static inputs from the config file.
 #[derive(Debug, Clone)]
 pub struct BindConfig {
-    /// `edge.endpoint`.
+    /// `edge.endpoint`; empty when clients tunnel through the API.
     pub endpoint: String,
+    /// `tcp://<edge.serviceName>.<namespace>.svc:<edge port>`: what an
+    /// in-cluster claim dials when `endpoint` is empty (edge.md §10).
+    pub service_endpoint: String,
     /// `edge.serverName`.
     pub server_name: String,
     /// `edge.allocationDomain`, `None` when unset.
@@ -59,9 +62,19 @@ pub struct BindConfig {
 }
 
 impl BindConfig {
-    /// The endpoint of allocation `id`: per allocation with `allocationDomain`.
+    /// The endpoint of allocation `id` for a claim in `claim_namespace`: per
+    /// allocation with `allocationDomain`. With no `edge.endpoint`, the API's
+    /// claims (the controller's namespace) get the tunnel path, and an
+    /// in-cluster claim gets the edge Service, never the tunnel.
     #[must_use]
-    pub fn endpoint(&self, id: &str) -> String {
+    pub fn endpoint(&self, id: &str, claim_namespace: &str) -> String {
+        if self.endpoint.is_empty() {
+            return if claim_namespace == self.namespace {
+                buildkit_controller_api::dto::TUNNEL_PATH.to_owned()
+            } else {
+                self.service_endpoint.clone()
+            };
+        }
         match &self.allocation_domain {
             Some(d) => {
                 let port = self.endpoint.rsplit_once(':').map_or("", |(_, p)| p);
@@ -534,7 +547,7 @@ impl Binder {
         let binding = Binding {
             alloc_id: ask.alloc_id.to_string(),
             pod: pod_name.to_owned(),
-            endpoint: self.cfg.endpoint(ask.alloc_id.as_str()),
+            endpoint: self.cfg.endpoint(ask.alloc_id.as_str(), ns),
             server_name: self.cfg.server_name.clone(),
             expires_at: fmt_ts(expires_at),
             certificate: cert.cert_pem().to_owned(),

@@ -316,7 +316,8 @@ impl Default for Pki {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct Edge {
-    /// `tcp://host:port` returned to clients (required).
+    /// `tcp://host:port` returned to clients, or empty: clients then tunnel
+    /// through the API (edge.md §10). See [`Edge::client_endpoint`].
     pub endpoint: String,
     /// DNS name returned as serverName (required).
     pub server_name: String,
@@ -358,6 +359,27 @@ impl Default for Edge {
             max_handshakes_per_ip: 32,
             proxy_protocol: ProxyProtocol::default(),
         }
+    }
+}
+
+impl Edge {
+    /// The `endpoint` the API returns: `edge.endpoint`, or the tunnel path
+    /// when it is unset.
+    #[must_use]
+    pub fn client_endpoint(&self) -> &str {
+        if self.endpoint.is_empty() {
+            buildkit_controller_api::dto::TUNNEL_PATH
+        } else {
+            &self.endpoint
+        }
+    }
+
+    /// `perAllocationEndpoints`: every allocation reaches its own endpoint,
+    /// through its own tunnel forwarder or its own name under
+    /// `edge.allocationDomain`.
+    #[must_use]
+    pub fn per_allocation_endpoints(&self) -> bool {
+        self.endpoint.is_empty() || !self.allocation_domain.is_empty()
     }
 }
 
@@ -878,6 +900,18 @@ impl Config {
         v
     }
 
+    /// `tcp://<edge.serviceName>.<namespace>.svc:<listen.edge port>`: the edge
+    /// Service, which in-cluster claims dial when `edge.endpoint` is unset
+    /// (edge.md §10). The serving cert holds that name as a SAN.
+    #[must_use]
+    pub fn edge_service_endpoint(&self, namespace: &str) -> String {
+        format!(
+            "tcp://{}.{namespace}.svc:{}",
+            self.edge.service_name,
+            self.listen.edge.port()
+        )
+    }
+
     /// The namespaces whose in-cluster claims are served: the controller's own
     /// and `claims.namespaces`.
     #[must_use]
@@ -926,8 +960,13 @@ impl Config {
             .and_then(|r| r.rsplit_once(':'))
         {
             Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => {}
+            _ if e.endpoint.is_empty() => {
+                if !e.allocation_domain.is_empty() {
+                    p.push("edge.allocationDomain needs a tcp:// edge.endpoint".into());
+                }
+            }
             _ => p.push(format!(
-                "edge.endpoint must be tcp://<host>:<port> (got `{}`)",
+                "edge.endpoint must be empty or tcp://<host>:<port> (got `{}`)",
                 e.endpoint
             )),
         }

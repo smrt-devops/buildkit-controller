@@ -91,6 +91,7 @@ impl Component for Allocator {
                 certs,
                 BindConfig {
                     endpoint: c.edge.endpoint.clone(),
+                    service_endpoint: c.edge_service_endpoint(&namespace),
                     server_name: c.edge.server_name.clone(),
                     allocation_domain: Some(c.edge.allocation_domain.clone())
                         .filter(|d| !d.is_empty()),
