@@ -1,0 +1,9 @@
+# The host port API_PORT (filled in by `cargo xtask tunnel-verify`, see PORTS in
+# xtask/src/tunnel_verify.rs) reaches the NodePort 30084 of the Envoy Gateway
+# Service, the HTTPS listener of `gateway::TUNNEL` in xtask/src/gateway.rs.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - {containerPort: 30084, hostPort: API_PORT, listenAddress: "127.0.0.1"}

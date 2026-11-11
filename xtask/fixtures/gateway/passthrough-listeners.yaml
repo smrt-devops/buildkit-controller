@@ -1,0 +1,16 @@
+    # The edge: passthrough, so the controller sees the client certificate.
+    - name: edge
+      protocol: TLS
+      port: 8444
+      tls:
+        mode: Passthrough
+      allowedRoutes:
+        namespaces: {from: All}
+    # The API by passthrough, for gateway.api.mode=passthrough.
+    - name: api-passthrough
+      protocol: TLS
+      port: 9443
+      tls:
+        mode: Passthrough
+      allowedRoutes:
+        namespaces: {from: All}
