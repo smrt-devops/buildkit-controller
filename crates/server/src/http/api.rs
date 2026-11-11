@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use buildkit_controller_api::dto::{
     CreateAllocationRequest, ErrorBody, ErrorCode, MAX_BODY_BYTES, PoolList, PoolSummary,
+    TUNNEL_PATH,
 };
 use buildkit_controller_api::v1alpha1::{self as crd, BuildKitPool};
 use futures::future::BoxFuture;
@@ -29,6 +30,7 @@ pub const PUBLIC_KEY_REQUIRED: &str =
     "publicKey is required: generate an ECDSA P-256 key pair and send the PEM SPKI public key";
 
 use super::metrics::HttpMetrics;
+use super::tunnel::{self, Tunnels};
 use crate::alloc::front::MAX_WAIT;
 use crate::alloc::pool::access_rules;
 use crate::alloc::{AllocError, AllocService, Outcome};
@@ -138,6 +140,8 @@ pub struct ApiState<A> {
     pub metrics: HttpMetrics,
     /// Bounds the per-request authentication refusal log.
     pub refusals: LogSampler,
+    /// `GET /v1/tunnel`.
+    pub tunnels: Tunnels,
 }
 
 /// Lets [`LogSampler::PER_SECOND`] events a second through to the log and counts
@@ -189,7 +193,7 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+    pub(super) fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -235,6 +239,7 @@ pub fn router<A: Allocator>(state: Arc<ApiState<A>>) -> Router {
             get(status::<A>).delete(release::<A>).fallback(not_found),
         )
         .route("/v1/pools", get(pools::<A>).fallback(not_found))
+        .merge(tunnel::router(state.tunnels.clone()))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -261,6 +266,7 @@ async fn observe<A: Allocator>(
         Some("/v1/allocations") => "/v1/allocations",
         Some("/v1/allocations/{id}") => "/v1/allocations/{id}",
         Some("/v1/pools") => "/v1/pools",
+        Some(TUNNEL_PATH) => TUNNEL_PATH,
         _ => "other",
     };
     let r = next.run(req).await;

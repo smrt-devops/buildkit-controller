@@ -83,13 +83,14 @@ fn main() -> ExitCode {
     };
     let certs = Arc::new(Certs::new());
     let alloc = AllocService::new(certs.subscribe());
+    let (tunnel_door, tunnels) = buildkit_controller::edge::tunnel_channel();
     let hooks = Hooks {
         reconcile: |ctx| -> Arc<dyn LeaderWork> { Arc::new(Reconciler::new(ctx)) },
         pki: Arc::clone(&certs) as Arc<dyn Component>,
         alloc: Arc::new(alloc.clone()),
         allocator: Arc::new(alloc.allocator()),
-        http: Arc::new(HttpComponent::new(alloc, certs.subscribe())),
-        edge: Arc::new(EdgeComponent::proxy(certs.subscribe())),
+        http: Arc::new(HttpComponent::new(alloc, certs.subscribe(), tunnel_door)),
+        edge: Arc::new(EdgeComponent::proxy(certs.subscribe(), tunnels)),
     };
     match rt.block_on(run(settings, hooks)) {
         Ok(()) => ExitCode::SUCCESS,

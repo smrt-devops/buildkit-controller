@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::handler::Refusal;
 use super::super::listener::PerKey;
-use super::super::metrics::{Direction, EdgeMetrics, Revocation};
+use super::super::metrics::{Direction, EdgeMetrics, Revocation, Transport};
 use super::super::pods::{PodView, revocation};
 use super::super::revoke::{Registry, namespace_cap};
 use super::{End, pump};
@@ -480,7 +480,7 @@ async fn an_allocation_at_its_cap_is_refused_and_counted() {
     let p = inner(vec![pod(|_| {})], 1);
     let (_held, _rx) = p.live.register(&id()).unwrap();
     let (client, mut c) = tokio::io::duplex(1024);
-    p.forward(client, &id(), None).await;
+    p.forward(client, &id(), None, Transport::Tcp).await;
     assert_eq!(p.metrics.outcome_count(Some(&id()), "allocation_limit"), 1);
     assert_eq!(p.metrics.outcome_count(Some(&id()), "upstream_error"), 0);
     let mut b = Vec::new();
@@ -493,7 +493,7 @@ async fn an_allocation_at_its_cap_is_refused_and_counted() {
 async fn without_an_edge_client_cert_the_connection_is_an_upstream_error() {
     let p = inner(vec![pod(|_| {})], 64);
     let (client, _c) = tokio::io::duplex(1024);
-    p.forward(client, &id(), None).await;
+    p.forward(client, &id(), None, Transport::Tcp).await;
     assert_eq!(p.metrics.outcome_count(Some(&id()), "upstream_error"), 1);
     assert_eq!(p.metrics.outcome_count(Some(&id()), "ok"), 0);
     assert_eq!(p.live.len(), 0, "unregistered once closed");
@@ -602,7 +602,7 @@ async fn four_owners_in_one_namespace_are_capped_together() {
         .collect();
     for id in &ids {
         let (client, _c) = tokio::io::duplex(1024);
-        p.forward(client, id, None).await;
+        p.forward(client, id, None, Transport::Tcp).await;
     }
     // Outcomes are labelled by namespace and pool, so all four count together.
     assert_eq!(p.metrics.outcome_count(Some(&ids[0]), "namespace_limit"), 4);

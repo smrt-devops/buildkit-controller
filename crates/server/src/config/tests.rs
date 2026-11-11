@@ -27,9 +27,9 @@ fn unknown_keys_are_errors() {
 }
 
 #[test]
-fn edge_is_required_and_all_errors_are_listed() {
+fn server_name_is_required_and_all_errors_are_listed() {
     let v = errs("auth:\n  oidc:\n  - url: http://x\n");
-    assert!(v.iter().any(|m| m.contains("edge.endpoint")), "{v:?}");
+    assert!(!v.iter().any(|m| m.contains("edge.endpoint")), "{v:?}");
     assert!(v.iter().any(|m| m.contains("edge.serverName")), "{v:?}");
     assert!(v.iter().any(|m| m.contains("must be https")), "{v:?}");
     assert!(v.iter().any(|m| m.contains("audiences")), "{v:?}");
@@ -78,6 +78,30 @@ fn bad_endpoint_and_allocation_domain() {
     assert!(v.iter().any(|m| m.contains("allocationDomain")), "{v:?}");
 }
 
+#[test]
+fn an_empty_endpoint_means_tunnels() {
+    let c = Config::from_yaml("edge:\n  serverName: bk.example.com\n").unwrap();
+    assert_eq!(c.edge.client_endpoint(), "/v1/tunnel");
+    assert!(
+        c.edge.per_allocation_endpoints(),
+        "one forwarder per allocation"
+    );
+    let c = Config::from_yaml(MIN).unwrap();
+    assert_eq!(c.edge.client_endpoint(), "tcp://bk.exaple.com:8444");
+    assert!(!c.edge.per_allocation_endpoints());
+    let c = Config::from_yaml(&format!("{MIN}  allocationDomain: alloc.example.com\n")).unwrap();
+    assert!(c.edge.per_allocation_endpoints());
+}
+
+#[test]
+fn an_allocation_domain_needs_a_tcp_endpoint() {
+    let v = errs("edge:\n  serverName: bk.example.com\n  allocationDomain: alloc.example.com\n");
+    assert_eq!(
+        v,
+        ["edge.allocationDomain needs a tcp:// edge.endpoint"],
+        "{v:?}"
+    );
+}
 #[test]
 fn bad_duration_is_reported() {
     let v = errs(&format!("{MIN}shutdown:\n  delay: soon\n"));
@@ -814,4 +838,13 @@ fn version_prints_the_crate_version() {
     let e = Cli::try_parse_from(["x", "--version"]).unwrap_err();
     assert_eq!(e.kind(), clap::error::ErrorKind::DisplayVersion);
     assert!(e.to_string().contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn in_cluster_claims_dial_the_edge_service() {
+    let c = Config::from_yaml(
+        "listen:\n  edge: 0.0.0.0:9444\nedge:\n  serverName: bk.example.com\n  serviceName: bkc\n",
+    )
+    .unwrap();
+    assert_eq!(c.edge_service_endpoint("ops"), "tcp://bkc.ops.svc:9444");
 }

@@ -35,11 +35,12 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-pub use handler::{Accepted, ConnectionHandler, Refusal};
+pub use handler::{Accepted, BoxIo, ClientIo, ConnectionHandler, Refusal};
 pub use listener::{
-    ListenerOptions, PeerKey, PeerSlot, PerPeer, Serve, serve, serve_with_proxy, tune_socket,
+    Arrival, EdgeClosed, ListenerOptions, PeerKey, PeerSlot, PerPeer, Serve, TunnelDoor,
+    TunnelQueue, serve, serve_with_proxy, serve_with_tunnels, tune_socket, tunnel_channel,
 };
-pub use metrics::{Direction, EdgeMetrics, Revocation};
+pub use metrics::{Direction, EdgeMetrics, Revocation, Transport};
 pub use pods::{PodView, revocation};
 pub use proxy::{End, ProxyHandler, ProxyOptions, pump};
 pub use tls::{EdgeTls, TlsBuilder};
@@ -56,13 +57,19 @@ use buildkit_controller_api::v1alpha1::Duration as CrdDuration;
 /// The runtime's `edge` component.
 pub struct EdgeComponent {
     material: watch::Receiver<CertMaterial>,
+    /// Taken by the one run.
+    tunnels: std::sync::Mutex<Option<TunnelQueue>>,
 }
 
 impl EdgeComponent {
-    /// The production edge: proxies to workers.
+    /// The production edge: proxies to workers, from its TCP listener and
+    /// from the tunnels the API hands over through `tunnels`.
     #[must_use]
-    pub fn proxy(material: watch::Receiver<CertMaterial>) -> Self {
-        Self { material }
+    pub fn proxy(material: watch::Receiver<CertMaterial>, tunnels: TunnelQueue) -> Self {
+        Self {
+            material,
+            tunnels: std::sync::Mutex::new(Some(tunnels)),
+        }
     }
 }
 
@@ -80,6 +87,11 @@ impl Component for EdgeComponent {
 
     fn run(&self, ctx: AppContext, shutdown: CancellationToken) -> BoxResult {
         let certs = self.material.clone();
+        let tunnels = self
+            .tunnels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         Box::pin(async move {
             let ready = ctx.readiness().register("edge_listener");
             let metrics = EdgeMetrics::register(ctx.metrics());
@@ -142,7 +154,10 @@ impl Component for EdgeComponent {
                 options,
                 ready,
             };
-            serve_with_proxy(listener, s, proxy_protocol, shutdown).await;
+            match tunnels {
+                Some(t) => serve_with_tunnels(listener, s, proxy_protocol, t, shutdown).await,
+                None => serve_with_proxy(listener, s, proxy_protocol, shutdown).await,
+            }
             material_stop.cancel();
             let _ = material.await;
             revoke_stop.cancel();

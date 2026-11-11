@@ -19,15 +19,17 @@ use tracing::debug;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use super::handler::ConnectionHandler;
-use super::metrics::EdgeMetrics;
+use super::metrics::{EdgeMetrics, Transport};
 use crate::pki::{AllocCertError, AllocationId, verify_allocation_cert};
 
 /// One generation of edge TLS, the one new handshakes use. Swapped whole on hot
 /// reload; established connections keep the generation they started on.
 #[derive(Debug)]
 pub struct EdgeTls {
-    /// Server config for the client leg.
+    /// Server config for the client leg over the TCP listener.
     pub server: Arc<ServerConfig>,
+    /// The same config for tunnels; only its verifier's `transport` label differs.
+    pub tunnel: Arc<ServerConfig>,
     /// The client CA the verifier trusts (the only anchor).
     pub client_ca: CertificateDer<'static>,
     /// Client config for the worker leg; `None` until the
@@ -40,6 +42,15 @@ impl EdgeTls {
     /// handshake, evaluated now).
     pub fn identify(&self, leaf: &CertificateDer<'_>) -> Result<AllocationId, AllocCertError> {
         verify_allocation_cert(leaf, &self.client_ca, UnixTime::now())
+    }
+
+    /// The server config for connections that arrive over `transport`.
+    #[must_use]
+    pub fn server_for(&self, transport: Transport) -> &Arc<ServerConfig> {
+        match transport {
+            Transport::Tcp => &self.server,
+            Transport::Tunnel => &self.tunnel,
+        }
     }
 }
 
@@ -78,6 +89,8 @@ impl TlsBuilder {
     /// session resumption of any kind (rustls skips the verifier on resume).
     /// TLS 1.2 would send the client certificate, and with it the allocation
     /// identity, in cleartext; buildx and buildctl both negotiate 1.3.
+    /// The generation holds one such config per [`Transport`], identical but
+    /// for the `transport` label its verifier counts under.
     pub fn build(
         &self,
         serving: Arc<CertifiedKey>,
@@ -85,22 +98,27 @@ impl TlsBuilder {
     ) -> Result<EdgeTls, Error> {
         let (_, ca) = X509Certificate::from_der(&client_ca)
             .map_err(|_| Error::General("client CA is not a parseable certificate".into()))?;
-        let verifier = AllocationVerifier {
-            client_ca: client_ca.clone(),
-            hints: vec![DistinguishedName::from(ca.subject().as_raw().to_vec())],
-            algs: self.provider.signature_verification_algorithms,
-            handler: Arc::clone(&self.handler),
-            metrics: self.metrics.clone(),
+        let hints = vec![DistinguishedName::from(ca.subject().as_raw().to_vec())];
+        let config = |transport, serving| {
+            let verifier = AllocationVerifier {
+                client_ca: client_ca.clone(),
+                hints: hints.clone(),
+                algs: self.provider.signature_verification_algorithms,
+                handler: Arc::clone(&self.handler),
+                metrics: self.metrics.for_transport(transport),
+            };
+            let mut server = ServerConfig::builder_with_provider(Arc::clone(&self.provider))
+                .with_protocol_versions(&[&rustls::version::TLS13])?
+                .with_client_cert_verifier(Arc::new(verifier))
+                .with_cert_resolver(Arc::new(OneCert(serving)));
+            server.session_storage = Arc::new(NoServerSessionStorage {});
+            server.send_tls13_tickets = 0;
+            server.alpn_protocols = vec![b"h2".to_vec()];
+            Ok::<_, Error>(Arc::new(server))
         };
-        let mut server = ServerConfig::builder_with_provider(Arc::clone(&self.provider))
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .with_client_cert_verifier(Arc::new(verifier))
-            .with_cert_resolver(Arc::new(OneCert(serving)));
-        server.session_storage = Arc::new(NoServerSessionStorage {});
-        server.send_tls13_tickets = 0;
-        server.alpn_protocols = vec![b"h2".to_vec()];
         Ok(EdgeTls {
-            server: Arc::new(server),
+            server: config(Transport::Tcp, Arc::clone(&serving))?,
+            tunnel: config(Transport::Tunnel, serving)?,
             client_ca,
             upstream: None,
         })
