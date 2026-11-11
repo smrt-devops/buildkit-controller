@@ -383,10 +383,10 @@ impl Edge {
     }
 }
 
-/// Default `edge.maxConnections`, the same as the chart. Sized to the chart's
-/// 512Mi memory limit: an established edge connection holds about 200 KiB and
-/// an idle replica about 14 MiB, so 2000 connections stay near 400 MiB.
-/// Raise it together with the memory limit.
+/// Default `edge.maxConnections`, the same as the chart. The chart sizes the memory limit
+/// as about 14 MiB + `edge.maxConnections` x 460 KiB (tunnels; 200 KiB for `tcp://`) +
+/// `edge.maxHandshakes` x 280 KiB, so 2000 connections need about 900 MiB of it. Raise it
+/// together with the memory limit.
 pub const EDGE_MAX_CONNECTIONS: u32 = 2000;
 
 /// `edge.tls`.
