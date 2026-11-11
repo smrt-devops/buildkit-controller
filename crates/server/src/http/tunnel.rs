@@ -1,13 +1,16 @@
-//! `GET /v1/tunnel` (edge.md §10): the edge byte stream inside a WebSocket on
-//! the API listener, for gateways that terminate TLS and so never forward a
-//! client certificate.
+//! `/v1/tunnel` (edge.md §10): the edge byte stream inside a WebSocket on the
+//! API listener, for gateways that terminate TLS and so never forward a client
+//! certificate.
 //!
-//! The route takes no bearer token. It checks the RFC 6455 upgrade request,
-//! hands the connection to the edge ([`TunnelDoor::enter`]) and answers `101`
-//! once the edge holds a handshake slot for it. The API listener then lets the
-//! connection go, and with it its `api.maxConnections` and
-//! `api.maxConnectionsPerIp` slots. From there the edge runs the tunnel like
-//! an accepted TCP connection, over [`WsBytes`].
+//! The route takes no bearer token. It checks the WebSocket request, an
+//! HTTP/1.1 upgrade (RFC 6455) or an HTTP/2 extended `CONNECT` (RFC 8441),
+//! hands the stream to the edge ([`TunnelDoor::enter`]) and answers `101` or
+//! `200` once the edge holds a handshake slot for it. Over HTTP/1.1 the API
+//! listener then lets the connection go, and with it its `api.maxConnections`
+//! and `api.maxConnectionsPerIp` slots. Over HTTP/2 the tunnel is one stream:
+//! the connection keeps its slots and stays open while the tunnel lives
+//! ([`KeepOpen`]). From there the edge runs the tunnel like an accepted TCP
+//! connection, over [`WsBytes`].
 
 use std::io;
 use std::pin::Pin;
@@ -25,6 +28,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use buildkit_controller_api::dto::{ErrorCode, TUNNEL_PATH};
 use bytes::Bytes;
 use futures::{FutureExt as _, Sink, Stream};
+use hyper::ext::Protocol;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{Interval, MissedTickBehavior};
@@ -35,6 +39,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tracing::debug;
 
 use super::api::{ApiError, Peer};
+use super::listener::{Active, KeepOpen};
 use crate::edge::{Arrival, BoxIo, TunnelDoor};
 
 /// The server pings every tunnel this often, so idle timers in gateways and
@@ -85,12 +90,15 @@ pub fn router<S: Clone + Send + Sync + 'static>(tunnels: Tunnels) -> Router<S> {
 }
 
 async fn upgrade(State(t): State<Tunnels>, mut req: Request) -> Response {
-    let Some(accept) = accept_key(req.method(), req.version(), req.headers()) else {
-        return upgrade_required();
+    let protocol = req.extensions().get::<Protocol>();
+    let Some(form) = form(req.method(), req.version(), req.headers(), protocol) else {
+        return upgrade_required(req.version());
     };
     let Some(Peer(peer)) = req.extensions().get::<Peer>().copied() else {
         return unavailable();
     };
+    // Taken before the answer, so the connection is never idle in between.
+    let keep = req.extensions().get::<KeepOpen>().map(KeepOpen::hold);
     let upgraded = hyper::upgrade::on(&mut req);
     let ping_every = t.ping_every;
     let stream = async move {
@@ -104,11 +112,15 @@ async fn upgrade(State(t): State<Tunnels>, mut req: Request) -> Response {
         let ws =
             WebSocketStream::from_raw_socket(TokioIo::new(io), Role::Server, Some(ws_config()))
                 .await;
-        Some(Box::new(WsBytes::new(ws, ping_every)) as BoxIo)
+        let bytes = WsBytes {
+            _keep: keep,
+            ..WsBytes::new(ws, ping_every)
+        };
+        Some(Box::new(bytes) as BoxIo)
     }
     .boxed();
     match t.door.enter(Arrival { peer, stream }).await {
-        Ok(()) => switching(accept),
+        Ok(()) => form.answer(),
         Err(e) => {
             debug!(peer = %peer, error = %e, "tunnel refused");
             unavailable()
@@ -127,12 +139,27 @@ fn ws_config() -> WebSocketConfig {
         .max_message_size(Some(MAX_MESSAGE))
 }
 
-/// The `Sec-WebSocket-Accept` value for a well-formed RFC 6455 upgrade over
-/// HTTP/1.1, `None` for anything else.
-fn accept_key(method: &Method, version: Version, h: &HeaderMap) -> Option<HeaderValue> {
-    if method != Method::GET || version != Version::HTTP_11 {
-        return None;
-    }
+/// How a client asked for the WebSocket, with what the answer carries.
+#[derive(Debug, PartialEq, Eq)]
+enum Form {
+    /// HTTP/1.1 `GET` with `Upgrade: websocket`, answered `101` with this
+    /// `Sec-WebSocket-Accept`.
+    Upgrade(HeaderValue),
+    /// HTTP/2 extended `CONNECT` with `:protocol` `websocket`, answered `200`.
+    /// RFC 8441 needs no key, but a gateway that turns an HTTP/1.1 upgrade
+    /// into this form forwards the client's key and passes the answer's
+    /// `Sec-WebSocket-Accept` back, which the client checks (Envoy computes
+    /// none itself). So a key, when sent, is checked and answered.
+    Connect(Option<HeaderValue>),
+}
+
+/// The form of a well-formed WebSocket request, `None` for anything else.
+fn form(
+    method: &Method,
+    version: Version,
+    h: &HeaderMap,
+    protocol: Option<&Protocol>,
+) -> Option<Form> {
     let has = |name: HeaderName, token: &str| {
         h.get_all(name)
             .iter()
@@ -140,12 +167,30 @@ fn accept_key(method: &Method, version: Version, h: &HeaderMap) -> Option<Header
             .flat_map(|v| v.split(','))
             .any(|t| t.trim().eq_ignore_ascii_case(token))
     };
-    if !has(header::CONNECTION, "upgrade") || !has(header::UPGRADE, "websocket") {
-        return None;
-    }
     if h.get(header::SEC_WEBSOCKET_VERSION)?.as_bytes() != b"13" {
         return None;
     }
+    if *method == Method::GET && version == Version::HTTP_11 {
+        if !has(header::CONNECTION, "upgrade") || !has(header::UPGRADE, "websocket") {
+            return None;
+        }
+        return accept_key(h).map(Form::Upgrade);
+    }
+    if *method == Method::CONNECT
+        && version == Version::HTTP_2
+        && protocol.is_some_and(|p| p.as_str().eq_ignore_ascii_case("websocket"))
+    {
+        if !h.contains_key(header::SEC_WEBSOCKET_KEY) {
+            return Some(Form::Connect(None));
+        }
+        return accept_key(h).map(|a| Form::Connect(Some(a)));
+    }
+    None
+}
+
+/// The RFC 6455 `Sec-WebSocket-Accept` for the request's one well-formed
+/// `Sec-WebSocket-Key`.
+fn accept_key(h: &HeaderMap) -> Option<HeaderValue> {
     let mut keys = h.get_all(header::SEC_WEBSOCKET_KEY).iter();
     let key = keys.next()?;
     if keys.next().is_some() || BASE64.decode(key.as_bytes()).ok()?.len() != 16 {
@@ -157,21 +202,35 @@ fn accept_key(method: &Method, version: Version, h: &HeaderMap) -> Option<Header
     HeaderValue::from_str(&BASE64.encode(ctx.finish())).ok()
 }
 
-fn switching(accept: HeaderValue) -> Response {
-    let mut r = Response::new(Body::empty());
-    *r.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-    let h = r.headers_mut();
-    h.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
-    h.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
-    h.insert(header::SEC_WEBSOCKET_ACCEPT, accept);
-    r
+impl Form {
+    /// The `101` or `200` that opens the tunnel.
+    fn answer(self) -> Response {
+        let mut r = Response::new(Body::empty());
+        let h = r.headers_mut();
+        let accept = match self {
+            Form::Upgrade(accept) => {
+                h.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+                h.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+                *r.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+                Some(accept)
+            }
+            Form::Connect(accept) => accept,
+        };
+        if let Some(a) = accept {
+            r.headers_mut().insert(header::SEC_WEBSOCKET_ACCEPT, a);
+        }
+        r
+    }
 }
 
-fn upgrade_required() -> Response {
+fn upgrade_required(version: Version) -> Response {
     let mut r = StatusCode::UPGRADE_REQUIRED.into_response();
     let h = r.headers_mut();
-    h.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
-    h.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+    // HTTP/2 forbids connection-specific header fields.
+    if version < Version::HTTP_2 {
+        h.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+        h.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+    }
     h.insert(
         header::SEC_WEBSOCKET_VERSION,
         HeaderValue::from_static("13"),
@@ -206,6 +265,8 @@ pub struct WsBytes<S> {
     flush_due: bool,
     /// The peer closed or the stream ended: reads return EOF.
     eof: bool,
+    /// Keeps the HTTP/2 connection that carries the tunnel open while it lives.
+    _keep: Option<Active>,
 }
 
 impl<S> WsBytes<S> {
@@ -222,6 +283,7 @@ impl<S> WsBytes<S> {
             ping_due: false,
             flush_due: false,
             eof: false,
+            _keep: None,
         }
     }
 }

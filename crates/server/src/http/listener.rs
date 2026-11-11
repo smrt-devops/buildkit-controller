@@ -36,8 +36,20 @@ pub type ServingCerts = watch::Receiver<Option<Arc<CertifiedKey>>>;
 /// HTTP/2 ping cadence and the wait for its ack before closing.
 const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Concurrent HTTP/2 streams per connection.
+/// Concurrent HTTP/2 streams per connection. A gateway opens another
+/// connection once its tunnels fill one.
 const H2_MAX_STREAMS: u32 = 64;
+/// HTTP/2 receive windows. A stream's window is what a peer can make the
+/// server hold unread on that stream, an unauthenticated tunnel included, so
+/// it matches the tunnel's message cap (256 KiB, a quarter of hyper's
+/// default). On the in-cluster gateway hop that still moves about 250 MB/s
+/// per tunnel at a 1 ms round trip, and it is far above any API request
+/// body. The connection's window is shared by every stream, and a tunnel the
+/// edge reads slowly keeps up to a stream window of it, so it holds 16 stream
+/// windows: one stalled tunnel does not stall the others on a gateway
+/// connection.
+const H2_STREAM_WINDOW: u32 = 256 * 1024;
+const H2_CONN_WINDOW: u32 = 16 * H2_STREAM_WINDOW;
 /// Request head bound (HTTP/1 buffer, HTTP/2 header list); the token alone may be 16 KiB.
 const MAX_HEADER_BYTES: u32 = 64 * 1024;
 
@@ -235,8 +247,12 @@ async fn connection(
     };
     // The protocol comes from ALPN, so there is no sniffing phase without a deadline.
     let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
-    let inner = TowerToHyperService::new(app.layer(axum::Extension(Peer(peer))));
     let flight = Arc::new(InFlight::default());
+    let mut app = app.layer(axum::Extension(Peer(peer)));
+    if h2 {
+        app = app.layer(axum::Extension(KeepOpen(Arc::clone(&flight))));
+    }
+    let inner = TowerToHyperService::new(app);
     let svc = {
         let (flight, stop) = (Arc::clone(&flight), shutdown.clone());
         service_fn(move |req| {
@@ -262,23 +278,32 @@ async fn connection(
     };
     let io = TokioIo::new(stream);
     if h2 {
-        let conn = http2::Builder::new(TokioExecutor::new())
-            .timer(TokioTimer::new())
-            .keep_alive_interval(Some(H2_KEEPALIVE_INTERVAL))
-            .keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
-            .max_concurrent_streams(H2_MAX_STREAMS)
-            .max_header_list_size(MAX_HEADER_BYTES)
-            .serve_connection(io, svc);
-        drive(
-            conn,
-            http2::Connection::graceful_shutdown,
-            peer,
-            &flight,
-            limits,
-            shutdown,
-            true,
-        )
-        .await;
+        let mut conn = Box::pin(
+            http2::Builder::new(TokioExecutor::new())
+                .timer(TokioTimer::new())
+                .keep_alive_interval(Some(H2_KEEPALIVE_INTERVAL))
+                .keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
+                .max_concurrent_streams(H2_MAX_STREAMS)
+                .max_header_list_size(MAX_HEADER_BYTES)
+                .initial_stream_window_size(H2_STREAM_WINDOW)
+                .initial_connection_window_size(H2_CONN_WINDOW)
+                // `CONNECT /v1/tunnel` with `:protocol` `websocket` (RFC 8441).
+                .enable_connect_protocol()
+                .serve_connection(io, svc),
+        );
+        let close = http2::Connection::graceful_shutdown;
+        let exit = drive(conn.as_mut(), close, peer, &flight, limits, shutdown, true).await;
+        if exit == Exit::Tunnels {
+            // The API is done with the connection, but the tunnels on it
+            // belong to the edge and drain with it, as an HTTP/1.1 tunnel's
+            // socket does. The connection, GOAWAY already sent, lives on
+            // until they end, then closes as an idle one does.
+            debug!(peer = %peer, "API drained; the connection stays for its tunnels");
+            tokio::spawn(async move {
+                let never = CancellationToken::new();
+                drive(conn.as_mut(), close, peer, &flight, limits, never, true).await;
+            });
+        }
     } else {
         let conn = http1::Builder::new()
             .timer(TokioTimer::new())
@@ -288,8 +313,9 @@ async fn connection(
             // `GET /v1/tunnel`: the future ends at the `101`, which frees this
             // connection's API slots while the edge keeps the socket.
             .with_upgrades();
+        tokio::pin!(conn);
         drive(
-            conn,
+            conn.as_mut(),
             http1::UpgradeableConnection::graceful_shutdown,
             peer,
             &flight,
@@ -305,64 +331,111 @@ async fn connection(
 /// resolves (response head ready) or is dropped (stream reset). Body delivery
 /// is not counted, so a peer that never opens its flow-control window cannot
 /// hold the connection. The server cuts an undelivered 201 and retires its grant.
+///
+/// HTTP/2 tunnels are counted apart: a tunnel stream is not a request once its
+/// `200` is out, but the connection must stay open while it lives.
 #[derive(Default)]
 struct InFlight {
     open: AtomicUsize,
-    /// Signalled each time `open` falls to zero.
+    tunnels: AtomicUsize,
+    /// Signalled each time `open` or `tunnels` falls to zero.
     idle: Notify,
 }
 
 impl InFlight {
     fn start(this: &Arc<Self>) -> Active {
         this.open.fetch_add(1, Ordering::AcqRel);
-        Active(Arc::clone(this))
+        Active {
+            flight: Arc::clone(this),
+            tunnel: false,
+        }
     }
 
+    /// No request and no tunnel open.
     fn is_idle(&self) -> bool {
-        self.open.load(Ordering::Acquire) == 0
+        self.open.load(Ordering::Acquire) == 0 && self.tunnels.load(Ordering::Acquire) == 0
+    }
+
+    /// No request open, but a tunnel is.
+    fn only_tunnels(&self) -> bool {
+        self.open.load(Ordering::Acquire) == 0 && self.tunnels.load(Ordering::Acquire) > 0
     }
 }
 
-/// One open request; dropping it may make the connection idle.
-struct Active(Arc<InFlight>);
+/// The request extension on an HTTP/2 connection that lets a tunnel stream
+/// keep the connection open after its `200`.
+#[derive(Clone)]
+pub(crate) struct KeepOpen(Arc<InFlight>);
 
-impl Drop for Active {
-    fn drop(&mut self) {
-        if self.0.open.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.0.idle.notify_one();
+impl KeepOpen {
+    /// Counts one tunnel on the connection until the guard is dropped.
+    pub(crate) fn hold(&self) -> Active {
+        self.0.tunnels.fetch_add(1, Ordering::AcqRel);
+        Active {
+            flight: Arc::clone(&self.0),
+            tunnel: true,
         }
     }
 }
 
+/// One open request or tunnel; dropping it may make the connection idle.
+pub(crate) struct Active {
+    flight: Arc<InFlight>,
+    tunnel: bool,
+}
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        let f = &self.flight;
+        let count = if self.tunnel { &f.tunnels } else { &f.open };
+        if count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            f.idle.notify_one();
+        }
+    }
+}
+
+/// Why [`drive`] returned.
+#[derive(Debug, PartialEq, Eq)]
+enum Exit {
+    /// The connection ended, or the caller is to drop it.
+    Closed,
+    /// After shutdown no request is open, only HTTP/2 tunnels: the caller
+    /// keeps the connection running for them.
+    Tunnels,
+}
+
 /// Run `conn`, drain it on `shutdown`, and bound the time it may spend with no
-/// request open. The bound is `idle_timeout` from the end of the TLS handshake,
-/// re-armed each time the last open request ends. On expiry the server asks the
-/// connection to close (HTTP/2 GOAWAY, so a stream that raced in still
-/// completes). If the connection is still idle one more `idle_timeout` later,
-/// the server drops it. This function never bounds an open request, because a
-/// POST waits up to 20 s for its allocation and a GET up to 25 s.
+/// request or tunnel open. The bound is `idle_timeout` from the end of the TLS
+/// handshake, re-armed each time the last open request or tunnel ends. On
+/// expiry the server asks the connection to close (HTTP/2 GOAWAY, so a stream
+/// that raced in still completes). If the connection is still idle one more
+/// `idle_timeout` later, the server drops it. This function never bounds an
+/// open request, because a POST waits up to 20 s for its allocation and a GET
+/// up to 25 s.
 ///
 /// On `shutdown` an HTTP/2 connection gets GOAWAY at once, and is dropped once
 /// it has had no request open for `idle_timeout`. An HTTP/1 connection keeps
 /// running, its responses carry `Connection: close` from then on, and the idle
 /// bound closes it if no request comes. So a request already on the wire gets
 /// an answer, not a reset: a waiting allocation answers at once with its state.
+/// Once no request is open after `shutdown` but HTTP/2 tunnels are, this
+/// returns [`Exit::Tunnels`] with the connection still running.
 ///
 /// `close` asks the connection to close gracefully. An HTTP/1 connection whose
 /// request upgraded (`/v1/tunnel`) ends at the `101`.
 async fn drive<C, E>(
-    conn: C,
+    mut conn: Pin<&mut C>,
     close: fn(Pin<&mut C>),
     peer: SocketAddr,
     flight: &InFlight,
     limits: Limits,
     shutdown: CancellationToken,
     h2: bool,
-) where
+) -> Exit
+where
     C: Future<Output = Result<(), E>>,
     E: std::fmt::Display,
 {
-    tokio::pin!(conn);
     let deadline = tokio::time::sleep(limits.idle_timeout);
     tokio::pin!(deadline);
     let mut closing = false;
@@ -376,10 +449,13 @@ async fn drive<C, E>(
                 if let Err(e) = r {
                     debug!(peer = %peer, error = %e, "connection");
                 }
-                return;
+                return Exit::Closed;
             }
             () = flight.idle.notified() => {
                 deadline.as_mut().reset(Instant::now() + limits.idle_timeout);
+                if stopped && flight.only_tunnels() {
+                    return Exit::Tunnels;
+                }
             }
             () = &mut deadline, if flight.is_idle() => {
                 if !flight.is_idle() {
@@ -387,7 +463,7 @@ async fn drive<C, E>(
                 }
                 if closing {
                     debug!(peer = %peer, "still idle after asking to close; dropping");
-                    return;
+                    return Exit::Closed;
                 }
                 debug!(peer = %peer, "no request open before the deadline; closing");
                 close(conn.as_mut());
@@ -402,6 +478,9 @@ async fn drive<C, E>(
                     close(conn.as_mut());
                     closing = true;
                     deadline.as_mut().reset(Instant::now() + limits.idle_timeout);
+                }
+                if flight.only_tunnels() {
+                    return Exit::Tunnels;
                 }
             }
         }
@@ -445,6 +524,7 @@ mod tests {
         let driven = tokio::spawn({
             let (flight, stop) = (Arc::clone(&flight), stop.clone());
             async move {
+                let conn = std::pin::pin!(conn);
                 drive(
                     conn,
                     http2::Connection::graceful_shutdown,
@@ -498,6 +578,7 @@ mod tests {
                 Ok::<_, std::convert::Infallible>(hyper::Response::new(String::new()))
             });
             let conn = http1::Builder::new().serve_connection(TokioIo::new(server), svc);
+            let conn = pin!(conn);
             let peer: SocketAddr = ([127, 0, 0, 1], 1).into();
             let mut drive = pin!(drive(
                 conn,
@@ -508,10 +589,10 @@ mod tests {
                 CancellationToken::new(),
                 false
             ));
-            let poll_once = async |d: &mut std::pin::Pin<&mut dyn Future<Output = ()>>| {
+            let poll_once = async |d: &mut std::pin::Pin<&mut dyn Future<Output = Exit>>| {
                 poll_fn(|cx| Poll::Ready(d.as_mut().poll(cx).is_ready())).await
             };
-            let mut d: std::pin::Pin<&mut dyn Future<Output = ()>> = drive.as_mut();
+            let mut d: std::pin::Pin<&mut dyn Future<Output = Exit>> = drive.as_mut();
             assert!(!poll_once(&mut d).await);
             // A request opens and finishes while `drive` is not running...
             drop(InFlight::start(&flight));
