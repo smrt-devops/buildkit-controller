@@ -643,6 +643,39 @@ async fn a_text_frame_or_an_oversize_frame_closes_the_tunnel() {
     }
 }
 
+/// A frame of exactly [`MAX_MESSAGE`] payload bytes is read by the server (the
+/// bytes are not TLS, so the edge answers with an alert frame); one byte more
+/// closes the tunnel without a word.
+#[tokio::test]
+async fn a_frame_of_exactly_the_cap_is_read_and_one_more_byte_is_not() {
+    let cap = buildkit_controller::http::MAX_MESSAGE;
+    for form in FORMS {
+        let r = start(Knobs::default()).await;
+        let mut ws = websocket(&r, form).await;
+        ws.send(Message::Binary(Bytes::from(vec![0x16u8; cap])))
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("an answer");
+        assert!(
+            matches!(first, Some(Ok(Message::Binary(_)))),
+            "{form:?}: {first:?}"
+        );
+        let mut ws = websocket(&r, form).await;
+        let _ = ws
+            .send(Message::Binary(Bytes::from(vec![0x16u8; cap + 1])))
+            .await;
+        let first = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("the tunnel ends");
+        assert!(
+            !matches!(first, Some(Ok(Message::Binary(_)))),
+            "{form:?}: {first:?}"
+        );
+    }
+}
+
 /// The API listener stops without cutting a tunnel; the edge drains it like
 /// any edge connection and only then returns.
 #[tokio::test]

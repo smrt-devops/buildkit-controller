@@ -41,14 +41,13 @@ const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const H2_MAX_STREAMS: u32 = 64;
 /// HTTP/2 receive windows. A stream's window is what a peer can make the
 /// server hold unread on that stream, an unauthenticated tunnel included, so
-/// it matches the tunnel's message cap (256 KiB, a quarter of hyper's
-/// default). On the in-cluster gateway hop that still moves about 250 MB/s
-/// per tunnel at a 1 ms round trip, and it is far above any API request
-/// body. The connection's window is shared by every stream, and a tunnel the
-/// edge reads slowly keeps up to a stream window of it, so it holds 16 stream
+/// it matches the tunnel's message cap (64 KiB: the HTTP/2 protocol default of 65,535, and one sixteenth of hyper's 1 MiB). On the
+/// in-cluster gateway hop that still moves about 64 MB/s per tunnel at a 1 ms
+/// round trip, and it is above any API request head and most bodies. The connection's window is shared by every stream, and a
+/// tunnel the edge reads slowly keeps up to a stream window of it, so it holds 16 stream
 /// windows: one stalled tunnel does not stall the others on a gateway
 /// connection.
-const H2_STREAM_WINDOW: u32 = 256 * 1024;
+const H2_STREAM_WINDOW: u32 = 64 * 1024;
 const H2_CONN_WINDOW: u32 = 16 * H2_STREAM_WINDOW;
 /// Request head bound (HTTP/1 buffer, HTTP/2 header list); the token alone may be 16 KiB.
 const MAX_HEADER_BYTES: u32 = 64 * 1024;
