@@ -71,6 +71,10 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- if has .Release.Namespace (default (list) .Values.claims.namespaces) -}}
 {{- fail (printf "claims.namespaces must not include the release namespace %s: the API's claims live there and the leader trusts their owner and cache fields, so only cluster admins may create claims there" .Release.Namespace) -}}
 {{- end -}}
+{{- /* With no edge.endpoint, in-cluster claims dial the Service at the edge container port (8444). */ -}}
+{{- if and .Values.claims.namespaces (empty .Values.edge.endpoint) (ne (int .Values.service.ports.edge) 8444) -}}
+{{- fail (printf "service.ports.edge must be 8444 when claims.namespaces is set and edge.endpoint is empty: in-cluster claims dial tcp://%s.%s.svc:8444, so service.ports.edge %d would name a port the Service does not have. Set edge.endpoint to the edge address, or keep service.ports.edge at 8444." (include "bkc.fullname" .) .Release.Namespace (int .Values.service.ports.edge)) -}}
+{{- end -}}
 {{- if .Values.cache.enabled -}}
   {{- $_ := set $cfg "registry" (dict "host" (include "bkc.registryHost" .) "tlsSecretName" (printf "%s-registry-tls" $fn)) -}}
 {{- end -}}
