@@ -441,7 +441,7 @@ pub(crate) fn registry_verify() -> Result<()> {
 /// Branch caches, with the flags the controller gives each tier:
 ///
 /// e. `branch-a` (untrusted, branch scope a) builds the branch Dockerfile:
-///    the shared steps hit the trusted cache, and it exports to its branch.
+///    the shared RUN step hits the trusted cache, and it exports to its branch.
 /// f. `branch-a2`, a fresh worker of the same branch, hits the branch's own
 ///    step from the branch cache.
 /// g. `branch-b` (branch scope b) also asks for branch a's cache and gets
@@ -463,17 +463,22 @@ fn branch_scenarios(
     // e.
     let (before, denied_push) = (pushed(env)?, denied(env, "push")?);
     let (ok, log) = exec(env, "branch-a", &build_branch(&branch_flags(BRANCH_A)))?;
-    let (cached, own) = (cached_steps(&log), step_cached(&log, STEP));
+    let (shared, own) = (
+        step_cached(&log, "registry-cache-step"),
+        step_cached(&log, STEP),
+    );
     let after = pushed(env)?;
+    let pass = ok
+        && shared
+        && !own
+        && after - before >= 1.0
+        && (denied(env, "push")? - denied_push).abs() < f64::EPSILON;
     r.check(
         "e/branch build reads the trusted cache and exports its own",
-        ok && cached >= 3
-            && !own
-            && after - before >= 1.0
-            && (denied(env, "push")? - denied_push).abs() < f64::EPSILON,
-        &format!("build ok={ok}, {cached} CACHED, branch step cached={own}, manifest pushes {before}->{after}"),
+        pass,
+        &format!("build ok={ok}, shared step cached={shared}, branch step cached={own}, manifest pushes {before}->{after}"),
     );
-    if !ok {
+    if !pass {
         println!("{log}");
     }
 
