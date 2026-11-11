@@ -850,6 +850,31 @@ async fn other_paths_and_methods_are_404_not_found() {
     );
 }
 
+/// An HTTP/2 extended `CONNECT` with `:protocol` `websocket` anywhere but
+/// `/v1/tunnel` is refused like any other unknown request, never upgraded.
+#[tokio::test]
+async fn an_extended_connect_on_another_path_is_404() {
+    let metrics = Metrics::new();
+    let app = router(state(Fake::new(Next::Bound), &metrics));
+    for path in ["/v1/allocations", "/v1/pools", "/v1/tunnel/x", "/nope"] {
+        let req = Request::builder()
+            .method(axum::http::Method::CONNECT)
+            .version(axum::http::Version::HTTP_2)
+            .uri(format!("https://api.test{path}"))
+            .header(header::SEC_WEBSOCKET_VERSION, "13")
+            .header(header::AUTHORIZATION, format!("Bearer {ALICE}"))
+            .extension(hyper::ext::Protocol::from_static("websocket"))
+            .body(Body::empty())
+            .unwrap();
+        let (st, _, body) = call(&app, req).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(
+            body,
+            r#"{"error":{"code":"not_found","message":"not found"}}"#
+        );
+    }
+}
+
 // ---- real TLS ----
 
 fn serving(name: &str) -> (Arc<CertifiedKey>, CertificateDer<'static>) {
