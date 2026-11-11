@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 const https = require('node:https');
+const { spawn } = require('node:child_process');
 
 /** Split a comma/newline list, trim, drop empties. */
 function parseList(s) {
@@ -430,6 +431,84 @@ async function releaseAllocation({ api, ca, getToken, id, log, ...inject }) {
   if (res.status !== 204 && res.status !== 404) throw apiError(`release ${id}`, res);
 }
 
+/** An allocation `endpoint` that starts with "/" is a path on the API base URL: the tunnel (edge.md section 10). */
+function isTunnelEndpoint(endpoint) {
+  return typeof endpoint === 'string' && endpoint.startsWith('/');
+}
+
+/** The tunnel URL for a tunnel `endpoint`: a path on the API base URL (no trailing slash), so never another host. */
+function tunnelUrl(api, endpoint) {
+  return new URL(api + endpoint).href;
+}
+
+/**
+ * Start dist/tunnel.js detached (it outlives this step) with one listener per URL. The child gets
+ * no token or key, only the CA bundle for the WebSocket. Resolves {pid, ports} once it has printed
+ * its ports; on any failure the child is killed.
+ */
+function startForwarder({ urls, ca, timeoutMs = 10000, script = path.join(__dirname, 'tunnel.js') }) {
+  return new Promise((resolve, reject) => {
+    const args = [script, ...urls.flatMap((u) => ['--url', u])];
+    const child = spawn(process.execPath, args, { detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { BUILDKIT_TUNNEL_CA: ca || '' } });
+    let out = '';
+    let err = '';
+    let settled = false;
+    const settle = (fn, v) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.stdout.destroy();
+      child.stderr.destroy();
+      if (fn === reject) child.kill('SIGKILL'); else child.unref();
+      fn(v);
+    };
+    const timer = setTimeout(() => settle(reject, new Error('tunnel forwarder did not start in time')), timeoutMs);
+    child.on('error', (e) => settle(reject, new Error(`tunnel forwarder failed to start: ${e.message}`)));
+    child.on('exit', (code) => settle(reject, new Error(`tunnel forwarder exited with ${code}: ${err.trim().slice(0, 300)}`)));
+    child.stderr.on('data', (c) => { err += c; });
+    child.stdout.on('data', (c) => {
+      out += c;
+      const nl = out.indexOf('\n');
+      if (nl < 0) return;
+      try {
+        const { ports } = JSON.parse(out.slice(0, nl));
+        if (!Array.isArray(ports) || ports.length !== urls.length || !ports.every((p) => Number.isInteger(p) && p > 0 && p < 65536)) throw new Error('bad ports');
+        settle(resolve, { pid: child.pid, ports });
+      } catch { settle(reject, new Error('tunnel forwarder printed an unreadable port line')); }
+    });
+  });
+}
+
+/** SIGTERM the forwarder with this pid. A missing process is not an error; returns whether one was signalled. */
+function stopForwarder(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 1) return false;
+  try {
+    process.kill(n, 'SIGTERM');
+    return true;
+  } catch (e) {
+    if (e.code === 'ESRCH') return false;
+    throw e;
+  }
+}
+
+/**
+ * Give every node whose endpoint is a tunnel path a local `tcp://127.0.0.1:<port>` endpoint from one
+ * forwarder process, one listener per node. Nodes with a tcp:// endpoint are returned as they are
+ * and no process starts when there is no tunnel node. `onStarted(pid)` fires as soon as the
+ * forwarder is up, so the caller can record the pid for the post step.
+ */
+async function useTunnels(nodes, { api, ca, start = startForwarder, onStarted = () => {} }) {
+  const idx = nodes.flatMap((n, i) => (isTunnelEndpoint(n.endpoint) ? [i] : []));
+  if (idx.length === 0) return nodes;
+  const urls = idx.map((i) => tunnelUrl(api, nodes[i].endpoint));
+  const { pid, ports } = await start({ urls, ca });
+  onStarted(pid);
+  const out = nodes.slice();
+  idx.forEach((i, k) => { out[i] = { ...nodes[i], endpoint: `tcp://127.0.0.1:${ports[k]}` }; });
+  return out;
+}
+
 /** Payload `exp` of a JWT in ms since the epoch, or undefined when the token cannot be decoded. */
 function jwtExpiryMs(token) {
   try {
@@ -471,5 +550,6 @@ async function fetchOidcToken(audience, setSecret) {
 module.exports = {
   parseList, parsePool, REQUEST_TIMEOUT_MS, postTimeoutMs, isCurrentServer, cachedToken, jwtExpiryMs, FAST_POLL_MS, pollAllocation, allocate, errorCode, parseDuration, generateKey, allocationBody,
   validatePools, buildxCommands, parseCacheInputs, cacheFlags, checkAllocationId, createBuilder, writeMaterial, request, apiError,
+  isTunnelEndpoint, tunnelUrl, startForwarder, stopForwarder, useTunnels,
   effectiveQueueTimeout, retryBudgetMs, SHORT_BUDGET_MS, releaseAllocation, queueTimeoutFor, retryAfterMs, requestWithRetry, fetchOidcToken,
 };

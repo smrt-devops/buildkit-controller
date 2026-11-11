@@ -85,10 +85,12 @@ async function run() {
   const dirs = ids.map((id) => path.join(root, `buildkit-${id}`));
   const builder = gha.getInput('builder-name') || `bk-${ids[0]}`;
 
-  const nodes = allocs.map((a, i) => {
+  const direct = allocs.map((a, i) => {
     const m = L.writeMaterial(dirs[i], a, keys[i].privateKey);
     return { ...m, endpoint: a.endpoint, serverName: a.serverName, platforms: found[i].platforms || [] };
   });
+  // A path endpoint is the tunnel (edge.md section 10): one detached forwarder, one local port per allocation.
+  const nodes = await L.useTunnels(direct, { api, ca, onStarted: (pid) => gha.saveState('forwarder', String(pid)) });
   L.createBuilder(builder, nodes, docker, () => gha.saveState('builder', builder));
 
   gha.setOutput('builder', builder);
