@@ -13,7 +13,7 @@ The tunnel is now the default way to reach the controller. Builds run inside a W
 - With a tunnel behind a Gateway, the chart renders `edge.maxHandshakesPerIp` as 0 unless `api.proxyProtocol` is on, because a tunnel handshake counts against the API connection's address. NOTES.txt describes the tunnel and its per-address caps.
 - The Action runs a local forwarder when the allocation endpoint is a path and needs no new inputs. The shell recipe (`docs/ci/buildkit-allocate.sh`) works only with a `tcp://` endpoint until a client binary ships, and it now stops with a clear message, after releasing the allocation, when the endpoint starts with `/`.
 - The examples use the tunnel default. `examples/helm-values-tcp.yaml` keeps a TCP passthrough install.
-- The controller memory limit rises from 512Mi to 1Gi. A tunnelled edge connection can hold about 460 KiB, so the default 2000 connections need about 900 MiB. Lower `edge.maxConnections` or raise `resources.limits.memory` together with it.
+- The controller memory limit rises from 512Mi to 1536Mi. The limit is about 14 MiB plus 460 KiB per established tunnelled connection (`edge.maxConnections`) plus 280 KiB per handshake in progress (`edge.maxHandshakes`), about 1.16 GiB at the defaults, so the limit leaves about 344 MiB of margin. Lower those caps or raise the limit together with them.
 
 ### Compatibility
 

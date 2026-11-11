@@ -19,16 +19,17 @@ podDisruptionBudget:
   enabled: true
   minAvailable: 1
 
-# Memory limit = baseline + edge.maxConnections x per-connection cost. The baseline of an idle
-# replica is about 14 MiB. A tcp:// edge connection costs about 200 KiB (two 64 KiB copy buffers
-# and two TLS sessions). A tunnelled connection costs about 460 KiB at worst (the 200 KiB of a
-# TCP edge connection, a 64 KiB HTTP/2 stream window, up to 128 KiB of WebSocket read buffer and
-# message, and one 65 KiB outgoing frame). At the default edge.maxConnections of 2000, tunnels
-# need about 900 MiB, so 1Gi holds them. To lower the limit, lower edge.maxConnections; to raise
-# edge.maxConnections, raise the limit together with it.
+# Memory limit = baseline + edge.maxConnections x 460 KiB + edge.maxHandshakes x 280 KiB.
+# The baseline of an idle replica is about 14 MiB. An established tunnelled connection costs about
+# 460 KiB at worst (the 200 KiB of a tcp:// edge connection, a 64 KiB HTTP/2 stream window, up to
+# 128 KiB of WebSocket read buffer and message, and one 65 KiB outgoing frame; a tcp:// connection
+# costs 200 KiB). A handshake in progress costs about 280 KiB. Tunnels share the handshake budget.
+# At the defaults (edge.maxConnections 2000, edge.maxHandshakes 1024) the total is about 1.16 GiB,
+# so 1536Mi leaves about 344 MiB of margin. To lower the limit, lower edge.maxConnections or
+# edge.maxHandshakes; to raise either, raise the limit together with it.
 resources:
   requests: {cpu: 100m, memory: 128Mi}
-  limits: {memory: 1Gi}
+  limits: {memory: 1536Mi}
 
 logLevel: info
 logFormat: json
