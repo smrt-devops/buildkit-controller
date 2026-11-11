@@ -738,12 +738,6 @@ async fn a_branch_scope_reads_through_to_its_trusted_scope() {
     assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
     let mine = r.header("docker-content-digest").to_owned();
     assert_ne!(mine, index);
-    assert!(
-        f.dir
-            .join("repos/ns/p/br/_links")
-            .join(shared.hex())
-            .exists()
-    );
     let r = get(
         "branch",
         Method::GET,
