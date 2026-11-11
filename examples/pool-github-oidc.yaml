@@ -24,6 +24,16 @@ spec:
             repository_id: "87654321"   # the repository's numeric id (gh api repos/<owner>/<name> --jq .id)
             event_name: push
             job_workflow_ref: smrt-devops/app/.github/workflows/release.yml@*
+      # Every domain of one organization except pci. "*" requires the claim to be present and
+      # non-empty, and is allowed because repository_owner_id pins the rule. exclude refuses
+      # any listed pattern. It also works in spec.workers.cache.writers.
+      - oidc:
+          issuer: https://token.actions.githubusercontent.com
+          claims:
+            repository_owner_id: "12345678"
+            repo_property_domain: "*"
+          exclude:
+            repo_property_domain: [pci]
       # In-cluster jobs that run as the builder ServiceAccount in this namespace.
       - serviceAccount:
           name: builder

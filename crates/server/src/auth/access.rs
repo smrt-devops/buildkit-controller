@@ -14,6 +14,7 @@ const MAX_RULES: usize = 64;
 const MAX_CLAIMS: usize = 16;
 const MAX_CLAIM_VALUE: usize = 256;
 const MAX_ISSUER: usize = 512;
+const MAX_EXCLUDE_PATTERNS: usize = 16;
 
 /// Why a rule set was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -25,9 +26,13 @@ pub enum RuleError {
     #[error("oidc rule needs between 1 and {MAX_CLAIMS} claims")]
     ClaimCount,
     #[error(
-        "claim {0:?}: value must be 1..={MAX_CLAIM_VALUE} characters and contain a character other than '*'"
+        "claim {0:?}: value must be 1..={MAX_CLAIM_VALUE} characters, and a value made only of '*' needs another claim in the rule whose value has a character other than '*'"
     )]
     BadClaimValue(String),
+    #[error(
+        "exclude needs at most {MAX_CLAIMS} claims, each with 1 to {MAX_EXCLUDE_PATTERNS} patterns of 1..={MAX_CLAIM_VALUE} characters that are not only '*'"
+    )]
+    BadExclude,
     #[error("serviceAccount {0:?} is not a valid DNS name")]
     BadServiceAccount(String),
     #[error("claims rule needs between 1 and {MAX_CLAIM_NAMESPACES} DNS-1123 namespaces")]
@@ -43,6 +48,8 @@ pub enum AccessRule {
     Oidc {
         issuer: String,
         claims: BTreeMap<String, String>,
+        /// Claim name to patterns; a match on any of them refuses the rule.
+        exclude: BTreeMap<String, Vec<String>>,
     },
     ServiceAccount {
         /// `None` = the pool's namespace.
@@ -77,7 +84,11 @@ impl AccessRules {
 
 fn validate(rule: &AccessRule) -> Result<(), RuleError> {
     match rule {
-        AccessRule::Oidc { issuer, claims } => {
+        AccessRule::Oidc {
+            issuer,
+            claims,
+            exclude,
+        } => {
             if !issuer.starts_with("https://") || issuer.len() > MAX_ISSUER {
                 return Err(RuleError::BadIssuer);
             }
@@ -85,9 +96,25 @@ fn validate(rule: &AccessRule) -> Result<(), RuleError> {
                 return Err(RuleError::ClaimCount);
             }
             for (name, pattern) in claims {
-                if pattern.chars().count() > MAX_CLAIM_VALUE || pattern.chars().all(|c| c == '*') {
+                if pattern.is_empty() || pattern.chars().count() > MAX_CLAIM_VALUE {
                     return Err(RuleError::BadClaimValue(name.clone()));
                 }
+            }
+            // A presence-only claim is allowed only beside a claim pinned to something.
+            if claims.values().all(|p| is_presence(p)) {
+                let first = claims.keys().next().cloned().unwrap_or_default();
+                return Err(RuleError::BadClaimValue(first));
+            }
+            if exclude.len() > MAX_CLAIMS
+                || exclude.values().any(|ps| {
+                    ps.is_empty()
+                        || ps.len() > MAX_EXCLUDE_PATTERNS
+                        || ps.iter().any(|p| {
+                            p.is_empty() || p.chars().count() > MAX_CLAIM_VALUE || is_presence(p)
+                        })
+                })
+            {
+                return Err(RuleError::BadExclude);
             }
             Ok(())
         }
@@ -115,7 +142,11 @@ fn validate(rule: &AccessRule) -> Result<(), RuleError> {
 fn matches(rule: &AccessRule, who: &Identity, pool_namespace: &str) -> bool {
     match (rule, who) {
         (
-            AccessRule::Oidc { issuer, claims },
+            AccessRule::Oidc {
+                issuer,
+                claims,
+                exclude,
+            },
             Identity::Oidc {
                 issuer: iss,
                 claims: have,
@@ -126,6 +157,9 @@ fn matches(rule: &AccessRule, who: &Identity, pool_namespace: &str) -> bool {
                 && claims
                     .iter()
                     .all(|(name, pattern)| claim_matches(have.get(name), pattern))
+                && !exclude.iter().any(|(name, patterns)| {
+                    patterns.iter().any(|p| claim_matches(have.get(name), p))
+                })
         }
         (
             AccessRule::ServiceAccount { namespace, name },
@@ -147,12 +181,25 @@ fn matches(rule: &AccessRule, who: &Identity, pool_namespace: &str) -> bool {
 
 fn claim_matches(value: Option<&Value>, pattern: &str) -> bool {
     match value {
-        Some(Value::String(s)) => glob(pattern, s),
+        Some(Value::String(s)) => text_matches(pattern, s),
         Some(Value::Array(items)) => items
             .iter()
-            .any(|v| v.as_str().is_some_and(|s| glob(pattern, s))),
+            .any(|v| v.as_str().is_some_and(|s| text_matches(pattern, s))),
         _ => false,
     }
+}
+
+/// A value made only of `*` means "present": any non-empty string. Anything else is a glob.
+fn text_matches(pattern: &str, text: &str) -> bool {
+    if is_presence(pattern) {
+        !text.is_empty()
+    } else {
+        glob(pattern, text)
+    }
+}
+
+fn is_presence(pattern: &str) -> bool {
+    !pattern.is_empty() && pattern.chars().all(|c| c == '*')
 }
 
 /// `*` matches any sequence (including empty and `/`); everything else is literal.
@@ -225,6 +272,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect(),
+            exclude: BTreeMap::new(),
         }
     }
 
@@ -253,9 +301,14 @@ mod tests {
             (rule(&[("a", "*")]), RuleError::BadClaimValue("a".into())),
             (rule(&[("a", "")]), RuleError::BadClaimValue("a".into())),
             (
+                rule(&[("a", "*"), ("b", "**")]),
+                RuleError::BadClaimValue("a".into()),
+            ),
+            (
                 AccessRule::Oidc {
                     issuer: "http://x".into(),
                     claims: [("a".into(), "b".into())].into(),
+                    exclude: BTreeMap::new(),
                 },
                 RuleError::BadIssuer,
             ),
@@ -273,6 +326,7 @@ mod tests {
         let r = AccessRule::Oidc {
             issuer: GH.into(),
             claims: many.into_iter().collect(),
+            exclude: BTreeMap::new(),
         };
         assert_eq!(AccessRules::new(vec![r]), Err(RuleError::ClaimCount));
         let too_many = vec![sa_rule(None, None); 65];
@@ -326,6 +380,123 @@ mod tests {
             let rules = AccessRules::new(vec![rule(claims)]).unwrap();
             assert_eq!(rules.allows(&id, "ci"), *want, "{claims:?}");
         }
+    }
+
+    #[test]
+    fn presence_claim_needs_a_pinned_claim_and_a_non_empty_string() {
+        let r = [("repository_owner_id", "1"), ("repo_property_domain", "*")];
+        let rules = AccessRules::new(vec![rule(&r)]).unwrap();
+        let tok = |owner: &str, extra: Value| {
+            let mut c = json!({"repository_owner_id": owner});
+            c.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            oidc(GH, c)
+        };
+        let domain = |v: Value| tok("1", json!({"repo_property_domain": v}));
+        assert!(rules.allows(&domain(json!("payments")), "ci"));
+        assert!(rules.allows(&domain(json!(["", "payments"])), "ci"));
+        for v in [
+            json!(""),
+            json!([""]),
+            json!(1),
+            json!(true),
+            json!(null),
+            json!({"a": "b"}),
+            json!([1]),
+        ] {
+            assert!(!rules.allows(&domain(v.clone()), "ci"), "{v}");
+        }
+        assert!(!rules.allows(&tok("1", json!({})), "ci"));
+        assert!(!rules.allows(&tok("2", json!({"repo_property_domain": "x"})), "ci"));
+        // `**` is the same as `*`.
+        let r = [("repository_owner_id", "1"), ("repo_property_domain", "**")];
+        let rules = AccessRules::new(vec![rule(&r)]).unwrap();
+        assert!(rules.allows(&domain(json!("x")), "ci"));
+        assert!(!rules.allows(&domain(json!("")), "ci"));
+        // Presence alone is refused; so is a rule whose values are all wildcards.
+        for r in [vec![("a", "*")], vec![("a", "*"), ("b", "**")]] {
+            assert!(matches!(
+                AccessRules::new(vec![rule(&r)]),
+                Err(RuleError::BadClaimValue(_))
+            ));
+        }
+        // `*` inside a value still matches the empty run.
+        let rules = AccessRules::new(vec![rule(&[("a", "x*")])]).unwrap();
+        assert!(rules.allows(&oidc(GH, json!({"a": "x"})), "ci"));
+    }
+
+    fn excluding(excl: &[(&str, &[&str])]) -> AccessRule {
+        let AccessRule::Oidc { issuer, claims, .. } =
+            rule(&[("repository_owner_id", "1"), ("repo_property_domain", "*")])
+        else {
+            panic!("oidc")
+        };
+        let exclude = excl
+            .iter()
+            .map(|(k, ps)| {
+                (
+                    (*k).to_owned(),
+                    ps.iter().map(|p| (*p).to_owned()).collect(),
+                )
+            })
+            .collect();
+        AccessRule::Oidc {
+            issuer,
+            claims,
+            exclude,
+        }
+    }
+
+    #[test]
+    fn exclude_refuses_matching_claims_and_never_admits_alone() {
+        let rules = AccessRules::new(vec![excluding(&[(
+            "repo_property_domain",
+            &["pci", "x-*"],
+        )])])
+        .unwrap();
+        let tok = |owner: &str, d: Value| {
+            oidc(
+                GH,
+                json!({"repository_owner_id": owner, "repo_property_domain": d}),
+            )
+        };
+        assert!(rules.allows(&tok("1", json!("payments")), "ci"));
+        assert!(!rules.allows(&tok("1", json!("pci")), "ci"));
+        assert!(!rules.allows(&tok("1", json!("x-eu")), "ci"));
+        assert!(!rules.allows(&tok("2", json!("payments")), "ci"));
+        assert!(!rules.allows(&tok("1", json!(["payments", "pci"])), "ci"));
+        assert!(rules.allows(&tok("1", json!(["payments", "web"])), "ci"));
+        // A missing domain fails the claims entry; exclude does not rescue it.
+        assert!(!rules.allows(&oidc(GH, json!({"repository_owner_id": "1"})), "ci"));
+        // A rule whose claims match nobody admits nobody, with or without exclude.
+        let mut r = excluding(&[("repo_property_domain", &["pci"])]);
+        if let AccessRule::Oidc { claims, .. } = &mut r {
+            claims.insert("repository_owner_id".into(), "9".into());
+        }
+        let rules = AccessRules::new(vec![r]).unwrap();
+        assert!(!rules.allows(&tok("1", json!("payments")), "ci"));
+        // An excluded claim that is absent or not a string excludes nothing.
+        let rules = AccessRules::new(vec![excluding(&[("other", &["x"])])]).unwrap();
+        assert!(rules.allows(&tok("1", json!("payments")), "ci"));
+    }
+
+    #[test]
+    fn exclude_validation() {
+        let many: Vec<&str> = vec!["a"; 17];
+        let long = "x".repeat(257);
+        let bad: Vec<AccessRule> = vec![
+            excluding(&[("a", &["*"])]),
+            excluding(&[("a", &["**"])]),
+            excluding(&[("a", &[])]),
+            excluding(&[("a", &[""])]),
+            excluding(&[("a", &many)]),
+            excluding(&[("a", &[long.as_str()])]),
+        ];
+        for r in bad {
+            assert_eq!(AccessRules::new(vec![r]), Err(RuleError::BadExclude));
+        }
+        AccessRules::new(vec![excluding(&[("a", &["*x*"])])]).unwrap();
     }
 
     #[test]
