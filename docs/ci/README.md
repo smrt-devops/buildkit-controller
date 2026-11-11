@@ -21,7 +21,7 @@ The post step removes the builder and releases every allocation, even when the j
 
 ### Trusting the API
 
-`ca-cert` is the CA the Action trusts for the API listener; without it, the system roots. Which certificate the API presents depends on how the chart exposes it:
+`ca-cert` is the CA the Action trusts for the API listener. Without it, the Action uses the PEM file named by `NODE_EXTRA_CA_CERTS`, then the one named by `SSL_CERT_FILE`, for the API calls and for the tunnel forwarder; a named file that does not exist fails the step with an error naming the variable. `ca-cert` and `SSL_CERT_FILE` replace the trusted roots, so they must hold every CA the connection needs; `NODE_EXTRA_CA_CERTS` adds to Node's built-in roots, as it does for Node itself, so a publicly trusted gateway still verifies. With none of the three, the system roots. The forwarder runs with a stripped environment and gets the CA only through its own variable. Which certificate the API presents depends on how the chart exposes it:
 
 - Behind a Gateway with `gateway.api.mode: terminate` (the chart's default), the Gateway's own certificate. With a publicly trusted one, leave `ca-cert` out. With a private CA, pass that CA.
 - With `service.type: LoadBalancer` or `gateway.api.mode: passthrough`, the controller's serving certificate. Pass the controller's CA from the `buildkit-controller-ca-bundle` ConfigMap (key `ca.crt`), unless `edge.tls.secretName` holds a publicly trusted certificate.

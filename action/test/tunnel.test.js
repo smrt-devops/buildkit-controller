@@ -305,18 +305,33 @@ test('one forwarder serves several targets on separate ports', async (t) => {
   }
 });
 
-test('a tunnel the server refuses drops the local connection', async (t) => {
+test('a tunnel the server refuses drops the local connection and is logged with its status', async (t) => {
   const { ws, port } = await setup(t, { refuse: true });
   const s = await connect(port);
   await once(s, 'close');
   assert.equal(ws.state.upgrades, 1);
 });
 
-test('nothing listening behind the tunnel URL drops the local connection', async (t) => {
-  const fwd = await serve(['http://127.0.0.1:1/v1/tunnel']);
+test('a failed open reaches the log callback with the URL and the HTTP status', async (t) => {
+  const ws = await wsServer({ refuse: true });
+  t.after(() => ws.close());
+  const seen = [];
+  const url = `http://127.0.0.1:${ws.port}/v1/tunnel`;
+  const fwd = await serve([url], { log: (u, e) => seen.push([u, e.message]) });
   t.after(() => fwd.close());
   const s = await connect(fwd.ports[0]);
   await once(s, 'close');
+  assert.deepEqual(seen, [[url, 'tunnel refused: HTTP 426']]);
+});
+
+test('nothing listening behind the tunnel URL drops the local connection and logs the error code', async (t) => {
+  const url = 'http://127.0.0.1:1/v1/tunnel';
+  const seen = [];
+  const fwd = await serve([url], { log: (u, e) => seen.push([u, e.code]) });
+  t.after(() => fwd.close());
+  const s = await connect(fwd.ports[0]);
+  await once(s, 'close');
+  assert.deepEqual(seen, [[url, 'ECONNREFUSED']]);
 });
 
 test('over TLS the forwarder trusts the given CA and only that', { skip }, async (t) => {
