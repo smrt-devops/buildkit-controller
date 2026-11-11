@@ -155,7 +155,9 @@ spec:
                           type: string
                         type: array
                       to:
-                        description: "`--cache-to` value. Absent when the caller may only read the cache."
+                        description: |-
+                          `--cache-to` value: the shared cache for a trusted caller, else its branch
+                          cache. Absent when the caller may only read the cache.
                         nullable: true
                         type: string
                     required:
@@ -221,7 +223,10 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               endpoint:
-                description: Edge endpoint, for example `tcp://bk.example.com:8444`.
+                description: |-
+                  Edge endpoint, for example `tcp://bk.example.com:8444`, or `/v1/tunnel` (a path on the
+                  API base URL) when `edge.endpoint` is unset and clients tunnel through the API. A claim
+                  outside the controller's namespace gets the edge Service's `tcp://` address in that case.
                 nullable: true
                 type: string
               expiresAt:

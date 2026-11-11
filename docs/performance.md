@@ -5,6 +5,8 @@ and how to repeat the measurement.
 
 ## Results
 
+The edge figures below, connect overhead and throughput, are for the `tcp://` edge: the rig dials the edge port directly. The tunnel's extra hop, a WebSocket inside the API connection through a gateway, is not in them (see [Through the tunnel](#through-the-tunnel)).
+
 Two runs of `cargo xtask perf` on 2026-10-20, each on a fresh kind cluster. The
 measured column is the median of the two runs, with the median of two being
 the mean. The allocation row is the exception: it is one later run, with the
@@ -98,6 +100,10 @@ The edge copies with `tokio::io::copy_bidirectional_with_sizes` and 64 KiB
 buffers per direction in `crates/server/src/edge/proxy.rs`. Nothing in that
 path looks like a limit below 1 GiB/s. The loopback benchmark below measures
 the proxy without buildkit or a cluster. No product change was needed.
+
+### Through the tunnel
+
+No rig measures the tunnel's overhead against the `tcp://` edge. The one measurement available is a manual one: a 1 GB build context and a 1 GB image through a TLS-terminating Envoy Gateway on EKS took about 36 to 73 s up and about 38 s down in two runs. It is noisy and from a single cluster, so read it as an order of magnitude, not a rate.
 
 ## Loopback
 

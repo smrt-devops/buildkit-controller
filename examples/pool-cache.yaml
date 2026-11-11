@@ -4,9 +4,11 @@
 # Each repository has its own cache (scope: identity, the default). A build
 # reads its repository's cache, and writes it only when a writers rule matches
 # the caller. Without writers, push, schedule and workflow_dispatch runs on a
-# protected ref (ref_protected: "true") and in-cluster callers write; pull
-# requests only read. Here only pushes to main write, so branch builds start
-# warm from main without changing it.
+# protected ref (ref_protected: "true") and in-cluster callers write it. Here
+# only pushes to main write it. Every other build, pull requests included,
+# reads and writes a cache of its own branch or pull request. The registry
+# answers what that cache lacks from the shared one, so branch builds start warm
+# from main without changing it.
 apiVersion: buildkit.smrt-devops.net/v1alpha1
 kind: BuildKitPool
 metadata:

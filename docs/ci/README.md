@@ -13,7 +13,7 @@ See `action/`. The job needs `permissions: id-token: write`. Pin the Action to a
     # ca-cert: ${{ vars.BK_CA }}   # see "Trusting the API" below
     pools: |
       ci/amd64
-      ci/arm64        # more than one pool needs edge.allocationDomain and distinct pool platforms
+      ci/arm64        # more than one pool needs distinct pool platforms (and edge.allocationDomain with a tcp:// endpoint)
 - run: docker buildx build --platform linux/amd64,linux/arm64 .
 ```
 
@@ -21,12 +21,12 @@ The post step removes the builder and releases every allocation, even when the j
 
 ### Trusting the API
 
-`ca-cert` is the CA the Action trusts for the API listener; without it, the system roots. Which certificate the API presents depends on how the chart exposes it:
+`ca-cert` is the CA the Action trusts for the API listener. Without it, the Action uses the PEM file named by `NODE_EXTRA_CA_CERTS`, then the one named by `SSL_CERT_FILE`, for the API calls and for the tunnel forwarder; a named file that does not exist fails the step with an error naming the variable. `ca-cert` and `SSL_CERT_FILE` replace the trusted roots, so they must hold every CA the connection needs; `NODE_EXTRA_CA_CERTS` adds to Node's built-in roots, as it does for Node itself, so a publicly trusted gateway still verifies. With none of the three, the system roots. The forwarder runs with a stripped environment and gets the CA only through its own variable. Which certificate the API presents depends on how the chart exposes it:
 
 - Behind a Gateway with `gateway.api.mode: terminate` (the chart's default), the Gateway's own certificate. With a publicly trusted one, leave `ca-cert` out. With a private CA, pass that CA.
 - With `service.type: LoadBalancer` or `gateway.api.mode: passthrough`, the controller's serving certificate. Pass the controller's CA from the `buildkit-controller-ca-bundle` ConfigMap (key `ca.crt`), unless `edge.tls.secretName` holds a publicly trusted certificate.
 
-The edge needs no input: each allocation response carries the CA for the edge, and the Action uses it.
+The build connection needs no input. By default the Action runs a local forwarder that tunnels it through the API route (`/v1/tunnel`), so one hostname and one HTTPS route are enough behind any gateway, including ones that terminate TLS, and each allocation response carries the CA for the build connection. A controller with a `tcp://` `edge.endpoint` makes the Action dial the edge port instead, with no input either. Action versions before the tunnel cannot use a tunnel endpoint: `buildx create` refuses the path. Upgrade the Action before you drop `edge.endpoint` on an install that clients already use.
 
 ### How an allocation completes
 
@@ -67,7 +67,11 @@ A v0.1.0 controller does not derive the id from the key, so a `POST` it received
 
 The pool's built-in cache registry is on by default (see [Build cache](../architecture.md#build-cache)). The controller returns the cache flags in the allocation response, and the Action turns them into outputs. A build that does not pass them on runs without the cache.
 
-A repository has its own cache. A build that the pool trusts to write (by default `push`, `schedule` and `workflow_dispatch` events on a protected ref) gets `--cache-from` and `--cache-to`. A build that it does not trust, such as a `pull_request`, gets `--cache-from` only: it starts warm and cannot change the cache. The Action then logs `read only for this build`, and the `cache-to` output is empty. A cache outage never fails a build, because the flags carry `ignore-error=true`.
+A repository has its own cache, the shared cache. A build that the pool trusts to write it (by default `push`, `schedule` and `workflow_dispatch` events on a protected ref) gets `--cache-to` and `--cache-from` for the shared cache.
+
+Any other build with a `ref` claim, such as a `pull_request` or a push to an unprotected branch, gets a branch cache of its own: one per repository and ref, so every branch and every pull request has a separate one. It gets `--cache-to` and `--cache-from` for the branch cache. When the branch cache lacks a step, the registry reads it from the shared cache, so the first run starts warm and later runs reuse their own layers. It can never write the shared cache, and a trusted build never reads a branch cache. Both kinds of build get the same shape of flags, so the Action logs one line for them: `reads and writes the shared cache if the pool trusts this build, else this branch's own`.
+
+A token without a `ref` claim that the pool does not trust gets `--cache-from` for the shared cache only. The Action then logs `read only for this build`, and the `cache-to` output is empty. A cache outage never fails a build, because the flags carry `ignore-error=true`.
 
 | Input | Meaning |
 |---|---|
@@ -119,6 +123,8 @@ export TOKEN=...   # OIDC token or service-account token with the controller aud
 sh docs/ci/buildkit-allocate.sh sh -c 'docker buildx build --builder "$BUILDER" .'
 ```
 
+The script has no tunnel client yet, so it works only when the controller returns a `tcp://` endpoint (`edge.endpoint` set). Against a tunnel endpoint (a path such as `/v1/tunnel`) it releases the allocation and stops with a clear message.
+
 Optional variables are `TTL` and `QUEUE_TIMEOUT` (seconds), `API_CA` (PEM file for the API listener, needed under the same conditions as the Action's `ca-cert`),
 `CACHE_KEY` and `CACHE` (the Action's `cache-key` and `cache` inputs). The script retries the allocation
 the same way as the Action (see [How an allocation completes](#how-an-allocation-completes) and [Retries](#retries)): it follows a `202` by polling, retries a 503 with `Retry-After` and a code from the table, or a curl failure to resolve or connect, and stops at the queue timeout plus 60 seconds, shrinking the queue timeout it sends on each retry. Its release and pool listing retry any 503 with `Retry-After` for 60 seconds.
@@ -127,7 +133,7 @@ Without `QUEUE_TIMEOUT` it reads the pool default from `GET /v1/pools` first, as
 The script reads `TOKEN` once and unsets it, so the command does not inherit it. The token must still be valid when the script releases the allocation after the command, and a `401` on the release leaves the worker held until its TTL. For a short-lived token, such as a CI OIDC token or `kubectl create token`, keep a fresh token in a file and set `TOKEN_FILE` instead: the script reads it again before every request.
 
 The script prints the cache
-flags to stderr and exports them to the command as `$CACHE_ARGS`. A build that the pool does not trust to write the cache gets `--cache-from` only (see [Build cache](#build-cache)):
+flags to stderr and exports them to the command as `$CACHE_ARGS`. A build gets the flags for its trust level, as the Action does (see [Build cache](#build-cache)):
 
 ```sh
 CACHE_KEY=app-main sh docs/ci/buildkit-allocate.sh \

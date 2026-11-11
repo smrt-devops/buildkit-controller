@@ -316,7 +316,8 @@ impl Default for Pki {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct Edge {
-    /// `tcp://host:port` returned to clients (required).
+    /// `tcp://host:port` returned to clients, or empty: clients then tunnel
+    /// through the API (see docs/architecture.md). See [`Edge::client_endpoint`].
     pub endpoint: String,
     /// DNS name returned as serverName (required).
     pub server_name: String,
@@ -361,10 +362,31 @@ impl Default for Edge {
     }
 }
 
-/// Default `edge.maxConnections`, the same as the chart. Sized to the chart's
-/// 512Mi memory limit: an established edge connection holds about 200 KiB and
-/// an idle replica about 14 MiB, so 2000 connections stay near 400 MiB.
-/// Raise it together with the memory limit.
+impl Edge {
+    /// The `endpoint` the API returns: `edge.endpoint`, or the tunnel path
+    /// when it is unset.
+    #[must_use]
+    pub fn client_endpoint(&self) -> &str {
+        if self.endpoint.is_empty() {
+            buildkit_controller_api::dto::TUNNEL_PATH
+        } else {
+            &self.endpoint
+        }
+    }
+
+    /// `perAllocationEndpoints`: every allocation reaches its own endpoint,
+    /// through its own tunnel forwarder or its own name under
+    /// `edge.allocationDomain`.
+    #[must_use]
+    pub fn per_allocation_endpoints(&self) -> bool {
+        self.endpoint.is_empty() || !self.allocation_domain.is_empty()
+    }
+}
+
+/// Default `edge.maxConnections`, the same as the chart. The chart sizes the memory limit
+/// as about 14 MiB + `edge.maxConnections` x 460 KiB (tunnels; 200 KiB for `tcp://`) +
+/// `edge.maxHandshakes` x 280 KiB, so 2000 connections need about 900 MiB of it. Raise it
+/// together with the memory limit.
 pub const EDGE_MAX_CONNECTIONS: u32 = 2000;
 
 /// `edge.tls`.
@@ -483,6 +505,9 @@ pub struct WorkerNetwork {
     /// metadata, loopback, cluster or extra denied ranges.
     #[serde(rename = "permittedCIDRs")]
     pub permitted_cidrs: Vec<String>,
+    /// `allowHosts` names whose addresses may lie in the cluster or extra denied
+    /// ranges (exact names).
+    pub permitted_hosts: Vec<String>,
     /// DNS allowance.
     pub dns: Dns,
 }
@@ -495,6 +520,7 @@ impl Default for WorkerNetwork {
             extra_denied_cidrs: d.extra_denied_cidrs,
             cluster_cidrs: d.cluster_cidrs,
             permitted_cidrs: d.permitted_cidrs,
+            permitted_hosts: d.permitted_hosts,
             dns: Dns {
                 namespace: d.dns.namespace,
                 pod_labels: d.dns.pod_labels,
@@ -878,6 +904,18 @@ impl Config {
         v
     }
 
+    /// `tcp://<edge.serviceName>.<namespace>.svc:<listen.edge port>`: the edge
+    /// Service, which in-cluster claims dial when `edge.endpoint` is unset
+    /// (see docs/architecture.md). The serving cert holds that name as a SAN.
+    #[must_use]
+    pub fn edge_service_endpoint(&self, namespace: &str) -> String {
+        format!(
+            "tcp://{}.{namespace}.svc:{}",
+            self.edge.service_name,
+            self.listen.edge.port()
+        )
+    }
+
     /// The namespaces whose in-cluster claims are served: the controller's own
     /// and `claims.namespaces`.
     #[must_use]
@@ -926,8 +964,13 @@ impl Config {
             .and_then(|r| r.rsplit_once(':'))
         {
             Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => {}
+            _ if e.endpoint.is_empty() => {
+                if !e.allocation_domain.is_empty() {
+                    p.push("edge.allocationDomain needs a tcp:// edge.endpoint".into());
+                }
+            }
             _ => p.push(format!(
-                "edge.endpoint must be tcp://<host>:<port> (got `{}`)",
+                "edge.endpoint must be empty or tcp://<host>:<port> (got `{}`)",
                 e.endpoint
             )),
         }
@@ -1022,6 +1065,13 @@ impl Config {
                 }
             }
         }
+        for h in &n.permitted_hosts {
+            if !buildkit_controller_api::v1alpha1::is_host_name(h) {
+                p.push(format!(
+                    "workerNetwork.permittedHosts: `{h}` is not a lowercase DNS name (no port, no wildcard, no IP address)"
+                ));
+            }
+        }
         if n.dns.pod_labels.is_empty() && n.dns.cidrs.is_empty() {
             p.push("workerNetwork.dns needs non-empty podLabels or cidrs".into());
         }
@@ -1111,7 +1161,7 @@ impl Config {
             return false;
         }
         tracing::warn!(
-            "workerNetwork.clusterCIDRs is empty: allowCIDRs entries cannot be checked against the cluster's pod, service and node ranges, so a pool can open worker egress into the cluster; set clusterCIDRs"
+            "workerNetwork.clusterCIDRs is empty: allowCIDRs entries and allowHosts addresses cannot be checked against the cluster's pod, service and node ranges, so a pool can open worker egress into the cluster; set clusterCIDRs"
         );
         true
     }
@@ -1150,6 +1200,7 @@ impl Config {
                 extra_denied_cidrs: n.extra_denied_cidrs.clone(),
                 cluster_cidrs: n.cluster_cidrs.clone(),
                 permitted_cidrs: n.permitted_cidrs.clone(),
+                permitted_hosts: n.permitted_hosts.clone(),
                 dns: crate::render::WorkerDns {
                     namespace: n.dns.namespace.clone(),
                     pod_labels: n.dns.pod_labels.clone(),

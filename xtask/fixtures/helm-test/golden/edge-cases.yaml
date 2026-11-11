@@ -137,6 +137,7 @@ data:
           k8s-app: kube-dns
       extraDeniedCIDRs: []
       permittedCIDRs: []
+      permittedHosts: []
 
 ---
 # Source: buildkit-controller/templates/rbac.yaml
@@ -477,7 +478,7 @@ spec:
         app.kubernetes.io/version: "0.3.0"
         helm.sh/chart: buildkit-controller-0.3.0
       annotations:
-        checksum/config: f4434ff88190703b704b66f4a4544c18cfb3ec2062c2cdedda4dfbf2246a6ae9
+        checksum/config: 339f74d0679eed9a8ad470546542f90d91cd57080c0b97cd92448f026405b7ea
     spec:
       serviceAccountName: buildkit-controller
       terminationGracePeriodSeconds: 345
@@ -518,7 +519,7 @@ spec:
             periodSeconds: 5
           resources:
             limits:
-              memory: 512Mi
+              memory: 1536Mi
             requests:
               cpu: 100m
               memory: 128Mi

@@ -39,6 +39,8 @@ struct Fake {
     secrets: Mutex<Vec<Secret>>,
     /// When set, every apply waits for a permit first.
     gate: Option<Arc<tokio::sync::Notify>>,
+    /// Every applied `NetworkPolicy`.
+    policies: Mutex<Vec<k8s_openapi::api::networking::v1::NetworkPolicy>>,
 }
 
 impl Fake {
@@ -81,9 +83,13 @@ impl Fake {
 }
 
 impl KubeOps for Fake {
-    async fn apply<K: Applied>(&self, _obj: &K) -> OpResult {
+    async fn apply<K: Applied>(&self, obj: &K) -> OpResult {
         if let Some(g) = &self.gate {
             g.notified().await;
+        }
+        if K::kind(&()) == "NetworkPolicy" {
+            let np = serde_json::from_value(serde_json::to_value(obj).unwrap()).unwrap();
+            self.policies.lock().unwrap().push(np);
         }
         self.call(format!("apply:{}", K::kind(&())))
     }
@@ -177,6 +183,10 @@ fn env<'a>(
         ca_epoch: epoch,
         ca_secret_name: "bk-ca",
         render: RENDER.get_or_init(fixtures::default_config),
+        hosts: {
+            static NO_HOSTS: crate::render::HostAddrs = std::collections::BTreeMap::new();
+            &NO_HOSTS
+        },
         worker_cert_validity: crate::pki::LeafValidity::default().worker_serving,
         replica: "r0",
         now: now(),
@@ -1346,4 +1356,139 @@ async fn an_unlistable_namespace_does_not_hold_the_other_pools() {
     assert_eq!(first, Some(Trigger::All));
     assert_eq!(store.state().len(), 1);
     drop(tx);
+}
+
+/// One pool pass after resolving the pool's `allowHosts` names through `hosts`,
+/// as the leader runs it.
+async fn host_pass(
+    fake: &Fake,
+    hosts: &super::hosts::Hosts,
+    p: &BuildKitPool,
+    ca: &super::pass::CaView,
+    mem: &mut PoolMemory,
+) {
+    let names = super::hosts::names(p);
+    hosts.refresh(&names).await;
+    let view = hosts.view(&names);
+    let guard = CaGuard::default();
+    super::pass::run(
+        fake,
+        &guard,
+        &ca_settings(),
+        p,
+        &[],
+        ca,
+        mem,
+        0,
+        &view,
+        now(),
+    )
+    .await;
+}
+
+/// The host rule (TCP 443) of the last applied policy, as CIDRs.
+fn host_cidrs(fake: &Fake) -> Option<Vec<String>> {
+    let np = fake.policies.lock().unwrap().last().cloned()?;
+    let rules = np.spec.unwrap().egress.unwrap();
+    Some(
+        rules
+            .iter()
+            .filter(|r| {
+                r.ports.as_ref().is_some_and(|p| {
+                    p.iter().any(|p| {
+                        p.port
+                            == Some(
+                                k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(443),
+                            )
+                    })
+                })
+            })
+            .flat_map(|r| r.to.iter().flatten())
+            .map(|p| p.ip_block.as_ref().unwrap().cidr.clone())
+            .collect(),
+    )
+}
+
+fn degraded(fake: &Fake) -> (String, String, String) {
+    let s = fake.statuses.lock().unwrap().last().cloned().unwrap();
+    let c = |t: &str| s.conditions.iter().find(|c| c.type_ == t).cloned().unwrap();
+    let (d, r) = (c(condition::DEGRADED), c(condition::READY));
+    (format!("{}/{}", d.status, d.reason), r.status, d.message)
+}
+
+/// The policy follows a name's addresses within one pass of the change, and a
+/// name that stops resolving keeps its last addresses in the policy while the
+/// pool reports `Degraded/UnresolvedHost` and stays Ready.
+#[tokio::test]
+async fn the_policy_follows_a_named_host_and_keeps_it_when_resolution_fails() {
+    use super::hosts::Hosts;
+    use super::hosts::tests::FakeResolver;
+    let r = Arc::new(FakeResolver::default());
+    let hosts = Hosts::new(r.clone());
+    let mut p = pool();
+    p.spec.network.egress.allow_hosts = vec!["reg.example.com".into()];
+    let data = CaBundle::generate(super::exec::odt(now()))
+        .unwrap()
+        .to_secret_data();
+    let ca = ca_view(1, Some(data));
+    let mut mem = PoolMemory::default();
+    let fake = Fake::default();
+
+    r.set("reg.example.com", Ok(&["203.0.113.9"]));
+    host_pass(&fake, &hosts, &p, &ca, &mut mem).await;
+    assert_eq!(host_cidrs(&fake).unwrap(), ["203.0.113.9/32"]);
+    assert_eq!(degraded(&fake).0, "False/AsExpected");
+
+    // Same generation, within the reapply interval: only the new addresses
+    // apply the policy again.
+    r.set("reg.example.com", Ok(&["203.0.113.10", "203.0.113.9"]));
+    host_pass(&fake, &hosts, &p, &ca, &mut mem).await;
+    assert_eq!(fake.policies.lock().unwrap().len(), 2);
+    assert_eq!(
+        host_cidrs(&fake).unwrap(),
+        ["203.0.113.9/32", "203.0.113.10/32"]
+    );
+    host_pass(&fake, &hosts, &p, &ca, &mut mem).await;
+    assert_eq!(
+        fake.policies.lock().unwrap().len(),
+        2,
+        "unchanged addresses apply nothing"
+    );
+
+    // Resolution fails: the addresses stay, the pool is Degraded and Ready.
+    r.set("reg.example.com", Err("SERVFAIL"));
+    host_pass(&fake, &hosts, &p, &ca, &mut mem).await;
+    assert_eq!(fake.policies.lock().unwrap().len(), 2);
+    let (d, ready, msg) = degraded(&fake);
+    assert_eq!(
+        (d.as_str(), ready.as_str()),
+        ("True/UnresolvedHost", "True")
+    );
+    assert!(
+        msg.contains("reg.example.com") && msg.contains("SERVFAIL"),
+        "{msg}"
+    );
+    // A new generation renders the policy again, still with the last addresses.
+    p.metadata.generation = Some(4);
+    host_pass(&fake, &hosts, &p, &ca, &mut mem).await;
+    assert_eq!(fake.policies.lock().unwrap().len(), 3);
+    assert_eq!(
+        host_cidrs(&fake).unwrap(),
+        ["203.0.113.9/32", "203.0.113.10/32"]
+    );
+
+    // Only refused addresses (a private address, no clusterCIDRs, not
+    // permitted): the rule goes, and the pool says why.
+    r.set("reg.example.com", Ok(&["10.1.2.3"]));
+    host_pass(&fake, &hosts, &p, &ca, &mut mem).await;
+    assert_eq!(host_cidrs(&fake).unwrap(), Vec::<String>::new());
+    let (d, ready, msg) = degraded(&fake);
+    assert_eq!(
+        (d.as_str(), ready.as_str()),
+        ("True/HostNotPermitted", "True")
+    );
+    assert!(
+        msg.contains("reg.example.com") && msg.contains("10.1.2.3"),
+        "{msg}"
+    );
 }

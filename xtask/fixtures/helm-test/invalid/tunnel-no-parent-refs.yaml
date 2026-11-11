@@ -1,0 +1,3 @@
+# expect: gateway.api.parentRefs (or gateway.parentRefs) is required
+# The tunnel needs only the API route, but that route still needs a Gateway listener or a LoadBalancer.
+edge: {serverName: bk.example.com}

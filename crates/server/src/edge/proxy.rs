@@ -23,7 +23,7 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 
 use super::handler::{Accepted, ConnectionHandler, Refusal};
 use super::listener::PerKey;
-use super::metrics::{Direction, EdgeMetrics, Revocation};
+use super::metrics::{Direction, EdgeMetrics, Revocation, Transport};
 use super::pods::PodView;
 use super::revoke::{MAX_CONNECTIONS_PER_ALLOCATION, Registry};
 use super::tls::EdgeTls;
@@ -144,20 +144,32 @@ impl Inner {
     }
 
     async fn serve(self: Arc<Self>, conn: Accepted) {
-        let Accepted { stream, id, .. } = conn;
+        let Accepted {
+            stream,
+            id,
+            transport,
+            ..
+        } = conn;
         // The deadline is absolute and fixed at accept, so dial time cannot stretch the session.
         let not_after = leaf_not_after(&stream);
-        self.forward(stream, &id, not_after).await;
+        self.forward(stream, &id, not_after, transport).await;
     }
 
-    /// Everything after the client handshake, over any client stream.
-    async fn forward<C>(&self, mut client: C, id: &AllocationId, not_after: Option<Instant>)
-    where
+    /// Everything after the client handshake, over any client stream, counted
+    /// under `transport`.
+    async fn forward<C>(
+        &self,
+        mut client: C,
+        id: &AllocationId,
+        not_after: Option<Instant>,
+        transport: Transport,
+    ) where
         C: AsyncRead + AsyncWrite + Unpin,
     {
+        let metrics = self.metrics.for_transport(transport);
         // Index first, so a revocation racing the re-resolve below still lands.
         let Some((_reg, revoked)) = self.live.register(id) else {
-            self.metrics.outcome(Some(id), "allocation_limit");
+            metrics.outcome(Some(id), "allocation_limit");
             warn!("edge per-allocation connection limit reached; closing");
             let _ = tokio::time::timeout(CLOSE_GRACE, client.shutdown()).await;
             return;
@@ -165,7 +177,7 @@ impl Inner {
         let target = match self.view.resolve(id, OffsetDateTime::now_utc()) {
             Ok(t) => t,
             Err(r) => {
-                self.metrics.outcome(Some(id), r.result_label());
+                metrics.outcome(Some(id), r.result_label());
                 debug!(result = r.result_label(), "forwarding refused");
                 let _ = tokio::time::timeout(CLOSE_GRACE, client.shutdown()).await;
                 return;
@@ -173,7 +185,7 @@ impl Inner {
         };
         // One tenant's allocations together may not fill the replica.
         let Some(_ns) = self.namespaces.try_take(id.namespace.as_str()) else {
-            self.metrics.outcome(Some(id), "namespace_limit");
+            metrics.outcome(Some(id), "namespace_limit");
             warn!("edge per-namespace connection limit reached; closing");
             let _ = tokio::time::timeout(CLOSE_GRACE, client.shutdown()).await;
             return;
@@ -193,25 +205,16 @@ impl Inner {
         let mut upstream = match dialed {
             Ok(s) => s,
             Err(error) => {
-                self.metrics.outcome(Some(id), "upstream_error");
+                metrics.outcome(Some(id), "upstream_error");
                 warn!(%addr, %error, "upstream connect failed");
                 let _ = tokio::time::timeout(CLOSE_GRACE, client.shutdown()).await;
                 return;
             }
         };
-        self.metrics.outcome(Some(id), "ok");
-        self.metrics
-            .upstream_connected(start.elapsed().as_secs_f64());
+        metrics.outcome(Some(id), "ok");
+        metrics.upstream_connected(start.elapsed().as_secs_f64());
         info!(%addr, "edge connection proxied");
-        relay(
-            &self.metrics,
-            id,
-            &mut client,
-            &mut upstream,
-            not_after,
-            revoked,
-        )
-        .await;
+        relay(&metrics, id, &mut client, &mut upstream, not_after, revoked).await;
         let _ = tokio::time::timeout(CLOSE_GRACE, async {
             let _ = client.shutdown().await;
             let _ = upstream.shutdown().await;

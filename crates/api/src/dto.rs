@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 /// Largest accepted request body, in bytes.
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
 
+/// The tunnel route, and the `endpoint` a client gets when the edge has no
+/// `tcp://` endpoint: a path on the API base URL to open with `wss`.
+pub const TUNNEL_PATH: &str = "/v1/tunnel";
+
 /// `POST /v1/allocations` request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -63,7 +67,8 @@ pub struct CacheResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RegistryCacheFlags {
-    /// `--cache-to` value. Absent when the caller may only read the cache.
+    /// `--cache-to` value: the shared cache for a trusted caller, else its branch
+    /// cache. Absent when the caller may only read the cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
     /// `--cache-from` values, in order.
@@ -118,7 +123,8 @@ pub struct AllocationResponse {
     /// Caller identity: `sa:<ns>/<name>`, `claim:<ns>/<name>#<uid>`, or `oidc:<iss>#<sub>`
     /// followed by any run claims (see the allocation owner section of the architecture doc).
     pub owner: String,
-    /// Edge endpoint, for example `tcp://bk.example.com:8444`.
+    /// Edge endpoint, for example `tcp://bk.example.com:8444`, or
+    /// [`TUNNEL_PATH`] when clients tunnel through the API.
     pub endpoint: String,
     /// TLS server name.
     pub server_name: String,
@@ -183,7 +189,7 @@ pub struct PoolSummary {
     pub max: i32,
     /// Value of `status.platforms`. Empty when unknown.
     pub platforms: Vec<String>,
-    /// Edge endpoint.
+    /// Edge endpoint: `edge.endpoint`, or [`TUNNEL_PATH`] when it is unset.
     pub endpoint: String,
     /// TLS server name.
     pub server_name: String,
@@ -206,7 +212,8 @@ pub struct PoolSummary {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PoolList {
-    /// True when `edge.allocationDomain` is set. Multi-node builders require it.
+    /// True when `edge.endpoint` is unset (each allocation gets its own local
+    /// forwarder) or `edge.allocationDomain` is set. Multi-node builders require it.
     pub per_allocation_endpoints: bool,
     /// Pools visible to the caller, sorted by namespace then name.
     pub pools: Vec<PoolSummary>,

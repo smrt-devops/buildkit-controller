@@ -98,9 +98,9 @@ pub struct BuildKitClaimSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheTier {
-    /// Pull and push.
+    /// Pull and push the scope.
     Trusted,
-    /// Pull only.
+    /// Pull the scope. With a branch scope, pull and push that too.
     Untrusted,
 }
 
@@ -180,7 +180,9 @@ pub struct BuildKitClaimStatus {
     /// Allocation id (set once bound).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocation_id: Option<String>,
-    /// Edge endpoint, for example `tcp://bk.example.com:8444`.
+    /// Edge endpoint, for example `tcp://bk.example.com:8444`, or `/v1/tunnel` (a path on the
+    /// API base URL) when `edge.endpoint` is unset and clients tunnel through the API. A claim
+    /// outside the controller's namespace gets the edge Service's `tcp://` address in that case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     /// TLS server name of the edge.

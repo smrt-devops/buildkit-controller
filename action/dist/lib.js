@@ -5,6 +5,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 const https = require('node:https');
+const tls = require('node:tls');
+const { spawn } = require('node:child_process');
 
 /** Split a comma/newline list, trim, drop empties. */
 function parseList(s) {
@@ -112,6 +114,30 @@ function cacheFlags(allocs, { mode, from: extra = [] } = {}) {
   return { to, from, args };
 }
 
+/**
+ * What one allocation may do with the cache, for the log line: 'writes' reads and
+ * writes one cache, which is the shared cache for a trusted build and the branch's
+ * own for any other (the response looks the same for both; the registry reads the
+ * shared cache for a branch that lacks a step), 'read-only' only reads. `null`
+ * without registry flags.
+ */
+function cacheAccess(alloc) {
+  const reg = alloc && alloc.cache && alloc.cache.registry;
+  if (!reg) return null;
+  return reg.to ? 'writes' : 'read-only';
+}
+
+const CACHE_NOTES = {
+  writes: "reads and writes the shared cache if the pool trusts this build, else this branch's own",
+  'read-only': 'read only for this build',
+};
+
+/** The log line for `alloc`'s cache, or `null` without registry flags. */
+function cacheNote(alloc) {
+  const access = cacheAccess(alloc);
+  return access && `${alloc.namespace}/${alloc.pool}: cache key ${alloc.cache.key}, ${CACHE_NOTES[access]}`;
+}
+
 
 /**
  * Check the GET /v1/pools answer against the wanted pools (api.md, Clients).
@@ -127,7 +153,7 @@ function validatePools(resp, wanted) {
   });
   if (found.length > 1) {
     if (!resp.perAllocationEndpoints) {
-      throw new Error('multiple pools need edge.allocationDomain (perAllocationEndpoints is false)');
+      throw new Error('multiple pools need per-allocation endpoints: an empty edge.endpoint (tunnel) or edge.allocationDomain (perAllocationEndpoints is false)');
     }
     const seen = new Map();
     for (const p of found) {
@@ -200,7 +226,7 @@ function request(url, { method = 'GET', headers = {}, body, ca, timeoutMs = 9000
     const lib = u.protocol === 'http:' ? http : https;
     const data = body === undefined ? undefined : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
     const opts = { method, headers: { ...headers }, timeout: timeoutMs };
-    if (ca) opts.ca = ca;
+    if (ca) opts.ca = caOption(ca);
     if (data) opts.headers['Content-Length'] = data.length;
     const req = lib.request(u, opts, (res) => {
       const chunks = [];
@@ -423,11 +449,120 @@ async function allocate(api, { what, ca, getToken, attemptOpts, budgetMs, queueS
   }
 }
 
+/** Marks a CA text that adds to Node's built-in roots instead of replacing them. */
+const WITH_ROOTS = '# with built-in roots\n';
+
+/** The `ca` option for https: a marked text is Node's built-in roots plus the text; any other text replaces the roots. */
+function caOption(ca) {
+  return ca.startsWith(WITH_ROOTS) ? [...tls.rootCertificates, ca] : ca;
+}
+
+/**
+ * The CA text to trust for the API and the forwarder: the ca-cert input, else the file named by
+ * NODE_EXTRA_CA_CERTS, else the one named by SSL_CERT_FILE, else undefined (system roots). The input
+ * and SSL_CERT_FILE replace the roots; NODE_EXTRA_CA_CERTS adds to them, as it does for Node itself
+ * (the text is marked, see `caOption`). A named file that cannot be read is an error naming its variable.
+ */
+function resolveCa(input, env = process.env) {
+  if (input) return input;
+  for (const name of ['NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE']) {
+    const file = env[name];
+    if (!file) continue;
+    try {
+      const pem = fs.readFileSync(file, 'utf8');
+      return name === 'NODE_EXTRA_CA_CERTS' ? WITH_ROOTS + pem : pem;
+    } catch (e) { throw new Error(`${name} names ${file}, which cannot be read (${e.code || e.message}); set ca-cert or fix ${name}`); }
+  }
+  return undefined;
+}
+
 /** Release allocation `id`. 404 counts as released. Own short retry budget: a down API must not hold the job. */
 async function releaseAllocation({ api, ca, getToken, id, log, ...inject }) {
   const res = await requestWithRetry(`${api}/v1/allocations/${id}`, { method: 'DELETE', ca, timeoutMs: 30000 },
     { what: `release ${id}`, getToken, budgetMs: SHORT_BUDGET_MS, log, ...inject });
   if (res.status !== 204 && res.status !== 404) throw apiError(`release ${id}`, res);
+}
+
+/** An allocation `endpoint` that starts with "/" is a path on the API base URL: the tunnel. */
+function isTunnelEndpoint(endpoint) {
+  return typeof endpoint === 'string' && endpoint.startsWith('/');
+}
+
+/** The tunnel URL for a tunnel `endpoint`: a path on the API base URL (no trailing slash), so never another host. */
+function tunnelUrl(api, endpoint) {
+  return new URL(api + endpoint).href;
+}
+
+/**
+ * Start dist/tunnel.js detached (it outlives this step) with one listener per URL. The child gets
+ * no token or key, only the CA bundle for the WebSocket and the path of its error log. Resolves {pid, ports} once it has printed
+ * its ports; on any failure the child is killed.
+ */
+function startForwarder({ urls, ca, logFile, timeoutMs = 10000, script = path.join(__dirname, 'tunnel.js') }) {
+  return new Promise((resolve, reject) => {
+    const args = [script, ...urls.flatMap((u) => ['--url', u])];
+    // The tracking id is not a secret; a self-hosted runner's orphan cleanup finds the process by it.
+    const env = { BUILDKIT_TUNNEL_CA: ca || '' };
+    if (logFile) env.BUILDKIT_TUNNEL_LOG = logFile;
+    if (process.env.RUNNER_TRACKING_ID) env.RUNNER_TRACKING_ID = process.env.RUNNER_TRACKING_ID;
+    const child = spawn(process.execPath, args, { detached: true, stdio: ['ignore', 'pipe', 'pipe'], env });
+    let out = '';
+    let err = '';
+    let settled = false;
+    const settle = (fn, v) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.stdout.destroy();
+      child.stderr.destroy();
+      if (fn === reject) child.kill('SIGKILL'); else child.unref();
+      fn(v);
+    };
+    const timer = setTimeout(() => settle(reject, new Error('tunnel forwarder did not start in time')), timeoutMs);
+    child.on('error', (e) => settle(reject, new Error(`tunnel forwarder failed to start: ${e.message}`)));
+    child.on('exit', (code) => settle(reject, new Error(`tunnel forwarder exited with ${code}: ${err.trim().slice(0, 300)}`)));
+    child.stderr.on('data', (c) => { err += c; });
+    child.stdout.on('data', (c) => {
+      out += c;
+      const nl = out.indexOf('\n');
+      if (nl < 0) return;
+      try {
+        const { ports } = JSON.parse(out.slice(0, nl));
+        if (!Array.isArray(ports) || ports.length !== urls.length || !ports.every((p) => Number.isInteger(p) && p > 0 && p < 65536)) throw new Error('bad ports');
+        settle(resolve, { pid: child.pid, ports });
+      } catch { settle(reject, new Error('tunnel forwarder printed an unreadable port line')); }
+    });
+  });
+}
+
+/** SIGTERM the forwarder with this pid. A missing process is not an error; returns whether one was signalled. */
+function stopForwarder(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 1) return false;
+  try {
+    process.kill(n, 'SIGTERM');
+    return true;
+  } catch (e) {
+    if (e.code === 'ESRCH') return false;
+    throw e;
+  }
+}
+
+/**
+ * Give every node whose endpoint is a tunnel path a local `tcp://127.0.0.1:<port>` endpoint from one
+ * forwarder process, one listener per node. Nodes with a tcp:// endpoint are returned as they are
+ * and no process starts when there is no tunnel node. `onStarted(pid)` fires as soon as the
+ * forwarder is up, so the caller can record the pid for the post step.
+ */
+async function useTunnels(nodes, { api, ca, logFile, start = startForwarder, onStarted = () => {} }) {
+  const idx = nodes.flatMap((n, i) => (isTunnelEndpoint(n.endpoint) ? [i] : []));
+  if (idx.length === 0) return nodes;
+  const urls = idx.map((i) => tunnelUrl(api, nodes[i].endpoint));
+  const { pid, ports } = await start({ urls, ca, logFile });
+  onStarted(pid);
+  const out = nodes.slice();
+  idx.forEach((i, k) => { out[i] = { ...nodes[i], endpoint: `tcp://127.0.0.1:${ports[k]}` }; });
+  return out;
 }
 
 /** Payload `exp` of a JWT in ms since the epoch, or undefined when the token cannot be decoded. */
@@ -470,6 +605,7 @@ async function fetchOidcToken(audience, setSecret) {
 
 module.exports = {
   parseList, parsePool, REQUEST_TIMEOUT_MS, postTimeoutMs, isCurrentServer, cachedToken, jwtExpiryMs, FAST_POLL_MS, pollAllocation, allocate, errorCode, parseDuration, generateKey, allocationBody,
-  validatePools, buildxCommands, parseCacheInputs, cacheFlags, checkAllocationId, createBuilder, writeMaterial, request, apiError,
+  validatePools, buildxCommands, parseCacheInputs, cacheFlags, cacheAccess, cacheNote, checkAllocationId, createBuilder, writeMaterial, request, apiError,
+  resolveCa, caOption, isTunnelEndpoint, tunnelUrl, startForwarder, stopForwarder, useTunnels,
   effectiveQueueTimeout, retryBudgetMs, SHORT_BUDGET_MS, releaseAllocation, queueTimeoutFor, retryAfterMs, requestWithRetry, fetchOidcToken,
 };

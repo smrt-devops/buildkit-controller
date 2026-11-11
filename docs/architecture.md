@@ -9,13 +9,13 @@ The `buildkit-controller` binary (`crates/server`) runs as one Deployment with t
 | Role | Port | Job | Runs on |
 |---|---|---|---|
 | API | 8443 (HTTPS) | Authenticates callers, creates and reads allocation claims, answers with the certificate once a claim is bound | every replica |
-| Edge | 8444 (mTLS) | Proxies a build connection to its worker | every replica |
+| Edge | 8444 (mTLS); also reached through the API port by the tunnel (`/v1/tunnel`) | Proxies a build connection to its worker | every replica |
 | Reconciler and allocator | none | Keeps warm pods, binds queued claims to pods, signs allocation certificates, retires expired pods, manages CAs and worker certificates, writes status | the Lease holder only |
 | Registry (`buildkit-controller registry`) | 5000 (mTLS), 8080 (ops) | Stores BuildKit cache for the workers | one StatefulSet pod |
 
 Two names stay apart in this project. "Cache" is the user feature: the Helm values `cache.*`, the pool field `spec.workers.cache` and the `cache` field of an allocation. "Registry" is the component that stores it: the `registry` role, the `<fullname>-registry` objects and the `buildkit_registry_*` metrics.
 
-Clients reach the API and edge ports through a Gateway by default: the API through an HTTPRoute, where the gateway terminates TLS and re-encrypts to the controller, and the edge through a TLS passthrough TLSRoute, so that the edge itself checks the client certificate. A LoadBalancer Service is the alternative. See [Exposure](operations.md#exposure).
+Clients reach the controller through a Gateway by default, through one HTTPRoute for the API, where the gateway terminates TLS and re-encrypts to the controller. Builds ride a WebSocket tunnel on that route (`/v1/tunnel`), so the edge still checks the client certificate and the gateway sees only ciphertext. One hostname and one HTTPS route are enough behind any gateway. With a `tcp://` `edge.endpoint`, clients dial the edge port instead, through a TLS passthrough TLSRoute or a load balancer. A LoadBalancer Service is the alternative to a Gateway. See [Exposure](operations.md#exposure).
 
 A separate ops port (8080, plain HTTP, on its own ClusterIP Service) serves `/healthz`, `/readyz` and `/metrics`. All replicas share in-memory watch caches of pools, claims and pods, so the API and edge read from memory. The API replicas hold no queue. They authenticate the caller, check the pool's access rules, and write or read a claim. Every replica loads both CA keys, because each issues its own serving certificate and edge client certificate, so a compromise of any replica exposes both CAs.
 
@@ -72,7 +72,7 @@ sequenceDiagram
     API->>K: create BuildKitClaim
     L->>K: bind a free pod, write certificate to claim status
     API-->>CI: 201, or 202 then GET ?wait=25s until 200
-    CI->>Edge: buildx remote driver, mTLS with allocation certificate
+    CI->>Edge: buildx remote driver, mTLS with allocation certificate (default: inside a WebSocket on API :8443 /v1/tunnel, through a local forwarder)
     Edge->>Edge: verify certificate chain and URI SAN, look up pod in cache
     Edge->>W: mTLS with edge client certificate (internal CA)
     CI-->>W: build traffic, copied in both directions
@@ -82,6 +82,8 @@ sequenceDiagram
 ```
 
 The allocation certificate's URI SAN names the pod, the allocation and the pool. The edge reads those fields and finds the pod in its watch cache, so it needs no database and no per-request call to Kubernetes. When the allocation is released, expires, or the pod disappears, the edge closes its connections.
+
+By default the build connection reaches the edge as a WebSocket upgrade on the API listener. The edge then treats the upgraded stream as an accepted connection, so the handshake, the certificate checks and everything after them are the same as over TCP. The Action runs a local forwarder on `127.0.0.1` that copies bytes between buildx and the tunnel. It holds no credentials.
 
 Behind a gateway, the API and edge connections come from the gateway. With PROXY protocol on for a listener, the gateway prefixes each connection with the client's address, the controller reads that header before TLS from trusted gateway addresses only, and the per-address caps and logs use the client's address. See [PROXY protocol](operations.md#proxy-protocol).
 
@@ -104,12 +106,23 @@ The owner is per run attempt, not per job. All jobs of one attempt, such as the 
 
 Builds get a cache from the cache registry, a built-in role of the controller binary. It runs as a one-replica StatefulSet `<fullname>-registry` with one volume, and the chart turns it on by default (`cache.enabled`). It serves the part of the OCI distribution API that BuildKit's registry cache exporter and importer use: blob upload, blob and manifest read, and manifest write. It serves nothing else, and it verifies each blob against its digest as the blob streams in.
 
-The allocation response carries the cache flags, and the client passes them to buildx:
+The allocation response carries the cache flags, and the client passes them to buildx. A trusted build gets:
 
 ```
 --cache-from type=registry,ref=<registry>/<namespace>/<pool>/<scope>:<tag>
 --cache-to   type=registry,ref=<registry>/<namespace>/<pool>/<scope>:<tag>,mode=max,ignore-error=true,oci-mediatypes=true
 ```
+
+An untrusted build with a branch scope (see [Scope and trust tiers](#scope-and-trust-tiers)) reads and exports its branch cache only:
+
+```
+--cache-from type=registry,ref=<registry>/<namespace>/<pool>/<branch-scope>:<tag>
+--cache-to   type=registry,ref=<registry>/<namespace>/<pool>/<branch-scope>:<tag>,mode=max,ignore-error=true,oci-mediatypes=true
+```
+
+When the branch cache lacks a manifest or a layer, the registry answers the read from the caller's shared cache, so a branch's first run starts warm. There is one source, not two, because BuildKit does not reliably follow cached steps across two cache imports. Once a branch has its own cache manifest, it sees newer shared entries only for the steps it rebuilds.
+
+Any other untrusted build gets the first `--cache-from` of the trusted form and no `--cache-to`.
 
 `<tag>` is the request's `cacheKey`, or the pool name when there is none. `ignore-error=true` covers the export: a cache that cannot take the export never fails the build. The import is different. BuildKit reads the cache manifest at the start and fetches the layers it matched later, so a registry that restarts, or garbage collection that removes those layers, during the build can fail it. A client that does not pass the flags builds without a cache. A request that sets `cache: none` gets no flags.
 
@@ -117,34 +130,42 @@ The allocation response carries the cache flags, and the client passes them to b
 
 Only worker pods can, and mTLS is the boundary: the registry accepts a connection only with a valid worker client certificate, and a NetworkPolicy that admits worker pods to its port is an extra layer, not the check. Each worker has two certificates. Its serving certificate comes from the internal CA and is for serverAuth only, so it cannot be used as a client. A second leaf, issued by the client CA for the worker's DNS name and valid for clientAuth only, is the one the worker's `buildkitd.toml` presents to the registry. buildkitd trusts the internal CA alone and the edge wants an allocation URI, so no certificate a worker holds opens any buildkitd or the edge. The registry's serving certificate is from the internal CA and its trust anchor for clients is the client CA; the leader reissues the serving certificate when either CA changes. There are no credentials for a build to steal or an operator to manage.
 
-The registry identifies the worker by its certificate and finds the pod in its watch cache, as the edge does. It reads the pod's live allocation: the pool, the caller's cache scope and the trust tier, which the leader wrote on the pod as the annotations `buildkit.smrt-devops.net/scope` and `buildkit.smrt-devops.net/tier`. It then allows:
+The registry identifies the worker by its certificate and finds the pod in its watch cache, as the edge does. It reads the pod's live allocation: the pool, the caller's cache scope, the trust tier and, for an untrusted allocation, its branch scope. The leader wrote them on the pod as the annotations `buildkit.smrt-devops.net/scope`, `buildkit.smrt-devops.net/tier` and `buildkit.smrt-devops.net/branch-scope`. It then allows:
 
 | Action | Allowed when |
 |---|---|
-| Pull from `<namespace>/<pool>/<scope>` | the pod holds a live allocation of that pool and scope |
+| Pull from `<namespace>/<pool>/<scope>` | the pod holds a live allocation of that pool and scope, either tier |
 | Push to it | the same, and the allocation's tier is `trusted` |
+| Pull from or push to `<namespace>/<pool>/<branch-scope>` | the pod's allocation is untrusted and that branch scope is its own |
 
-A worker with no live allocation gets nothing. A build cannot read or write another scope's cache, whatever `--cache-to` it passes. The registry trusts the annotations on the pod, so anyone who may patch pods in a pool namespace can write any cache of that pool. Grant `pods/patch` there only to cluster admins.
+A pull from the branch scope that finds nothing there is answered from the allocation's own scope, for HEAD and GET, by tag or digest, with ranges. Pushes never fall back, and nothing else does: a trusted or read-only worker, another branch's scope and another repository are never read this way.
+
+A trusted allocation never gets a branch scope, even when its pod carries the annotation. A worker with no live allocation gets nothing. A build cannot read or write another scope's or another branch's cache, whatever `--cache-to` it passes. The registry never mounts a blob from one repository into another. A layer reaches a cache by an upload into it, with one exception. A manifest pushed to a branch scope may reference a layer that the allocation's own scope holds, and the registry then links that layer into the branch scope. BuildKit needs this, because its HEAD for the layer succeeds through the fallback and it skips the upload. The branch could already read that layer, so the link exposes nothing. The registry refuses a layer that only another repository or another branch holds. It stores each layer once on the volume, however many caches link it. The registry trusts the annotations on the pod, so anyone who may patch pods in a pool namespace can write any cache of that pool. Grant `pods/patch` there only to cluster admins.
 
 ### Scope and trust tiers
 
 The scope says whose cache it is. `spec.workers.cache.scope` sets how scopes are drawn:
 
-- `identity`, the default, gives each caller its own scope. An OIDC token with a `repository_id` claim (GitHub Actions) is scoped to that repository id, one with only a `repository` claim to that name, and any other OIDC token to its `sub`. The token's issuer is always part of the scope. A ServiceAccount is scoped to its namespace and name, and a `BuildKitClaim` to its namespace. Every run, branch and pull request of one repository shares that repository's scope.
+- `identity`, the default, gives each caller its own scope. An OIDC token with a `repository_id` claim (GitHub Actions) is scoped to that repository id, one with only a `repository` claim to that name, and any other OIDC token to its `sub`. The token's issuer is always part of the scope. A ServiceAccount is scoped to its namespace and name, and a `BuildKitClaim` to its namespace. Every run, branch and pull request of one repository shares that repository's scope. An untrusted one also has a branch scope of its own (below).
 - `pool` puts every caller the pool admits in one scope. Use it only when the pool's access rules admit a single trust domain.
 
-The tier says whether the caller may write. `spec.workers.cache.writers` lists the callers that may, in the syntax of `access.rules`. Everyone else reads only.
+The tier says whether the caller may write the scope's shared cache. `spec.workers.cache.writers` lists the callers that may, in the syntax of `access.rules`.
 
-- Unset, a GitHub Actions caller is trusted when its `event_name` claim is `push`, `schedule` or `workflow_dispatch` and its `ref_protected` claim is `true`. Every branch shares the repository's scope, so an unprotected branch that anyone with push access can write must not feed the protected branch's builds. `merge_group` is not trusted by default, because its queue ref is never protected. Every ServiceAccount and `BuildKitClaim` caller is trusted. A pull request is not, so a fork build starts warm from its own repository's cache and cannot change it. A caller whose token has no `event_name` claim, such as a GitLab job, reads only until you list it in `writers`.
-- Builds from `pull_request`, `pull_request_target`, `workflow_run`, `issue_comment`, `pull_request_review`, `pull_request_review_comment`, `deployment` and `deployment_status` events are always read-only, whatever `writers` says, and so are GitLab pipelines whose `pipeline_source` is `merge_request_event`, `external_pull_request_event` or `parent_pipeline`.
+- Unset, a GitHub Actions caller is trusted when its `event_name` claim is `push`, `schedule` or `workflow_dispatch` and its `ref_protected` claim is `true`. Every branch shares the repository's scope, so an unprotected branch that anyone with push access can write must not feed the protected branch's builds. `merge_group` is not trusted by default, because its queue ref is never protected. Every ServiceAccount and `BuildKitClaim` caller is trusted. A pull request is not, so a fork build starts warm from its own repository's cache and cannot change it. A caller whose token has no `event_name` claim, such as a GitLab job, is untrusted until you list it in `writers`.
+- Builds from `pull_request`, `pull_request_target`, `workflow_run`, `issue_comment`, `pull_request_review`, `pull_request_review_comment`, `deployment` and `deployment_status` events are always untrusted, whatever `writers` says, and so are GitLab pipelines whose `pipeline_source` is `merge_request_event`, `external_pull_request_event` or `parent_pipeline`.
 - Pin `event_name` and `ref_protected` in every `writers` rule. A rule without them lets any branch write the cache that the protected branch reads.
 - `writers: []` trusts nobody.
-- A trusted allocation gets `--cache-to` and `--cache-from`. An untrusted one gets `--cache-from` only, and the Action logs that the cache is read only for the build.
+
+An untrusted OIDC caller whose token has a `ref` claim (`refs/heads/<branch>`, `refs/pull/<n>/merge`, a GitLab ref) also has a branch scope: the first 32 hex characters of the SHA-256 of the scope's name, the caller's repository identity, the ref and, for an event that can run code from forks (the events and GitLab pipeline sources listed above), the event, each prefixed with its length, so no crafted ref or repository value can reach another caller's branch scope. Every branch and every pull request has its own, and a `pull_request_target` or `workflow_run` build does not share one with a push to its base ref. An untrusted caller without a `ref` claim has none.
+
+- A trusted allocation gets `--cache-to` and `--cache-from` for its scope.
+- An untrusted allocation with a branch scope gets `--cache-to` and `--cache-from` for the branch scope, and the registry falls back to the scope for what the branch lacks. The response has the same shape as a trusted one, so the Action logs the same line for both.
+- An untrusted allocation without one gets `--cache-from` for its scope only, and the Action logs that the cache is read only for the build.
 
 ### Limits and garbage collection
 
 - `spec.workers.cache.maxSize` caps what a pool's caches hold together. A pool without it gets the chart's `cache.poolMaxSize`. The chart's `cache.maxSize` caps the whole volume.
-- Every manifest records its last pull or push time. Garbage collection (`cache.gcInterval`, 10 minutes by default) keeps the newest first while they fit the budget: manifests by last use, and blobs of uploads that no manifest references yet by upload time, which count against the budget too. An item that does not fit is removed and the scan goes on, so one oversized push cannot empty a pool. A mark and sweep then deletes the blobs that nothing references. While the registry cannot list pools, it evicts nothing for a pool budget.
+- Every manifest records its last pull or push time. A pull that a branch scope falls back for records the use on the shared manifest and layers it read, and creates nothing in the branch scope. Garbage collection (`cache.gcInterval`, 10 minutes by default) keeps the newest first while they fit the budget: manifests by last use, and blobs of uploads that no manifest references yet by upload time, which count against the budget too. An item that does not fit is removed and the scan goes on, so one oversized push cannot empty a pool. A mark and sweep then deletes the blobs that nothing references. While the registry cannot list pools, it evicts nothing for a pool budget.
 - A blob over `cache.maxBlobSize` is refused. Upload sessions expire after 1 hour idle. `cache.maxUploadSize` bounds the bytes that uploads in progress hold together, so size the volume to `cache.maxSize` plus `cache.maxUploadSize` ([sizing](operations.md#sizing)).
 - One replica means one volume. Builds that start while the cache pod restarts run uncached, and a build that imported from it before the restart can fail when it fetches a layer. The cache is an accelerator, so the allocation does not wait for it.
 
@@ -169,7 +190,7 @@ spec:
 
 The spec is immutable, so a different builder is a different claim. The leader binds both kinds through the same queue. `kubectl get bkc -A` shows the pool, the phase, the Secret and the expiry; sorted by creation time it lists the queue in order. An in-cluster claim must be admitted by a pool access rule `claims: {namespaces: [...]}`. A claim's identity is its namespace, name and UID, which the API server sets, so a tenant cannot forge another namespace. A claim for a pool that is missing or does not admit its namespace fails with reason `PoolNotFound`. A claim under 30 seconds old stays Pending with that reason first, so a pool that is created together with the claim has time to appear.
 
-When the worker is ready the controller creates a Secret `<claim>-buildkit` owned by the claim with `tls.crt`, `tls.key`, `ca.crt` (omitted when the edge uses public roots), `endpoint` and `server-name`, and sets `status.phase` to `Bound`. A claim ends as `Expired` at `status.expiresAt` or `Lost` if its worker pod disappears (the controller does not rebind it). A claim that cannot be served is `Failed`. All three are final: delete the claim and create a new one. Deleting a claim deletes its Secret, and the controller releases the worker within a few seconds.
+When the worker is ready the controller creates a Secret `<claim>-buildkit` owned by the claim with `tls.crt`, `tls.key`, `ca.crt` (omitted when the edge uses public roots), `endpoint` and `server-name`, and sets `status.phase` to `Bound`. With `edge.endpoint` empty, the Secret's `endpoint` is `tcp://<edge.serviceName>.<controller namespace>.svc:<edge port>`, never the tunnel path. A claim ends as `Expired` at `status.expiresAt` or `Lost` if its worker pod disappears (the controller does not rebind it). A claim that cannot be served is `Failed`. All three are final: delete the claim and create a new one. Deleting a claim deletes its Secret, and the controller releases the worker within a few seconds.
 
 ## Failure handling
 

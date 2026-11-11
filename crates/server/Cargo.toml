@@ -54,6 +54,7 @@ time = { workspace = true }
 socket2 = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync", "net", "signal", "rt-multi-thread", "io-util", "fs"] }
 tokio-rustls = { workspace = true, features = ["ring"] }
+tokio-tungstenite = { workspace = true }
 tokio-util = { version = "0.7.20", features = ["io"] }
 toml_edit = "0.25.17"
 tower = { version = "0.5.3", features = ["util"] }

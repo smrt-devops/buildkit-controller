@@ -1,4 +1,4 @@
-# buildkit-controller. edge.endpoint and edge.serverName are required, and gateway.parentRefs
+# buildkit-controller. edge.serverName is required, and gateway.api.parentRefs (or gateway.parentRefs)
 # unless service.type is LoadBalancer or gateway.enabled is false.
 
 image:
@@ -19,12 +19,17 @@ podDisruptionBudget:
   enabled: true
   minAvailable: 1
 
-# Each proxied edge connection holds two 64 KiB copy buffers and two TLS sessions, about
-# 200 KiB, and an idle replica uses about 14 MiB, so 512Mi holds roughly 2300 connections.
-# edge.maxConnections (2000) is sized to this limit: raise one only with the other.
+# Memory limit = baseline + edge.maxConnections x 460 KiB + edge.maxHandshakes x 280 KiB.
+# The baseline of an idle replica is about 14 MiB. An established tunnelled connection costs about
+# 460 KiB at worst (the 200 KiB of a tcp:// edge connection, a 64 KiB HTTP/2 stream window, up to
+# 128 KiB of WebSocket read buffer and message, and one 65 KiB outgoing frame; a tcp:// connection
+# costs 200 KiB). A handshake in progress costs about 280 KiB. Tunnels share the handshake budget.
+# At the defaults (edge.maxConnections 2000, edge.maxHandshakes 1024) the total is about 1.16 GiB,
+# so 1536Mi leaves about 344 MiB of margin. To lower the limit, lower edge.maxConnections or
+# edge.maxHandshakes; to raise either, raise the limit together with it.
 resources:
   requests: {cpu: 100m, memory: 128Mi}
-  limits: {memory: 512Mi}
+  limits: {memory: 1536Mi}
 
 logLevel: info
 logFormat: json
@@ -38,9 +43,14 @@ logFormat: json
 watchNamespaces: []
 
 edge:
-  endpoint: ""       # required, tcp://<host>:<port>, returned to clients
+  # "" (the default): clients tunnel through the API route, so one hostname and one HTTPS
+  # route are enough behind any gateway, including ones that terminate TLS. The edge port
+  # stays on the Service for in-cluster clients. tcp://<host>:<port>: clients dial the edge
+  # port instead, through a TLS passthrough route or a LoadBalancer Service, and the chart
+  # renders the edge TLSRoute.
+  endpoint: ""
   serverName: ""     # required DNS name, in the serving certificate
-  allocationDomain: ""
+  allocationDomain: ""   # needs a tcp:// endpoint: a tunnel gives each allocation its own local port
   extraNames: []
   tls:
     secretName: ""   # "" = self-issued; else a kubernetes.io/tls Secret in the release namespace
@@ -48,7 +58,8 @@ edge:
   maxConnections: 2000       # established connections per replica; taken after the handshake
   maxHandshakes: 1024        # connections still in the TLS handshake, per replica
   maxHandshakesPerIp: 32     # in-handshake connections from one client address (IPv4, or IPv6 /64); 0 = no cap.
-                             # Over it the oldest is closed. Rendered as 0 behind a Gateway without edge.proxyProtocol.
+                             # Over it the oldest is closed. Rendered as 0 behind a Gateway when the address would be
+                             # the gateway's: edge.proxyProtocol is off with an edge route, or api.proxyProtocol is off with a tunnel.
   # PROXY protocol v2 from a gateway or load balancer, off by default. When on, a
   # connection from trustedCIDRs (the gateway's own source addresses, never the
   # clients') must open with a v2 header, and its source address replaces the
@@ -101,6 +112,10 @@ workerNetwork:
   # loopback, clusterCIDRs or extraDeniedCIDRs. An allowCIDRs entry passes only
   # inside one of these. Never 0.0.0.0/0 or ::/0.
   permittedCIDRs: []
+  # Names a pool's allowHosts may resolve into clusterCIDRs or extraDeniedCIDRs (or into
+  # a family clusterCIDRs does not cover). Exact lowercase names, no port. Link-local,
+  # loopback, metadata and NAT64 local-use addresses stay closed whatever this says.
+  permittedHosts: []
   dns:
     namespace: kube-system
     podLabels: {k8s-app: kube-dns}
@@ -133,7 +148,8 @@ service:
 # Behind a gateway the controller sees the gateway's addresses, not the clients', so
 # every client shares api.maxConnectionsPerIp (128) and
 # auth.serviceAccount.maxReviewsPerIp (4), and the chart renders edge.maxHandshakesPerIp
-# as 0 unless edge.proxyProtocol is on. Turn on PROXY protocol (edge.proxyProtocol,
+# as 0 unless the PROXY protocol of the listener that carries the handshakes is on
+# (edge.proxyProtocol for an edge route, api.proxyProtocol for the tunnel). Turn on PROXY protocol (edge.proxyProtocol,
 # api.proxyProtocol, and gateway.envoy.proxyProtocol on Envoy Gateway) so the caps count
 # clients again, or raise them, or set them to 0, to match the number of CI jobs that
 # can start at once.
@@ -142,9 +158,10 @@ gateway:
   # render unless service.type is LoadBalancer. false: no routes, e.g. an in-cluster-only
   # install reached through the Service or a port-forward.
   enabled: true
-  # Default listeners for both routes. The API and the edge need different listeners
-  # (HTTPS and TLS passthrough), so set api.parentRefs and edge.parentRefs instead, each
-  # with a sectionName. A ref without sectionName attaches the API HTTPRoute to every
+  # Default listeners for both routes. With the default empty edge.endpoint only the API route
+  # exists and this is enough. With a tcp:// endpoint the API and the edge need different
+  # listeners (HTTPS and TLS passthrough), so set api.parentRefs and edge.parentRefs instead,
+  # each with a sectionName. A ref without sectionName attaches the API HTTPRoute to every
   # HTTP and HTTPS listener that admits it, plain HTTP included (NOTES.txt warns).
   parentRefs: []
   annotations: {}
@@ -159,7 +176,9 @@ gateway:
     parentRefs: []         # e.g. [{name: shared, namespace: gateway-system, sectionName: https}]
     hostnames: []          # [] = [edge.serverName]
     # HTTPRoute timeouts (terminate mode). API requests last at most 25 s: a queued
-    # allocation answers 202 and the client polls. Keep both above that.
+    # allocation answers 202 and the client polls. Keep both above that. With a tunnel
+    # (empty edge.endpoint) the route /v1/tunnel gets its own rule with both set to 0s,
+    # so no gateway cuts a long build; these timeouts keep applying to every other path.
     timeouts:
       request: 60s
       backendRequest: 60s
@@ -171,6 +190,7 @@ gateway:
       caCertificateRefs: []        # e.g. [{group: "", kind: ConfigMap, name: my-ca}]
       wellKnownCACertificates: ""  # "System" for a publicly trusted edge.tls.secretName; exclusive with caCertificateRefs
   edge:
+    # Only with a tcp:// edge.endpoint; ignored (NOTES.txt warns) when it is empty.
     # TLS passthrough only: the controller checks the client certificate itself, so the
     # gateway must never terminate this TLS. Needs a TLS listener in Passthrough mode. The
     # TLSRoute matches the SNI edge.serverName, plus *.<edge.allocationDomain> when set.

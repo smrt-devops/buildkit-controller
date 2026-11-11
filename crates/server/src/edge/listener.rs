@@ -1,5 +1,6 @@
 //! Accept loop: handshake and connection caps, keepalive,
-//! `ClientHello` and handshake timeouts, readiness and drain.
+//! `ClientHello` and handshake timeouts, readiness and drain. Tunnels from
+//! the API listener ([`TunnelDoor`]) join the same loop after their `101`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
@@ -7,17 +8,18 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use futures::future::BoxFuture;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio_rustls::LazyConfigAcceptor;
 use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, info_span, warn};
 
-use super::handler::{Accepted, ConnectionHandler};
-use super::metrics::EdgeMetrics;
+use super::handler::{Accepted, BoxIo, ConnectionHandler};
+use super::metrics::{EdgeMetrics, Transport};
 use super::tls::{EdgeTls, counted_by_verifier};
 use crate::net::ProxyProtocol;
 use crate::pki::AllocationId;
@@ -178,7 +180,7 @@ impl Evicted {
 /// cannot hold the budget. To lock out a client whose handshake completes
 /// promptly, an attacker must open a whole cap's worth of connections within
 /// that handshake's few round trips, instead of a trickle every
-/// `handshake_timeout`.
+/// `handshake_timeout`. TCP connections and tunnels share the budget.
 #[derive(Clone)]
 struct Handshakes {
     max: usize,
@@ -197,6 +199,8 @@ struct Pending {
 struct Waiting {
     /// `None` until the client address is known (after the PROXY header).
     peer: Option<PeerKey>,
+    /// The evicted connection is counted under its own transport.
+    transport: Transport,
     evict: CancellationToken,
 }
 
@@ -245,8 +249,8 @@ impl Handshakes {
     }
 
     /// A slot for a new connection. With `max` already open, the oldest is
-    /// evicted, and the result says so.
-    fn take(&self) -> (HandshakeSlot, Option<Evicted>) {
+    /// evicted, and the result says so and how it arrived.
+    fn take(&self, transport: Transport) -> (HandshakeSlot, Option<(Evicted, Transport)>) {
         let mut s = self.lock();
         let mut evicted = None;
         if s.open.len() >= self.max
@@ -254,7 +258,7 @@ impl Handshakes {
             && let Some(w) = s.remove(seq)
         {
             w.evict.cancel();
-            evicted = Some(Evicted::Total);
+            evicted = Some((Evicted::Total, w.transport));
         }
         let seq = s.next;
         s.next += 1;
@@ -263,6 +267,7 @@ impl Handshakes {
             seq,
             Waiting {
                 peer: None,
+                transport,
                 evict: evict.clone(),
             },
         );
@@ -276,8 +281,8 @@ impl Handshakes {
 
     /// Counts `slot` against the cap of `ip`'s [`PeerKey`]. When that peer
     /// already holds `max_per_peer`, its oldest is evicted, and the result
-    /// says so.
-    fn assign(&self, slot: &HandshakeSlot, ip: IpAddr) -> Option<Evicted> {
+    /// says so and how it arrived.
+    fn assign(&self, slot: &HandshakeSlot, ip: IpAddr) -> Option<(Evicted, Transport)> {
         if self.max_per_peer == 0 {
             return None;
         }
@@ -296,7 +301,7 @@ impl Handshakes {
             && let Some(w) = s.remove(seq)
         {
             w.evict.cancel();
-            evicted = Some(Evicted::Peer);
+            evicted = Some((Evicted::Peer, w.transport));
         }
         if let Some(w) = s.open.get_mut(&slot.seq) {
             w.peer = Some(key);
@@ -309,6 +314,86 @@ impl Handshakes {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.lock().open.len()
+    }
+}
+
+/// A tunnel the API listener hands to the edge (see docs/architecture.md).
+pub struct Arrival {
+    /// The client address of the API connection that carries the tunnel
+    /// (the PROXY source behind a trusted gateway).
+    pub peer: SocketAddr,
+    /// Resolves to the tunnel's byte stream once the `101` is out, or `None`
+    /// when the upgrade failed.
+    pub stream: BoxFuture<'static, Option<BoxIo>>,
+}
+
+/// An [`Arrival`] and the signal that its handshake slot is taken.
+struct Queued {
+    arrival: Arrival,
+    taken: oneshot::Sender<()>,
+}
+
+/// The edge is not taking tunnels: it has no serving cert yet, or it stopped.
+#[derive(Debug, thiserror::Error)]
+#[error("the edge is not taking tunnels")]
+pub struct EdgeClosed;
+
+/// The API listener's side of the tunnel hand-over.
+#[derive(Clone, Debug)]
+pub struct TunnelDoor {
+    tx: mpsc::Sender<Queued>,
+}
+
+/// The edge's side of the tunnel hand-over, served by [`serve_with_tunnels`].
+#[derive(Debug)]
+pub struct TunnelQueue {
+    rx: mpsc::Receiver<Queued>,
+}
+
+impl std::fmt::Debug for Queued {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Queued")
+            .field("peer", &self.arrival.peer)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Arrivals the accept loop has not picked up yet. Each one is picked up at
+/// once, so this only smooths bursts; a full queue makes the route wait.
+const TUNNEL_QUEUE: usize = 64;
+
+/// A connected [`TunnelDoor`] and [`TunnelQueue`].
+#[must_use]
+pub fn tunnel_channel() -> (TunnelDoor, TunnelQueue) {
+    let (tx, rx) = mpsc::channel(TUNNEL_QUEUE);
+    (TunnelDoor { tx }, TunnelQueue { rx })
+}
+
+impl TunnelQueue {
+    /// Takes the next arrival as the edge would, without running it (tests).
+    #[cfg(test)]
+    pub(crate) async fn take_for_test(&mut self) -> SocketAddr {
+        let Some(q) = self.rx.recv().await else {
+            panic!("door dropped");
+        };
+        let _ = q.taken.send(());
+        q.arrival.peer
+    }
+}
+
+impl TunnelDoor {
+    /// Hands `arrival` to the edge and returns once it holds a handshake slot
+    /// (`edge.maxHandshakes`, and `edge.maxHandshakesPerIp` against `peer`),
+    /// evicting the oldest handshake when a cap is full. The caller answers
+    /// `101` only after this succeeds, so the connection is never outside
+    /// both the API and the edge budgets.
+    pub async fn enter(&self, arrival: Arrival) -> Result<(), EdgeClosed> {
+        let (taken, rx) = oneshot::channel();
+        self.tx
+            .send(Queued { arrival, taken })
+            .await
+            .map_err(|_| EdgeClosed)?;
+        rx.await.map_err(|_| EdgeClosed)
     }
 }
 
@@ -349,6 +434,30 @@ pub async fn serve_with_proxy(
     proxy: ProxyProtocol,
     shutdown: CancellationToken,
 ) {
+    serve_edge(listener, s, proxy, None, shutdown).await;
+}
+
+/// [`serve_with_proxy`] that also takes the tunnels of `tunnels`. A tunnel
+/// runs exactly as an accepted TCP connection does from the point its client
+/// address is known: the same handshake slots, timeouts, verifier,
+/// established slots, handler and drain. Its timeouts run from the `101`.
+pub async fn serve_with_tunnels(
+    listener: TcpListener,
+    s: Serve,
+    proxy: ProxyProtocol,
+    tunnels: TunnelQueue,
+    shutdown: CancellationToken,
+) {
+    serve_edge(listener, s, proxy, Some(tunnels), shutdown).await;
+}
+
+async fn serve_edge(
+    listener: TcpListener,
+    s: Serve,
+    proxy: ProxyProtocol,
+    mut tunnels: Option<TunnelQueue>,
+    shutdown: CancellationToken,
+) {
     let Serve {
         mut tls,
         handler,
@@ -356,9 +465,25 @@ pub async fn serve_with_proxy(
         options,
         ready,
     } = s;
-    tokio::select! {
-        () = shutdown.cancelled() => return,
-        r = tls.wait_for(Option::is_some) => if r.is_err() { return },
+    // Until the first generation loads, tunnels are refused at once (the
+    // route answers 503), so none waits holding an API connection.
+    loop {
+        tokio::select! {
+            // A loaded cert wins over a queued tunnel, which it would serve.
+            biased;
+            () = shutdown.cancelled() => return,
+            r = tls.wait_for(Option::is_some) => {
+                if r.is_err() {
+                    return;
+                }
+                break;
+            }
+            q = next_tunnel(tunnels.as_mut()), if tunnels.is_some() => {
+                if q.is_none() {
+                    tunnels = None;
+                }
+            }
+        }
     }
     ready.set();
     info!(addr = ?listener.local_addr().ok(), "edge listening");
@@ -382,16 +507,26 @@ pub async fn serve_with_proxy(
             }
             (tcp, peer) = accept(&listener) => {
                 let Some(current) = tls.borrow().clone() else { continue };
-                let (slot, evicted) = shared.handshakes.take();
-                if let Some(e) = evicted {
-                    shared.metrics.outcome(None, e.label());
-                    debug!(remote = %peer, "edge handshake limit reached; evicted the oldest");
-                }
+                let slot = shared.take(Transport::Tcp, peer);
                 conns.spawn(admit(tcp, peer, current, slot, Arc::clone(&shared)));
+            }
+            q = next_tunnel(tunnels.as_mut()), if tunnels.is_some() => {
+                let Some(Queued { arrival, taken }) = q else {
+                    tunnels = None;
+                    continue;
+                };
+                // Dropping `taken` refuses the tunnel.
+                let Some(current) = tls.borrow().clone() else { continue };
+                let slot = shared.take(Transport::Tunnel, arrival.peer);
+                shared.assign(&slot, arrival.peer, None);
+                if taken.send(()).is_ok() {
+                    conns.spawn(tunnel(arrival, current, slot, Arc::clone(&shared)));
+                }
             }
         }
     }
     drop(listener);
+    drop(tunnels);
     info!(open = conns.len(), "edge listener closed, draining");
     let mut conns = Draining(conns);
     let mut progress = tokio::time::interval_at(
@@ -405,6 +540,10 @@ pub async fn serve_with_proxy(
         }
     }
     info!("edge drained");
+}
+
+async fn next_tunnel(q: Option<&mut TunnelQueue>) -> Option<Queued> {
+    q?.rx.recv().await
 }
 
 /// The connections a draining listener waits for. Dropped with some still open,
@@ -453,6 +592,7 @@ pub fn tune_socket(tcp: &TcpStream) -> std::io::Result<()> {
 /// State every connection task of one listener shares.
 struct Shared {
     handler: Arc<dyn ConnectionHandler>,
+    /// Labelled `tcp`; [`EdgeMetrics::for_transport`] gives the others.
     metrics: EdgeMetrics,
     options: ListenerOptions,
     /// `max_connections`: established connections.
@@ -460,6 +600,40 @@ struct Shared {
     /// `max_handshakes` and `max_handshakes_per_ip`.
     handshakes: Handshakes,
     proxy: ProxyProtocol,
+}
+
+impl Shared {
+    /// A handshake slot, counting the connection it evicted, if any. `remote`
+    /// is only logged.
+    fn take(&self, transport: Transport, remote: SocketAddr) -> HandshakeSlot {
+        let (slot, evicted) = self.handshakes.take(transport);
+        if let Some((e, t)) = evicted {
+            self.metrics.for_transport(t).outcome(None, e.label());
+            debug!(remote = %remote, "edge handshake limit reached; evicted the oldest");
+        }
+        slot
+    }
+
+    /// Counts `slot` against `peer`'s address, counting the connection it
+    /// evicted, if any.
+    fn assign(&self, slot: &HandshakeSlot, peer: SocketAddr, via: Option<SocketAddr>) {
+        if let Some((e, t)) = self.handshakes.assign(slot, peer.ip()) {
+            self.metrics.for_transport(t).outcome(None, e.label());
+            debug!(peer = %peer, via = ?via, "edge per-address handshake limit reached; evicted the oldest");
+        }
+    }
+}
+
+/// The span every edge connection runs in; `peer` is the client.
+fn conn_span(peer: SocketAddr, transport: Transport) -> tracing::Span {
+    info_span!(
+        "edge_conn",
+        peer = %peer,
+        transport = transport.label(),
+        via = tracing::field::Empty,
+        alloc_id = tracing::field::Empty,
+        pod_uid = tracing::field::Empty,
+    )
 }
 
 /// Finds the client address (the PROXY source behind a trusted gateway, else
@@ -491,40 +665,68 @@ async fn admit(
     if let Some(v) = via {
         debug!(peer = %client.addr, via = %v, "edge PROXY header accepted");
     }
-    if let Some(e) = shared.handshakes.assign(&slot, client.addr.ip()) {
-        shared.metrics.outcome(None, e.label());
-        debug!(peer = %client.addr, via = ?via, "edge per-address handshake limit reached; evicted the oldest");
-    }
-    let span = info_span!(
-        "edge_conn",
-        peer = %client.addr,
-        via = tracing::field::Empty,
-        alloc_id = tracing::field::Empty,
-        pod_uid = tracing::field::Empty,
-    );
+    shared.assign(&slot, client.addr, via);
+    let span = conn_span(client.addr, Transport::Tcp);
     if let Some(via) = via {
         span.record("via", tracing::field::display(via));
     }
-    connection(tcp, client.addr, tls, &shared, slot)
-        .instrument(span)
-        .await;
+    connection(
+        Box::new(tcp),
+        client.addr,
+        Transport::Tcp,
+        tls,
+        &shared,
+        slot,
+    )
+    .instrument(span)
+    .await;
+}
+
+/// Waits for the tunnel's byte stream (the `101` going out) under its
+/// handshake slot, bounded by `handshake_timeout`, then runs it as a
+/// connection.
+async fn tunnel(arrival: Arrival, tls: Arc<EdgeTls>, slot: HandshakeSlot, shared: Arc<Shared>) {
+    let Arrival { peer, stream } = arrival;
+    let run = async {
+        let io = tokio::select! {
+            () = slot.evicted.cancelled() => {
+                debug!("edge tunnel evicted by a newer connection; closing");
+                return;
+            }
+            r = tokio::time::timeout(shared.options.handshake_timeout, stream) => match r {
+                Ok(Some(io)) => io,
+                Ok(None) => {
+                    debug!("edge tunnel upgrade failed; closing");
+                    return;
+                }
+                Err(_) => {
+                    debug!("edge tunnel upgrade timed out; closing");
+                    return;
+                }
+            },
+        };
+        connection(io, peer, Transport::Tunnel, tls, &shared, slot).await;
+    };
+    run.instrument(conn_span(peer, Transport::Tunnel)).await;
 }
 
 /// TLS handshake, identity and connection slot under the handshake slot, then
-/// the handler. `peer` is the client address from [`admit`].
+/// the handler. `peer` is the client address.
 async fn connection(
-    tcp: TcpStream,
+    io: BoxIo,
     peer: SocketAddr,
+    transport: Transport,
     tls: Arc<EdgeTls>,
     shared: &Shared,
     slot: HandshakeSlot,
 ) {
+    let metrics = shared.metrics.for_transport(transport);
     let established = tokio::select! {
         () = slot.evicted.cancelled() => {
             debug!("edge handshake evicted by a newer connection; closing");
             return;
         }
-        e = establish(tcp, &tls, shared) => e,
+        e = establish(io, &tls, transport, &metrics, shared) => e,
     };
     let Some((stream, id, _permit)) = established else {
         return;
@@ -533,7 +735,15 @@ async fn connection(
     let span = tracing::Span::current();
     span.record("alloc_id", id.alloc_id.as_str());
     span.record("pod_uid", id.pod_uid.as_str());
-    shared.handler.handle(Accepted { stream, id, peer }).await;
+    shared
+        .handler
+        .handle(Accepted {
+            stream,
+            id,
+            peer,
+            transport,
+        })
+        .await;
 }
 
 /// The `ClientHello` within [`CLIENT_HELLO_TIMEOUT`], the rest of the handshake
@@ -541,22 +751,23 @@ async fn connection(
 /// another `handshake_timeout`. `None` once the connection is closed and
 /// counted.
 async fn establish(
-    tcp: TcpStream,
+    io: BoxIo,
     tls: &EdgeTls,
+    transport: Transport,
+    metrics: &EdgeMetrics,
     shared: &Shared,
-) -> Option<(TlsStream<TcpStream>, AllocationId, OwnedSemaphorePermit)> {
-    let Shared {
-        metrics, options, ..
-    } = shared;
+) -> Option<(TlsStream<BoxIo>, AllocationId, OwnedSemaphorePermit)> {
+    let options = &shared.options;
     let start = Instant::now();
     let hello = tokio::time::timeout(
         CLIENT_HELLO_TIMEOUT.min(options.handshake_timeout),
-        LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tcp),
+        LazyConfigAcceptor::new(rustls::server::Acceptor::default(), io),
     );
     let handshake = async {
         let hello = hello.await.map_err(|_| None)?.map_err(Some)?;
         let rest = options.handshake_timeout.saturating_sub(start.elapsed());
-        tokio::time::timeout(rest, hello.into_stream(Arc::clone(&tls.server)))
+        let config = Arc::clone(tls.server_for(transport));
+        tokio::time::timeout(rest, hello.into_stream(config))
             .await
             .map_err(|_| None)?
             .map_err(Some)
@@ -643,11 +854,11 @@ mod tests {
     #[test]
     fn a_full_handshake_budget_evicts_its_oldest() {
         let h = Handshakes::new(2, 0);
-        let (first, none) = h.take();
+        let (first, none) = h.take(Transport::Tcp);
         assert_eq!(none, None);
-        let (second, _) = h.take();
-        let (third, evicted) = h.take();
-        assert_eq!(evicted, Some(Evicted::Total));
+        let (second, _) = h.take(Transport::Tcp);
+        let (third, evicted) = h.take(Transport::Tcp);
+        assert_eq!(evicted, Some((Evicted::Total, Transport::Tcp)));
         assert!(first.evicted.is_cancelled(), "the oldest goes");
         assert!(!second.evicted.is_cancelled() && !third.evicted.is_cancelled());
         assert_eq!(h.len(), 2);
@@ -660,17 +871,20 @@ mod tests {
     #[test]
     fn a_full_peer_evicts_its_own_oldest_only() {
         let h = Handshakes::new(100, 2);
-        let (other, _) = h.take();
+        let (other, _) = h.take(Transport::Tcp);
         assert_eq!(h.assign(&other, ip("10.0.0.9")), None);
         let slots: Vec<_> = (0..2)
             .map(|_| {
-                let (s, _) = h.take();
+                let (s, _) = h.take(Transport::Tcp);
                 assert_eq!(h.assign(&s, ip("10.0.0.1")), None);
                 s
             })
             .collect();
-        let (s, _) = h.take();
-        assert_eq!(h.assign(&s, ip("10.0.0.1")), Some(Evicted::Peer));
+        let (s, _) = h.take(Transport::Tcp);
+        assert_eq!(
+            h.assign(&s, ip("10.0.0.1")),
+            Some((Evicted::Peer, Transport::Tcp))
+        );
         assert!(slots[0].evicted.is_cancelled());
         assert!(!slots[1].evicted.is_cancelled() && !s.evicted.is_cancelled());
         assert!(
@@ -679,7 +893,7 @@ mod tests {
         );
         drop(slots);
         drop(s);
-        let (t, _) = h.take();
+        let (t, _) = h.take(Transport::Tcp);
         assert_eq!(h.assign(&t, ip("10.0.0.1")), None, "freed on drop");
     }
 
@@ -730,6 +944,8 @@ mod tests {
             stop: CancellationToken,
             /// Set to true to end the connections the handler holds.
             release: watch::Sender<bool>,
+            /// Tunnels into the same loop.
+            door: TunnelDoor,
         }
 
         /// A 2 s handshake timeout, defaults otherwise.
@@ -786,7 +1002,14 @@ mod tests {
                 ProxyMetrics::register(&Metrics::new(), "edge"),
             );
             let stop = CancellationToken::new();
-            tokio::spawn(serve_with_proxy(listener, s, proxy, stop.clone()));
+            let (door, tunnels) = tunnel_channel();
+            tokio::spawn(serve_with_tunnels(
+                listener,
+                s,
+                proxy,
+                tunnels,
+                stop.clone(),
+            ));
             let leaf = bundle
                 .issue_allocation(
                     &ID.parse().unwrap(),
@@ -804,6 +1027,7 @@ mod tests {
                 metrics,
                 stop,
                 release,
+                door,
             }
         }
 
@@ -1028,6 +1252,141 @@ mod tests {
             dial(&r, &[]).await.unwrap();
             next_peer(&mut r).await;
             r.stop.cancel();
+        }
+
+        /// A tunnel whose `101` never completes, from `peer`.
+        fn stalled_tunnel(peer: &str) -> Arrival {
+            Arrival {
+                peer: peer.parse().unwrap(),
+                stream: futures::future::pending().boxed(),
+            }
+        }
+
+        use futures::FutureExt as _;
+
+        /// `enter` returns only once the tunnel holds a handshake slot: with
+        /// one slot, the next TCP connection evicts the tunnel, counted under
+        /// `transport="tunnel"`.
+        #[tokio::test]
+        async fn a_tunnel_holds_a_handshake_slot_once_enter_returns() {
+            let one = ListenerOptions {
+                max_handshakes: 1,
+                max_handshakes_per_ip: 0,
+                ..options()
+            };
+            let mut r = start_with("10.0.0.0/8", one, true).await;
+            r.door
+                .enter(stalled_tunnel("192.0.2.7:1000"))
+                .await
+                .unwrap();
+            let tunnel = r.metrics.for_transport(Transport::Tunnel);
+            assert_eq!(tunnel.outcome_count(None, "handshake_limit"), 0);
+            dial(&r, &[]).await.expect("evicts the tunnel");
+            next_peer(&mut r).await;
+            assert_eq!(tunnel.outcome_count(None, "handshake_limit"), 1);
+            assert_eq!(r.metrics.outcome_count(None, "handshake_limit"), 0);
+            r.stop.cancel();
+        }
+
+        /// The tunnel counts against the API connection's client address,
+        /// in the same per-address budget as TCP connections from it.
+        #[tokio::test]
+        async fn a_tunnel_counts_against_its_client_address() {
+            let one = ListenerOptions {
+                max_handshakes_per_ip: 1,
+                ..options()
+            };
+            let mut r = start_with("127.0.0.0/8", one, true).await;
+            r.door
+                .enter(stalled_tunnel("192.0.2.7:1000"))
+                .await
+                .unwrap();
+            dial(&r, &header("192.0.2.8:1000".parse().unwrap()))
+                .await
+                .unwrap();
+            next_peer(&mut r).await;
+            let tunnel = r.metrics.for_transport(Transport::Tunnel);
+            assert_eq!(tunnel.outcome_count(None, "peer_handshake_limit"), 0);
+            dial(&r, &header("192.0.2.7:2000".parse().unwrap()))
+                .await
+                .unwrap();
+            assert_eq!(next_peer(&mut r).await, "192.0.2.7:2000".parse().unwrap());
+            assert_eq!(tunnel.outcome_count(None, "peer_handshake_limit"), 1);
+            r.stop.cancel();
+        }
+
+        /// A `101` that never completes frees its slot at the handshake
+        /// timeout: the next connection evicts nothing.
+        #[tokio::test]
+        async fn a_stalled_upgrade_frees_its_slot_at_the_handshake_timeout() {
+            let one = ListenerOptions {
+                max_handshakes: 1,
+                handshake_timeout: Duration::from_millis(300),
+                ..options()
+            };
+            let mut r = start_with("10.0.0.0/8", one, true).await;
+            r.door
+                .enter(stalled_tunnel("192.0.2.7:1000"))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            dial(&r, &[]).await.unwrap();
+            next_peer(&mut r).await;
+            let tunnel = r.metrics.for_transport(Transport::Tunnel);
+            assert_eq!(tunnel.outcome_count(None, "handshake_limit"), 0);
+            r.stop.cancel();
+        }
+
+        /// Before its first cert loads, the edge refuses a tunnel at once
+        /// (the route's 503), so no request waits holding an API connection.
+        #[tokio::test]
+        async fn an_edge_without_a_cert_refuses_tunnels_at_once() {
+            let (tx, _peers) = mpsc::unbounded_channel();
+            let (_release, release) = watch::channel(true);
+            let handler: Arc<dyn ConnectionHandler> = Arc::new(Peers { tx, release });
+            let (tls_tx, tls) = watch::channel(None);
+            let s = Serve {
+                tls,
+                handler,
+                metrics: EdgeMetrics::register(&Metrics::new()),
+                options: options(),
+                ready: Readiness::with_spec_checks().register("edge_listener"),
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (door, tunnels) = tunnel_channel();
+            let stop = CancellationToken::new();
+            tokio::spawn(serve_with_tunnels(
+                listener,
+                s,
+                ProxyProtocol::off(),
+                tunnels,
+                stop.clone(),
+            ));
+            for _ in 0..3 {
+                let r = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    door.enter(stalled_tunnel("192.0.2.7:1")),
+                )
+                .await
+                .expect("answered at once, not left waiting");
+                assert!(r.is_err());
+            }
+            drop(tls_tx);
+            stop.cancel();
+        }
+
+        /// A stopped edge takes no tunnels.
+        #[tokio::test]
+        async fn a_stopped_edge_refuses_tunnels() {
+            let r = start("10.0.0.0/8").await;
+            r.stop.cancel();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while r.door.enter(stalled_tunnel("192.0.2.7:1")).await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("refused once stopped");
         }
     }
 }

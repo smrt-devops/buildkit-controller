@@ -1,0 +1,22 @@
+# It has no access rules, so it admits nobody until you add some (see
+# pool-github-oidc.yaml).
+# Workers with no internet egress that pull from and push to a private registry
+# by name. The leader resolves each name every 30 seconds and keeps the pool's
+# NetworkPolicy pointed at its current addresses, TCP on the given port only.
+# If the registry resolves into workerNetwork.clusterCIDRs or extraDeniedCIDRs
+# (a VPC endpoint in the node subnets, an in-cluster mirror), the operator must
+# also list the name in the Helm value workerNetwork.permittedHosts.
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata:
+  name: private-registry
+  namespace: ci
+spec:
+  network:
+    egress:
+      internet: Deny
+      allowHosts:
+      - registry.example.com          # port 443
+      - mirror.corp.example.com:5000
+  scaling:
+    max: 5

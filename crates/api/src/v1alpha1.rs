@@ -484,15 +484,17 @@ pub struct Cache {
     /// namespace. `pool` gives every caller the pool admits one cache, so use it only
     /// when they are one trust domain.
     pub scope: CacheScope,
-    /// Callers whose builds may write the cache, in the syntax of `access.rules`; the
-    /// rest only read it. Unset trusts every `ServiceAccount` and `BuildKitClaim` caller,
+    /// Callers whose builds may write the scope's shared cache, in the syntax of
+    /// `access.rules`. The others read it. An OIDC caller among them whose token has a
+    /// `ref` claim also reads and writes a cache of its own ref (and, for the events
+    /// below, its event), and reads the shared cache for what that one lacks. Unset trusts every `ServiceAccount` and `BuildKitClaim` caller,
     /// and OIDC tokens whose `event_name` claim is `push`, `schedule` or
     /// `workflow_dispatch` and whose `ref_protected` claim is `true`. `[]` trusts nobody.
     /// A token whose `event_name` is `pull_request`, `pull_request_target`,
     /// `workflow_run`, `issue_comment`, `pull_request_review`,
     /// `pull_request_review_comment`, `deployment` or `deployment_status`, or whose GitLab
     /// `pipeline_source` is `merge_request_event`, `external_pull_request_event` or
-    /// `parent_pipeline`, only reads, whatever these rules say, since those jobs can run
+    /// `parent_pipeline`, never writes the shared cache, whatever these rules say, since those jobs can run
     /// code from forks or unreviewed refs. Pin `event_name` and `ref_protected: "true"` in
     /// OIDC rules here (GitLab: `ref_protected` and `pipeline_source`) rather than
     /// matching on the repository alone.
@@ -559,6 +561,69 @@ pub struct Egress {
         inner(length(max = 64))
     )]
     pub allow_cidrs: Vec<String>,
+    /// Hosts the workers may reach by name, each `<dns-name>` or `<dns-name>:<port>` (port 443 when left out), for example a private registry behind addresses that change. The leader resolves each name every 30 seconds and opens TCP on the entry's port to at most 16 of its addresses. It never opens a link-local, loopback, cloud metadata or NAT64 local-use address. It opens an address inside `workerNetwork.clusterCIDRs` or `workerNetwork.extraDeniedCIDRs`, or one the controller cannot tell from a cluster address while `clusterCIDRs` holds no range of its family, only when the operator lists the name in `workerNetwork.permittedHosts`. A name that stops resolving keeps its last known addresses and makes the pool `Degraded=True/UnresolvedHost`; one that resolves only to refused addresses makes it `Degraded=True/HostNotPermitted`. Lowercase names only, no wildcard, no IP address. Each name is looked up as an absolute name, so the controller's DNS search path never applies: write an in-cluster Service with its full name.
+    #[schemars(
+        length(max = 16),
+        inner(length(max = 253), regex(pattern = ALLOW_HOST_PATTERN))
+    )]
+    pub allow_hosts: Vec<String>,
+}
+
+/// The CRD pattern of a `spec.network.egress.allowHosts` entry: lowercase DNS
+/// labels of at most 63 characters, the last starting with a letter (so no
+/// IPv4 address matches), then an optional `:<port>` from 1 to 65535.
+/// [`parse_allow_host`] is the controller-side check of the same form.
+pub const ALLOW_HOST_PATTERN: &str = r"^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\.)*[a-z]([-a-z0-9]{0,61}[a-z0-9])?(:(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}))?$";
+
+/// Port of an `allowHosts` entry that names none.
+pub const DEFAULT_HOST_PORT: u16 = 443;
+
+/// One parsed `spec.network.egress.allowHosts` entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllowHost<'a> {
+    /// The DNS name, as written.
+    pub name: &'a str,
+    /// The TCP port, [`DEFAULT_HOST_PORT`] when the entry names none.
+    pub port: u16,
+}
+
+/// A lowercase DNS name of at most 253 characters whose labels have at most 63
+/// characters, no leading or trailing hyphen, and whose last label starts with
+/// a letter. No trailing dot, no wildcard, and so never an IP address.
+#[must_use]
+pub fn is_host_name(s: &str) -> bool {
+    let label = |l: &str| {
+        (1..=63).contains(&l.len())
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    s.len() <= 253
+        && s.split('.').all(label)
+        && s.rsplit('.')
+            .next()
+            .is_some_and(|l| l.starts_with(|c: char| c.is_ascii_lowercase()))
+}
+
+/// Parses an `allowHosts` entry, `<dns-name>` or `<dns-name>:<port>`, the form
+/// [`ALLOW_HOST_PATTERN`] admits. `None` when it is not one.
+#[must_use]
+pub fn parse_allow_host(s: &str) -> Option<AllowHost<'_>> {
+    if s.len() > 253 {
+        return None;
+    }
+    let (name, port) = match s.split_once(':') {
+        None => (s, DEFAULT_HOST_PORT),
+        Some((name, p)) => {
+            let digits = !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+            if !digits || p.starts_with('0') {
+                return None;
+            }
+            (name, p.parse::<u16>().ok().filter(|n| *n > 0)?)
+        }
+    };
+    is_host_name(name).then_some(AllowHost { name, port })
 }
 
 /// `spec.network.egress.internet`.
@@ -678,15 +743,24 @@ pub struct ClaimsRule {
     pub namespaces: Vec<String>,
 }
 
-/// A claim pattern. `*` matches any run of characters, and the pattern needs at least one character that is not `*`.
+/// A claim pattern, 1 to 256 characters. `*` matches any run of characters, the empty run included.
+/// A value made only of `*` means the claim is present (a non-empty string, or an array holding one),
+/// and is accepted only beside another claim whose value has a character other than `*`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
-#[schemars(extend("maxLength" = 256, "pattern" = r"^.*[^*].*$"))]
+#[schemars(extend("minLength" = 1, "maxLength" = 256))]
 pub struct ClaimPattern(pub String);
+
+/// A pattern in `exclude`: like a claim pattern, but never made only of `*`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(extend("minLength" = 1, "maxLength" = 256, "pattern" = r"^.*[^*].*$"))]
+pub struct ExcludePattern(pub String);
 
 /// OIDC rule.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(extend("x-kubernetes-validations" = [{"rule": "self.claims.exists(k, self.claims[k].matches('[^*]'))", "message": "at least one claim value must contain a character other than *"}]))]
 pub struct OidcRule {
     /// Issuer URL. It must equal a configured issuer byte for byte.
     #[schemars(length(max = 512), regex(pattern = r"^https://"))]
@@ -694,6 +768,21 @@ pub struct OidcRule {
     /// Claims that must all match.
     #[schemars(extend("minProperties" = 1, "maxProperties" = 16))]
     pub claims: BTreeMap<String, ClaimPattern>,
+    /// Claim name to patterns. The rule does not match a token when any listed claim matches any
+    /// of its patterns (an array claim: any element). It never admits a caller on its own.
+    /// A value made only of `*` is refused.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(schema_with = "exclude_schema")]
+    pub exclude: BTreeMap<String, Vec<ExcludePattern>>,
+}
+
+fn exclude_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let item = generator.subschema_for::<ExcludePattern>();
+    schemars::json_schema!({
+        "type": "object",
+        "maxProperties": 16,
+        "additionalProperties": {"type": "array", "minItems": 1, "maxItems": 16, "items": item}
+    })
 }
 
 /// Service-account rule.
@@ -775,7 +864,7 @@ pub struct BuildKitPoolStatus {
     /// Platforms from `spec.platforms`, or derived from the template's arch selector.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub platforms: Vec<String>,
-    /// Edge endpoint.
+    /// Edge endpoint: `edge.endpoint`, or `/v1/tunnel` when it is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     /// TLS server name.
@@ -819,6 +908,10 @@ pub mod reason {
     pub const POD_FAILED: &str = "PodFailed";
     /// An `oidc` rule names an unknown issuer.
     pub const UNKNOWN_ISSUER: &str = "UnknownIssuer";
+    /// An `allowHosts` name resolves only to refused addresses.
+    pub const HOST_NOT_PERMITTED: &str = "HostNotPermitted";
+    /// An `allowHosts` name failed to resolve.
+    pub const UNRESOLVED_HOST: &str = "UnresolvedHost";
     /// A slot name is held by a pod the pool does not own.
     pub const SLOT_TAKEN: &str = "SlotTaken";
     /// The CA Secret was hard-replaced and pods under the old CA remain.

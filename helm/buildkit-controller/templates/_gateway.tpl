@@ -3,20 +3,22 @@ What the chart renders for Gateway API exposure, as JSON:
   apiRefs, edgeRefs   parentRefs per route; [] = that route is not rendered
   apiHostnames        HTTPRoute or TLSRoute hostnames of the API
   edgeHostnames       TLSRoute hostnames (SNI) of the edge
+  tunnel              edge.endpoint is empty: clients tunnel through the API route, so there is no edge route
   envoyMissing        gateway.envoy.enabled but no BackendTrafficPolicy CRD
   apiUnpinned         an HTTPRoute parentRef names no sectionName or port
-Fails when a route has no parentRefs and service.type is not LoadBalancer, and in
+Fails when a route has no parentRefs (the edge route is not rendered with an empty edge.endpoint) and service.type is not LoadBalancer, and in
 passthrough mode when both TLSRoutes could match one SNI on one listener.
 */}}
 {{- define "bkc.gateway" -}}
 {{- $gw := .Values.gateway -}}
-{{- $out := dict "apiRefs" (list) "edgeRefs" (list) "apiHostnames" (list) "edgeHostnames" (list) "envoyMissing" false -}}
+{{- $tunnel := empty .Values.edge.endpoint -}}
+{{- $out := dict "apiRefs" (list) "edgeRefs" (list) "apiHostnames" (list) "edgeHostnames" (list) "envoyMissing" false "tunnel" $tunnel -}}
 {{- if $gw.enabled -}}
   {{- $apiRefs := default $gw.parentRefs $gw.api.parentRefs -}}
-  {{- $edgeRefs := default $gw.parentRefs $gw.edge.parentRefs -}}
+  {{- $edgeRefs := ternary (list) (default $gw.parentRefs $gw.edge.parentRefs) $tunnel -}}
   {{- $empty := list -}}
   {{- if not $apiRefs }}{{ $empty = append $empty "gateway.api.parentRefs" }}{{ end -}}
-  {{- if not $edgeRefs }}{{ $empty = append $empty "gateway.edge.parentRefs" }}{{ end -}}
+  {{- if and (not $tunnel) (not $edgeRefs) }}{{ $empty = append $empty "gateway.edge.parentRefs" }}{{ end -}}
   {{- if and $empty (ne .Values.service.type "LoadBalancer") -}}
     {{- $which := ternary "gateway.parentRefs is" (printf "%s (or gateway.parentRefs) is" (first $empty)) (eq (len $empty) 2) -}}
     {{- fail (printf "%s required: list the Gateway listeners that expose the controller, as {name, namespace, sectionName}. To expose the Service directly instead, set service.type=LoadBalancer; for an in-cluster-only install, set gateway.enabled=false." $which) -}}
@@ -24,7 +26,7 @@ passthrough mode when both TLSRoutes could match one SNI on one listener.
   {{- if and $gw.api.backendTLS.caCertificateRefs $gw.api.backendTLS.wellKnownCACertificates -}}
     {{- fail "gateway.api.backendTLS: set caCertificateRefs or wellKnownCACertificates, not both" -}}
   {{- end -}}
-  {{- $edgeHosts := list .Values.edge.serverName -}}
+  {{- $edgeHosts := ternary (list) (list .Values.edge.serverName) $tunnel -}}
   {{- with .Values.edge.allocationDomain }}{{ $edgeHosts = append $edgeHosts (printf "*.%s" .) }}{{ end -}}
   {{- $apiHosts := default (list .Values.edge.serverName) $gw.api.hostnames -}}
   {{- /* Passthrough: two TLSRoutes on one listener with overlapping SNI would let the

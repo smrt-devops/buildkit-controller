@@ -50,7 +50,9 @@ To run exactly the image you verified, pin its digest: `--set image.tag=0.3.0@sh
 
 ### On a real cluster
 
-The chart exposes the controller through a Gateway API Gateway: an HTTPRoute for the API and a TLS passthrough TLSRoute for the edge. You need the Gateway API v1.5.0 or later standard-channel CRDs, an implementation that supports TLSRoute, and a Gateway with two listeners: HTTPS for the API, with a certificate for your DNS name, and TLS in Passthrough mode for the edge. [the chart README](../helm/buildkit-controller/README.md#exposure) has an Envoy Gateway example and the list of implementations. This page assumes a Gateway `bk` in namespace `gateway-system` with the API on 443 and the edge on 8444.
+The chart exposes the controller through a Gateway API Gateway: one HTTPRoute for the API. Builds tunnel through that route, so one hostname and one HTTPS listener are enough behind any gateway, including ones that terminate TLS. You need the Gateway API v1.4.0 or later standard-channel CRDs, an implementation that supports HTTPRoute and BackendTLSPolicy, and a Gateway with an HTTPS listener whose certificate covers your DNS name. [the chart README](../helm/buildkit-controller/README.md#exposure) has an Envoy Gateway example and the list of implementations. This page assumes a Gateway `bk` in namespace `gateway-system` with the API listener `api` on 443.
+
+Installs that want to skip the extra hop of the tunnel can set `edge.endpoint` to a `tcp://` address and add a TLS passthrough listener for the edge. See the chart README.
 
 Pick a DNS name, create the pool namespace, install, then point the name at the Gateway's address. The namespace must exist before `helm install`, because the chart creates a Role and RoleBinding in each namespace in `watchNamespaces`.
 
@@ -58,20 +60,19 @@ Pick a DNS name, create the pool namespace, install, then point the name at the 
 kubectl create namespace ci
 kubectl label namespace ci pod-security.kubernetes.io/enforce=privileged
 helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
-  --set edge.endpoint=tcp://bk.example.com:8444 --set edge.serverName=bk.example.com \
+  --set edge.serverName=bk.example.com \
   --set-json 'gateway.api.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"api"}]' \
-  --set-json 'gateway.edge.parentRefs=[{"name":"bk","namespace":"gateway-system","sectionName":"edge"}]' \
   --set 'watchNamespaces={ci}' \
   --set 'auth.oidc[0].url=https://token.actions.githubusercontent.com' \
   --set 'auth.oidc[0].audiences={buildkit-controller}'
-kubectl get httproute,tlsroute -n buildkit-system
+kubectl get httproute -n buildkit-system
 ```
 
-`watchNamespaces` lists the namespaces that hold pools (`ci`, created before the install). The chart grants the controller pod and Secret access in those namespaces only, and the controller ignores pools anywhere else. Leave it out and the controller serves every namespace through a ClusterRole that can create pods and Secrets anywhere, kube-system included. The chart refuses to render without `edge.endpoint`, `edge.serverName` and `gateway.parentRefs`. The API URL is `https://bk.example.com`, and `edge.endpoint` must be the Gateway's edge listener. Without `auth.oidc`, only ServiceAccount tokens authenticate.
+`watchNamespaces` lists the namespaces that hold pools (`ci`, created before the install). The chart grants the controller pod and Secret access in those namespaces only, and the controller ignores pools anywhere else. Leave it out and the controller serves every namespace through a ClusterRole that can create pods and Secrets anywhere, kube-system included. The chart refuses to render without `edge.serverName` and `gateway.api.parentRefs` (or `gateway.parentRefs`). The API URL is `https://bk.example.com`. The Action runs a local forwarder for the tunnel and needs no new inputs. Without `auth.oidc`, only ServiceAccount tokens authenticate.
 
-Behind a gateway every client reaches the controller from the gateway's addresses. The chart then turns off the edge's per-address handshake cap, but `api.maxConnectionsPerIp` and `auth.serviceAccount.maxReviewsPerIp` apply to all clients together. Raise them or set them to 0 before many jobs start at once, or turn on PROXY protocol (see [operations.md](operations.md#exposure)).
+Behind a gateway every client reaches the controller from the gateway's addresses. The chart then turns off `edge.maxHandshakesPerIp`, because a tunnel handshake counts against the gateway's address, but `api.maxConnectionsPerIp` and `auth.serviceAccount.maxReviewsPerIp` apply to all clients together. Raise them or set them to 0 before many jobs start at once, or turn on PROXY protocol (see [operations.md](operations.md#exposure)).
 
-Without a Gateway, or where the managed gateway has no TLS passthrough (GKE's managed Gateway, the AWS Load Balancer Controller), use a load balancer instead: replace the two `parentRefs` flags with `--set service.type=LoadBalancer`, point the DNS name at the Service address from `kubectl get svc -n buildkit-system`, and use `https://bk.example.com:8443` as the API URL. Some load balancers need a higher idle timeout. See [the chart README](../helm/buildkit-controller/README.md#load-balancer-idle-timeout).
+Without a Gateway, use a load balancer instead: replace the `parentRefs` flag with `--set service.type=LoadBalancer`, point the DNS name at the Service address from `kubectl get svc -n buildkit-system`, and use `https://bk.example.com:8443` as the API URL. Some load balancers need a higher idle timeout. See [the chart README](../helm/buildkit-controller/README.md#load-balancer-idle-timeout).
 
 ### On kind
 
@@ -90,6 +91,8 @@ helm install bk helm/buildkit-controller -n buildkit-system --create-namespace \
   --set edge.endpoint=tcp://localhost:8444 --set edge.serverName=localhost
 kubectl -n buildkit-system port-forward svc/buildkit-controller 8443:8443 8444:8444 &
 ```
+
+This install sets `edge.endpoint=tcp://localhost:8444` so the curl recipe in step 4 works, because the recipe has no tunnel client yet. Leave `edge.endpoint` out and forward only port 8443 to use the Action's tunnel instead.
 
 The chart also starts the build cache: a one-pod StatefulSet `buildkit-controller-registry` with a 60Gi volume, from your default StorageClass. kind has one. Check it with `kubectl -n buildkit-system get pods`. To run without a cache, add `--set cache.enabled=false`.
 
@@ -152,7 +155,7 @@ The inputs are:
 
 The outputs are `builder`, `platforms` (the union of the pools' platforms), `allocation-ids`, `cache-to` and `cache-from` (one value per line, for `docker/build-push-action`) and `cache-args` (the same values as flags for `docker buildx build`). The cache inputs and outputs are explained in [Using it from CI](ci/README.md#build-cache). The post step removes the builder and releases every allocation even when the job fails.
 
-Behind the Gateway, the API presents the Gateway's certificate. When that certificate is publicly trusted, the Action needs no `ca-cert`. The edge always passes through to the controller, and the Action trusts the CA that comes with each allocation.
+Behind the Gateway, the API presents the Gateway's certificate. When that certificate is publicly trusted, the Action needs no `ca-cert`. The Action runs a local forwarder for the tunnel and trusts the CA that comes with each allocation.
 
 With a LoadBalancer, or `gateway.api.mode: passthrough`, the API serves the controller's own certificate, issued by its client CA. To trust it, read the CA from the ConfigMap the leader maintains and store it in the `BK_CA` variable that the workflow passes as `ca-cert`.
 
@@ -170,9 +173,11 @@ The GitHub OIDC rule in `examples/pool-github-oidc.yaml` decides which workflows
 - Prefer `repository_id` and `repository_owner_id` over `repository` and `repository_owner`. A name can be re-registered after a rename or deletion by someone else, but an id cannot.
 - A `ref` rule also matches `pull_request_target` runs. For that event GitHub sets `ref` to the base branch, for example `refs/heads/main`, even though the workflow can check out and run code from the pull request. Add `event_name` (for example `push`) to the same rule to exclude it. `job_workflow_ref` excludes the event only when the named workflow has no `pull_request_target` trigger, because a run of that workflow on the base branch carries the same value for every event.
 
+An `oidc` rule may require that a claim is present without naming its value: a value made only of `*` matches a non-empty string claim, or an array claim holding one, and never a missing or empty claim. Such a rule needs another claim with a real value, such as `repository_owner_id`, so it is always pinned. `exclude` maps a claim name to patterns, and a token that matches any of them does not match that rule, so `claims: {repository_owner_id: "146818127", repo_property_domain: "*"}` with `exclude: {repo_property_domain: [pci]}` admits every domain of one organisation except `pci`, provided no other rule in the list admits it (add the same `exclude` to those rules). `exclude` never admits a caller on its own, and a value made only of `*` is refused in it. Both work in `spec.workers.cache.writers` too. See `examples/pool-github-oidc.yaml`.
+
 ## 4. First build with curl
 
-The script `docs/ci/buildkit-allocate.sh` needs `curl`, `jq`, `openssl` and `docker buildx`. It generates a P-256 key, sends only the public key, creates a remote builder, runs your command, and releases the allocation on exit.
+The script `docs/ci/buildkit-allocate.sh` needs `curl`, `jq`, `openssl` and `docker buildx`. It works only with a `tcp://` `edge.endpoint`, such as the one in the kind install above, until a client binary ships: with the default tunnel endpoint it stops with a clear message. It generates a P-256 key, sends only the public key, creates a remote builder, runs your command, and releases the allocation on exit.
 
 On a cluster, a ServiceAccount token is the simplest credential. The pool above already allows the `builder` ServiceAccount. Run these commands.
 

@@ -16,7 +16,7 @@ async function run() {
   if (!api || pools.length === 0) throw new Error('url and pools are required');
   const ttl = L.parseDuration(gha.getInput('ttl'));
   const qt = L.parseDuration(gha.getInput('queue-timeout'));
-  const ca = gha.getInput('ca-cert') || undefined;
+  const ca = L.resolveCa(gha.getInput('ca-cert'));
   const cache = L.parseCacheInputs({
     cache: gha.getInput('cache'), cacheKey: gha.getInput('cache-key'),
     cacheMode: gha.getInput('cache-mode'), cacheFrom: gha.getInput('cache-from'),
@@ -85,9 +85,15 @@ async function run() {
   const dirs = ids.map((id) => path.join(root, `buildkit-${id}`));
   const builder = gha.getInput('builder-name') || `bk-${ids[0]}`;
 
-  const nodes = allocs.map((a, i) => {
+  const direct = allocs.map((a, i) => {
     const m = L.writeMaterial(dirs[i], a, keys[i].privateKey);
     return { ...m, endpoint: a.endpoint, serverName: a.serverName, platforms: found[i].platforms || [] };
+  });
+  // A path endpoint is the tunnel: one detached forwarder, one local port per allocation.
+  const logFile = path.join(root, `buildkit-tunnel-${ids[0]}.log`);
+  const nodes = await L.useTunnels(direct, {
+    api, ca, logFile,
+    onStarted: (pid) => { gha.saveState('forwarder', String(pid)); gha.saveState('forwarder-log', logFile); },
   });
   L.createBuilder(builder, nodes, docker, () => gha.saveState('builder', builder));
 
@@ -97,7 +103,7 @@ async function run() {
   gha.setOutput('cache-to', flags.to.join('\n'));
   gha.setOutput('cache-from', flags.from.join('\n'));
   gha.setOutput('cache-args', flags.args.join(' '));
-  for (const a of allocs) if (a.cache && a.cache.registry && !a.cache.registry.to) gha.info(`${a.namespace}/${a.pool}: cache key ${a.cache.key}, read only for this build`);
+  for (const a of allocs) { const note = L.cacheNote(a); if (note) gha.info(note); }
   gha.setOutput('platforms', [...new Set(nodes.flatMap((n) => n.platforms))].join(','));
   gha.info(`builder ${builder} ready with ${ids.length} node(s)`);
 }

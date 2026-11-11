@@ -44,8 +44,11 @@ const RETRY: Duration = Duration::from_secs(1);
 /// Static inputs from the config file.
 #[derive(Debug, Clone)]
 pub struct BindConfig {
-    /// `edge.endpoint`.
+    /// `edge.endpoint`; empty when clients tunnel through the API.
     pub endpoint: String,
+    /// `tcp://<edge.serviceName>.<namespace>.svc:<edge port>`: what an
+    /// in-cluster claim dials when `endpoint` is empty (see docs/architecture.md, `BuildKitClaim`).
+    pub service_endpoint: String,
     /// `edge.serverName`.
     pub server_name: String,
     /// `edge.allocationDomain`, `None` when unset.
@@ -59,9 +62,19 @@ pub struct BindConfig {
 }
 
 impl BindConfig {
-    /// The endpoint of allocation `id`: per allocation with `allocationDomain`.
+    /// The endpoint of allocation `id` for a claim in `claim_namespace`: per
+    /// allocation with `allocationDomain`. With no `edge.endpoint`, the API's
+    /// claims (the controller's namespace) get the tunnel path, and an
+    /// in-cluster claim gets the edge Service, never the tunnel.
     #[must_use]
-    pub fn endpoint(&self, id: &str) -> String {
+    pub fn endpoint(&self, id: &str, claim_namespace: &str) -> String {
+        if self.endpoint.is_empty() {
+            return if claim_namespace == self.namespace {
+                buildkit_controller_api::dto::TUNNEL_PATH.to_owned()
+            } else {
+                self.service_endpoint.clone()
+            };
+        }
         match &self.allocation_domain {
             Some(d) => {
                 let port = self.endpoint.rsplit_once(':').map_or("", |(_, p)| p);
@@ -534,7 +547,7 @@ impl Binder {
         let binding = Binding {
             alloc_id: ask.alloc_id.to_string(),
             pod: pod_name.to_owned(),
-            endpoint: self.cfg.endpoint(ask.alloc_id.as_str()),
+            endpoint: self.cfg.endpoint(ask.alloc_id.as_str(), ns),
             server_name: self.cfg.server_name.clone(),
             expires_at: fmt_ts(expires_at),
             certificate: cert.cert_pem().to_owned(),
@@ -800,17 +813,32 @@ fn ask(
         .map(CacheKey::try_from)
         .transpose()
         .map_err(|e| e.to_string())?;
-    // A claim the API wrote carries the scope and tier the API derived from
-    // its caller; without a well-formed scope it gets no cache.
+    // A claim the API wrote carries the scope, tier and branch scope the API
+    // derived from its caller; without a well-formed scope it gets no cache.
+    // `plan` drops a branch scope from a trusted allocation.
     let who = match (&caller.identity, &caller.cache_scope) {
-        (Some(id), _) => Some((cache::scope(pool, id), cache::tier(pool, id))),
-        (None, Some(s)) if rnd::is_scope_id(s) => {
-            Some((s.clone(), caller.cache_tier.unwrap_or(CacheTier::Untrusted)))
-        }
+        (Some(id), _) => Some((
+            cache::scope(pool, id),
+            cache::tier(pool, id),
+            cache::branch_scope(pool, id),
+        )),
+        (None, Some(s)) if rnd::is_scope_id(s) => Some((
+            s.clone(),
+            caller.cache_tier.unwrap_or(CacheTier::Untrusted),
+            caller.branch_scope.clone(),
+        )),
         (None, _) => None,
     };
-    let plan = who.and_then(|(scope, tier)| {
-        cache::plan(registry_host, pool, key.as_ref(), c.spec.cache, scope, tier)
+    let plan = who.and_then(|(scope, tier, branch)| {
+        cache::plan(
+            registry_host,
+            pool,
+            key.as_ref(),
+            c.spec.cache,
+            scope,
+            tier,
+            branch,
+        )
     });
     Ok(Ask {
         deadline: claims::queue_deadline(c, qt),

@@ -19,7 +19,9 @@
 # Env: API, POOL (<namespace>/<pool>), TOKEN or TOKEN_FILE; optional TTL (seconds),
 # QUEUE_TIMEOUT (seconds), API_CA (PEM file trusted for the API listener),
 # CACHE_KEY (cache tag, default the pool name) and CACHE (auto or none). A build
-# the pool does not trust to write the cache gets --cache-from only.
+# the pool trusts writes the shared cache. Any other build with a ref claim writes
+# its own branch cache, and the registry answers what that lacks from the shared
+# one. The rest only read.
 #
 # TOKEN is read once and unset, so the command does not inherit it. TOKEN_FILE names a file
 # that holds the token and is read again before every request, including the release at the
@@ -300,8 +302,17 @@ jq -r '.caCert // empty' "$D/alloc.json" > "$D/ca.pem"
 OPTS="cert=$D/cert.pem,key=$D/key.pem,servername=$(jq -r .serverName "$D/alloc.json")"
 [ ! -s "$D/ca.pem" ] || OPTS="cacert=$D/ca.pem,$OPTS"
 
+ENDPOINT=$(jq -r .endpoint "$D/alloc.json")
+# A path means the controller serves a tunnel (edge.endpoint empty). buildx dials only tcp:// and
+# unix://, and this script has no forwarder, so stop here; the exit trap releases the allocation.
+case $ENDPOINT in
+  /*)
+    echo "this controller returns the tunnel endpoint $ENDPOINT, which this script cannot use: it needs a tcp:// edge.endpoint until a client binary ships. Use the GitHub Action, or set edge.endpoint on the controller." >&2
+    exit 1 ;;
+esac
+
 docker buildx create --name "$BUILDER" --driver remote --driver-opt "$OPTS" \
-  "$(jq -r .endpoint "$D/alloc.json")" >/dev/null
+  "$ENDPOINT" >/dev/null
 # Cache values hold no spaces, so an unquoted $CACHE_ARGS splits into one word per flag.
 CACHE_ARGS=$(jq -r '[(.cache.registry.from // [])[] | "--cache-from=\(.)"]
   + [.cache.registry.to // empty | "--cache-to=\(.)"] | join(" ")' "$D/alloc.json")

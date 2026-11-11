@@ -8,6 +8,36 @@ const os = require('node:os');
 const path = require('node:path');
 const L = require('../dist/lib');
 
+test('resolveCa: input, then NODE_EXTRA_CA_CERTS, then SSL_CERT_FILE, then none', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bk-ca-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const node = path.join(dir, 'node.pem');
+  const ssl = path.join(dir, 'ssl.pem');
+  fs.writeFileSync(node, 'NODE PEM');
+  fs.writeFileSync(ssl, 'SSL PEM');
+  assert.equal(L.resolveCa('INPUT PEM', { NODE_EXTRA_CA_CERTS: node, SSL_CERT_FILE: ssl }), 'INPUT PEM');
+  assert.equal(L.resolveCa('', { NODE_EXTRA_CA_CERTS: node, SSL_CERT_FILE: ssl }), '# with built-in roots\nNODE PEM');
+  assert.equal(L.resolveCa('', { SSL_CERT_FILE: ssl }), 'SSL PEM');
+  assert.equal(L.resolveCa('', { NODE_EXTRA_CA_CERTS: '', SSL_CERT_FILE: ssl }), 'SSL PEM');
+  assert.equal(L.resolveCa('', {}), undefined);
+});
+
+test('caOption: NODE_EXTRA_CA_CERTS text adds to the built-in roots, other text replaces them', () => {
+  const tls = require('node:tls');
+  assert.equal(L.caOption('INPUT PEM'), 'INPUT PEM');
+  const withRoots = L.caOption(L.resolveCa('', { NODE_EXTRA_CA_CERTS: __filename }));
+  assert.ok(Array.isArray(withRoots));
+  assert.equal(withRoots.length, tls.rootCertificates.length + 1);
+  assert.deepEqual(withRoots.slice(0, -1), tls.rootCertificates, 'public roots stay trusted, so a publicly trusted server still verifies');
+});
+
+test('resolveCa: a named file that is missing is an error naming the variable', () => {
+  assert.throws(() => L.resolveCa('', { NODE_EXTRA_CA_CERTS: '/nonexistent/ca.pem' }), /NODE_EXTRA_CA_CERTS names \/nonexistent\/ca\.pem/);
+  assert.throws(() => L.resolveCa('', { SSL_CERT_FILE: '/nonexistent/ca.pem' }), /SSL_CERT_FILE/);
+  // The first variable that is set decides; a good second one does not paper over a bad first.
+  assert.throws(() => L.resolveCa('', { NODE_EXTRA_CA_CERTS: '/nonexistent/ca.pem', SSL_CERT_FILE: __filename }), /NODE_EXTRA_CA_CERTS/);
+});
+
 test('parseList splits commas and newlines', () => {
   assert.deepEqual(L.parseList('ci/a, ci/b\n\n ci/c\n'), ['ci/a', 'ci/b', 'ci/c']);
   assert.deepEqual(L.parseList(''), []);
@@ -48,7 +78,7 @@ test('validatePools: single pool needs no platforms', () => {
   assert.equal(r.length, 1);
 });
 
-test('validatePools rejects missing, unready, multi without allocation domain, empty or overlapping platforms', () => {
+test('validatePools rejects missing, unready, multi without per-allocation endpoints, empty or overlapping platforms', () => {
   const w = [{ namespace: 'ci', pool: 'a' }, { namespace: 'ci', pool: 'b' }];
   assert.throws(() => L.validatePools({ pools: [pool('a', ['linux/amd64'])] }, w), /not found/);
   assert.throws(() => L.validatePools({ pools: [pool('a', [], false)] }, [w[0]]), /not ready/);
@@ -157,6 +187,31 @@ test('cacheFlags: registry flags from responses, mode override, extra refs, dedu
   assert.deepEqual(L.cacheFlags([ro], {}), { to: [], from: ['type=registry,ref=r/c:app'], args: ['--cache-from=type=registry,ref=r/c:app'] });
   assert.deepEqual(L.cacheFlags([{}], {}), { to: [], from: [], args: [] });
   assert.deepEqual(L.cacheFlags([{}], { from: ['type=gha'] }).args, ['--cache-from=type=gha']);
+});
+
+test('cacheFlags: to and every from entry pass through in order', () => {
+  const br = 'type=registry,ref=h/ns/p/bbbb:app';
+  const sh = 'type=registry,ref=h/ns/p/ssss:app';
+  const to = 'type=registry,ref=h/ns/p/bbbb:app,mode=max,ignore-error=true,oci-mediatypes=true';
+  const a = { cache: { key: 'app', registry: { to, from: [br, sh] } } };
+  assert.deepEqual(L.cacheFlags([a], {}), { to: [to], from: [br, sh], args: [`--cache-from=${br}`, `--cache-from=${sh}`, `--cache-to=${to}`] });
+});
+
+test('cacheNote: a build that writes and a read-only build each say what they may do', () => {
+  const sh = 'type=registry,ref=h/ns/p/ssss:app';
+  const br = 'type=registry,ref=h/ns/p/bbbb:app';
+  const alloc = (registry) => ({ namespace: 'ns', pool: 'p', cache: { key: 'app', registry } });
+  const trusted = alloc({ to: `${sh},mode=max,ignore-error=true,oci-mediatypes=true`, from: [sh] });
+  const branch = alloc({ to: `${br},mode=max,ignore-error=true,oci-mediatypes=true`, from: [br] });
+  const ro = alloc({ from: [sh] });
+  for (const a of [trusted, branch]) {
+    assert.equal(L.cacheAccess(a), 'writes');
+    assert.equal(L.cacheNote(a), "ns/p: cache key app, reads and writes the shared cache if the pool trusts this build, else this branch's own");
+  }
+  assert.equal(L.cacheAccess(ro), 'read-only');
+  assert.equal(L.cacheAccess({}), null);
+  assert.equal(L.cacheNote(ro), 'ns/p: cache key app, read only for this build');
+  assert.equal(L.cacheNote({ namespace: 'ns', pool: 'p' }), null);
 });
 
 test('the current server gets a 40 s POST timeout, v0.1.0 keeps the whole budget', () => {

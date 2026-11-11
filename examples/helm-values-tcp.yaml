@@ -1,0 +1,51 @@
+# Values for: helm install bk helm/buildkit-controller -n buildkit-system -f helm-values-tcp.yaml
+#
+# TCP passthrough instead of the tunnel, for installs that want to skip the extra hop. Clients
+# dial the edge port directly, so the Gateway needs a TLS listener in Passthrough mode, and the
+# curl recipe (docs/ci/buildkit-allocate.sh) works. helm-values.yaml is the default and needs
+# only the HTTPS route.
+replicaCount: 2
+
+# The edge endpoint is the Gateway's TLS passthrough listener.
+edge:
+  endpoint: tcp://bk.example.com:8444
+  serverName: bk.example.com
+  # Behind a gateway every client shares the gateway's addresses, so the per-address
+  # caps apply to all CI jobs together. Size them for the jobs that start at once.
+  maxHandshakesPerIp: 256
+api:
+  maxConnectionsPerIp: 1024
+
+watchNamespaces: [ci]
+
+auth:
+  oidc:
+    - url: https://token.actions.githubusercontent.com
+      audiences: [buildkit-controller]
+  serviceAccount:
+    enabled: true
+    audiences: [buildkit-controller]
+    maxReviewsPerIp: 32
+
+# Routes on the Gateway bk (namespace gateway-system): the API on its HTTPS listener and the
+# edge on its TLS passthrough listener. See helm/buildkit-controller/README.md#exposure.
+gateway:
+  api:
+    parentRefs: [{name: bk, namespace: gateway-system, sectionName: api}]
+  edge:
+    parentRefs: [{name: bk, namespace: gateway-system, sectionName: edge}]
+
+pools:
+  - name: amd64
+    namespace: ci
+    spec:
+      platforms: [linux/amd64]
+      scaling:
+        max: 10
+      access:
+        rules:
+          - oidc:
+              issuer: https://token.actions.githubusercontent.com
+              claims:
+                repository_owner_id: "12345678"   # the org's numeric id (gh api orgs/<org> --jq .id)
+                event_name: push

@@ -1,0 +1,6 @@
+apiVersion: buildkit.smrt-devops.net/v1alpha1
+kind: BuildKitPool
+metadata: {name: oidc-exclude-17-patterns, namespace: default}
+spec:
+  access:
+    rules: [{oidc: {issuer: "https://a", claims: {a: b}, exclude: {a: [p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17]}}}]

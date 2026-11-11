@@ -1,0 +1,12 @@
+# A tunnel behind Envoy Gateway with PROXY protocol on the API listener only: the API
+# HTTPRoute gets the unbounded /v1/tunnel rule, and the per-address handshake cap stays on.
+edge:
+  serverName: bk.example.com
+api:
+  proxyProtocol: {enabled: true, trustedCIDRs: [10.244.3.17/32]}
+gateway:
+  api:
+    parentRefs: [{name: eg, namespace: envoy-gateway-system, sectionName: https}]
+  envoy:
+    enabled: true
+    proxyProtocol: true

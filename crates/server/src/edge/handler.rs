@@ -5,22 +5,44 @@ use std::net::SocketAddr;
 
 use futures::future::BoxFuture;
 use rustls::{CertificateError, Error};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::server::TlsStream;
 
+use super::metrics::Transport;
 use crate::pki::AllocationId;
+
+/// A client byte stream the edge runs its handshake on: an accepted TCP
+/// connection, or the joined binary frames of a tunnel.
+pub trait ClientIo: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> ClientIo for T {}
+
+/// A boxed [`ClientIo`], so one handler serves every transport.
+pub type BoxIo = Box<dyn ClientIo>;
 
 /// A client connection that completed the mTLS handshake with a valid
 /// allocation cert.
-#[derive(Debug)]
 pub struct Accepted {
     /// The client leg; `stream.get_ref().1.peer_certificates()` holds the
     /// verified leaf (its `notAfter` drives the per-connection timer).
-    pub stream: TlsStream<TcpStream>,
+    pub stream: TlsStream<BoxIo>,
     /// Identity from the leaf's single URI SAN.
     pub id: AllocationId,
-    /// Remote address (`peer` log field).
+    /// Remote address (`peer` log field). For a tunnel, the client address
+    /// of the API connection that carries it.
     pub peer: SocketAddr,
+    /// How the connection reached the edge.
+    pub transport: Transport,
+}
+
+impl std::fmt::Debug for Accepted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Accepted")
+            .field("id", &self.id)
+            .field("peer", &self.peer)
+            .field("transport", &self.transport)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Why [`ConnectionHandler::admit`] refused an allocation.

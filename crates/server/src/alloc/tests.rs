@@ -376,6 +376,11 @@ struct Env {
 }
 
 fn env() -> Env {
+    env_with("tcp://bk.example.com:8444", Some("alloc.bk.example.com"))
+}
+
+/// [`env`] with another `edge.endpoint` and `edge.allocationDomain`.
+fn env_with(endpoint: &str, allocation_domain: Option<&str>) -> Env {
     let ca = Arc::new(CaBundle::generate(OffsetDateTime::now_utc()).unwrap());
     let pool = pool();
     let mut pools = Writer::<BuildKitPool>::default();
@@ -397,9 +402,10 @@ fn env() -> Env {
         (pools.as_reader(), pods.clone(), claims.clone()),
         Arc::clone(&certs) as Arc<dyn super::CertSource>,
         BindConfig {
-            endpoint: "tcp://bk.example.com:8444".into(),
+            endpoint: endpoint.into(),
+            service_endpoint: "tcp://bkc.ops.svc:8444".into(),
             server_name: "bk.example.com".into(),
-            allocation_domain: Some("alloc.bk.example.com".into()),
+            allocation_domain: allocation_domain.map(str::to_owned),
             namespace: OWN.into(),
             served: served.clone(),
             registry_host: Some(CACHE_HOST.into()),
@@ -798,6 +804,48 @@ async fn a_written_owner_counts_only_in_the_controllers_namespace() {
         e.fake.claim("other", "build").unwrap().status.is_none(),
         "not served: the tidy pass refuses it"
     );
+}
+
+/// With no `edge.endpoint`, the API's allocations tunnel, and an in-cluster
+/// claim gets the edge Service in its status and Secret, never the tunnel.
+#[tokio::test]
+async fn without_an_edge_endpoint_only_the_api_tunnels() {
+    let e = Arc::new(env_with("", None));
+    e.warm(0);
+    e.warm(1);
+    e.claim(CI, "build", 0, json!({}));
+    e.binder.pass(&key()).await;
+    let s = e.fake.status(CI, "build");
+    assert_eq!(phase(&s), ClaimPhase::Bound);
+    assert_eq!(s.endpoint.as_deref(), Some("tcp://bkc.ops.svc:8444"));
+    let data = e.fake.w.lock().unwrap().secrets[&(CI.to_owned(), "build-buildkit".to_owned())]
+        .clone()
+        .data
+        .unwrap();
+    let text = |k: &str| String::from_utf8(data[k].0.clone()).unwrap();
+    assert_eq!(text("endpoint"), "tcp://bkc.ops.svc:8444");
+    assert_eq!(text("server-name"), "bk.example.com");
+
+    let req: CreateAllocationRequest = serde_json::from_value(json!({
+        "namespace": POOL_NS, "pool": POOL, "ttlSeconds": 600, "queueTimeoutSeconds": 30, "publicKey": *KEY
+    }))
+    .unwrap();
+    let leader = {
+        let e = Arc::clone(&e);
+        let mut sub = ClaimSubscription::new(e.fake.tx.subscribe());
+        tokio::spawn(async move {
+            while sub.recv().await.is_some() {
+                e.binder.pass(&key()).await;
+            }
+        })
+    };
+    let out = e.front.allocate(&sa("alice"), &req).await.unwrap();
+    leader.abort();
+    let Outcome::Bound(r) = out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(r.endpoint, "/v1/tunnel");
+    assert_eq!(r.server_name, "bk.example.com");
 }
 
 /// Claims the pool cannot serve fail at once: no `publicKey` in the

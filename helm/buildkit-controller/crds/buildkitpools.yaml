@@ -81,15 +81,33 @@ spec:
                           properties:
                             claims:
                               additionalProperties:
-                                description: >-
-                                  A claim pattern. `*` matches any run of characters, and the pattern needs at
-                                  least one character that is not `*`.
+                                description: |-
+                                  A claim pattern, 1 to 256 characters. `*` matches any run of characters, the empty run included.
+                                  A value made only of `*` means the claim is present (a non-empty string, or an array holding one),
+                                  and is accepted only beside another claim whose value has a character other than `*`.
                                 maxLength: 256
-                                pattern: ^.*[^*].*$
+                                minLength: 1
                                 type: string
                               description: Claims that must all match.
                               maxProperties: 16
                               minProperties: 1
+                              type: object
+                            exclude:
+                              additionalProperties:
+                                items:
+                                  description: "A pattern in `exclude`: like a claim pattern, but never made only of `*`."
+                                  maxLength: 256
+                                  minLength: 1
+                                  pattern: ^.*[^*].*$
+                                  type: string
+                                maxItems: 16
+                                minItems: 1
+                                type: array
+                              description: |-
+                                Claim name to patterns. The rule does not match a token when any listed claim matches any
+                                of its patterns (an array claim: any element). It never admits a caller on its own.
+                                A value made only of `*` is refused.
+                              maxProperties: 16
                               type: object
                             issuer:
                               description: Issuer URL. It must equal a configured issuer byte for byte.
@@ -100,6 +118,9 @@ spec:
                           - claims
                           - issuer
                           type: object
+                          x-kubernetes-validations:
+                          - message: at least one claim value must contain a character other than *
+                            rule: self.claims.exists(k, self.claims[k].matches('[^*]'))
                         serviceAccount:
                           description: Match a Kubernetes service account.
                           properties:
@@ -180,12 +201,14 @@ spec:
                 default:
                   egress:
                     allowCIDRs: []
+                    allowHosts: []
                     internet: Allow
                 description: Network policy settings for worker pods.
                 properties:
                   egress:
                     default:
                       allowCIDRs: []
+                      allowHosts: []
                       internet: Allow
                     description: Egress policy of worker pods.
                     properties:
@@ -211,6 +234,16 @@ spec:
                         x-kubernetes-validations:
                         - message: allowCIDRs entries must be CIDR ranges with no bits set beyond the prefix length
                           rule: self.all(c, isCIDR(c) && cidr(c) == cidr(c).masked())
+                      allowHosts:
+                        default: []
+                        description: "Hosts the workers may reach by name, each `<dns-name>` or `<dns-name>:<port>` (port 443 when left out), for example a private registry behind addresses that change. The leader resolves each name every 30 seconds and opens TCP on the entry's port to at most 16 of its addresses. It never opens a link-local, loopback, cloud metadata or NAT64 local-use address. It opens an address inside `workerNetwork.clusterCIDRs` or `workerNetwork.extraDeniedCIDRs`, or one the controller cannot tell from a cluster address while `clusterCIDRs` holds no range of its family, only when the operator lists the name in `workerNetwork.permittedHosts`. A name that stops resolving keeps its last known addresses and makes the pool `Degraded=True/UnresolvedHost`; one that resolves only to refused addresses makes it `Degraded=True/HostNotPermitted`. Lowercase names only, no wildcard, no IP address. Each name is looked up as an absolute name, so the controller's DNS search path never applies: write an in-cluster Service with its full name."
+                        items:
+                          maxLength: 253
+                          pattern: >-
+                            ^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\.)*[a-z]([-a-z0-9]{0,61}[a-z0-9])?(:(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}))?$
+                          type: string
+                        maxItems: 16
+                        type: array
                       internet:
                         default: Allow
                         description: Whether workers may reach the internet.
@@ -2098,15 +2131,17 @@ spec:
                         type: string
                       writers:
                         description: |-
-                          Callers whose builds may write the cache, in the syntax of `access.rules`; the
-                          rest only read it. Unset trusts every `ServiceAccount` and `BuildKitClaim` caller,
+                          Callers whose builds may write the scope's shared cache, in the syntax of
+                          `access.rules`. The others read it. An OIDC caller among them whose token has a
+                          `ref` claim also reads and writes a cache of its own ref (and, for the events
+                          below, its event), and reads the shared cache for what that one lacks. Unset trusts every `ServiceAccount` and `BuildKitClaim` caller,
                           and OIDC tokens whose `event_name` claim is `push`, `schedule` or
                           `workflow_dispatch` and whose `ref_protected` claim is `true`. `[]` trusts nobody.
                           A token whose `event_name` is `pull_request`, `pull_request_target`,
                           `workflow_run`, `issue_comment`, `pull_request_review`,
                           `pull_request_review_comment`, `deployment` or `deployment_status`, or whose GitLab
                           `pipeline_source` is `merge_request_event`, `external_pull_request_event` or
-                          `parent_pipeline`, only reads, whatever these rules say, since those jobs can run
+                          `parent_pipeline`, never writes the shared cache, whatever these rules say, since those jobs can run
                           code from forks or unreviewed refs. Pin `event_name` and `ref_protected: "true"` in
                           OIDC rules here (GitLab: `ref_protected` and `pipeline_source`) rather than
                           matching on the repository alone.
@@ -2135,15 +2170,33 @@ spec:
                               properties:
                                 claims:
                                   additionalProperties:
-                                    description: >-
-                                      A claim pattern. `*` matches any run of characters, and the pattern needs at
-                                      least one character that is not `*`.
+                                    description: |-
+                                      A claim pattern, 1 to 256 characters. `*` matches any run of characters, the empty run included.
+                                      A value made only of `*` means the claim is present (a non-empty string, or an array holding one),
+                                      and is accepted only beside another claim whose value has a character other than `*`.
                                     maxLength: 256
-                                    pattern: ^.*[^*].*$
+                                    minLength: 1
                                     type: string
                                   description: Claims that must all match.
                                   maxProperties: 16
                                   minProperties: 1
+                                  type: object
+                                exclude:
+                                  additionalProperties:
+                                    items:
+                                      description: "A pattern in `exclude`: like a claim pattern, but never made only of `*`."
+                                      maxLength: 256
+                                      minLength: 1
+                                      pattern: ^.*[^*].*$
+                                      type: string
+                                    maxItems: 16
+                                    minItems: 1
+                                    type: array
+                                  description: |-
+                                    Claim name to patterns. The rule does not match a token when any listed claim matches any
+                                    of its patterns (an array claim: any element). It never admits a caller on its own.
+                                    A value made only of `*` is refused.
+                                  maxProperties: 16
                                   type: object
                                 issuer:
                                   description: Issuer URL. It must equal a configured issuer byte for byte.
@@ -2154,6 +2207,9 @@ spec:
                               - claims
                               - issuer
                               type: object
+                              x-kubernetes-validations:
+                              - message: at least one claim value must contain a character other than *
+                                rule: self.claims.exists(k, self.claims[k].matches('[^*]'))
                             serviceAccount:
                               description: Match a Kubernetes service account.
                               properties:
@@ -2264,7 +2320,7 @@ spec:
                 nullable: true
                 type: integer
               endpoint:
-                description: Edge endpoint.
+                description: "Edge endpoint: `edge.endpoint`, or `/v1/tunnel` when it is unset."
                 nullable: true
                 type: string
               observedGeneration:

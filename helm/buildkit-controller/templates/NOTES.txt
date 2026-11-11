@@ -61,10 +61,14 @@ API URL (HTTPS) on a node port:
 
 API URL (HTTPS), in-cluster only (the Service is ClusterIP):
   https://{{ $fn }}.{{ .Release.Namespace }}.svc:{{ .Values.service.ports.api }}
-From outside the cluster, forward both the API and the edge port, because a build needs both:
-  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $fn }} {{ .Values.service.ports.api }}:{{ .Values.service.ports.api }} {{ .Values.service.ports.edge }}:{{ .Values.service.ports.edge }}
+From outside the cluster, forward the API port{{ if not $plan.tunnel }} and the edge port, because a build needs both{{ end }}:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $fn }} {{ .Values.service.ports.api }}:{{ .Values.service.ports.api }}{{ if not $plan.tunnel }} {{ .Values.service.ports.edge }}:{{ .Values.service.ports.edge }}{{ end }}
+{{- if $plan.tunnel }}
+The API URL is then https://localhost:{{ .Values.service.ports.api }}, and builds tunnel through it.
+{{- else }}
 Then the API URL is https://localhost:{{ .Values.service.ports.api }}, and edge.endpoint must point at the forwarded edge port
 (tcp://localhost:{{ .Values.service.ports.edge }}, with edge.serverName set to localhost).
+{{- end }}
 {{- end }}
 {{- if not (and $plan.apiRefs (eq $gw.api.mode "terminate")) }}
 The API serves the controller's certificate. Unless edge.tls.secretName is publicly trusted,
@@ -72,6 +76,33 @@ clients need its CA (the Action's ca-cert, the recipe's API_CA):
   {{ $ca }}
 The edge needs no CA setup: each allocation response carries the CA for it.
 {{- end }}
+
+{{- if $plan.tunnel }}
+
+Builds tunnel through the API: clients open a WebSocket at /v1/tunnel on the API URL and need no edge address.
+The route needs no bearer token; the TLS handshake inside the tunnel authenticates the client.
+The Action must be this release or later, and the shell recipe needs a tcp:// edge.endpoint.
+{{- if $plan.apiRefs }}
+{{- if eq $gw.api.mode "terminate" }}
+The chart gave /v1/tunnel its own HTTPRoute rule with no timeout. A gateway or load balancer in front of the
+Gateway must not cut a long connection either; the server pings every 20 seconds, so an idle timeout
+above 30 seconds is enough.
+{{- end }}
+{{- if .Values.api.proxyProtocol.enabled }}
+PROXY protocol is on for the API, so the per-address caps count the client addresses in the gateway's PROXY headers.
+{{- else }}
+Every client now reaches the controller from the gateway's addresses, so the per-address
+caps api.maxConnectionsPerIp {{ .Values.api.maxConnectionsPerIp }} and auth.serviceAccount.maxReviewsPerIp {{ .Values.auth.serviceAccount.maxReviewsPerIp }} apply to all
+clients together. Raise them or set 0, or turn on PROXY protocol (api.proxyProtocol) so they count
+clients. The chart turned off edge.maxHandshakesPerIp, because a tunnel handshake counts against the same address.
+{{- end }}
+{{- end }}
+{{- if $gw.edge.parentRefs }}
+
+WARNING: gateway.edge.parentRefs is set, but edge.endpoint is empty, so the chart rendered no edge TLSRoute.
+Set edge.endpoint to a tcp:// address to use TLS passthrough.
+{{- end }}
+{{- else }}
 
 The edge endpoint returned to clients is {{ .Values.edge.endpoint }}.
 {{- if $plan.edgeRefs }}
@@ -97,6 +128,7 @@ Reach the edge on its node port (kubectl -n {{ .Release.Namespace }} get svc {{ 
 {{- else }}
 The edge is on the Service's port {{ .Values.service.ports.edge }}, in-cluster only. Port-forward it together with the API
 (see above) and set edge.endpoint to the forwarded address.
+{{- end }}
 {{- end }}
 {{- if .Values.auth.oidc }}
 
@@ -131,7 +163,7 @@ Watching pools in: {{ join ", " $watch }}. A pool in any other namespace is igno
 
 WARNING: workerNetwork.clusterCIDRs is empty, so the controller cannot tell this cluster's
 pod, service and node addresses from outside ones. It refuses every IPv6 and private IPv4
-pool allowCIDRs entry, and IPv6 egress stays closed.
+pool allowCIDRs entry and every allowHosts name that resolves to one, and IPv6 egress stays closed.
 List this cluster's pod, service and node ranges:
   helm upgrade {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} --reuse-values \
     --set 'workerNetwork.clusterCIDRs={10.244.0.0/16,10.96.0.0/12}'

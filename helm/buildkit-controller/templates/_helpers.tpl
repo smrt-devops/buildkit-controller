@@ -35,17 +35,23 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
   {{- $issuers = append $issuers $c -}}
 {{- end -}}
 {{- $fn := include "bkc.fullname" . -}}
-{{- /* Behind a Gateway without PROXY protocol every edge connection comes from the
-       gateway's address, so a per-address handshake cap would evict other clients'
-       handshakes. The chart turns it off. */ -}}
+{{- if and .Values.edge.allocationDomain (empty .Values.edge.endpoint) -}}
+{{- fail "edge.allocationDomain needs a tcp:// edge.endpoint: with an empty endpoint clients tunnel through the API and each allocation gets its own local port, so there is no per-allocation hostname. Unset edge.allocationDomain, or set edge.endpoint to the edge address." -}}
+{{- end -}}
+{{- /* Behind a Gateway without PROXY protocol every connection comes from the gateway's
+       address, so a per-address handshake cap would evict other clients' handshakes. The
+       chart turns it off. The edge route carries edge connections. A tunnel handshake
+       counts against the API connection's address, so with a tunnel the API route and
+       api.proxyProtocol decide. */ -}}
+{{- $plan := include "bkc.gateway" . | fromJson -}}
 {{- $perIp := int .Values.edge.maxHandshakesPerIp -}}
-{{- if and (include "bkc.gateway" . | fromJson).edgeRefs (not .Values.edge.proxyProtocol.enabled) }}{{ $perIp = 0 }}{{ end -}}
+{{- if or (and $plan.edgeRefs (not .Values.edge.proxyProtocol.enabled)) (and $plan.tunnel $plan.apiRefs (not .Values.api.proxyProtocol.enabled)) }}{{ $perIp = 0 }}{{ end -}}
 {{- $cfg := dict
   "listen" (dict "api" "0.0.0.0:8443" "edge" "0.0.0.0:8444" "ops" (printf "0.0.0.0:%d" (int .Values.metrics.port)))
   "pki" (dict "caSecretName" (printf "%s-ca" $fn))
   "leaderElection" (dict "leaseName" (printf "%s-leader" $fn))
   "edge" (dict
-    "endpoint" (required "edge.endpoint is required" .Values.edge.endpoint)
+    "endpoint" .Values.edge.endpoint
     "serverName" (required "edge.serverName is required" .Values.edge.serverName)
     "allocationDomain" .Values.edge.allocationDomain
     "extraNames" .Values.edge.extraNames
@@ -64,6 +70,10 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
   "claims" (dict "namespaces" .Values.claims.namespaces) -}}
 {{- if has .Release.Namespace (default (list) .Values.claims.namespaces) -}}
 {{- fail (printf "claims.namespaces must not include the release namespace %s: the API's claims live there and the leader trusts their owner and cache fields, so only cluster admins may create claims there" .Release.Namespace) -}}
+{{- end -}}
+{{- /* With no edge.endpoint, in-cluster claims dial the Service at the edge container port (8444). */ -}}
+{{- if and .Values.claims.namespaces (empty .Values.edge.endpoint) (ne (int .Values.service.ports.edge) 8444) -}}
+{{- fail (printf "service.ports.edge must be 8444 when claims.namespaces is set and edge.endpoint is empty: in-cluster claims dial tcp://%s.%s.svc:8444, so service.ports.edge %d would name a port the Service does not have. Set edge.endpoint to the edge address, or keep service.ports.edge at 8444." (include "bkc.fullname" .) .Release.Namespace (int .Values.service.ports.edge)) -}}
 {{- end -}}
 {{- if .Values.cache.enabled -}}
   {{- $_ := set $cfg "registry" (dict "host" (include "bkc.registryHost" .) "tlsSecretName" (printf "%s-registry-tls" $fn)) -}}

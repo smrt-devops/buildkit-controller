@@ -23,14 +23,17 @@ use std::fmt;
 use buildkit_controller_api::v1alpha1::{BuildKitPool, GROUP, VERSION};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 
-pub use config::{buildkitd_config, is_scope_id, quantity_bytes, scope_id};
+pub use config::{branch_scope_id, buildkitd_config, is_scope_id, quantity_bytes, scope_id};
 pub use hash::{config_hash, template_hash};
 pub use objects::{ca_bundle_config_map, network_policy, service_account, worker_secret};
 pub use pod::{pod_spec, worker_pod};
 pub use validate::{
-    ALWAYS_DENIED, Conflict, PROTECTED_CIDRS, refused_allow_cidr, refused_allow_cidrs,
-    validate_template,
+    ALWAYS_DENIED, Conflict, HostCheck, MAX_HOST_ADDRS, PROTECTED_CIDRS, check_host,
+    refused_allow_cidr, refused_allow_cidrs, refused_host_addr, validate_template,
 };
+
+/// The last known addresses of each `allowHosts` name, as the leader resolved them.
+pub type HostAddrs = BTreeMap<String, Vec<std::net::IpAddr>>;
 
 pub use crate::pki::worker_secret_name;
 use crate::pki::{Ca, IssuedCert};
@@ -79,6 +82,10 @@ pub const DRAINING: &str = "draining";
 pub const ANN_SCOPE: &str = "buildkit.smrt-devops.net/scope";
 /// `P tier`: `trusted` or `untrusted`, whether that allocation may write the cache.
 pub const ANN_TIER: &str = "buildkit.smrt-devops.net/tier";
+/// `P branch-scope`: the branch scope id of an untrusted allocation, which it
+/// may pull and push. The API writes it on the claims it creates in the
+/// controller's namespace, and the bind copies it to the pod.
+pub const ANN_BRANCH_SCOPE: &str = "buildkit.smrt-devops.net/branch-scope";
 /// Value of [`LABEL_NAME`] on the built-in cache registry pod; workers may reach it.
 pub const REGISTRY_NAME: &str = "buildkit-registry";
 
@@ -167,6 +174,10 @@ pub struct WorkerNetwork {
     /// Ranges a pool's `allowCIDRs` may open although they overlap the link-local,
     /// metadata, loopback, cluster or extra denied ranges. An entry must lie wholly inside one.
     pub permitted_cidrs: Vec<String>,
+    /// `allowHosts` names whose addresses may lie in the cluster or extra denied
+    /// ranges, or in a family `cluster_cidrs` does not cover. Exact names; never a
+    /// protected address.
+    pub permitted_hosts: Vec<String>,
     /// Where workers may resolve names.
     pub dns: WorkerDns,
 }
@@ -203,6 +214,7 @@ impl Default for WorkerNetwork {
             extra_denied_cidrs: Vec::new(),
             cluster_cidrs: Vec::new(),
             permitted_cidrs: Vec::new(),
+            permitted_hosts: Vec::new(),
             dns: WorkerDns {
                 namespace: "kube-system".into(),
                 pod_labels: BTreeMap::from([("k8s-app".into(), "kube-dns".into())]),
