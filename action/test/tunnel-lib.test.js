@@ -84,13 +84,36 @@ test('the forwarder gets the CA and none of the runner environment, so no token 
   const script = fakeScript(t, `require('fs').writeFileSync(${JSON.stringify(out)}, JSON.stringify(process.env));
 process.stdout.write('{"ports":[6001]}\\n'); setInterval(() => {}, 1000);`);
   process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = 'secret-bearer';
-  t.after(() => { delete process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN; });
+  const tracking = process.env.RUNNER_TRACKING_ID;
+  delete process.env.RUNNER_TRACKING_ID;
+  t.after(() => { delete process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN; if (tracking !== undefined) process.env.RUNNER_TRACKING_ID = tracking; });
   const f = await L.startForwarder({ urls: ['https://a/v1/tunnel'], ca: 'CA PEM', script });
   t.after(() => L.stopForwarder(f.pid));
   const env = JSON.parse(fs.readFileSync(out, 'utf8'));
   assert.equal(env.BUILDKIT_TUNNEL_CA, 'CA PEM');
   assert.ok(!JSON.stringify(env).includes('secret-bearer'));
   assert.deepEqual(Object.keys(env).filter((k) => /^(ACTIONS|GITHUB|RUNNER|INPUT|STATE)_/.test(k)), []);
+});
+
+test('the forwarder gets RUNNER_TRACKING_ID when the runner sets it, and nothing else besides the CA', async (t) => {
+  const out = path.join(scratch(t), 'env.json');
+  const script = fakeScript(t, `require('fs').writeFileSync(${JSON.stringify(out)}, JSON.stringify(process.env));
+process.stdout.write('{"ports":[6002]}\\n'); setInterval(() => {}, 1000);`);
+  const tracking = process.env.RUNNER_TRACKING_ID;
+  process.env.RUNNER_TRACKING_ID = 'track-7';
+  process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = 'secret-bearer';
+  t.after(() => {
+    delete process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+    if (tracking === undefined) delete process.env.RUNNER_TRACKING_ID; else process.env.RUNNER_TRACKING_ID = tracking;
+  });
+  const f = await L.startForwarder({ urls: ['https://a/v1/tunnel'], ca: 'CA PEM', script });
+  t.after(() => L.stopForwarder(f.pid));
+  const env = JSON.parse(fs.readFileSync(out, 'utf8'));
+  assert.equal(env.RUNNER_TRACKING_ID, 'track-7');
+  assert.equal(env.BUILDKIT_TUNNEL_CA, 'CA PEM');
+  // macOS adds __CF_USER_TEXT_ENCODING to every child process; it is not passed by the parent.
+  assert.deepEqual(Object.keys(env).filter((k) => k !== '__CF_USER_TEXT_ENCODING').sort(), ['BUILDKIT_TUNNEL_CA', 'RUNNER_TRACKING_ID']);
+  assert.ok(!JSON.stringify(env).includes('secret-bearer'));
 });
 
 test('the forwarder outlives the process that started it', async (t) => {

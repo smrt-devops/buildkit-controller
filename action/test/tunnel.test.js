@@ -239,6 +239,24 @@ test('an EOF from the server without a close frame ends the local connection', a
   assert.equal(got().toString(), 'bye');
 });
 
+test('local bytes written after the server closed do not cut the tail still queued for the client', async (t) => {
+  // 8 MiB tail plus a close frame; the client is paused so the tail queues in the forwarder's
+  // write buffer, then the client writes after the close has ended the local side.
+  const tail = crypto.randomBytes(8 * 1024 * 1024);
+  const { port } = await setup(t, { onConn: (c) => { c.write(OP.BIN, tail); c.write(OP.CLOSE, Buffer.from([0x03, 0xe8])); } });
+  const s = await connect(port, true);
+  s.pause();
+  await sleep(200);
+  s.write('late');
+  const chunks = [];
+  s.on('data', (c) => chunks.push(c));
+  s.resume();
+  await once(s, 'end');
+  assert.deepEqual(Buffer.concat(chunks), tail);
+  s.end();
+  await once(s, 'close');
+});
+
 test('a local connection that is reset sends close 1001', async (t) => {
   const { ws, port } = await setup(t);
   const s = await connect(port);

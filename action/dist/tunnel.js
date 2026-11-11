@@ -215,6 +215,9 @@ function bridge(local, { socket, head }, { closeGraceMs = CLOSE_GRACE_MS } = {})
   local.on('drain', () => socket.resume());
   socket.on('drain', () => local.resume());
   local.on('data', (chunk) => {
+    // After the close is sent or the tunnel is not writable, late local bytes are dropped; a write
+    // here would raise ERR_STREAM_WRITE_AFTER_END and finish() would discard the tail still queued for local.
+    if (closeSent || !socket.writable) return;
     for (let i = 0; i < chunk.length; i += CHUNK) {
       if (!socket.write(encodeFrame(OP.BIN, chunk.subarray(i, i + CHUNK)))) local.pause();
     }
