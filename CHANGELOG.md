@@ -23,9 +23,16 @@ All notable changes are listed here, newest first.
 - `buildkit_claims{phase}` is cleared when a replica's leader term ends, like the pool gauges, so it no longer stays at its last value on a replica that lost the Lease.
 - The cache registry pod no longer exports controller-only families (`buildkit_leader`, `buildkit_ca_valid`, `buildkit_cert_not_after_seconds`, `buildkit_cert_load_errors_total`, `buildkit_leader_transitions_total`, `buildkit_releases_total`). It exports its own `buildkit_registry_*` families and the watch error counters of its pod and pool watches.
 - Metric help text says what each series means, and `docs/operations.md` keeps a short list of metrics to start with and the alerts, and links to the reference.
+- The cache registry keeps its store behind one object-store interface, with a new layout: every write goes to a fresh key, manifest records carry their references, and links are rebuilt from the records at start instead of being stored. Start-up lists the store and reads each manifest record once; it no longer reads manifest bodies or tags. Pull times are written by the garbage collection pass instead of at most once a minute, so a crash loses at most one `cache.gcInterval` of recency.
+- `BUILDKIT_CACHE_STORE_URL` (`--store-url`) replaces `BUILDKIT_CACHE_DATA_DIR` (`--data-dir`). The default, `file:///var/lib/buildkit-cache`, is the same directory. The role refuses to start while `BUILDKIT_CACHE_DATA_DIR` is set and says what to set instead.
+- The `registry` role's `--max-size` defaults to 40Gi, the budget of the whole store, instead of 50Gi.
+- A store error answers `503` with `Retry-After: 5` instead of `500`.
 
 ### Upgrading from 0.4.0
 
+- The cache starts cold. On its first start the registry deletes the 0.4 files on its volume, which frees their space, and the first builds after the upgrade export their cache again.
+- Rolling back to 0.4 on the same volume needs the registry PVC deleted first: 0.4 cannot read the 0.5 layout.
+- If you run the `registry` role yourself, replace `--data-dir` or `BUILDKIT_CACHE_DATA_DIR=<dir>` with `BUILDKIT_CACHE_STORE_URL=file://<dir>`, and set `--max-size` if you relied on the old 50Gi default.
 - Alerts that read `buildkit_leader` or `buildkit_ca_valid` no longer see the registry pod's constant 0 when both Services are scraped under one selector. If you relied on those series being present for the registry pod, drop that expectation.
 - `docs/operations.md` no longer lists `unready`, `stale_template`, `cert_expiring`, `out_of_range` and `idle` as `buildkit_releases_total` reasons. The code only writes `released`, `allocation_idle`, `pod_lost`, `expired`, `failed`, `start_timeout` and `ca_replaced`.
 - Allocations and queue waits from claims created before the upgrade still use `creationTimestamp` until they bind or time out.

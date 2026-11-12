@@ -2,21 +2,25 @@
 //!
 //! It serves the part of the OCI distribution API that `--cache-to
 //! type=registry` and `--cache-from type=registry` use ([`api`]), over mTLS
-//! with the internal CA ([`listener`]), from one directory ([`store`]).
+//! with the internal CA ([`listener`]), from one object store ([`store`]).
 //! Every request is checked against the caller's [`Grant`], which an
 //! [`Authorizer`] derives from the verified worker identity. A periodic
-//! collection keeps each pool and the whole volume within budget ([`gc`]).
+//! collection keeps each pool and the whole store within budget ([`gc`]).
 //! `/metrics`, `/healthz` and `/readyz` are on the ops listener, as in the
 //! controller.
 
 mod api;
 mod auth;
+mod backend;
 mod config;
 mod gc;
+mod layout;
 mod listener;
 pub mod metrics;
 mod pods;
 mod store;
+#[cfg(test)]
+mod testing;
 #[cfg(test)]
 mod tests;
 
@@ -30,6 +34,7 @@ use tracing::{info, warn};
 
 pub use api::{MAX_MANIFEST, Registry, handle};
 pub use auth::{Action, Authorizer, Grant, PeerError, StaticGrants, Writes, peer_identity};
+pub use backend::StoreUrl;
 pub use config::{RegistryArgs, parse_duration, parse_size};
 pub use gc::{Budgets, FixedBudgets, Reason};
 pub use listener::{Limits, server_config};
@@ -52,6 +57,7 @@ pub async fn run(args: RegistryArgs, shutdown: CancellationToken) -> anyhow::Res
         version = env!("CARGO_PKG_VERSION"),
         "cache registry starting"
     );
+    config::refuse_data_dir(std::env::var_os(config::OLD_DATA_DIR))?;
     let metrics = Arc::new(Metrics::for_registry());
     let readiness = Arc::new(Readiness::default());
     let ready = readiness.register("registry_listener");
@@ -69,14 +75,16 @@ pub async fn run(args: RegistryArgs, shutdown: CancellationToken) -> anyhow::Res
     let (auth, budgets) = authorizer(&args, &metrics, &readiness, &stop).await?;
     let (files, tls) = listener::load(&args.tls_dir)?;
     let store = {
-        let dir = args.data_dir.clone();
+        // The volume sweep walks the whole tree, and finishes before serving.
+        let url = args.store_url.clone();
+        let os = tokio::task::spawn_blocking(move || url.open()).await??;
         let limits = StoreLimits {
             max_blob: args.max_blob_size,
             max_upload_bytes: args.max_upload_size,
         };
-        tokio::task::spawn_blocking(move || Store::open(&dir, limits))
-            .await?
-            .with_context(|| format!("opening the store at {}", args.data_dir.display()))?
+        Store::open(os, limits)
+            .await
+            .with_context(|| format!("opening the store at {}", args.store_url))?
     };
     let reg = Arc::new(Registry {
         store,
@@ -101,7 +109,7 @@ pub async fn run(args: RegistryArgs, shutdown: CancellationToken) -> anyhow::Res
     let tcp = crate::runtime::listen::bind(args.listen)
         .with_context(|| format!("binding {}", args.listen))?;
     ready.set();
-    info!(addr = %args.listen, data_dir = %args.data_dir.display(), "cache registry listening");
+    info!(addr = %args.listen, store_url = %args.store_url, "cache registry listening");
     tokio::spawn({
         let (r, s) = (Arc::clone(&readiness), shutdown.clone());
         async move {
@@ -129,7 +137,7 @@ async fn collect(
         let expired = reg.store.expire_uploads(UPLOAD_TTL).await;
         let r = reg.store.gc(&*budgets, UPLOAD_TTL).await;
         reg.metrics.gc(&r);
-        let stats = reg.store.stats().await;
+        let stats = reg.store.stats();
         reg.metrics.stats(stats);
         if expired > 0 || r.deleted_blobs > 0 || r.evicted_pool + r.evicted_volume > 0 {
             info!(

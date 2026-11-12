@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use super::backend::{DEFAULT_URL, StoreUrl};
 use crate::config::LogFormat;
 
 /// `buildkit-controller registry [flags]`.
@@ -24,13 +25,10 @@ pub struct RegistryArgs {
         default_value = "0.0.0.0:8080"
     )]
     pub ops_listen: SocketAddr,
-    /// The store: one directory on one volume.
-    #[arg(
-        long,
-        env = "BUILDKIT_CACHE_DATA_DIR",
-        default_value = "/var/lib/buildkit-cache"
-    )]
-    pub data_dir: PathBuf,
+    /// The store, as a URL: `file:///<absolute path>` for a directory on a
+    /// volume.
+    #[arg(long, env = "BUILDKIT_CACHE_STORE_URL", default_value = DEFAULT_URL, value_parser = parse_store_url)]
+    pub store_url: StoreUrl,
     /// Holds `tls.crt` and `tls.key` (the serving cert, from the internal CA) and
     /// `ca.crt` (the client CA, the only anchor for the workers' registry client
     /// certs). Re-read every minute.
@@ -49,8 +47,8 @@ pub struct RegistryArgs {
     /// and every pool gets `--pool-max-size`.
     #[arg(long, env = "BUILDKIT_CACHE_GRANTS_FILE")]
     pub grants_file: Option<PathBuf>,
-    /// Budget of the whole volume, e.g. `50Gi`.
-    #[arg(long, env = "BUILDKIT_CACHE_MAX_SIZE", default_value = "50Gi", value_parser = parse_size)]
+    /// Budget of the whole store, e.g. `40Gi`.
+    #[arg(long, env = "BUILDKIT_CACHE_MAX_SIZE", default_value = "40Gi", value_parser = parse_size)]
     pub max_size: u64,
     /// Budget of a pool without `cache.maxSize` (repositories under `<namespace>/<pool>/`).
     #[arg(long, env = "BUILDKIT_CACHE_POOL_MAX_SIZE", default_value = "10Gi", value_parser = parse_size)]
@@ -59,7 +57,7 @@ pub struct RegistryArgs {
     #[arg(long, env = "BUILDKIT_CACHE_MAX_BLOB_SIZE", default_value = "5Gi", value_parser = parse_size)]
     pub max_blob_size: u64,
     /// Bytes all uploads in progress may hold together; one worker may hold
-    /// a quarter. The volume needs room for `--max-size` plus this.
+    /// a quarter. The store needs room for `--max-size` plus this.
     #[arg(long, env = "BUILDKIT_CACHE_MAX_UPLOAD_SIZE", default_value = "10Gi", value_parser = parse_size)]
     pub max_upload_size: u64,
     /// Time between garbage collections, e.g. `10m`.
@@ -71,6 +69,26 @@ pub struct RegistryArgs {
     /// Log encoding.
     #[arg(long, env = "LOG_FORMAT", value_enum, default_value = "json")]
     pub log_format: LogFormat,
+}
+
+/// The variable that named the data directory before the store URL. Clap
+/// ignores unknown variables, so a stale setting would fall back to the
+/// default store without a word; the role refuses to start instead.
+pub const OLD_DATA_DIR: &str = "BUILDKIT_CACHE_DATA_DIR";
+
+/// Fails when [`OLD_DATA_DIR`] is set, with `value` its value.
+pub fn refuse_data_dir(value: Option<std::ffi::OsString>) -> anyhow::Result<()> {
+    match value {
+        Some(v) => anyhow::bail!(
+            "{OLD_DATA_DIR} is no longer read; unset it and set BUILDKIT_CACHE_STORE_URL=file://{} instead",
+            std::path::Path::new(&v).display()
+        ),
+        None => Ok(()),
+    }
+}
+
+fn parse_store_url(s: &str) -> Result<StoreUrl, String> {
+    StoreUrl::parse(s).map_err(|e| format!("{e:#}"))
 }
 
 /// Bytes, with an optional `Ki`, `Mi`, `Gi` or `Ti` suffix.
@@ -130,7 +148,26 @@ mod tests {
         let a = RegistryArgs::try_parse_from(["registry"]).unwrap();
         assert_eq!(a.listen.port(), 5000);
         assert_eq!(a.max_blob_size, 5 << 30);
+        assert_eq!(a.max_size, 40 << 30);
+        assert_eq!(
+            a.store_url,
+            StoreUrl::File("/var/lib/buildkit-cache".into())
+        );
         assert!(a.grants_file.is_none());
+    }
+
+    #[test]
+    fn the_old_data_dir_variable_is_refused() {
+        assert!(refuse_data_dir(None).is_ok());
+        let e = refuse_data_dir(Some("/data".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains(OLD_DATA_DIR) && e.contains("BUILDKIT_CACHE_STORE_URL=file:///data"),
+            "{e}"
+        );
+        assert!(RegistryArgs::try_parse_from(["registry", "--data-dir=/data"]).is_err());
+        assert!(RegistryArgs::try_parse_from(["registry", "--store-url=s3://bucket"]).is_err());
     }
 
     #[test]

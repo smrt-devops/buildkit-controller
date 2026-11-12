@@ -1,7 +1,9 @@
 //! Garbage collection planning.
 //!
 //! [`plan`] reads the index and returns what to remove; the store applies the
-//! plan under its index lock, so no upload or push interleaves. Candidates are
+//! plan to the index under its lock and deletes the objects after releasing
+//! it. Every write goes to a fresh key, so a re-upload or re-push that lands
+//! meanwhile is never deleted with the old objects. Candidates are
 //! the manifests, with every blob they reach, and the recent blob links that
 //! no manifest reaches yet (a push in flight: its blobs land before the
 //! manifest that references them). In order:
@@ -11,7 +13,8 @@
 //!    was made or last read) while the distinct blobs they hold fit the pool
 //!    budget. One that does not fit is removed and the scan goes on, so one
 //!    oversized push cannot empty the pool.
-//! 2. The same over every remaining candidate, against the volume budget.
+//! 2. The same over every remaining candidate, against the budget of the
+//!    whole store.
 //! 3. Mark and sweep: a repository keeps a blob link while a remaining
 //!    manifest of it reaches the blob, or while the link is younger than the
 //!    grace period and was not removed. A blob no repository links is deleted.
@@ -32,7 +35,7 @@ pub trait Budgets: Send + Sync {
     fn total(&self) -> u64;
 }
 
-/// One budget for every pool and one for the volume.
+/// One budget for every pool and one for the whole store.
 #[derive(Clone, Copy, Debug)]
 pub struct FixedBudgets {
     pub pool: u64,
@@ -118,7 +121,7 @@ fn fit<'a>(
             .then_with(|| a.1.cmp(b.1))
             .then_with(|| a.3.cmp(&b.3))
     });
-    let size = |d: &Digest| idx.blobs.get(d).copied().unwrap_or(0);
+    let size = |d: &Digest| idx.blobs.get(d).map_or(0, |b| b.size);
     let mut used: u64 = 0;
     let mut blobs: HashSet<&Digest> = HashSet::new();
     let mut kept_manifests: HashSet<(&str, &Digest)> = HashSet::new();
@@ -250,11 +253,20 @@ pub(super) fn plan(idx: &Index, budgets: &dyn Budgets, now: u64, grace: u64) -> 
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::super::store::Manifest;
+    use super::super::layout::Id;
+    use super::super::store::{Blob, Manifest};
     use super::*;
 
     fn dg(n: u8) -> Digest {
         Digest::of(&[n])
+    }
+
+    fn id() -> Id {
+        Id::random().unwrap()
+    }
+
+    fn blob(size: u64) -> Blob {
+        Blob { size, id: id() }
     }
 
     /// Repo `name` with manifest `m` (last used `t`) referencing `refs`, all linked at time 0.
@@ -262,7 +274,7 @@ mod tests {
         let repo = idx.repos.entry(name.to_owned()).or_default();
         for r in refs.iter().chain([&m]) {
             repo.links.insert(dg(*r), 0);
-            idx.blobs.insert(dg(*r), sizes);
+            idx.blobs.insert(dg(*r), blob(sizes));
         }
         repo.manifests.insert(
             dg(m),
@@ -271,6 +283,7 @@ mod tests {
                 refs: refs.iter().map(|r| dg(*r)).collect(),
                 last_used: t,
                 persisted: t,
+                record: id(),
             },
         );
     }
@@ -304,8 +317,8 @@ mod tests {
         let mut idx = Index::default();
         put(&mut idx, "ns/p/a", 1, 10, &[2, 3], 10);
         idx.repos.get_mut("ns/p/a").unwrap().links.insert(dg(9), 0);
-        idx.blobs.insert(dg(9), 10);
-        idx.blobs.insert(dg(8), 10);
+        idx.blobs.insert(dg(9), blob(10));
+        idx.blobs.insert(dg(8), blob(10));
         let p = plan(&idx, &BIG, 100, 50);
         assert!(p.evict.is_empty());
         assert_eq!(p.unlink, vec![("ns/p/a".to_owned(), dg(9))]);
@@ -418,7 +431,7 @@ mod tests {
         put(&mut idx, "ns/p/a", 1, 10, &[], 10);
         // A push in flight: a blob uploaded at t=95, no manifest yet.
         idx.repos.get_mut("ns/p/a").unwrap().links.insert(dg(7), 95);
-        idx.blobs.insert(dg(7), 10);
+        idx.blobs.insert(dg(7), blob(10));
         let b = FixedBudgets {
             pool: 15,
             total: u64::MAX,
@@ -436,7 +449,7 @@ mod tests {
             .zip(first..)
             .map(|(t, n)| {
                 repo.links.insert(dg(n), *t);
-                idx.blobs.insert(dg(n), 10);
+                idx.blobs.insert(dg(n), blob(10));
                 dg(n)
             })
             .collect()
@@ -446,7 +459,7 @@ mod tests {
         idx.blobs
             .iter()
             .filter(|(d, _)| !p.delete.contains(d))
-            .map(|(_, s)| s)
+            .map(|(_, b)| b.size)
             .sum()
     }
 
