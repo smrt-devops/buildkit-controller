@@ -276,6 +276,8 @@ Use a prefix, or a bucket of its own, that nothing else writes to. The registry 
 
 Options are the provider's own configuration keys: `region`, `endpoint`, `allow_http`, `access_key_id`, `secret_access_key` and `session_token` for S3; `service_account_key` for GCS; `account_name` and `account_key` for Azure. Names are matched in lower case, so `ACCESS_KEY_ID` and `access_key_id` name the same key.
 
+The S3-compatible and Azure Blob paths are verified on kind against MinIO and Azurite (`cargo xtask registry-verify --store minio` and `--store azure`). This project does not test the GCS path, because fake-gcs-server does not serve the XML listing API the client uses; real GCS serves it.
+
 The registry reads each `BUILDKIT_CACHE_STORE_OPT_<key>` variable and refuses to start, naming the key, when:
 
 - the key is not one its provider knows. A typo fails at start-up and never silently does nothing;
