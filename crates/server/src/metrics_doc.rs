@@ -414,7 +414,7 @@ mod tests {
     /// A controller registry with every module's families, proxy protocol on.
     fn controller() -> Metrics {
         let m = Metrics::new();
-        AllocMetrics::with_releases(m.releases()).register(&m);
+        AllocMetrics::with_releases(m.releases(), m.held()).register(&m);
         let _ = ReconcileMetrics::register(&m);
         let _ = EdgeMetrics::register(&m);
         let _ = HttpMetrics::register(&m);

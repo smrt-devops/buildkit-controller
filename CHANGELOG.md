@@ -9,7 +9,7 @@ All notable changes are listed here, newest first.
 - `cache.podLabels` adds labels to the cache registry pod.
 - `docs/metrics.md` lists every metric with its type, labels, the values each label takes, and the histogram buckets. `cargo xtask crdgen` generates it from the same tables that register the metrics, and `cargo xtask crdgen --check` fails when it is stale.
 - `buildkit_pool_max{namespace,pool}` exports `scaling.max`, so a dashboard can show utilisation against it. `buildkit_pool_desired_warm` already carries the effective floor, schedule windows included.
-- `buildkit_allocation_held_seconds{namespace,pool,reason}` records how long a worker was held, for the retirements the allocator records (`released`, `allocation_idle`, `pod_lost`).
+- `buildkit_allocation_held_seconds{namespace,pool,reason}` records how long a worker was held, with the same reasons as `buildkit_releases_total`.
 - The API stamps the annotation `buildkit.smrt-devops.net/created-at` (RFC 3339 with milliseconds) on each claim it creates. `buildkit_allocation_duration_seconds` and `buildkit_queue_wait_seconds` measure from it, so a warm bind no longer rounds to a whole second. A claim without it falls back to `creationTimestamp`.
 
 ### Changed

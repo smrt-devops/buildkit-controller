@@ -354,6 +354,8 @@ pub enum Action {
         /// they lose to a commit that moved it from the claim value after
         /// the state they judged.
         expires_at: Option<String>,
+        /// When the pod was bound, for `buildkit_allocation_held_seconds`.
+        allocated_at: Option<Timestamp>,
         /// Why.
         reason: RetireReason,
     },
@@ -1030,6 +1032,7 @@ impl<'a> Planner<'_, 'a> {
             expires_at: matches!(reason, RetireReason::Expired | RetireReason::StartTimeout)
                 .then(|| p.expires_at_raw.clone())
                 .flatten(),
+            allocated_at: p.allocated_at,
             reason,
         });
     }

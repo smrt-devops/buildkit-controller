@@ -128,6 +128,7 @@ pub struct Metrics {
     cert_load_errors: Family<Labels, Counter>,
     cert_not_after: Family<Labels, Gauge>,
     releases: Family<PoolLabels, Counter>,
+    held: crate::alloc::metrics::Hist,
     pools: Mutex<Pools>,
     pool_source: OnceLock<Store<BuildKitPool>>,
 }
@@ -171,6 +172,7 @@ impl Metrics {
             cert_load_errors: Family::default(),
             cert_not_after: Family::default(),
             releases: Family::default(),
+            held: Family::new_with_constructor(crate::alloc::metrics::held_hist),
             pools: Mutex::default(),
             pool_source: OnceLock::new(),
         };
@@ -305,6 +307,12 @@ impl Metrics {
         self.cert_not_after
             .get_or_create(&vec![("kind", kind.label().to_owned())])
             .set(not_after.unix_timestamp());
+    }
+
+    /// `buildkit_allocation_held_seconds{namespace,pool,reason}`, shared by alloc and reconcile.
+    #[must_use]
+    pub fn held(&self) -> crate::alloc::metrics::Hist {
+        self.held.clone()
     }
 
     /// `buildkit_releases_total{namespace,pool,reason}`, shared by alloc and reconcile.

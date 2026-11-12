@@ -163,6 +163,8 @@ pub struct Report {
     pub ca_replacements: Vec<&'static str>,
     /// `buildkit_releases_total{reason}` (allocated pods retired).
     pub releases: Vec<&'static str>,
+    /// `(reason, seconds)` for `buildkit_allocation_held_seconds`, one per release with a bind time.
+    pub held: Vec<(&'static str, f64)>,
     /// Labels of each executed action, in order (tests, debug logs).
     pub trace: Vec<String>,
 }
@@ -243,15 +245,21 @@ pub async fn execute<O: KubeOps>(ops: &O, guard: &CaGuard, env: &Env<'_>, plan: 
                 uid,
                 alloc_id,
                 expires_at,
+                allocated_at,
                 reason,
             } => {
                 r.trace.push(format!("retire:{pod}"));
                 let exp = expires_at.as_deref();
                 if retire(ops, &ns, pod, uid, alloc_id, exp, &mut r).await {
-                    r.releases.push(match reason.label() {
+                    let why = match reason.label() {
                         "ca_rotated" => "ca_replaced",
                         other => other,
-                    });
+                    };
+                    r.releases.push(why);
+                    if let Some(at) = allocated_at {
+                        let held = env.now.duration_since(*at).as_secs_f64().max(0.0);
+                        r.held.push((why, held));
+                    }
                 }
             }
             Action::CreatePod { slot, name } => {

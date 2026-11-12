@@ -7,7 +7,7 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::histogram::Histogram;
 
 use crate::metrics_doc::{Def, Handle, Label, Labels, POOL, Role, register_table};
-use crate::runtime::metrics::{Metrics, PoolSeries, RELEASES};
+use crate::runtime::metrics::{Metrics, PoolSeries, RELEASE_REASONS, RELEASES};
 
 /// Allocation histogram buckets, in seconds: 0.05 s doubling over 14 buckets.
 pub const BUCKETS: [f64; 14] = [
@@ -41,8 +41,6 @@ pub const RESULTS: &[&str] = &[
 const PATHS: &[&str] = &["warm", "cold"];
 const QUEUE_RESULTS: &[&str] = &["ok", "timeout"];
 const TIERS: &[&str] = &["trusted", "untrusted"];
-/// The releases the allocator records, which know when the worker was bound.
-const HELD_REASONS: &[&str] = &["released", "allocation_idle", "pod_lost"];
 
 /// The families alloc owns, and `buildkit_releases_total` through the runtime's.
 pub const TABLE: [Def; 6] = [
@@ -84,10 +82,10 @@ pub const TABLE: [Def; 6] = [
         &[
             Label::namespace(),
             Label::pool(),
-            Label::closed("reason", HELD_REASONS),
+            Label::closed("reason", RELEASE_REASONS),
         ],
         &HELD_BUCKETS,
-        "How long a worker was held, from its bind to its retirement, for the retirements the allocator records (`released`, `allocation_idle`, `pod_lost`, as in `buildkit_releases_total`). Use it to size scaling.max and the TTLs",
+        "How long a worker was held, from its bind to its retirement, by the same reasons as `buildkit_releases_total`. Use it to size scaling.max and the TTLs",
     ),
     Def::counter(
         "claim_conflicts",
@@ -111,11 +109,11 @@ fn new_hist() -> Histogram {
     Histogram::new(BUCKETS)
 }
 
-fn held_hist() -> Histogram {
+pub(crate) fn held_hist() -> Histogram {
     Histogram::new(HELD_BUCKETS)
 }
 
-type Hist = Family<Labels, Histogram, fn() -> Histogram>;
+pub(crate) type Hist = Family<Labels, Histogram, fn() -> Histogram>;
 
 /// The families alloc owns; cheap to clone (shared handles).
 #[derive(Clone, Debug)]
@@ -156,8 +154,9 @@ impl AllocMetrics {
     /// Families of its own, writing releases into the shared
     /// [`crate::runtime::metrics::Metrics::releases`] family.
     #[must_use]
-    pub fn with_releases(releases: Family<Labels, Counter>) -> Self {
+    pub fn with_releases(releases: Family<Labels, Counter>, held: Hist) -> Self {
         Self {
+            held,
             releases,
             ..Self::default()
         }

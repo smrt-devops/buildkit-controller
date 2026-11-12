@@ -117,6 +117,7 @@ pub struct ReconcileMetrics {
     duration: Histogram,
     ca_replacements: Family<Labels, Counter>,
     releases: Family<Labels, Counter>,
+    held: crate::alloc::metrics::Hist,
 }
 
 impl ReconcileMetrics {
@@ -133,6 +134,7 @@ impl ReconcileMetrics {
             duration: Histogram::new(BUCKETS),
             ca_replacements: Family::default(),
             releases: metrics.releases(),
+            held: metrics.held(),
         };
         metrics.with_registry(|r| {
             register_table(
@@ -226,6 +228,11 @@ impl ReconcileMetrics {
                 .get_or_create(&p(Some(("reason", (*reason).into()))))
                 .inc();
         }
+        for (reason, held) in &report.held {
+            self.held
+                .get_or_create(&p(Some(("reason", (*reason).into()))))
+                .observe(*held);
+        }
         let result = if report.errors.is_empty() {
             "ok"
         } else {
@@ -295,7 +302,7 @@ mod tests {
     #[test]
     fn alloc_and_reconcile_share_one_releases_family() {
         let m = Metrics::new();
-        let alloc = AllocMetrics::with_releases(m.releases());
+        let alloc = AllocMetrics::with_releases(m.releases(), m.held());
         alloc.register(&m);
         let rec = ReconcileMetrics::register(&m);
         alloc.release("ns", "p", "released", None);
@@ -362,6 +369,39 @@ mod tests {
             assert!(!text.contains(g), "{g} survived the term:\n{text}");
         }
         assert!(text.contains("buildkit_reconcile_total{"), "counters stay");
+    }
+
+    /// A retire by the reconciler records the hold time of the allocation it ended.
+    #[test]
+    fn an_expired_allocation_observes_how_long_it_was_held() {
+        let m = Metrics::new();
+        let rec = ReconcileMetrics::register(&m);
+        let alloc = AllocMetrics::with_releases(m.releases(), m.held());
+        alloc.register(&m);
+        let report = Report {
+            releases: vec!["expired"],
+            held: vec![("expired", 10.0)],
+            ..Report::default()
+        };
+        rec.pass(
+            "ns",
+            "p",
+            Some(&status()),
+            PodCounts::default(),
+            &report,
+            0.01,
+        );
+        let text = m.render();
+        let line = |suffix: &str| {
+            let prefix = format!(
+                "buildkit_allocation_held_seconds_{suffix}{{namespace=\"ns\",pool=\"p\",reason=\"expired\"}} "
+            );
+            text.lines()
+                .find_map(|l| l.strip_prefix(prefix.as_str()))
+                .map(|v| v.parse::<f64>().unwrap())
+        };
+        assert_eq!(line("count"), Some(1.0), "{text}");
+        assert_eq!(line("sum"), Some(10.0), "{text}");
     }
 
     #[test]

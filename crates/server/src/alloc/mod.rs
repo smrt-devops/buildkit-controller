@@ -71,7 +71,9 @@ impl Shared {
     fn metrics(&self, ctx: &AppContext) -> AllocMetrics {
         let m = self
             .metrics
-            .get_or_init(|| AllocMetrics::with_releases(ctx.metrics().releases()))
+            .get_or_init(|| {
+                AllocMetrics::with_releases(ctx.metrics().releases(), ctx.metrics().held())
+            })
             .clone();
         self.registered.call_once(|| m.register(ctx.metrics()));
         m
