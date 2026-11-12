@@ -60,6 +60,9 @@ pub const ANN_ALLOC: &str = "buildkit.smrt-devops.net/alloc";
 pub const ANN_OWNER: &str = "buildkit.smrt-devops.net/owner";
 /// `P allocated-at`.
 pub const ANN_ALLOCATED_AT: &str = "buildkit.smrt-devops.net/allocated-at";
+/// Claim annotation the API stamps when it creates a claim: RFC 3339 UTC with
+/// milliseconds. Allocation and queue durations measure from it.
+pub const ANN_CREATED_AT: &str = "buildkit.smrt-devops.net/created-at";
 /// `P expires-at`.
 pub const ANN_EXPIRES_AT: &str = "buildkit.smrt-devops.net/expires-at";
 /// `P worker-cert-not-after`.

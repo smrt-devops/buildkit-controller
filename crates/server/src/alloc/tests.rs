@@ -25,7 +25,10 @@ use super::{AllocError, BindConfig, Binder, Front, Outcome};
 use crate::auth::Identity;
 use crate::certs::{CaCertRule, CertMaterial};
 use crate::pki::CaBundle;
-use crate::render::{ANN_ALLOC, ANN_CLAIM, ANN_OWNER, PodInputs, fixtures, worker_pod};
+use crate::render::{
+    ANN_ALLOC, ANN_ALLOCATED_AT, ANN_CLAIM, ANN_CREATED_AT, ANN_OWNER, PodInputs, fixtures,
+    worker_pod,
+};
 use crate::runtime::stores::{ClaimEvent, ClaimSubscription};
 
 const POOL_NS: &str = fixtures::POOL_NAMESPACE;
@@ -1474,8 +1477,7 @@ async fn tidy_ends_claims_and_retires_strays() {
         (ClaimPhase::Failed, reason::NAMESPACE_NOT_SERVED)
     );
     // The metric counts the release.
-    let mut reg = prometheus_client::registry::Registry::default();
-    e.metrics.register(&mut reg);
+    e.metrics.register(&crate::runtime::metrics::Metrics::new());
 }
 
 /// An allocation made before every allocation was a claim has no claim: its
@@ -1774,4 +1776,92 @@ async fn a_free_worker_goes_first_to_an_owner_under_the_hold_limit() {
     e.warm(2);
     e.binder.pass(&key()).await;
     assert_eq!(phase(&e.fake.status(OWN, &b)), ClaimPhase::Bound);
+}
+
+/// The value of the first sample line starting with `prefix` and containing `label`.
+fn sample(text: &str, prefix: &str, label: &str) -> f64 {
+    text.lines()
+        .find(|l| l.starts_with(prefix) && l.contains(label))
+        .and_then(|l| l.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("no {prefix} {label} in:\n{text}"))
+}
+
+fn stamp(ago: Duration) -> String {
+    (k8s_openapi::jiff::Timestamp::now() - ago)
+        .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
+/// A claim made 15 ms before its bind measures its wait from `created-at`,
+/// not from the whole-second `creationTimestamp` 30 s earlier.
+#[tokio::test]
+async fn a_bind_measures_from_the_created_at_stamp() {
+    let e = env();
+    e.warm(0);
+    let id = e.ci_claim(30, "sa:x/a");
+    let mut c = e.fake.claim(OWN, &id).unwrap();
+    c.metadata.annotations = Some(BTreeMap::from([(
+        ANN_CREATED_AT.to_owned(),
+        stamp(Duration::from_millis(15)),
+    )]));
+    e.fake.put_claim(c);
+    e.binder.pass(&key()).await;
+    assert_eq!(phase(&e.fake.status(OWN, &id)), ClaimPhase::Bound);
+    let m = crate::runtime::metrics::Metrics::new();
+    e.metrics.register(&m);
+    let text = m.render();
+    let path = "path=\"warm\"";
+    let prefix = "buildkit_allocation_duration_seconds";
+    assert!((sample(&text, &format!("{prefix}_count"), path) - 1.0).abs() < f64::EPSILON);
+    let sum = sample(&text, &format!("{prefix}_sum"), path);
+    assert!((0.015..0.1).contains(&sum), "waited {sum} s:\n{text}");
+}
+
+/// Without the stamp the wait falls back to `creationTimestamp`.
+#[test]
+fn a_claim_without_the_stamp_waits_from_its_creation_timestamp() {
+    let e = env();
+    let mut c = e.claim(OWN, "no-stamp", 30, json!({}));
+    let waited = super::bind::waited(&c);
+    assert!((30.0..32.0).contains(&waited), "{waited}");
+    c.metadata.annotations = Some(BTreeMap::from([(
+        ANN_CREATED_AT.to_owned(),
+        stamp(Duration::from_millis(15)),
+    )]));
+    assert!(super::bind::waited(&c) < 0.1);
+    c.metadata.annotations = Some(BTreeMap::from([(
+        ANN_CREATED_AT.to_owned(),
+        "not a time".to_owned(),
+    )]));
+    assert!(
+        super::bind::waited(&c) >= 30.0,
+        "an unreadable stamp falls back"
+    );
+}
+
+/// A release records how long the worker was held, by the release's reason.
+#[tokio::test(start_paused = true)]
+async fn a_release_observes_how_long_the_worker_was_held() {
+    let e = env();
+    let name = e.warm(0);
+    let id = new_alloc_id().unwrap().to_string();
+    let mut pod = e.fake.pod(&name);
+    let a = pod.metadata.annotations.as_mut().unwrap();
+    a.insert(ANN_ALLOC.into(), id.clone());
+    a.insert(ANN_OWNER.into(), "sa:render-verify/alice".into());
+    a.insert(
+        ANN_ALLOCATED_AT.into(),
+        fmt_ts(OffsetDateTime::now_utc() - time::Duration::seconds(10)),
+    );
+    e.fake.put_pod(pod);
+    e.front.release(&sa("alice"), &id).await.unwrap();
+    let m = crate::runtime::metrics::Metrics::new();
+    e.metrics.register(&m);
+    let text = m.render();
+    let reason = "reason=\"released\"";
+    let prefix = "buildkit_allocation_held_seconds";
+    assert!((sample(&text, &format!("{prefix}_count"), reason) - 1.0).abs() < f64::EPSILON);
+    let sum = sample(&text, &format!("{prefix}_sum"), reason);
+    assert!((9.5..11.5).contains(&sum), "held {sum} s:\n{text}");
 }

@@ -32,7 +32,9 @@ use super::pods::{
 };
 use super::pool::{MIN_TTL, access_rules, pool_ready, seconds};
 use crate::pki::{AllocId, AllocationId, CaBundle, ClientPublicKey, LeafKey};
-use crate::render::{self as rnd, ANN_ALLOC, ANN_EXPIRES_AT, template_hash};
+use crate::render::{
+    self as rnd, ANN_ALLOC, ANN_ALLOCATED_AT, ANN_CREATED_AT, ANN_EXPIRES_AT, template_hash,
+};
 
 /// How long the binder remembers a claim it bound or a pod it took, for
 /// stores that have not caught up yet.
@@ -867,17 +869,35 @@ fn claim_names(c: &BuildKitClaim) -> (&str, &str) {
     )
 }
 
-/// Seconds from the claim's creation to now.
-fn waited(c: &BuildKitClaim) -> f64 {
+/// Seconds from the claim's creation to now: from the API's `created-at`
+/// stamp, which has milliseconds, else from `creationTimestamp`, which has
+/// whole seconds (claims made in the cluster by other means).
+pub(super) fn waited(c: &BuildKitClaim) -> f64 {
     let created = c
         .metadata
-        .creation_timestamp
+        .annotations
         .as_ref()
-        .map_or(0, |t| t.0.as_millisecond());
+        .and_then(|a| a.get(ANN_CREATED_AT))
+        .and_then(|s| s.parse::<jiff::Timestamp>().ok())
+        .or_else(|| c.metadata.creation_timestamp.as_ref().map(|t| t.0))
+        .map_or(0, jiff::Timestamp::as_millisecond);
     let now = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
     #[allow(clippy::cast_precision_loss, reason = "a wait in milliseconds fits")]
     let ms = (now - i128::from(created)).max(0) as f64;
     ms / 1000.0
+}
+
+/// Seconds a worker was held, from its `allocated-at` stamp to now.
+fn held_seconds(pod: &Pod) -> Option<f64> {
+    let at = pod
+        .metadata
+        .annotations
+        .as_ref()?
+        .get(ANN_ALLOCATED_AT)
+        .and_then(|s| parse_ts(s))?;
+    let ms = (OffsetDateTime::now_utc() - at).whole_milliseconds().max(0);
+    #[allow(clippy::cast_precision_loss, reason = "a hold in milliseconds fits")]
+    Some(ms as f64 / 1000.0)
 }
 
 /// The claim's `resourceVersion`, the precondition of its status writes.
@@ -910,7 +930,7 @@ pub(super) async fn retire_pod(
             if let Err(error) = backend.delete_pod(ns, name, uid, grace).await {
                 warn!(namespace = %ns, pod = %name, error, "deleting retired pod");
             }
-            metrics.release(ns, pool, why);
+            metrics.release(ns, pool, why, held_seconds(pod));
             true
         }
         PatchOutcome::Lost => false,

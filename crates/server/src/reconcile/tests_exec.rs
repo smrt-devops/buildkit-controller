@@ -238,6 +238,7 @@ fn full_pass() -> Vec<Action> {
             uid: "u3".into(),
             alloc_id: "a3".into(),
             expires_at: Some("2026-01-01T00:00:00Z".into()),
+            allocated_at: Some(Timestamp::from_second(1_790_000_000 - 10).unwrap()),
             reason: RetireReason::Expired,
         },
         Action::CreatePod {
@@ -285,6 +286,8 @@ async fn actions_run_in_plan_order() {
         }]
     );
     assert_eq!(r.releases, ["expired"]);
+    // The retire records the 10 s the allocation was held.
+    assert_eq!(r.held, [("expired", 10.0)]);
     // Force delete uses grace 0; the retire delete carries the patched resourceVersion.
     let deletes = fake.deletes.lock().unwrap().clone();
     assert_eq!(deletes[1], ("p-5".into(), None, Some(0)));

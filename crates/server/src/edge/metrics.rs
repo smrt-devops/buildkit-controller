@@ -1,21 +1,112 @@
 //! Edge metric families.
 
+use std::sync::Arc;
+
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
-use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
+use prometheus_client::metrics::histogram::Histogram;
 
+use crate::metrics_doc::{Def, Handle, Label, Labels, Role, register_table};
 use crate::pki::AllocationId;
-use crate::runtime::metrics::Metrics;
+use crate::runtime::metrics::{Metrics, PoolSeries};
 
-type Labels = Vec<(&'static str, String)>;
 /// A histogram family whose series share one bucket layout.
 type Histograms = Family<Labels, Histogram, fn() -> Histogram>;
 
-/// Buckets from 1 ms to about 4 s.
+/// Buckets from 1 ms to about 4 s: 1 ms doubling over 13 buckets.
+pub const BUCKETS: [f64; 13] = [
+    0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128, 0.256, 0.512, 1.024, 2.048, 4.096,
+];
+
 fn seconds() -> Histogram {
-    Histogram::new(exponential_buckets(0.001, 2.0, 13))
+    Histogram::new(BUCKETS)
 }
+
+const TRANSPORTS: &[&str] = &["tcp", "tunnel"];
+/// `result` values of `buildkit_edge_connections_total`.
+const RESULTS: &[&str] = &[
+    "ok",
+    "tls_error",
+    "bad_san",
+    "pod_not_found",
+    "alloc_mismatch",
+    "expired",
+    "pod_not_ready",
+    "store_stale",
+    "upstream_error",
+    "allocation_limit",
+    "namespace_limit",
+    "connection_limit",
+    "handshake_limit",
+    "peer_handshake_limit",
+];
+/// The results counted before the allocation is known, with empty namespace and pool.
+const UNATTRIBUTED: &[&str] = &[
+    "tls_error",
+    "bad_san",
+    "handshake_limit",
+    "peer_handshake_limit",
+];
+const DIRECTIONS: &[&str] = &["client_to_worker", "worker_to_client"];
+const REVOCATIONS: &[&str] = &["released", "expired", "pod_gone", "drain"];
+
+/// The edge's families. Each carries the `transport` the client came in by.
+pub const TABLE: [Def; 6] = [
+    Def::counter(
+        "edge_connections",
+        Role::Controller,
+        &[
+            Label::namespace(),
+            Label::pool(),
+            Label::closed("result", RESULTS),
+            Label::closed("transport", TRANSPORTS),
+        ],
+        "Client connections to the edge by outcome. `ok`: proxied. `tls_error`, `bad_san`: the client certificate was refused before an allocation was known (empty namespace and pool). `pod_not_found`, `alloc_mismatch`, `expired`, `pod_not_ready`: the allocation's pod or lease failed a check. `store_stale`: a pool or pod watch erred since its last completed list. `upstream_error`: the worker could not be reached. `allocation_limit`, `namespace_limit`, `connection_limit`: a connection cap. `handshake_limit`, `peer_handshake_limit`: an unfinished handshake was evicted by a newer one",
+    ),
+    Def::gauge(
+        "edge_active_connections",
+        Role::Controller,
+        &[
+            Label::namespace(),
+            Label::pool(),
+            Label::closed("transport", TRANSPORTS),
+        ],
+        "Proxied connections open now",
+    ),
+    Def::histogram(
+        "edge_handshake_seconds",
+        Role::Controller,
+        &[Label::closed("transport", TRANSPORTS)],
+        &BUCKETS,
+        "Client TLS handshake duration, including certificate verification",
+    ),
+    Def::histogram(
+        "edge_upstream_connect_seconds",
+        Role::Controller,
+        &[Label::closed("transport", TRANSPORTS)],
+        &BUCKETS,
+        "Time from the end of the client handshake to the end of the upstream TLS handshake: the edge's own overhead",
+    ),
+    Def::counter(
+        "edge_bytes",
+        Role::Controller,
+        &[
+            Label::closed("direction", DIRECTIONS),
+            Label::closed("transport", TRANSPORTS),
+        ],
+        "Bytes proxied between clients and workers",
+    ),
+    Def::counter(
+        "edge_revocations",
+        Role::Controller,
+        &[
+            Label::closed("reason", REVOCATIONS),
+            Label::closed("transport", TRANSPORTS),
+        ],
+        "Live connections closed because their allocation ended. `released`: the pod's allocation changed. `expired`: the certificate's notAfter passed. `pod_gone`: the pod was deleted. `drain`: shutdown ran out of drain time",
+    ),
+];
 
 /// How a client connection reached the edge: the `transport` label and log
 /// field.
@@ -65,33 +156,38 @@ impl EdgeMetrics {
             revocations: Family::default(),
         };
         metrics.with_registry(|r| {
-            r.register(
-                "edge_connections",
-                "Edge connections by outcome",
-                m.connections.clone(),
-            );
-            r.register(
-                "edge_active_connections",
-                "Open proxied connections",
-                m.active.clone(),
-            );
-            r.register(
-                "edge_handshake_seconds",
-                "Client TLS handshake including verification",
-                m.handshake.clone(),
-            );
-            r.register(
-                "edge_upstream_connect_seconds",
-                "Client handshake done to upstream TLS done",
-                m.upstream_connect.clone(),
-            );
-            r.register("edge_bytes", "Bytes proxied, by direction", m.bytes.clone());
-            r.register(
-                "edge_revocations",
-                "Live edge connections closed by revocation",
-                m.revocations.clone(),
+            register_table(
+                r,
+                Role::Controller,
+                &TABLE,
+                vec![
+                    ("edge_connections", Handle::new(m.connections.clone())),
+                    ("edge_active_connections", Handle::new(m.active.clone())),
+                    ("edge_handshake_seconds", Handle::new(m.handshake.clone())),
+                    (
+                        "edge_upstream_connect_seconds",
+                        Handle::new(m.upstream_connect.clone()),
+                    ),
+                    ("edge_bytes", Handle::new(m.bytes.clone())),
+                    ("edge_revocations", Handle::new(m.revocations.clone())),
+                ],
             );
         });
+        TABLE[2].seed(None, &m.handshake);
+        TABLE[3].seed(None, &m.upstream_connect);
+        TABLE[4].seed(None, &m.bytes);
+        TABLE[5].seed(None, &m.revocations);
+        for transport in TRANSPORTS {
+            for result in UNATTRIBUTED {
+                drop(m.connections.get_or_create(&vec![
+                    ("namespace", String::new()),
+                    ("pool", String::new()),
+                    ("result", (*result).to_owned()),
+                    ("transport", (*transport).to_owned()),
+                ]));
+            }
+        }
+        metrics.track_pools(Arc::new(m.clone()));
         m
     }
 
@@ -225,5 +321,17 @@ impl Revocation {
             Self::PodGone => "pod_gone",
             Self::Drain => "drain",
         }
+    }
+}
+
+impl PoolSeries for EdgeMetrics {
+    fn seed(&self, namespace: &str, pool: &str) {
+        TABLE[0].seed(Some((namespace, pool)), &self.connections);
+        TABLE[1].seed(Some((namespace, pool)), &self.active);
+    }
+
+    fn forget(&self, namespace: &str, pool: &str) {
+        TABLE[0].forget(namespace, pool, &self.connections);
+        TABLE[1].forget(namespace, pool, &self.active);
     }
 }

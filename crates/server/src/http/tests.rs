@@ -1094,7 +1094,7 @@ async fn pre_allocate_refusals_are_counted_once_each() {
 async fn alloc_service_counts_rejections_with_empty_labels() {
     let metrics = Metrics::new();
     let m = AllocMetrics::default();
-    metrics.with_registry(|r| m.register(r));
+    m.register(&metrics);
     let app = router(state(
         AllocService::with_metrics(watch::channel(crate::certs::CertMaterial::empty()).1, m),
         &metrics,

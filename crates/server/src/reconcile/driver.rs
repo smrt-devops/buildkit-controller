@@ -433,6 +433,8 @@ async fn pass_once(term: &Term, key: &PoolKey) -> Option<Duration> {
             .filter_map(|p| WorkerPod::from_pod(p, &key.0, &key.1, &pool.uid().unwrap_or_default()))
             .collect();
         let counts = PodCounts::of(&workers);
+        term.metrics
+            .set_max(&key.0, &key.1, pool.spec.scaling.max);
         let elapsed = started.elapsed();
         term.metrics.pass(
             &key.0,

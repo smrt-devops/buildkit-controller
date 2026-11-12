@@ -5,6 +5,7 @@ cache:
   poolMaxSize: 20Gi
   gcInterval: 30m
   persistence: {size: 150Gi, storageClass: fast}
+  podLabels: {team: builds}
   podAnnotations: {team: ci}
   nodeSelector: {disk: ssd}
 pools:

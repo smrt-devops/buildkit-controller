@@ -156,6 +156,7 @@ impl AppContext {
             },
             shutdown,
         );
+        metrics.follow_pools(stores.pools.clone());
         Self {
             inner: Arc::new(Inner {
                 client,

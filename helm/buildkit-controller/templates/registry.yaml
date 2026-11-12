@@ -101,6 +101,7 @@ spec:
   template:
     metadata:
       labels: {{- $labels | nindent 8 }}
+      {{- with .Values.cache.podLabels }}{{ toYaml . | nindent 8 }}{{ end }}
       {{- with .Values.cache.podAnnotations }}
       annotations: {{- toYaml . | nindent 8 }}
       {{- end }}
