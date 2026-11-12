@@ -13,7 +13,7 @@
       {"name": "datasource", "label": "Data source", "type": "datasource", "query": "prometheus", "current": {}},
       {"name": "namespace", "label": "Namespace", "type": "query", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "query": {"query": "label_values(buildkit_pool_max, namespace)", "refId": "namespace"}, "definition": "label_values(buildkit_pool_max, namespace)", "refresh": 2, "includeAll": true, "multi": true, "allValue": ".*", "current": {"selected": true, "text": "All", "value": "$__all"}, "sort": 1},
       {"name": "pool", "label": "Pool", "type": "query", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "query": {"query": "label_values(buildkit_pool_max{namespace=~\"$namespace\"}, pool)", "refId": "pool"}, "definition": "label_values(buildkit_pool_max{namespace=~\"$namespace\"}, pool)", "refresh": 2, "includeAll": true, "multi": true, "allValue": ".*", "current": {"selected": true, "text": "All", "value": "$__all"}, "sort": 1},
-      {"name": "cache_budget_bytes", "label": "Cache budget (bytes)", "type": "textbox", "query": "10737418240", "current": {"text": "10737418240", "value": "10737418240"}}
+      {"name": "cache_budget_bytes", "label": "Cache budget in bytes (chart cache.maxSize, default 40Gi)", "description": "The chart value cache.maxSize in bytes. The registry does not export its budget. The default is the chart default, 40Gi.", "type": "textbox", "query": "42949672960", "current": {"text": "42949672960", "value": "42949672960"}}
     ]
   },
   "panels": [
