@@ -24,6 +24,7 @@ fixtures = []
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = "0.1.92"
 base64 = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
@@ -37,6 +38,7 @@ jsonwebtoken = { workspace = true }
 jiff = { workspace = true }
 json-patch = { workspace = true }
 object_store = { workspace = true }
+object_store_reqwest = { workspace = true }
 k8s-openapi = { workspace = true }
 kube = { workspace = true, features = ["ring", "jsonpatch"] }
 pem = { workspace = true }
@@ -66,7 +68,6 @@ webpki-roots = { workspace = true }
 x509-parser = { workspace = true }
 
 [dev-dependencies]
-async-trait = "0.1.92"
 hyper = { workspace = true, features = ["client"] }
 insta = { workspace = true }
 proptest = { workspace = true }

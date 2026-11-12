@@ -166,6 +166,12 @@ impl From<StoreError> for ApiError {
                 "TOOMANYREQUESTS",
                 e.to_string(),
             ),
+            StoreError::PartsBusy => Self::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOOMANYREQUESTS",
+                e.to_string(),
+            )
+            .with(RETRY_AFTER, "1".to_owned()),
             StoreError::Stalled => Self::new(
                 StatusCode::REQUEST_TIMEOUT,
                 "BLOB_UPLOAD_INVALID",
@@ -562,6 +568,9 @@ fn range_header(size: u64) -> String {
 }
 
 /// Streams the request body into the upload; aborts the upload on error.
+/// On a bucket it first takes a part permit; with none free it answers 429
+/// before reading the body and leaves the upload open, so the client can
+/// send the request again.
 async fn receive(
     reg: &Registry,
     id: &str,
@@ -579,6 +588,7 @@ async fn receive(
         reg.store.abort(id, up).await;
         return Err(too_large(max));
     }
+    reg.store.take_permit(&mut up, declared == Some(0)).await?;
     let body = req.into_body().into_data_stream();
     if let Err(e) = reg.store.append(&mut up, body, BODY_IDLE).await {
         reg.store.abort(id, up).await;

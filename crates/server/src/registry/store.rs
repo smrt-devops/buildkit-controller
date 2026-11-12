@@ -18,7 +18,7 @@ use std::fmt;
 use std::io;
 use std::str::FromStr;
 use std::sync::{Arc, MutexGuard, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use futures::stream::{self, BoxStream};
@@ -26,7 +26,8 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{GetOptions, MultipartUpload, ObjectStore, ObjectStoreExt, PutPayload};
 use ring::digest::{Context, SHA256};
-use tokio::sync::OwnedMutexGuard;
+use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 use tracing::warn;
 
 use super::gc::{self, Budgets, Reason};
@@ -122,6 +123,8 @@ pub enum StoreError {
     ManifestBlobUnknown(Digest),
     #[error("open uploads hold all the upload space")]
     UploadSpace,
+    #[error("uploads hold every part buffer; try again")]
+    PartsBusy,
     #[error("request body stalled")]
     Stalled,
     #[error("request body: {0}")]
@@ -207,8 +210,9 @@ pub(super) struct Index {
     pub repos: BTreeMap<String, Repo>,
 }
 
-/// An upload in progress. Its bytes go to `data/<id>`, as one part per
-/// received chunk, from the first chunk on.
+/// An upload in progress. Its bytes go to `data/<id>`: on the volume as one
+/// part per received chunk, on a bucket through a part buffer of
+/// [`PART_SIZE`], or as one put if they never fill it.
 pub struct Upload {
     repo: String,
     /// The worker that opened it: the DNS name of its certificate, nonce
@@ -216,8 +220,14 @@ pub struct Upload {
     owner: String,
     id: Id,
     part: Option<Box<dyn MultipartUpload>>,
+    /// Bytes not yet sent as a part. Holds its own copy, never a network
+    /// buffer.
+    buf: Vec<u8>,
+    /// The part permit, held from the first byte to the end of the upload.
+    permit: Option<OwnedSemaphorePermit>,
     hasher: Context,
     size: u64,
+    /// When a request last wrote to it.
     touched: Instant,
 }
 
@@ -270,6 +280,26 @@ pub const MAX_UPLOADS: usize = 1024;
 pub const MAX_UPLOADS_PER_OWNER: usize = 64;
 /// Record reads at open, and record writes in a collection, in flight at once.
 const RECORD_IO: usize = 32;
+/// Part buffers of uploads to a bucket, over all uploads.
+pub const PART_PERMITS: usize = 48;
+/// Part buffers one owner may hold: a quarter, as with upload bytes.
+pub const PART_PERMITS_PER_OWNER: usize = PART_PERMITS / 4;
+/// A part: the smallest S3 and the GCS XML API take, except the last.
+pub const PART_SIZE: usize = 5 << 20;
+/// An upload that holds a part permit and has seen no request for this long
+/// is aborted when a permit is wanted, and at each collection. Twice the
+/// longest gap within a request body.
+pub const PART_IDLE: Duration = Duration::from_mins(2);
+
+/// How the store takes the parts of an upload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Parts {
+    /// Each chunk as it arrives: the volume, whose parts have no minimum.
+    Direct,
+    /// Through a part buffer of [`PART_SIZE`], one of [`PART_PERMITS`]: a
+    /// bucket.
+    Buffered,
+}
 
 /// Size bounds of the store.
 #[derive(Clone, Copy, Debug)]
@@ -281,11 +311,20 @@ pub struct StoreLimits {
     pub max_upload_bytes: u64,
 }
 
-/// Slots and bytes held by open uploads, in total and per owner.
+/// What one owner's open uploads hold.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Held {
+    slots: usize,
+    bytes: u64,
+    permits: usize,
+}
+
+/// Slots, bytes and part permits held by open uploads, in total and per
+/// owner.
 #[derive(Debug, Default)]
 struct Quota {
     bytes: u64,
-    owners: HashMap<String, (usize, u64)>,
+    owners: HashMap<String, Held>,
 }
 
 type Slot = Arc<tokio::sync::Mutex<Upload>>;
@@ -294,6 +333,9 @@ type Slot = Arc<tokio::sync::Mutex<Upload>>;
 pub struct Store {
     os: Arc<dyn ObjectStore>,
     limits: StoreLimits,
+    parts: Parts,
+    /// [`PART_PERMITS`], taken only with [`Parts::Buffered`].
+    permits: Arc<Semaphore>,
     index: std::sync::Mutex<Index>,
     uploads: std::sync::Mutex<HashMap<String, Slot>>,
     quota: std::sync::Mutex<Quota>,
@@ -468,7 +510,11 @@ impl Store {
     /// and one read per manifest record. Keys that do not belong are queued
     /// for deletion, which the first collection performs, so they do not
     /// hold up serving.
-    pub async fn open(os: Arc<dyn ObjectStore>, limits: StoreLimits) -> Result<Self, StoreError> {
+    pub async fn open(
+        os: Arc<dyn ObjectStore>,
+        limits: StoreLimits,
+        parts: Parts,
+    ) -> Result<Self, StoreError> {
         let mut l = Self::list(&*os).await?;
         let now = now_secs();
         let mut idx = Index::default();
@@ -567,6 +613,8 @@ impl Store {
         Ok(Self {
             os,
             limits,
+            parts,
+            permits: Arc::new(Semaphore::new(PART_PERMITS)),
             index: std::sync::Mutex::new(idx),
             uploads: std::sync::Mutex::default(),
             quota: std::sync::Mutex::default(),
@@ -750,20 +798,22 @@ impl Store {
             owner: owner.to_owned(),
             id: id.clone(),
             part: None,
+            buf: Vec::new(),
+            permit: None,
             hasher: Context::new(&SHA256),
             size: 0,
             touched: Instant::now(),
         };
         let mut uploads = self.uploads();
         let mut q = self.quota();
-        let slots = &mut q.owners.entry(owner.to_owned()).or_default().0;
-        if uploads.len() >= MAX_UPLOADS || *slots >= MAX_UPLOADS_PER_OWNER {
-            if *slots == 0 {
+        let held = q.owners.entry(owner.to_owned()).or_default();
+        if uploads.len() >= MAX_UPLOADS || held.slots >= MAX_UPLOADS_PER_OWNER {
+            if *held == Held::default() {
                 q.owners.remove(owner);
             }
             return Ok(None);
         }
-        *slots += 1;
+        held.slots += 1;
         let id = id.as_str().to_owned();
         uploads.insert(id.clone(), Arc::new(tokio::sync::Mutex::new(up)));
         Ok(Some(id))
@@ -781,28 +831,38 @@ impl Store {
     fn reserve(&self, owner: &str, n: u64) -> Result<(), StoreError> {
         let max_owner = self.owner_bytes();
         let mut q = self.quota();
-        let held = q.owners.get(owner).map_or(0, |o| o.1);
+        let held = q.owners.get(owner).map_or(0, |o| o.bytes);
         if q.bytes.saturating_add(n) > self.limits.max_upload_bytes
             || held.saturating_add(n) > max_owner
         {
             return Err(StoreError::UploadSpace);
         }
         q.bytes += n;
-        q.owners.entry(owner.to_owned()).or_default().1 += n;
+        q.owners.entry(owner.to_owned()).or_default().bytes += n;
         Ok(())
     }
 
-    /// Gives back `slots` uploads and `bytes` of `owner`.
-    fn release(&self, owner: &str, slots: usize, bytes: u64) {
+    /// Gives back what `owner` held: `slots` uploads, `bytes` and `permits`.
+    fn release(&self, owner: &str, slots: usize, bytes: u64, permits: usize) {
         let mut q = self.quota();
         q.bytes = q.bytes.saturating_sub(bytes);
         if let Some(o) = q.owners.get_mut(owner) {
-            o.0 = o.0.saturating_sub(slots);
-            o.1 = o.1.saturating_sub(bytes);
-            if *o == (0, 0) {
+            o.slots = o.slots.saturating_sub(slots);
+            o.bytes = o.bytes.saturating_sub(bytes);
+            o.permits = o.permits.saturating_sub(permits);
+            if *o == Held::default() {
                 q.owners.remove(owner);
             }
         }
+    }
+
+    /// Ends `up`: gives back its slot, bytes and permit, drops its buffer,
+    /// and returns its multipart upload for the caller to abort or complete.
+    fn end(&self, up: &mut Upload) -> Option<Box<dyn MultipartUpload>> {
+        let permits = usize::from(up.permit.take().is_some());
+        up.buf = Vec::new();
+        self.release(&up.owner, 1, up.size, permits);
+        up.part.take()
     }
 
     /// The upload `id` of `repo`, locked for this request. `Err(())` when
@@ -819,12 +879,47 @@ impl Store {
     /// Ends the upload `id` and deletes what it received.
     pub async fn abort(&self, id: &str, mut up: OwnedMutexGuard<Upload>) {
         self.uploads().remove(id);
-        self.release(&up.owner, 1, up.size);
-        let part = up.part.take();
+        let part = self.end(&mut up);
         drop(up);
         if let Some(p) = part {
             abort_part(p).await;
         }
+    }
+
+    /// Gives `up` a part permit before a request writes to it, unless the
+    /// store takes chunks directly, the request declares an empty body, or
+    /// `up` holds one. With none free, it first aborts the uploads that hold
+    /// one and have been idle for [`PART_IDLE`]. Fails with
+    /// [`StoreError::PartsBusy`] when still none is free, or when the owner
+    /// holds [`PART_PERMITS_PER_OWNER`]; the upload stays as it was.
+    pub async fn take_permit(&self, up: &mut Upload, empty: bool) -> Result<(), StoreError> {
+        if self.parts == Parts::Direct || empty || up.permit.is_some() {
+            return Ok(());
+        }
+        if self.try_permit(up) {
+            return Ok(());
+        }
+        self.expire_where(|u| u.permit.is_some() && u.touched.elapsed() >= PART_IDLE)
+            .await;
+        if self.try_permit(up) {
+            Ok(())
+        } else {
+            Err(StoreError::PartsBusy)
+        }
+    }
+
+    fn try_permit(&self, up: &mut Upload) -> bool {
+        let mut q = self.quota();
+        let held = q.owners.entry(up.owner.clone()).or_default();
+        if held.permits >= PART_PERMITS_PER_OWNER {
+            return false;
+        }
+        let Ok(p) = Arc::clone(&self.permits).try_acquire_owned() else {
+            return false;
+        };
+        held.permits += 1;
+        up.permit = Some(p);
+        true
     }
 
     /// Appends `body` to the upload, hashing as it streams. A gap of `idle`
@@ -857,9 +952,9 @@ impl Store {
             }
             let n = chunk.len() as u64;
             self.reserve(&up.owner, n)?;
-            if let Err(e) = self.write_part(up, chunk.clone()).await {
-                self.release(&up.owner, 0, n);
-                return Err(e.into());
+            if let Err(e) = self.write(up, &chunk).await {
+                self.release(&up.owner, 0, n, 0);
+                return Err(e);
             }
             up.hasher.update(&chunk);
             up.size = size;
@@ -867,20 +962,48 @@ impl Store {
         }
     }
 
-    async fn write_part(&self, up: &mut Upload, chunk: Bytes) -> Result<(), object_store::Error> {
+    /// Writes `chunk`: on the volume as one part; on a bucket into the part
+    /// buffer, sending each full part and waiting for it before more of the
+    /// body is read, so an upload holds one buffer at most.
+    async fn write(&self, up: &mut Upload, chunk: &Bytes) -> Result<(), StoreError> {
+        if self.parts == Parts::Direct {
+            return Ok(self.send_part(up, chunk.clone()).await?);
+        }
+        // A request that declared an empty body and sent bytes all the same.
+        if up.permit.is_none() && !self.try_permit(up) {
+            return Err(StoreError::PartsBusy);
+        }
+        let mut rest = &chunk[..];
+        while !rest.is_empty() {
+            if up.buf.capacity() == 0 {
+                up.buf.reserve_exact(PART_SIZE);
+            }
+            let take = (PART_SIZE - up.buf.len()).min(rest.len());
+            up.buf.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if up.buf.len() == PART_SIZE {
+                let part = Bytes::from(std::mem::take(&mut up.buf));
+                self.send_part(up, part).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_part(&self, up: &mut Upload, part: Bytes) -> Result<(), object_store::Error> {
         if up.part.is_none() {
             let key = Key::Data(up.id.clone()).path();
             up.part = Some(self.os.put_multipart(&key).await?);
         }
         match up.part.as_mut() {
-            Some(part) => part.put_part(PutPayload::from(chunk)).await,
+            Some(p) => p.put_part(PutPayload::from(part)).await,
             None => Ok(()),
         }
     }
 
     /// Ends the upload `id` as blob `want`: verifies the digest, completes
-    /// its data object, writes its marker and commits it into its
-    /// repository. The upload is gone either way.
+    /// its data object, or puts it whole if it never filled a part, writes
+    /// its marker and commits it into its repository. The upload is gone
+    /// either way; it keeps its permit until its last bytes are sent.
     pub async fn finish(
         &self,
         id: &str,
@@ -888,36 +1011,49 @@ impl Store {
         want: &Digest,
     ) -> Result<(), StoreError> {
         self.uploads().remove(id);
-        self.release(&up.owner, 1, up.size);
         let got = Digest::finish(up.hasher.clone());
-        let (repo, size, data_id, part) = (up.repo.clone(), up.size, up.id.clone(), up.part.take());
-        drop(up);
-        if &got != want {
-            if let Some(p) = part {
-                abort_part(p).await;
-            }
-            return Err(StoreError::DigestMismatch(want.clone()));
-        }
+        let (repo, size, data_id) = (up.repo.clone(), up.size, up.id.clone());
+        let buf = Bytes::from(std::mem::take(&mut up.buf));
         let data = Key::Data(data_id.clone()).path();
         let marker = Key::Marker(want.clone(), data_id.clone()).path();
-        let written = async {
-            match part {
-                Some(mut p) => {
-                    if let Err(e) = p.complete().await {
-                        abort_part(p).await;
-                        return Err(e);
+        let written = if &got == want {
+            let part = up.part.take();
+            async {
+                match part {
+                    Some(mut p) => {
+                        let sent = async {
+                            if !buf.is_empty() {
+                                p.put_part(PutPayload::from(buf)).await?;
+                            }
+                            p.complete().await
+                        }
+                        .await;
+                        if let Err(e) = sent {
+                            abort_part(p).await;
+                            return Err(e);
+                        }
+                    }
+                    None => {
+                        self.os.put(&data, PutPayload::from(buf)).await?;
                     }
                 }
-                None => {
-                    self.os.put(&data, PutPayload::default()).await?;
-                }
+                self.os.put(&marker, PutPayload::default()).await
             }
-            self.os.put(&marker, PutPayload::default()).await
+            .await
+            .map_err(StoreError::from)
+        } else {
+            Err(StoreError::DigestMismatch(want.clone()))
+        };
+        let part = self.end(&mut up);
+        drop(up);
+        if let Some(p) = part {
+            abort_part(p).await;
         }
-        .await;
         if let Err(e) = written {
-            self.delete(vec![marker, data]).await;
-            return Err(e.into());
+            if !matches!(e, StoreError::DigestMismatch(_)) {
+                self.delete(vec![marker, data]).await;
+            }
+            return Err(e);
         }
         let doomed = commit(&mut self.index(), &repo, want, Blob { size, id: data_id });
         self.delete(doomed).await;
@@ -1050,14 +1186,25 @@ impl Store {
         })
     }
 
-    /// Deletes uploads idle for `max_age` that no request holds. Returns how many.
+    /// Deletes uploads that no request holds and that have been idle for
+    /// `max_age`, or for [`PART_IDLE`] while holding a part permit. Returns
+    /// how many.
     pub async fn expire_uploads(&self, max_age: Duration) -> usize {
+        let part_idle = PART_IDLE.min(max_age);
+        self.expire_where(|u| {
+            let idle = u.touched.elapsed();
+            idle >= max_age || (u.permit.is_some() && idle >= part_idle)
+        })
+        .await
+    }
+
+    /// Deletes the uploads that no request holds and that `doomed` picks.
+    async fn expire_where(&self, doomed: impl Fn(&Upload) -> bool) -> usize {
         let mut parts = Vec::new();
         let mut n = 0;
         self.uploads().retain(|_, slot| match slot.try_lock() {
-            Ok(mut up) if up.touched.elapsed() >= max_age => {
-                self.release(&up.owner, 1, up.size);
-                parts.extend(up.part.take());
+            Ok(mut up) if doomed(&up) => {
+                parts.extend(self.end(&mut up));
                 n += 1;
                 false
             }
@@ -1279,6 +1426,25 @@ impl Store {
             .unwrap_or_default()
     }
 
+    /// The last-used time of each manifest record in the store, read from
+    /// the store.
+    #[cfg(test)]
+    pub(super) async fn recorded_times(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for key in self.listed().await {
+            if !key.contains("/_manifests/") {
+                continue;
+            }
+            let Ok(r) = self.os.get(&Path::from(key)).await else {
+                continue;
+            };
+            let text = r.bytes().await.unwrap_or_default();
+            let text = String::from_utf8_lossy(&text);
+            out.extend(text.lines().nth(1).and_then(|l| l.parse::<u64>().ok()));
+        }
+        out
+    }
+
     /// The blobs linked in `repo`.
     #[cfg(test)]
     pub(super) fn links(&self, repo: &str) -> Vec<Digest> {
@@ -1329,7 +1495,9 @@ mod tests {
     #[tokio::test]
     async fn a_failed_pull_record_does_not_fail_the_read() {
         let probe = Arc::new(Probe::new(Arc::new(InMemory::new())));
-        let store = Store::open(probe.clone(), LIMITS).await.unwrap();
+        let store = Store::open(probe.clone(), LIMITS, Parts::Buffered)
+            .await
+            .unwrap();
         let body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
         let tag = Reference::Tag("t".into());
         let d = store

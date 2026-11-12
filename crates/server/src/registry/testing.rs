@@ -1,6 +1,7 @@
-//! A store wrapper for tests: records reads, fails writes, holds deletes.
+//! A store wrapper for tests: records reads, fails calls, holds deletes.
 
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
@@ -16,9 +17,20 @@ use tokio::sync::watch;
 pub struct Probe {
     inner: Arc<dyn ObjectStore>,
     gets: Mutex<Vec<String>>,
+    multiparts: AtomicUsize,
     fail_puts: watch::Sender<bool>,
+    fail_all: watch::Sender<bool>,
+    /// Delete batches that may still run; after them every delete fails.
+    batches: Mutex<Option<usize>>,
     /// Deletes wait while this is false.
     deletes: watch::Sender<bool>,
+}
+
+fn refused() -> object_store::Error {
+    object_store::Error::Generic {
+        store: "probe",
+        source: "refused".into(),
+    }
 }
 
 impl Probe {
@@ -26,7 +38,10 @@ impl Probe {
         Self {
             inner,
             gets: Mutex::default(),
+            multiparts: AtomicUsize::new(0),
             fail_puts: watch::Sender::new(false),
+            fail_all: watch::Sender::new(false),
+            batches: Mutex::new(None),
             deletes: watch::Sender::new(true),
         }
     }
@@ -36,9 +51,28 @@ impl Probe {
         self.gets.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
+    /// Multipart uploads started so far.
+    pub fn multiparts(&self) -> usize {
+        self.multiparts.load(Ordering::Relaxed)
+    }
+
     /// Fails every put and multipart write from now on, or no longer.
     pub fn fail_puts(&self, on: bool) {
         self.fail_puts.send_replace(on);
+    }
+
+    /// Fails every call from now on, as an unreachable store would, or no
+    /// longer.
+    pub fn fail_all(&self, on: bool) {
+        self.fail_all.send_replace(on);
+    }
+
+    /// Lets `n` more delete batches through; every later delete fails, as if
+    /// the process had died.
+    pub fn crash_after_deletes(&self, n: usize) {
+        if let Ok(mut b) = self.batches.lock() {
+            *b = Some(n);
+        }
     }
 
     /// Makes deletes wait until [`Probe::release_deletes`].
@@ -50,14 +84,37 @@ impl Probe {
         self.deletes.send_replace(true);
     }
 
-    fn check_put(&self) -> Result<()> {
-        if *self.fail_puts.borrow() {
-            return Err(object_store::Error::Generic {
-                store: "probe",
-                source: "writes refused".into(),
-            });
+    fn check(&self) -> Result<()> {
+        if *self.fail_all.borrow() {
+            return Err(refused());
         }
         Ok(())
+    }
+
+    fn check_put(&self) -> Result<()> {
+        self.check()?;
+        if *self.fail_puts.borrow() {
+            return Err(refused());
+        }
+        Ok(())
+    }
+
+    /// Whether this delete batch may run.
+    fn take_batch(&self) -> bool {
+        if *self.fail_all.borrow() {
+            return false;
+        }
+        let Ok(mut b) = self.batches.lock() else {
+            return false;
+        };
+        match &mut *b {
+            None => true,
+            Some(0) => false,
+            Some(n) => {
+                *n -= 1;
+                true
+            }
+        }
     }
 }
 
@@ -85,10 +142,12 @@ impl ObjectStore for Probe {
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
         self.check_put()?;
+        self.multiparts.fetch_add(1, Ordering::Relaxed);
         self.inner.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        self.check()?;
         if let Ok(mut g) = self.gets.lock() {
             g.push(location.to_string());
         }
@@ -99,6 +158,9 @@ impl ObjectStore for Probe {
         &self,
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
+        if !self.take_batch() {
+            return locations.map(|_| Err(refused())).boxed();
+        }
         let inner = Arc::clone(&self.inner);
         let mut open = self.deletes.subscribe();
         futures::stream::once(async move {
@@ -110,14 +172,19 @@ impl ObjectStore for Probe {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        if self.check().is_err() {
+            return futures::stream::once(async { Err(refused()) }).boxed();
+        }
         self.inner.list(prefix)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        self.check()?;
         self.inner.list_with_delimiter(prefix).await
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        self.check()?;
         self.inner.copy_opts(from, to, options).await
     }
 }

@@ -63,6 +63,8 @@ The `namespace` and `pool` labels name a pool; they are empty when the pool is n
 | `buildkit_registry_stored_bytes` | gauge | none | Bytes of blobs in the store. Compare it with the store budget (`--max-size`) |
 | `buildkit_registry_blobs` | gauge | none | Blobs in the store |
 | `buildkit_registry_manifests` | gauge | none | Manifests in the store, over all repositories |
+| `buildkit_registry_store_operations_total` | counter | `op`: `get`, `put`, `put_part`, `complete`, `abort`, `delete`, `list`; `result`: `ok`, `error` | Calls to the store (the volume or a bucket), by kind and result. `put` counts the start of a multipart upload too; `delete` counts each key; `list` counts each listing. A `get` or `delete` of a missing key is `ok`: the end of a race with garbage collection |
+| `buildkit_registry_store_operation_duration_seconds` | histogram | `op`: `get`, `put`, `put_part`, `complete`, `abort`, `delete`, `list` | Store call duration: a `get` until the response head, a `list` until its last page, a `delete` until that key's result |
 
 ## Histogram buckets
 
@@ -78,3 +80,4 @@ Upper bounds in seconds.
 | `buildkit_edge_handshake_seconds` | 0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128, 0.256, 0.512, 1.024, 2.048, 4.096 |
 | `buildkit_edge_upstream_connect_seconds` | 0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128, 0.256, 0.512, 1.024, 2.048, 4.096 |
 | `buildkit_registry_request_duration_seconds` | 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300 |
+| `buildkit_registry_store_operation_duration_seconds` | 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300 |
