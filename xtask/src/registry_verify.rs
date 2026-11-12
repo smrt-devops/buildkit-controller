@@ -28,13 +28,12 @@
 //! [`Store::listed`]), and scenario `i` deletes the registry pod and expects a
 //! daemon with no local cache to still hit the cache the dead pod served.
 //!
-//! Expected wall time: volume 2 min 54 s measured with a cold controller image
-//! build (137 s of it; about 45 s with the image cached). The stores add the
-//! store image load and start-up, about 30 s for `MinIO` and fake-gcs-server and
-//! about 60 s for Azurite, whose image is the largest; these are estimates
-//! until the first run that has the bucket binary. Every wait is at most 90 s,
-//! except the kind cluster create (120 s), the buildkitd pods' readiness (180 s)
-//! and the registry rollout (120 s), which the volume run already needs.
+//! Wall time, measured with every image already built and loaded: volume 36 s,
+//! `MinIO` 43 s, Azurite 46 s; a cold controller image build adds about 2 min 20 s.
+//! fake-gcs-server cannot run the registry (see [`Store::Gcs`]). Every wait is at
+//! most 90 s, except the kind cluster create (120 s), the buildkitd pods'
+//! readiness (180 s) and the registry rollout (120 s), which the volume run
+//! already needs.
 //!
 //! The registry's grants come from its static grants file, its certs from a
 //! test CA made here. Every kind and kubectl call gets the private kubeconfig
@@ -194,23 +193,25 @@ const AZURE_KEY: &str =
 /// Creates the container over the Azure Blob REST API, with a `SharedKey`
 /// signature, because the Azurite image carries no storage client. Arguments:
 /// host, port, account, key, container. A 409 means it exists.
-const AZURE_MKCONTAINER: &str = r"const http = require('http'), crypto = require('crypto');
+const AZURE_MKCONTAINER: &str = r#"const http = require("http"), crypto = require("crypto");
 const [host, port, acct, key, container] = process.argv.slice(1);
-const date = new Date().toUTCString(), ver = '2021-08-06';
+const date = new Date().toUTCString(), ver = "2021-08-06";
 const sts = `PUT\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:${date}\nx-ms-version:${ver}\n/${acct}/${acct}/${container}\nrestype:container`;
-const sig = crypto.createHmac('sha256', Buffer.from(key, 'base64')).update(sts).digest('base64');
-const req = http.request({host, port, method: 'PUT', path: `/${acct}/${container}?restype=container`,
-  headers: {'x-ms-date': date, 'x-ms-version': ver, 'Content-Length': 0, Authorization: `SharedKey ${acct}:${sig}`}},
+const sig = crypto.createHmac("sha256", Buffer.from(key, "base64")).update(sts).digest("base64");
+const req = http.request({host, port, method: "PUT", path: `/${acct}/${container}?restype=container`,
+  headers: {"x-ms-date": date, "x-ms-version": ver, "Content-Length": 0, Authorization: `SharedKey ${acct}:${sig}`}},
   r => { console.log(r.statusCode); process.exit(r.statusCode === 201 || r.statusCode === 409 ? 0 : 1); });
-req.on('error', e => { console.log(e.message); process.exit(1); });
-req.end();";
+req.on("error", e => { console.log(e.message); process.exit(1); });
+req.end();"#;
 
 /// An object store the registry can keep its blobs in, run in the cluster.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum Store {
     /// `MinIO`, through the `s3://` scheme.
     Minio,
-    /// fake-gcs-server, through `gs://`.
+    /// fake-gcs-server, through `gs://`. The registry's GCS client lists through
+    /// the XML API (`GET /<bucket>?list-type=2`), which the fake answers 404, so
+    /// this variant fails at the registry's start-up.
     Gcs,
     /// Azurite, through `az://`.
     Azure,
@@ -354,7 +355,7 @@ impl Store {
             ),
             Self::Azure => (
                 "command: [azurite-blob]\n          ",
-                "args: [--blobHost, \"0.0.0.0\", --skipApiVersionCheck]\n          ".to_owned(),
+                "args: [--blobHost, \"0.0.0.0\", --skipApiVersionCheck, --disableProductStyleUrl]\n          ".to_owned(),
                 String::new(),
                 "tcpSocket: {port: 10000}",
                 "securityContext: {}",
@@ -1015,6 +1016,15 @@ fn store_scenarios(env: &Cluster, r: &mut Report, store: Store) -> Result<()> {
         Ok(ready_replacement(&pods(env)?, &old))
     })
     .is_ok();
+    // Ready is the pod's word; the Service routes to it a moment later.
+    crate::proc::until(
+        "the registry port to accept connections",
+        Duration::from_mins(1),
+        || {
+            let probe = format!("nc -z -w 2 {} 5000", HOST.split(':').next().unwrap_or(HOST));
+            Ok(exec(env, "reader", &probe).ok().filter(|(ok, _)| *ok))
+        },
+    )?;
     let (pruned, out) = exec(
         env,
         "reader",
