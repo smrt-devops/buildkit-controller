@@ -15,7 +15,6 @@
 //! upload into it.
 
 use std::collections::HashMap;
-use std::io::SeekFrom;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,10 +26,8 @@ use axum::http::header::{
 };
 use axum::http::{HeaderValue, Method, Request, Response, StatusCode};
 use futures::StreamExt;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::{OwnedMutexGuard, Semaphore};
-use tokio_util::io::ReaderStream;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::auth::{Action, Authorizer, Grant};
 use super::metrics::RegistryMetrics;
@@ -140,6 +137,17 @@ fn internal(e: &std::io::Error) -> ApiError {
     )
 }
 
+/// The store failed: the client may try again shortly.
+fn unavailable(e: &object_store::Error) -> ApiError {
+    warn!(error = %e, "cache store");
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "UNKNOWN",
+        "store unavailable",
+    )
+    .with(RETRY_AFTER, "5".to_owned())
+}
+
 impl From<StoreError> for ApiError {
     fn from(e: StoreError) -> Self {
         match e {
@@ -158,6 +166,12 @@ impl From<StoreError> for ApiError {
                 "TOOMANYREQUESTS",
                 e.to_string(),
             ),
+            StoreError::PartsBusy => Self::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOOMANYREQUESTS",
+                e.to_string(),
+            )
+            .with(RETRY_AFTER, "1".to_owned()),
             StoreError::Stalled => Self::new(
                 StatusCode::REQUEST_TIMEOUT,
                 "BLOB_UPLOAD_INVALID",
@@ -165,6 +179,7 @@ impl From<StoreError> for ApiError {
             ),
             StoreError::Body(_) => upload_invalid(e.to_string()),
             StoreError::Io(io) => internal(&io),
+            StoreError::Store(e) => unavailable(&e),
         }
     }
 }
@@ -365,7 +380,7 @@ async fn dispatch(
         }
         Route::Uploads(name) if m == Method::POST => {
             reg.authorize(peer, name, Action::Push)?;
-            start_upload(reg, peer, name, query(&req)).await
+            start_upload(reg, peer, name, &query(&req))
         }
         Route::Upload(name, id) if m == Method::PATCH => {
             reg.authorize(peer, name, Action::Push)?;
@@ -471,22 +486,20 @@ async fn get_blob(
     };
     // A branch scope that lacks the blob reads it from the trusted scope;
     // that read counts as use of the trusted link.
-    let found = match reg.store.blob(at.repo, d).await {
-        Some(f) => Some(f),
-        None => match at.fallback {
-            Some(t) => reg.store.blob(t, d).await,
-            None => None,
-        },
-    };
-    let (path, size) = found.ok_or_else(unknown)?;
+    let found = reg
+        .store
+        .blob(at.repo, d)
+        .or_else(|| at.fallback.and_then(|t| reg.store.blob(t, d)))
+        .ok_or_else(unknown)?;
+    let size = found.size;
     let range = if head {
         None
     } else {
         parse_range(range, size)?
     };
-    let (status, start, len) = match range {
-        Some((s, e)) => (StatusCode::PARTIAL_CONTENT, s, e - s + 1),
-        None => (StatusCode::OK, 0, size),
+    let (status, len) = match range {
+        Some((s, e)) => (StatusCode::PARTIAL_CONTENT, e - s + 1),
+        None => (StatusCode::OK, size),
     };
     let mut b = Response::builder()
         .status(status)
@@ -501,27 +514,19 @@ async fn get_blob(
     let body = if head {
         Body::empty()
     } else {
-        // Garbage collection may delete the file between lookup and open;
-        // an open file stays readable after deletion.
-        let mut f = match tokio::fs::File::open(&path).await {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(unknown()),
-            Err(e) => return Err(e.into()),
-        };
-        if start > 0 {
-            f.seek(SeekFrom::Start(start)).await?;
-        }
-        Body::from_stream(ReaderStream::new(f.take(len)))
+        // Garbage collection may delete the blob between lookup and read.
+        let stream = reg.store.read(&found, range).await?.ok_or_else(unknown)?;
+        Body::from_stream(stream)
     };
     b.body(body)
         .map_err(|e| internal(&std::io::Error::other(e)))
 }
 
-async fn start_upload(
+fn start_upload(
     reg: &Registry,
     peer: &WorkerIdentity,
     name: &str,
-    q: HashMap<String, String>,
+    q: &HashMap<String, String>,
 ) -> Result<Response<Body>, ApiError> {
     if q.contains_key("digest") {
         return Err(ApiError::new(
@@ -533,7 +538,7 @@ async fn start_upload(
     // The full identity, nonce included: a later pod of the same name starts
     // with a clean quota.
     let owner = peer.dns_name();
-    let id = reg.store.start_upload(name, &owner).await?.ok_or_else(|| {
+    let id = reg.store.start_upload(name, &owner)?.ok_or_else(|| {
         ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "TOOMANYREQUESTS",
@@ -563,6 +568,9 @@ fn range_header(size: u64) -> String {
 }
 
 /// Streams the request body into the upload; aborts the upload on error.
+/// On a bucket it first takes a part permit; with none free it answers 429
+/// before reading the body and leaves the upload open, so the client can
+/// send the request again.
 async fn receive(
     reg: &Registry,
     id: &str,
@@ -580,6 +588,7 @@ async fn receive(
         reg.store.abort(id, up).await;
         return Err(too_large(max));
     }
+    reg.store.take_permit(&mut up, declared == Some(0)).await?;
     let body = req.into_body().into_data_stream();
     if let Err(e) = reg.store.append(&mut up, body, BODY_IDLE).await {
         reg.store.abort(id, up).await;
@@ -662,26 +671,19 @@ async fn get_manifest(
     };
     // As for blobs: the trusted scope answers what the branch scope lacks,
     // and the pull is recorded on the trusted manifest.
-    let m = match reg.store.manifest(at.repo, r).await {
-        Some(m) => Some(m),
-        None => match at.fallback {
-            Some(t) => reg.store.manifest(t, r).await,
-            None => None,
-        },
-    };
-    let m = m.ok_or_else(unknown)?;
+    let m = reg
+        .store
+        .manifest(at.repo, r)
+        .or_else(|| at.fallback.and_then(|t| reg.store.manifest(t, r)))
+        .ok_or_else(unknown)?;
     let body = if head {
         Body::empty()
     } else {
-        match tokio::fs::read(&m.path).await {
-            Ok(b) => Body::from(b),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(unknown()),
-            Err(e) => return Err(e.into()),
-        }
+        Body::from_stream(reg.store.read(&m.blob, None).await?.ok_or_else(unknown)?)
     };
     Response::builder()
         .header(CONTENT_TYPE, &m.media_type)
-        .header(CONTENT_LENGTH, m.size)
+        .header(CONTENT_LENGTH, m.blob.size)
         .header(DIGEST_HEADER, m.digest.to_string())
         .header(ETAG, format!("\"{}\"", m.digest))
         .body(body)

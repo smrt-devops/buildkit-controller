@@ -6,7 +6,7 @@ This chart installs:
 - one Deployment that runs the API, the mTLS edge and the reconciler (2 replicas by default, one of them the leader), with its config file in a ConfigMap;
 - a Service for the API and edge ports, Gateway API routes to it, and a ClusterIP metrics Service;
 - least-privilege RBAC and a PodDisruptionBudget;
-- with `cache.enabled` (the default), the cache registry: a StatefulSet `<fullname>-registry` with one PVC, a Service, a NetworkPolicy that admits only worker pods, and a ServiceAccount;
+- with `cache.enabled` (the default), the cache registry: a StatefulSet `<fullname>-registry` with one PVC (or none, with `cache.store.url`), a Service, a NetworkPolicy that admits only worker pods, and a ServiceAccount;
 - optionally a ServiceMonitor and one `BuildKitPool` per `pools` entry.
 
 `values.yaml` documents every value. The operator guide is [docs/operations.md](../../docs/operations.md).
@@ -249,11 +249,13 @@ The build sandbox depends on these cluster settings. Without an enforcing CNI or
 | `gateway.envoy.*` | `enabled` (false), `connectTimeout`, `tcpKeepalive`, `proxyProtocol` (false; PROXY protocol v2 to the listeners that read it): Envoy Gateway BackendTrafficPolicies |
 | `gateway.extraManifests` | extra objects (or `tpl` strings) for other implementations |
 | `metrics.port`, `metrics.serviceMonitor.enabled` | ops port (`/healthz`, `/readyz`, `/metrics`) on its own Service; ServiceMonitor `true`, `false` or `auto` (only when the CRD exists) |
-| `cache.enabled` | the built-in cache registry, on by default: a one-replica StatefulSet `<fullname>-registry` with one PVC, a Service and a NetworkPolicy that admits worker pods only. `false` removes it, and allocations then carry no cache flags |
+| `cache.enabled` | the built-in cache registry, on by default: a one-replica StatefulSet `<fullname>-registry` with one PVC (none with `cache.store.url`), a Service and a NetworkPolicy that admits worker pods only. `false` removes it, and allocations then carry no cache flags |
 | `cache.maxSize`, `.poolMaxSize`, `.maxBlobSize`, `.maxUploadSize`, `.gcInterval` | `40Gi` for the whole store, `10Gi` for a pool without `spec.workers.cache.maxSize`, `5Gi` for the largest blob, `10Gi` for uploads in progress together, `10m` between garbage collections |
-| `cache.persistence.size`, `.storageClass` | `60Gi`, and `""` for the cluster default. The volume must hold `maxSize` plus `maxUploadSize`; see [operations.md](../../docs/operations.md#sizing-the-volume) |
+| `cache.persistence.size`, `.storageClass` | `60Gi`, and `""` for the cluster default. Used only without `cache.store.url`. The volume must hold `maxSize` plus `maxUploadSize`; see [operations.md](../../docs/operations.md#sizing-the-volume) |
 | `cache.resources`, `.podAnnotations`, `.nodeSelector`, `.tolerations`, `.affinity` | scheduling and resources of the registry pod (100m CPU and 128Mi requested, 512Mi memory limit) |
 | `cache.podLabels` | `{}`. Extra labels on the registry pod template, added after the chart labels. String values only |
+| `cache.store.url`, `.options`, `.secretName` | `""` keeps the volume. `s3://`, `gs://` or `az://` plus bucket and prefix keeps the cache in that object store: the StatefulSet then has no volume and `cache.persistence` is ignored. `options` is a map of provider settings, one registry variable `BUILDKIT_CACHE_STORE_OPT_<key>` each; `secretName` names a Secret in the release namespace whose keys join them under the same prefix (for credentials). See [Build cache](#build-cache) |
+| `cache.serviceAccount.annotations` | `{}`. Annotations on the registry ServiceAccount, such as an IRSA role ARN or a GKE or Azure workload-identity annotation |
 | `claims.namespaces` | namespaces where pipelines create their own `BuildKitClaim`s, `[]` by default. The claim CRD is always installed, because every allocation is a claim. The controller serves claims from these namespaces only and gets Secret get, create and delete there only. With `edge.endpoint` empty, in-cluster claims dial the edge Service port, so `service.ports.edge` must stay 8444 (the chart fails otherwise). See [operations.md](../../docs/operations.md#in-cluster-claims) |
 | `pools` | list of `{name, namespace, spec}`, one BuildKitPool each; `namespace` is required unless `watchNamespaces` has one entry, must be in `watchNamespaces` when that is set, and must not be the release namespace (the chart fails to render otherwise); namespaces are not created |
 
@@ -264,7 +266,7 @@ An `oidc` rule may require that a claim is present without naming its value: a v
 ## Build cache
 
 `cache.enabled` (on by default) runs the cache registry, a one-replica
-StatefulSet with one volume (`cache.persistence`) that only worker pods reach,
+StatefulSet that only worker pods reach, with one volume (`cache.persistence`) or, with `cache.store.url`, an object store,
 over mTLS with the internal CA. Allocations carry `--cache-to` and
 `--cache-from` flags for it. A caller that a pool's `spec.workers.cache.writers`
 rules do not trust never writes the shared cache. With a `ref` claim it writes a
@@ -272,9 +274,24 @@ cache of its own branch or pull request, and the registry answers what that
 lacks from the shared one; without one it gets `--cache-from` only. By default pushes, schedules and
 `workflow_dispatch` runs on a protected ref and in-cluster callers write the
 shared cache. Each repository has its own cache unless the pool sets
-`spec.workers.cache.scope: pool`. `cache.maxSize` bounds the volume and
-`cache.poolMaxSize` each pool without `spec.workers.cache.maxSize`. The volume
-needs room for `cache.maxSize` plus `cache.maxUploadSize`.
+`spec.workers.cache.scope: pool`. `cache.maxSize` bounds the whole store and
+`cache.poolMaxSize` each pool without `spec.workers.cache.maxSize`. A volume
+needs room for `cache.maxSize` plus `cache.maxUploadSize`; a store has no disk to size.
+
+With `cache.store.url` the registry keeps the cache in an object store and the pod has no
+volume (`examples/helm-values-store-s3.yaml`). Give it credentials through the platform
+(`cache.serviceAccount.annotations`) or a Secret (`cache.store.secretName`). A key in
+`cache.store.options` that the provider does not know stops the registry at start-up. Worked examples for S3, MinIO, GCS and Azure, the bucket lifecycle rule and the outage behaviour are in [operations.md](../../docs/operations.md#choosing-the-volume-or-a-store).
+
+The API server refuses any change to a StatefulSet's volume claims, so switching an existing
+release between the volume and a store (either way) makes `helm upgrade` fail with the
+steps to take. The cache starts cold after the switch and no data moves:
+
+1. `kubectl -n <ns> delete statefulset <fullname>-registry --cascade=orphan`
+2. Rerun `helm upgrade` with the new `cache.store.url` (empty for the volume).
+3. Volume to store only, once the new pod is Ready: `kubectl -n <ns> delete pvc data-<fullname>-registry-0`.
+
+Rolling back to 0.4 on a volume needs the PVC deleted first, and every upgrade to 0.5.0 starts the cache cold ([operations.md](../../docs/operations.md#upgrading-to-050-and-rolling-back)).
 
 ## Load balancer idle timeout
 

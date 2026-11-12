@@ -258,7 +258,7 @@ pools: []
 # The built-in build cache: a registry that only worker pods reach, over mTLS with the
 # internal CA. Allocations name it in their --cache-to and --cache-from flags; callers a
 # pool's spec.workers.cache.writers rules do not trust (fork pull requests, by default)
-# get --cache-from only. One replica with one volume: while it restarts, builds run
+# get --cache-from only. One replica with one volume or one store: while it restarts, builds run
 # uncached. false: no registry, and allocations carry no cache flags.
 cache:
   enabled: true
@@ -271,6 +271,21 @@ cache:
   persistence:
     size: 60Gi
     storageClass: ""
+  # An object store instead of the volume. "" keeps the volume. With a URL (s3://bucket/prefix,
+  # gs://bucket/prefix, az://container/prefix) the StatefulSet has no volume and persistence is
+  # ignored. Credentials come from the platform or from a Secret. IRSA uses the annotation in
+  # serviceAccount.annotations; Pod Identity uses an association and no annotation; Azure
+  # workload identity also needs cache.podLabels.
+  store:
+    url: ""
+    # Provider settings, one registry variable BUILDKIT_CACHE_STORE_OPT_<key> each, such as
+    # region or endpoint. A key the provider does not know stops the registry at start-up.
+    options: {}
+    # A Secret in the release namespace whose keys join the options (same key space).
+    secretName: ""
+  # Annotations on the registry ServiceAccount, such as a workload-identity role.
+  serviceAccount:
+    annotations: {}
   resources:
     requests: {cpu: 100m, memory: 128Mi}
     limits: {memory: 512Mi}

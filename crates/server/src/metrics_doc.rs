@@ -506,6 +506,33 @@ mod tests {
     }
 
     #[test]
+    fn churned_pools_leave_no_gone_entries_or_series() {
+        use kube::runtime::{reflector, watcher};
+
+        let m = Metrics::new();
+        let alloc = AllocMetrics::with_releases(m.releases(), m.held());
+        alloc.register(&m);
+        let (store, mut writer) = reflector::store();
+        m.follow_pools(store);
+        let mut names = Vec::new();
+        for i in 0..50 {
+            let name = format!("churn{i}");
+            let pool = crate::render::fixtures::pool(&name, serde_json::json!({})).unwrap();
+            writer.apply_watcher_event(&watcher::Event::Apply(pool.clone()));
+            let _ = m.render();
+            writer.apply_watcher_event(&watcher::Event::Delete(pool));
+            names.push(name);
+        }
+        let _ = m.render();
+        let _ = m.render();
+        assert_eq!(m.gone_len(), 0);
+        let text = m.render();
+        for n in &names {
+            assert!(!text.contains(&format!("pool=\"{n}\"")), "{n} left series");
+        }
+    }
+
+    #[test]
     fn closed_counters_and_histograms_without_a_pool_start_at_zero() {
         let text = controller().render();
         for d in families()

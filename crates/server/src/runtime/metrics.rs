@@ -115,7 +115,8 @@ pub trait PoolSeries: Send + Sync {
 struct Pools {
     seen: HashSet<(String, String)>,
     /// Pools that were seen and are gone. A late write recreates their series, so
-    /// every scrape forgets them again. Bounded by the pools ever deleted.
+    /// the scrape after the deletion forgets them once more, then drops the entry.
+    /// A write later than that still leaks a series.
     gone: HashSet<(String, String)>,
     hooks: Vec<Arc<dyn PoolSeries>>,
 }
@@ -267,6 +268,7 @@ impl Metrics {
             .iter()
             .filter_map(|p| Some((p.namespace()?, p.name_any())))
             .collect();
+        let earlier: Vec<(String, String)> = self.lock_pools().gone.iter().cloned().collect();
         let gone: Vec<(String, String)> =
             self.lock_pools().seen.difference(&now).cloned().collect();
         for (ns, pool) in gone {
@@ -275,12 +277,19 @@ impl Metrics {
         for (ns, pool) in &now {
             self.pool_seen(ns, pool);
         }
-        let p = self.lock_pools();
-        for (ns, pool) in p.gone.difference(&now) {
-            for h in &p.hooks {
-                h.forget(ns, pool);
+        let mut p = self.lock_pools();
+        for key in earlier {
+            if !now.contains(&key) && p.gone.remove(&key) {
+                for h in &p.hooks {
+                    h.forget(&key.0, &key.1);
+                }
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gone_len(&self) -> usize {
+        self.lock_pools().gone.len()
     }
 
     fn lock_pools(&self) -> std::sync::MutexGuard<'_, Pools> {

@@ -94,7 +94,7 @@ kubectl -n buildkit-system port-forward svc/buildkit-controller 8443:8443 8444:8
 
 This install sets `edge.endpoint=tcp://localhost:8444` so the curl recipe in step 4 works, because the recipe has no tunnel client yet. Leave `edge.endpoint` out and forward only port 8443 to use the Action's tunnel instead.
 
-The chart also starts the build cache: a one-pod StatefulSet `buildkit-controller-registry` with a 60Gi volume, from your default StorageClass. kind has one. Check it with `kubectl -n buildkit-system get pods`. To run without a cache, add `--set cache.enabled=false`.
+The chart also starts the build cache: a one-pod StatefulSet `buildkit-controller-registry` with a 60Gi volume, from your default StorageClass. kind has one. (To keep the cache in an object store instead, see [Build cache](operations.md#build-cache).) Check it with `kubectl -n buildkit-system get pods`. To run without a cache, add `--set cache.enabled=false`.
 
 ## 2. Create a pool
 
@@ -200,4 +200,4 @@ kubectl delete bkp --all -A
 kind delete cluster --name bk
 ```
 
-Helm does not remove the CRDs. Delete them with `kubectl delete crd buildkitpools.buildkit.smrt-devops.net buildkitclaims.buildkit.smrt-devops.net` when you no longer need them. The cache volume is a PVC in `buildkit-system`; `helm uninstall` leaves it, so delete it with `kubectl -n buildkit-system delete pvc -l app.kubernetes.io/name=buildkit-registry` if you want the space back.
+Helm does not remove the CRDs. Delete them with `kubectl delete crd buildkitpools.buildkit.smrt-devops.net buildkitclaims.buildkit.smrt-devops.net` when you no longer need them. On the default volume, the cache is a PVC in `buildkit-system`; `helm uninstall` leaves it, so delete it with `kubectl -n buildkit-system delete pvc -l app.kubernetes.io/name=buildkit-registry` if you want the space back. With an object store there is no PVC; delete the bucket or its prefix instead.

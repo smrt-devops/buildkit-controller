@@ -1,0 +1,141 @@
+{
+  "uid": "buildkit-overview",
+  "title": "BuildKit overview",
+  "description": "Health of the controller replicas: leadership, certificates, reconcile loop and Kubernetes watches.",
+  "tags": ["buildkit"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "templating": {
+    "list": [
+      {"name": "datasource", "label": "Data source", "type": "datasource", "query": "prometheus", "current": {}},
+      {"name": "namespace", "label": "Namespace", "type": "query", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "query": {"query": "label_values(buildkit_pool_max, namespace)", "refId": "namespace"}, "definition": "label_values(buildkit_pool_max, namespace)", "refresh": 2, "includeAll": true, "multi": true, "allValue": ".*", "current": {"selected": true, "text": "All", "value": "$__all"}, "sort": 1},
+      {"name": "pool", "label": "Pool", "type": "query", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "query": {"query": "label_values(buildkit_pool_max{namespace=~\"$namespace\"}, pool)", "refId": "pool"}, "definition": "label_values(buildkit_pool_max{namespace=~\"$namespace\"}, pool)", "refresh": 2, "includeAll": true, "multi": true, "allValue": ".*", "current": {"selected": true, "text": "All", "value": "$__all"}, "sort": 1}
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Controller replicas",
+      "description": "Controller replicas whose metrics are scraped. Compare it with replicaCount. A lower number means a replica is down or is not scraped: check the Deployment and the ServiceMonitor.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "count(buildkit_leader)"}]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Leaders",
+      "description": "Replicas that hold the leader Lease. It must be 1. 0 for more than a couple of minutes means nothing binds claims or reconciles pools: check the controller logs and the Lease. More than 1 is a bug: report it.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "fieldConfig": {"defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}, {"color": "red", "value": 2}]}}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum(buildkit_leader)"}]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Leader changes in 1 hour",
+      "description": "Times a replica gained or lost the Lease in the last hour. A few after a rollout are normal. A steady flow means replicas lose the Lease to a slow API server or CPU starvation: look at Kubernetes API latency and the pods' CPU limits.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum(increase(buildkit_leader_transitions_total[1h]))"}]
+    },
+    {
+      "id": 4, "type": "stat", "title": "CA usable",
+      "description": "1 when every replica loads the CA Secret and can use it. 0 means new allocations fail with ca_unavailable: check the CA Secret and the controller logs.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "fieldConfig": {"defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "min(buildkit_ca_valid)"}]
+    },
+    {
+      "id": 5, "type": "stat", "title": "Soonest certificate expiry (days)",
+      "description": "Days until the first certificate the controller reports expires: the client CA, the internal CA, or a replica's edge certificates. Under 30 days, plan the rotation in docs/operations.md before it lapses.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "fieldConfig": {"defaults": {"unit": "d", "decimals": 0, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 30}, {"color": "green", "value": 90}]}}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "(min(buildkit_cert_not_after_seconds) - time()) / 86400"}]
+    },
+    {
+      "id": 6, "type": "stat", "title": "Claims waiting",
+      "description": "Claims queued for a worker across the selected pools. Above 0 for long means demand is over scaling.max or workers start too slowly: see the pools dashboard.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "fieldConfig": {"defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 1}]}}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum(buildkit_pool_waiting{namespace=~\"$namespace\",pool=~\"$pool\"})"}]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Allocation outcomes",
+      "description": "Allocation results per second for the selected pools. result=ok is a bound claim. Anything else is a refusal or a failure: pool_exhausted is a queue timeout (see the pools dashboard), unauthenticated and forbidden are caller access (see the edge and API dashboard), ca_unavailable needs the CA fixed.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (result) (rate(buildkit_allocations_total{namespace=~\"$namespace\",pool=~\"$pool\"}[$__rate_interval]))", "legendFormat": "{{result}}"}]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Reconcile passes",
+      "description": "Pool reconcile passes per second by result. result=error means a step of the pass failed and the pass retries. Errors that persist point at the Kubernetes API: check the watch errors panel and the controller logs.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (result) (rate(buildkit_reconcile_total[$__rate_interval]))", "legendFormat": "{{result}}"}]
+    },
+    {
+      "id": 9, "type": "timeseries", "title": "Reconcile duration",
+      "description": "Median, 95th and 99th percentile of one pool reconcile pass. It grows with the number of pools and with API server latency. A p99 near its seconds-long buckets means the API server is slow or the controller is CPU limited.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.5, sum by (le) (rate(buildkit_reconcile_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p50"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.95, sum by (le) (rate(buildkit_reconcile_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p95"},
+        {"refId": "C", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.99, sum by (le) (rate(buildkit_reconcile_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p99"}
+      ]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Certificate expiry by kind (days)",
+      "description": "Days left on each certificate kind, the soonest across replicas. client_ca and internal_ca are long lived, edge_serving and edge_client renew themselves. A line heading to 0 means the matching rotation did not happen: follow docs/operations.md.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "fieldConfig": {"defaults": {"unit": "d"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "(min by (kind) (buildkit_cert_not_after_seconds) - time()) / 86400", "legendFormat": "{{kind}}"}]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Kubernetes watch errors",
+      "description": "Errors per second from the controller's Kubernetes watches and from the cache registry's pod and pool watches, by what is watched. The watch retries by itself. A flow that does not stop means the API server is unreachable or RBAC is missing: see Kubernetes API outages in docs/operations.md.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (kind) (rate(buildkit_watch_errors_total[$__rate_interval]))", "legendFormat": "{{kind}}"}]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Namespaces a watch cannot list",
+      "description": "1 for each namespace that a pool or pod watch carries on without, because it cannot list it. Pools in that namespace do not get workers. Grant the controller access to the namespace or remove it from the configured scope.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "max by (kind, namespace) (buildkit_watch_namespace_unlisted)", "legendFormat": "{{kind}} {{namespace}}"}]
+    },
+    {
+      "id": 13, "type": "timeseries", "title": "Certificate load errors and CA replacements",
+      "description": "Failures to load the CA bundle or the edge serving certificate (cert), and CA Secret creations or replacements by the leader (reason), per hour. missing is expected once at install. Anything else, or repeated load errors, means the Secrets were edited or restored from a backup: check them.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (cert) (increase(buildkit_cert_load_errors_total[1h]))", "legendFormat": "load error {{cert}}"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (reason) (increase(buildkit_ca_replacements_total[1h]))", "legendFormat": "CA replaced {{reason}}"}
+      ]
+    },
+    {
+      "id": 14, "type": "timeseries", "title": "Worker pod writes",
+      "description": "Worker pod creates, retires and deletes by the reconciler, per second, by result. conflict means the pod was already gone or replaced and is harmless. A steady error rate means the controller cannot write pods: check RBAC, quotas and admission webhooks.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (op, result) (rate(buildkit_pod_operations_total[$__rate_interval]))", "legendFormat": "{{op}} {{result}}"}]
+    }
+  ]
+}

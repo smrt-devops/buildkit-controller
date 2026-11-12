@@ -1,0 +1,172 @@
+{
+  "uid": "buildkit-cache",
+  "title": "BuildKit build cache",
+  "description": "The built-in cache registry: requests, hit ratio, store size against its budget, garbage collection and denials.",
+  "tags": ["buildkit"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "templating": {
+    "list": [
+      {"name": "datasource", "label": "Data source", "type": "datasource", "query": "prometheus", "current": {}},
+      {"name": "namespace", "label": "Namespace", "type": "query", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "query": {"query": "label_values(buildkit_pool_max, namespace)", "refId": "namespace"}, "definition": "label_values(buildkit_pool_max, namespace)", "refresh": 2, "includeAll": true, "multi": true, "allValue": ".*", "current": {"selected": true, "text": "All", "value": "$__all"}, "sort": 1},
+      {"name": "pool", "label": "Pool", "type": "query", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "query": {"query": "label_values(buildkit_pool_max{namespace=~\"$namespace\"}, pool)", "refId": "pool"}, "definition": "label_values(buildkit_pool_max{namespace=~\"$namespace\"}, pool)", "refresh": 2, "includeAll": true, "multi": true, "allValue": ".*", "current": {"selected": true, "text": "All", "value": "$__all"}, "sort": 1},
+      {"name": "cache_budget_bytes", "label": "Cache budget in bytes (chart cache.maxSize, default 40Gi)", "description": "The chart value cache.maxSize in bytes. The registry does not export its budget. The default is the chart default, 40Gi.", "type": "textbox", "query": "42949672960", "current": {"text": "42949672960", "value": "42949672960"}}
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Manifest hit ratio",
+      "description": "Share of manifest GETs that found the manifest (200) among those that found it or did not (404). It is the cache hit ratio at the registry: BuildKit pulls a cache manifest per build. A low value after the first builds means builds do not share a cache key, or the cache is evicted before reuse.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum(rate(buildkit_registry_requests_total{route=\"manifest\",method=\"GET\",status=\"200\"}[$__range])) / sum(rate(buildkit_registry_requests_total{route=\"manifest\",method=\"GET\",status=~\"200|404\"}[$__range]))"}]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Store used against the budget",
+      "description": "Bytes of blobs in the store as a share of the budget set in the Cache budget variable. Set the variable to cache.maxSize in bytes (the registry does not export its budget). Above 0.9, garbage collection evicts constantly: raise cache.maxSize or shrink what builds push.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 0.8}, {"color": "red", "value": 0.9}]}}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "max(buildkit_registry_stored_bytes) / $cache_budget_bytes"}]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Manifests and blobs stored",
+      "description": "Manifests and blobs now in the store. Manifests are cache entries, blobs are their layers. Both fall after garbage collection. Counts that drop to 0 right after a restart mean the cache volume was lost.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "max(buildkit_registry_manifests)", "legendFormat": "manifests"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "max(buildkit_registry_blobs)", "legendFormat": "blobs"}
+      ]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Requests denied in the range",
+      "description": "Requests the registry refused in the selected range for a worker's grant: pushes from untrusted builds are refused by design. Pull denials are not expected. If pull denials appear, a worker asked for a cache it has no grant for: check the pool's cache settings.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (action) (increase(buildkit_registry_denied_total[$__range]))", "legendFormat": "{{action}}"}
+      ]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Registry requests by route and status",
+      "description": "Registry requests per second by route and status. 404 on manifest is a cache miss and is normal. Runs of 5xx mean the registry is failing: check its logs and the volume. 429 means uploads hit their limit.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (route, status) (rate(buildkit_registry_requests_total[$__rate_interval]))", "legendFormat": "{{route}} {{status}}"}]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Registry request latency",
+      "description": "50th and 95th percentile registry request duration until the response head, by route. Blob requests grow with size. A rise across all routes means the volume or the pod is slow: check disk latency and CPU limits.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.5, sum by (le, route) (rate(buildkit_registry_request_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p50 {{route}}"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.95, sum by (le, route) (rate(buildkit_registry_request_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p95 {{route}}"}
+      ]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Hit ratio over time",
+      "description": "Manifest GETs that found their manifest as a share of those that found it or did not, over time. Expect a dip when a new branch or base image first builds, then a recovery. A ratio that stays low means the cache is not being reused.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum(rate(buildkit_registry_requests_total{route=\"manifest\",method=\"GET\",status=\"200\"}[$__rate_interval])) / sum(rate(buildkit_registry_requests_total{route=\"manifest\",method=\"GET\",status=~\"200|404\"}[$__rate_interval]))", "legendFormat": "hit ratio"}]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Stored bytes against the budget",
+      "description": "Bytes of blobs in the store next to the budget from the Cache budget variable. When the line reaches the budget, garbage collection evicts manifests to make room. Set cache.maxSize to hold a few days of builds.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+      "fieldConfig": {"defaults": {"unit": "bytes"}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "max(buildkit_registry_stored_bytes)", "legendFormat": "stored"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "max(buildkit_registry_stored_bytes) * 0 + $cache_budget_bytes", "legendFormat": "budget"}
+      ]
+    },
+    {
+      "id": 9, "type": "timeseries", "title": "Garbage collection",
+      "description": "Manifests evicted to fit a budget (per hour, by budget) and blobs deleted. budget=pool is a pool over its share, budget=volume is the whole store full. Steady evictions mean the cache is too small for your builds: raise cache.maxSize or the pool's share.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (budget) (increase(buildkit_registry_gc_evicted_manifests_total[1h]))", "legendFormat": "evicted manifests {{budget}}"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum(increase(buildkit_registry_gc_deleted_blobs_total[1h]))", "legendFormat": "deleted blobs"}
+      ]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Bytes received in pushes",
+      "description": "Blob and manifest bytes the registry receives per second from cache pushes. Trusted builds push after they finish. A sustained high rate with a low hit ratio means builds push layers that nobody reuses.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22},
+      "fieldConfig": {"defaults": {"unit": "Bps"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum(rate(buildkit_registry_received_bytes_total[$__rate_interval]))", "legendFormat": "received"}]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Denied requests and refused connections",
+      "description": "Requests refused for a worker's grant, by action, and connections closed before a request, by reason. Push denials are expected for untrusted builds. A burst of pull denials or of bad_san and bad_certificate refusals means workers present the wrong certificate: check the pool's cache setup.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 30},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (action) (rate(buildkit_registry_denied_total[$__rate_interval]))", "legendFormat": "denied {{action}}"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (reason) (rate(buildkit_registry_connections_refused_total[$__rate_interval]))", "legendFormat": "refused {{reason}}"}
+      ]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Cache allocations by tier",
+      "description": "Claims that bound with cache flags per second, by pool and tier. trusted builds read and write the cache, untrusted ones only read it. A pool with no cache allocations does not use the cache: check its cache settings and the caller's access rule.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 30},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (namespace, pool, tier) (rate(buildkit_cache_allocations_total{namespace=~\"$namespace\",pool=~\"$pool\"}[$__rate_interval]))", "legendFormat": "{{namespace}}/{{pool}} {{tier}}"}]
+    },
+    {
+      "id": 13, "type": "row", "title": "Store operations", "collapsed": false, "panels": [],
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 38}
+    },
+    {
+      "id": 14, "type": "timeseries", "title": "Store operations by kind and result",
+      "description": "Calls the registry makes to its store (the volume or a bucket) per second, by operation and result. Errors are drawn in red. A get or delete of a missing key is ok, so errors are real failures. Sustained errors mean the store is unreachable or its credentials expired: builds continue uncached. Check the registry logs and readiness.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 39},
+      "fieldConfig": {
+        "defaults": {"unit": "ops"},
+        "overrides": [{"matcher": {"id": "byRegexp", "options": "error .*"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}, {"id": "custom.lineWidth", "value": 3}]}]
+      },
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (op) (rate(buildkit_registry_store_operations_total{result=\"ok\"}[$__rate_interval]))", "legendFormat": "ok {{op}}"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (op) (rate(buildkit_registry_store_operations_total{result=\"error\"}[$__rate_interval]))", "legendFormat": "error {{op}}"}
+      ]
+    },
+    {
+      "id": 15, "type": "timeseries", "title": "Store operation error ratio",
+      "description": "Share of store calls that failed, by operation. It should sit at 0. A rising ratio means the store is unreachable or its credentials expired: builds continue uncached, and pushes are lost. Check the registry logs and readiness, then the volume or the bucket and its credentials.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 39},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 0.05}]}}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (op) (rate(buildkit_registry_store_operations_total{result=\"error\"}[$__rate_interval])) / sum by (op) (rate(buildkit_registry_store_operations_total[$__rate_interval]))", "legendFormat": "{{op}}"}]
+    },
+    {
+      "id": 16, "type": "timeseries", "title": "Store operation latency by kind",
+      "description": "Median and 95th percentile duration of store calls, by operation. A get is timed until the response head and a list until its last page. A p95 that climbs for every operation means a slow volume or bucket: builds wait on cache reads and pushes. Check the store's own health and the registry logs.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 47},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.5, sum by (op, le) (rate(buildkit_registry_store_operation_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p50 {{op}}"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.95, sum by (op, le) (rate(buildkit_registry_store_operation_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p95 {{op}}"}
+      ]
+    }
+  ]
+}

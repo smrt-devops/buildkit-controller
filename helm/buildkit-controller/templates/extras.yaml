@@ -43,10 +43,13 @@ metadata:
     {{- include "bkc.labels" . | nindent 4 }}
     {{- with .Values.metrics.serviceMonitor.labels }}{{ toYaml . | nindent 4 }}{{ end }}
 spec:
+  {{- /* One monitor for both metrics Services: the controller's (component metrics) and the registry's (component registry). */}}
   selector:
     matchLabels:
-      {{- include "bkc.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: metrics
+      app.kubernetes.io/instance: {{ .Release.Name }}
+    matchExpressions:
+      - {key: app.kubernetes.io/name, operator: In, values: [buildkit-controller, buildkit-registry]}
+      - {key: app.kubernetes.io/component, operator: In, values: [metrics, registry]}
   endpoints:
     - {port: metrics, path: /metrics, interval: {{ .Values.metrics.serviceMonitor.interval }}}
 ---

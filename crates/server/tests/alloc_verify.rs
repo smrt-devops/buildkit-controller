@@ -376,10 +376,15 @@ async fn setup(stop: &CancellationToken) -> H {
     }
 }
 
-fn metric(m: &Metrics, needle: &str) -> u64 {
+/// Sums the samples of one metric family whose label set contains `needle`.
+/// Matches only `family{...}` or the bare `family` line, so a family that
+/// shares the prefix (`_bucket`, `_sum`, `_count`) is never counted.
+fn metric(m: &Metrics, family: &str, needle: &str) -> u64 {
+    let labelled = format!("{family}{{");
+    let bare = format!("{family} ");
     m.render()
         .lines()
-        .filter(|l| !l.starts_with('#') && l.contains(needle))
+        .filter(|l| (l.starts_with(&labelled) || l.starts_with(&bare)) && l.contains(needle))
         .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
         .map(|v| v as u64)
         .sum()
@@ -478,7 +483,7 @@ async fn alloc_verify() {
     }
     println!(
         "SCENARIO exclusive: {ROUNDS} rounds, bound {total_ok}, queue timeout {total_exhausted}, shared pods 0, conflicts {}",
-        metric(&h.leader.metrics, "buildkit_claim_conflicts_total{")
+        metric(&h.leader.metrics, "buildkit_claim_conflicts_total", "")
     );
 
     // 2. A waiting allocation binds after a release, in the same POST.
@@ -641,7 +646,11 @@ async fn alloc_verify() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let released = metric(&h.leader.metrics, "reason=\"released\"");
+    let released = metric(
+        &h.leader.metrics,
+        "buildkit_releases_total",
+        "reason=\"released\"",
+    );
     println!(
         "SCENARIO cancelled: 40 cancelled requests ({finished} completed), each retried with its key and released, claims left 0, allocated pods left 0, pods released {released}"
     );
@@ -720,11 +729,13 @@ async fn alloc_verify() {
         "SCENARIO metrics: allocations ok {}, pool_exhausted {}",
         metric(
             &h.leader.metrics,
-            "buildkit_allocations_total{namespace=\"bk-alloc\",pool=\"p\",result=\"ok\"}"
+            "buildkit_allocations_total",
+            "namespace=\"bk-alloc\",pool=\"p\",result=\"ok\""
         ),
         metric(
             &h.leader.metrics,
-            "buildkit_allocations_total{namespace=\"bk-alloc\",pool=\"p\",result=\"pool_exhausted\"}"
+            "buildkit_allocations_total",
+            "namespace=\"bk-alloc\",pool=\"p\",result=\"pool_exhausted\""
         )
     );
 
@@ -780,7 +791,11 @@ async fn idle(h: &H) {
     .await;
     h.gone(&names).await;
     assert_eq!(
-        metric(&h.leader.metrics, "reason=\"allocation_idle\""),
+        metric(
+            &h.leader.metrics,
+            "buildkit_releases_total",
+            "reason=\"allocation_idle\""
+        ),
         1,
         "{}",
         h.leader.metrics.render()

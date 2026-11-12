@@ -27,9 +27,14 @@ const REFUSALS: &[&str] = &[
     "bad_san",
 ];
 const BUDGETS: &[&str] = &["pool", "volume"];
+/// Calls to the object store, one value per kind of call.
+pub const STORE_OPS: &[&str] = &[
+    "get", "put", "put_part", "complete", "abort", "delete", "list",
+];
+const RESULTS: &[&str] = &["ok", "error"];
 
 /// The cache registry's families.
-pub const TABLE: [Def; 10] = [
+pub const TABLE: [Def; 12] = [
     Def::counter(
         "registry_requests",
         Role::Registry,
@@ -90,6 +95,22 @@ pub const TABLE: [Def; 10] = [
         &[],
         "Manifests in the store, over all repositories",
     ),
+    Def::counter(
+        "registry_store_operations",
+        Role::Registry,
+        &[
+            Label::closed("op", STORE_OPS),
+            Label::closed("result", RESULTS),
+        ],
+        "Calls to the store (the volume or a bucket), by kind and result. `put` counts the start of a multipart upload too; `delete` counts each key; `list` counts each listing. A `get` or `delete` of a missing key is `ok`: the end of a race with garbage collection",
+    ),
+    Def::histogram(
+        "registry_store_operation_duration_seconds",
+        Role::Registry,
+        &[Label::closed("op", STORE_OPS)],
+        &BUCKETS,
+        "Store call duration: a `get` until the response head, a `list` until its last page, a `delete` until that key's result",
+    ),
 ];
 
 fn histogram() -> Histogram {
@@ -109,6 +130,8 @@ pub struct RegistryMetrics {
     stored_bytes: Gauge,
     blobs: Gauge,
     manifests: Gauge,
+    store_ops: Family<Labels, Counter>,
+    store_duration: HistogramFamily,
 }
 
 impl Default for RegistryMetrics {
@@ -124,6 +147,8 @@ impl Default for RegistryMetrics {
             stored_bytes: Gauge::default(),
             blobs: Gauge::default(),
             manifests: Gauge::default(),
+            store_ops: Family::default(),
+            store_duration: Family::new_with_constructor(histogram),
         }
     }
 }
@@ -161,6 +186,14 @@ impl RegistryMetrics {
                     ("registry_stored_bytes", Handle::new(m.stored_bytes.clone())),
                     ("registry_blobs", Handle::new(m.blobs.clone())),
                     ("registry_manifests", Handle::new(m.manifests.clone())),
+                    (
+                        "registry_store_operations",
+                        Handle::new(m.store_ops.clone()),
+                    ),
+                    (
+                        "registry_store_operation_duration_seconds",
+                        Handle::new(m.store_duration.clone()),
+                    ),
                 ],
             );
         });
@@ -168,6 +201,8 @@ impl RegistryMetrics {
         TABLE[2].seed(None, &m.denied);
         TABLE[3].seed(None, &m.refused);
         TABLE[5].seed(None, &m.evicted);
+        TABLE[10].seed(None, &m.store_ops);
+        TABLE[11].seed(None, &m.store_duration);
         m
     }
 
@@ -208,6 +243,26 @@ impl RegistryMetrics {
                 .inc_by(n);
         }
         self.deleted_blobs.inc_by(r.deleted_blobs);
+    }
+
+    /// One store call of kind `op`, one of [`STORE_OPS`].
+    pub fn store_op(&self, op: &'static str, ok: bool, secs: f64) {
+        let result = if ok { "ok" } else { "error" };
+        self.store_ops
+            .get_or_create(&vec![("op", op.to_owned()), ("result", result.to_owned())])
+            .inc();
+        self.store_duration
+            .get_or_create(&vec![("op", op.to_owned())])
+            .observe(secs);
+    }
+
+    /// Store calls of kind `op` with `result` so far.
+    #[cfg(test)]
+    #[must_use]
+    pub fn store_ops(&self, op: &str, result: &str) -> u64 {
+        self.store_ops
+            .get_or_create(&vec![("op", op.to_owned()), ("result", result.to_owned())])
+            .get()
     }
 
     pub fn stats(&self, s: Stats) {

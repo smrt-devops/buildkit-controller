@@ -1,38 +1,37 @@
-//! The content store: one directory on one volume, content addressed.
+//! The content store: one object store, content addressed, with the index in
+//! memory.
 //!
-//! ```text
-//! blobs/sha256/<hex>              content (manifests too)
-//! repos/<repo>/_links/<hex>       empty: the blob is visible in <repo>
-//! repos/<repo>/_manifests/<hex>   "<media type>\n<last pull or push, unix s>\n"
-//! repos/<repo>/_tags/<tag>        "sha256:<hex>"
-//! uploads/<id>                    an upload in progress
-//! tmp/                            files on their way to an atomic rename
-//! ```
+//! Every object has a key of the [`layout`]. No key is written twice: each
+//! write goes to a fresh id, and a key is deleted only after the index has
+//! stopped naming it, so no write can race a delete of the same key. Store
+//! I/O happens outside the index lock, a [`std::sync::Mutex`] that no await
+//! may cross. Deletes run after the lock is released; one that fails goes on
+//! the store's one retry list, which the next collection deletes first.
 //!
-//! Repository components start with `[a-z0-9]`, so the `_` names cannot clash
-//! with a nested repository. The index lives in memory: [`Store::open`]
-//! rebuilds it from the tree, and every change is written through. Content
-//! lands in `uploads/` or `tmp/`, is hashed as it streams, synced, and renamed
-//! into `blobs/` under the index lock, the same lock garbage collection holds
-//! while it deletes. A blob is visible in a repository only through a link,
-//! so one scope cannot read another's cache by digest.
+//! A blob is visible in a repository only through a link, so one scope
+//! cannot read another's cache by digest. Links live in memory: [`Store::open`]
+//! rebuilds them from the manifest records, which carry each manifest's
+//! references, so the open never reads a manifest body or a tag.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io;
-use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::{Arc, MutexGuard, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::stream::{self, BoxStream};
+use futures::{Stream, StreamExt, TryStreamExt};
+use object_store::path::Path;
+use object_store::{GetOptions, MultipartUpload, ObjectStore, ObjectStoreExt, PutPayload};
 use ring::digest::{Context, SHA256};
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 use tracing::warn;
 
 use super::gc::{self, Budgets, Reason};
+use super::layout::{self, Id, Key};
 
 /// A `sha256:` digest, the only algorithm served.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -49,7 +48,7 @@ impl Digest {
         Self(hex(ctx.finish().as_ref()))
     }
 
-    fn from_hex(s: &str) -> Option<Self> {
+    pub(super) fn from_hex(s: &str) -> Option<Self> {
         (s.len() == 64 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')))
             .then(|| Self(s.to_owned()))
     }
@@ -74,7 +73,7 @@ impl fmt::Display for Digest {
     }
 }
 
-fn hex(b: &[u8]) -> String {
+pub(super) fn hex(b: &[u8]) -> String {
     use std::fmt::Write as _;
     b.iter()
         .fold(String::with_capacity(b.len() * 2), |mut s, x| {
@@ -124,12 +123,23 @@ pub enum StoreError {
     ManifestBlobUnknown(Digest),
     #[error("open uploads hold all the upload space")]
     UploadSpace,
+    #[error("uploads hold every part buffer; try again")]
+    PartsBusy,
     #[error("request body stalled")]
     Stalled,
     #[error("request body: {0}")]
     Body(String),
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[error(transparent)]
+    Store(#[from] object_store::Error),
+}
+
+/// One stored blob: its size and the id of its data object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Blob {
+    pub size: u64,
+    pub id: Id,
 }
 
 /// One manifest of a repository.
@@ -140,8 +150,47 @@ pub(super) struct Manifest {
     pub refs: Vec<Digest>,
     /// Last pull or push, unix seconds.
     pub last_used: u64,
-    /// `last_used` as last written to disk.
+    /// `last_used` as its stored record holds it.
     pub persisted: u64,
+    /// The id of its record's key.
+    pub record: Id,
+}
+
+impl Manifest {
+    /// The record: media type, last-used time, one line per reference.
+    fn record_text(&self) -> String {
+        use std::fmt::Write as _;
+        let head = format!("{}\n{}\n", self.media_type, self.last_used);
+        self.refs.iter().fold(head, |mut s, r| {
+            let _ = writeln!(s, "{r}");
+            s
+        })
+    }
+
+    fn parse_record(text: &str, record: Id) -> Option<Self> {
+        let mut lines = text.lines();
+        let media_type = lines.next().filter(|m| !m.is_empty())?.to_owned();
+        let last_used = lines.next()?.parse().ok()?;
+        let mut refs = lines
+            .map(|l| l.parse().ok())
+            .collect::<Option<Vec<Digest>>>()?;
+        refs.sort();
+        refs.dedup();
+        Some(Self {
+            media_type,
+            refs,
+            last_used,
+            persisted: last_used,
+            record,
+        })
+    }
+}
+
+/// A tag: the manifest it names and the id of its marker.
+#[derive(Clone, Debug)]
+pub(super) struct Tag {
+    pub digest: Digest,
+    pub id: Id,
 }
 
 /// One repository.
@@ -151,27 +200,34 @@ pub(super) struct Repo {
     /// seconds; in memory only, set to the start time on open).
     pub links: HashMap<Digest, u64>,
     pub manifests: HashMap<Digest, Manifest>,
-    pub tags: BTreeMap<String, Digest>,
+    pub tags: BTreeMap<String, Tag>,
 }
 
 /// The in-memory index.
 #[derive(Debug, Default)]
 pub(super) struct Index {
-    /// Blob sizes.
-    pub blobs: HashMap<Digest, u64>,
+    pub blobs: HashMap<Digest, Blob>,
     pub repos: BTreeMap<String, Repo>,
 }
 
-/// An upload in progress.
+/// An upload in progress. Its bytes go to `data/<id>`: on the volume as one
+/// part per received chunk, on a bucket through a part buffer of
+/// [`PART_SIZE`], or as one put if they never fill it.
 pub struct Upload {
     repo: String,
     /// The worker that opened it: the DNS name of its certificate, nonce
     /// included, so a later pod of the same name starts with a clean quota.
     owner: String,
-    file: tokio::fs::File,
-    path: PathBuf,
+    id: Id,
+    part: Option<Box<dyn MultipartUpload>>,
+    /// Bytes not yet sent as a part. Holds its own copy, never a network
+    /// buffer.
+    buf: Vec<u8>,
+    /// The part permit, held from the first byte to the end of the upload.
+    permit: Option<OwnedSemaphorePermit>,
     hasher: Context,
     size: u64,
+    /// When a request last wrote to it.
     touched: Instant,
 }
 
@@ -183,14 +239,23 @@ impl Upload {
     }
 }
 
+/// A blob found by [`Store::blob`]: its size, and what [`Store::read`] needs.
+#[derive(Debug)]
+pub struct Found {
+    pub size: u64,
+    id: Id,
+}
+
 /// A manifest found by [`Store::manifest`].
 #[derive(Debug)]
 pub struct FoundManifest {
     pub digest: Digest,
     pub media_type: String,
-    pub size: u64,
-    pub path: PathBuf,
+    pub blob: Found,
 }
+
+/// A body read from the store.
+pub type Body = BoxStream<'static, Result<Bytes, object_store::Error>>;
 
 /// Totals for the gauges.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -213,6 +278,28 @@ pub struct GcReport {
 pub const MAX_UPLOADS: usize = 1024;
 /// Uploads one worker may hold open at once.
 pub const MAX_UPLOADS_PER_OWNER: usize = 64;
+/// Record reads at open, and record writes in a collection, in flight at once.
+const RECORD_IO: usize = 32;
+/// Part buffers of uploads to a bucket, over all uploads.
+pub const PART_PERMITS: usize = 48;
+/// Part buffers one owner may hold: a quarter, as with upload bytes.
+pub const PART_PERMITS_PER_OWNER: usize = PART_PERMITS / 4;
+/// A part: the smallest S3 and the GCS XML API take, except the last.
+pub const PART_SIZE: usize = 5 << 20;
+/// An upload that holds a part permit and has seen no request for this long
+/// is aborted when a permit is wanted, and at each collection. Twice the
+/// longest gap within a request body.
+pub const PART_IDLE: Duration = Duration::from_mins(2);
+
+/// How the store takes the parts of an upload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Parts {
+    /// Each chunk as it arrives: the volume, whose parts have no minimum.
+    Direct,
+    /// Through a part buffer of [`PART_SIZE`], one of [`PART_PERMITS`]: a
+    /// bucket.
+    Buffered,
+}
 
 /// Size bounds of the store.
 #[derive(Clone, Copy, Debug)]
@@ -224,22 +311,36 @@ pub struct StoreLimits {
     pub max_upload_bytes: u64,
 }
 
-/// Slots and bytes held by open uploads, in total and per owner.
+/// What one owner's open uploads hold.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Held {
+    slots: usize,
+    bytes: u64,
+    permits: usize,
+}
+
+/// Slots, bytes and part permits held by open uploads, in total and per
+/// owner.
 #[derive(Debug, Default)]
 struct Quota {
     bytes: u64,
-    owners: HashMap<String, (usize, u64)>,
+    owners: HashMap<String, Held>,
 }
-/// How often a pulled manifest's last-used time is written back, at most.
-const PERSIST_EVERY: u64 = 60;
+
+type Slot = Arc<tokio::sync::Mutex<Upload>>;
 
 /// The store.
 pub struct Store {
-    root: PathBuf,
+    os: Arc<dyn ObjectStore>,
     limits: StoreLimits,
-    index: Mutex<Index>,
-    uploads: std::sync::Mutex<HashMap<String, Arc<Mutex<Upload>>>>,
+    parts: Parts,
+    /// [`PART_PERMITS`], taken only with [`Parts::Buffered`].
+    permits: Arc<Semaphore>,
+    index: std::sync::Mutex<Index>,
+    uploads: std::sync::Mutex<HashMap<String, Slot>>,
     quota: std::sync::Mutex<Quota>,
+    /// Keys the index no longer names whose delete failed.
+    retry: std::sync::Mutex<Vec<Path>>,
 }
 
 fn now_secs() -> u64 {
@@ -248,20 +349,17 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-fn random_id() -> io::Result<String> {
-    use ring::rand::SecureRandom;
-    let mut b = [0u8; 16];
-    ring::rand::SystemRandom::new()
-        .fill(&mut b)
-        .map_err(|_| io::Error::other("OS random number generator failed"))?;
-    Ok(hex(&b))
+fn lock<T>(m: &std::sync::Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-async fn remove(path: &Path) {
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => warn!(path = %path.display(), error = %e, "removing a cache file"),
+fn is_not_found(e: &object_store::Error) -> bool {
+    matches!(e, object_store::Error::NotFound { .. })
+}
+
+async fn abort_part(mut part: Box<dyn MultipartUpload>) {
+    if let Err(e) = part.abort().await {
+        warn!(error = %e, "aborting a cache upload");
     }
 }
 
@@ -306,129 +404,305 @@ pub(super) fn manifest_refs(body: &[u8]) -> Result<(Option<String>, Vec<Digest>)
     Ok((media, refs))
 }
 
+/// Checks that every ref is a stored blob linked in `repo` or in `fallback`,
+/// and returns those linked only in `fallback`.
+fn borrowed(
+    idx: &Index,
+    repo: &str,
+    fallback: Option<&str>,
+    refs: &[Digest],
+) -> Result<Vec<Digest>, StoreError> {
+    let linked = |name: Option<&str>, r: &Digest| {
+        name.and_then(|n| idx.repos.get(n))
+            .is_some_and(|x| x.links.contains_key(r))
+    };
+    let mut out = Vec::new();
+    for r in refs {
+        let here = linked(Some(repo), r);
+        if !idx.blobs.contains_key(r) || !(here || linked(fallback, r)) {
+            return Err(StoreError::ManifestBlobUnknown(r.clone()));
+        }
+        if !here {
+            out.push(r.clone());
+        }
+    }
+    Ok(out)
+}
+
+fn link(idx: &mut Index, repo: &str, d: &Digest) {
+    idx.repos
+        .entry(repo.to_owned())
+        .or_default()
+        .links
+        .insert(d.clone(), now_secs());
+}
+
+/// Installs `blob` as `d` (or keeps the stored one, returning the keys of
+/// `blob` to delete) and links it into `repo`.
+fn commit(idx: &mut Index, repo: &str, d: &Digest, blob: Blob) -> Vec<Path> {
+    let doomed = if idx.blobs.contains_key(d) {
+        vec![
+            Key::Marker(d.clone(), blob.id.clone()).path(),
+            Key::Data(blob.id).path(),
+        ]
+    } else {
+        idx.blobs.insert(d.clone(), blob);
+        Vec::new()
+    };
+    link(idx, repo, d);
+    doomed
+}
+
+/// Installs manifest `m` of `repo` with its body `blob`, links the refs it
+/// `borrowed`, and points `tag` at it. Returns the keys it replaced.
+fn install(
+    idx: &mut Index,
+    repo: &str,
+    d: &Digest,
+    blob: Blob,
+    borrowed: &[Digest],
+    m: Manifest,
+    tag: Option<(String, Id)>,
+) -> Vec<Path> {
+    let mut doomed = commit(idx, repo, d, blob);
+    for r in borrowed {
+        link(idx, repo, r);
+    }
+    let r = idx.repos.entry(repo.to_owned()).or_default();
+    if let Some(old) = r.manifests.insert(d.clone(), m) {
+        let key = Key::Record {
+            repo: repo.to_owned(),
+            digest: d.clone(),
+            id: old.record,
+        };
+        doomed.push(key.path());
+    }
+    if let Some((t, id)) = tag {
+        let new = Tag {
+            digest: d.clone(),
+            id,
+        };
+        if let Some(old) = r.tags.insert(t.clone(), new) {
+            let key = Key::Tag {
+                repo: repo.to_owned(),
+                tag: t,
+                digest: old.digest,
+                id: old.id,
+            };
+            doomed.push(key.path());
+        }
+    }
+    doomed
+}
+
+/// Keys found by the listings at open, sorted by what they hold.
+#[derive(Default)]
+struct Listed {
+    data: HashMap<Id, u64>,
+    markers: Vec<(Digest, Id, Path)>,
+    records: Vec<(String, Digest, Manifest)>,
+    tags: Vec<(String, String, Tag, (i64, u32))>,
+    doomed: Vec<Path>,
+}
+
 impl Store {
-    /// Opens the store at `root`, creating it if needed: clears `tmp/` and
-    /// `uploads/` and rebuilds the index. Blocking; run it before serving.
-    pub fn open(root: &Path, limits: StoreLimits) -> io::Result<Self> {
-        for d in ["tmp", "uploads"] {
-            match std::fs::remove_dir_all(root.join(d)) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-                _ => {}
-            }
-            std::fs::create_dir_all(root.join(d))?;
-        }
-        std::fs::create_dir_all(root.join("blobs/sha256"))?;
-        std::fs::create_dir_all(root.join("repos"))?;
+    /// Opens the store on `os` and rebuilds the index from three listings
+    /// and one read per manifest record. Keys that do not belong are queued
+    /// for deletion, which the first collection performs, so they do not
+    /// hold up serving.
+    pub async fn open(
+        os: Arc<dyn ObjectStore>,
+        limits: StoreLimits,
+        parts: Parts,
+    ) -> Result<Self, StoreError> {
+        let mut l = Self::list(&*os).await?;
+        let now = now_secs();
         let mut idx = Index::default();
-        for e in std::fs::read_dir(root.join("blobs/sha256"))? {
-            let e = e?;
-            match e.file_name().to_str().and_then(Digest::from_hex) {
-                Some(d) => {
-                    idx.blobs.insert(d, e.metadata()?.len());
+
+        // Markers with data are blobs; the first marker of a digest wins.
+        let mut named = HashSet::new();
+        for (d, id, path) in l.markers {
+            match l.data.get(&id) {
+                Some(&size) if !idx.blobs.contains_key(&d) && named.insert(id.clone()) => {
+                    idx.blobs.insert(d, Blob { size, id });
                 }
-                None => std::fs::remove_file(e.path())?,
+                _ => l.doomed.push(path),
             }
         }
-        let store = Self {
-            root: root.to_owned(),
+        l.doomed.extend(
+            l.data
+                .into_keys()
+                .filter(|id| !named.contains(id))
+                .map(|id| Key::Data(id).path()),
+        );
+
+        // Records of stored manifests; of two for one manifest, the newer.
+        for (repo, d, m) in l.records {
+            let record = |id: &Id| {
+                Key::Record {
+                    repo: repo.clone(),
+                    digest: d.clone(),
+                    id: id.clone(),
+                }
+                .path()
+            };
+            if !idx.blobs.contains_key(&d) {
+                l.doomed.push(record(&m.record));
+                continue;
+            }
+            let r = idx.repos.entry(repo.clone()).or_default();
+            match r.manifests.get(&d) {
+                Some(old) if old.last_used >= m.last_used => l.doomed.push(record(&m.record)),
+                _ => {
+                    if let Some(old) = r.manifests.insert(d.clone(), m) {
+                        l.doomed.push(record(&old.record));
+                    }
+                }
+            }
+        }
+        // Links: every manifest and each of its refs that is stored.
+        let Index { blobs, repos } = &mut idx;
+        for r in repos.values_mut() {
+            let reached: Vec<Digest> = r
+                .manifests
+                .iter()
+                .flat_map(|(d, m)| std::iter::once(d).chain(&m.refs))
+                .filter(|d| blobs.contains_key(*d))
+                .cloned()
+                .collect();
+            r.links.extend(reached.into_iter().map(|d| (d, now)));
+        }
+
+        // Tags whose manifest is in the repository; of several for one tag,
+        // the newest marker, then the newer manifest, then the digest.
+        l.tags.sort_by(|a, b| {
+            let used = |x: &(String, String, Tag, (i64, u32))| {
+                idx.repos
+                    .get(&x.0)
+                    .and_then(|r| r.manifests.get(&x.2.digest))
+                    .map(|m| m.last_used)
+            };
+            (&a.0, &a.1, a.3, used(a), &a.2.digest).cmp(&(&b.0, &b.1, b.3, used(b), &b.2.digest))
+        });
+        for (repo, tag, t, _) in l.tags {
+            let key = Key::Tag {
+                repo: repo.clone(),
+                tag: tag.clone(),
+                digest: t.digest.clone(),
+                id: t.id.clone(),
+            };
+            match idx.repos.get_mut(&repo) {
+                Some(r) if r.manifests.contains_key(&t.digest) => {
+                    // Sorted oldest first: each later marker replaces the one before.
+                    if let Some(old) = r.tags.insert(tag.clone(), t) {
+                        l.doomed.push(
+                            Key::Tag {
+                                repo,
+                                tag,
+                                digest: old.digest,
+                                id: old.id,
+                            }
+                            .path(),
+                        );
+                    }
+                }
+                _ => l.doomed.push(key.path()),
+            }
+        }
+
+        Ok(Self {
+            os,
             limits,
-            index: Mutex::new(Index::default()),
+            parts,
+            permits: Arc::new(Semaphore::new(PART_PERMITS)),
+            index: std::sync::Mutex::new(idx),
             uploads: std::sync::Mutex::default(),
             quota: std::sync::Mutex::default(),
-        };
-        store.scan(&root.join("repos"), "", &mut idx, now_secs())?;
-        Ok(Self {
-            index: Mutex::new(idx),
-            ..store
+            retry: std::sync::Mutex::new(l.doomed),
         })
     }
 
-    fn scan(&self, dir: &Path, name: &str, idx: &mut Index, now: u64) -> io::Result<()> {
-        let mut repo = Repo::default();
-        let entries = |sub: &str| -> io::Result<Vec<(String, PathBuf)>> {
-            match std::fs::read_dir(dir.join(sub)) {
-                Ok(rd) => rd
-                    .map(|e| {
-                        let e = e?;
-                        Ok((e.file_name().to_string_lossy().into_owned(), e.path()))
-                    })
-                    .collect(),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-                Err(e) => Err(e),
-            }
-        };
-        for (f, path) in entries("_links")? {
-            match Digest::from_hex(&f).filter(|d| idx.blobs.contains_key(d)) {
-                Some(d) => {
-                    repo.links.insert(d, now);
-                }
-                None => std::fs::remove_file(path)?,
-            }
-        }
-        for (f, path) in entries("_manifests")? {
-            match self.load_manifest(&f, &path, idx, &repo) {
-                Some((d, m)) => {
-                    repo.manifests.insert(d, m);
-                }
-                None => std::fs::remove_file(path)?,
-            }
-        }
-        for (f, path) in entries("_tags")? {
-            let d = std::fs::read_to_string(&path)?
-                .trim()
-                .parse::<Digest>()
-                .ok();
-            match d.filter(|d| repo.manifests.contains_key(d)) {
-                Some(d) => {
-                    repo.tags.insert(f, d);
-                }
-                None => std::fs::remove_file(path)?,
-            }
-        }
-        if !name.is_empty()
-            && (!repo.links.is_empty() || !repo.manifests.is_empty() || !repo.tags.is_empty())
-        {
-            idx.repos.insert(name.to_owned(), repo);
-        }
-        for e in std::fs::read_dir(dir)? {
-            let e = e?;
-            let f = e.file_name().to_string_lossy().into_owned();
-            if e.file_type()?.is_dir() && !f.starts_with('_') {
-                let child = if name.is_empty() {
-                    f
-                } else {
-                    format!("{name}/{f}")
+    /// Lists `data/`, `blobs/` and `repos/` at once, and reads each record
+    /// as the `repos/` listing yields it.
+    async fn list(os: &dyn ObjectStore) -> Result<Listed, StoreError> {
+        let data = os
+            .list(Some(&Path::from(layout::DATA)))
+            .try_collect::<Vec<_>>();
+        let blobs = os
+            .list(Some(&Path::from(layout::BLOBS)))
+            .try_collect::<Vec<_>>();
+        let mut tags = Vec::new();
+        let mut doomed = Vec::new();
+        let records = os
+            .list(Some(&Path::from(layout::REPOS)))
+            .try_filter_map(|meta| {
+                let out = match Key::parse(meta.location.as_ref()) {
+                    Some(Key::Record { repo, digest, id }) => {
+                        Some((repo, digest, id, meta.location))
+                    }
+                    Some(Key::Tag {
+                        repo,
+                        tag,
+                        digest,
+                        id,
+                    }) => {
+                        let t = meta.last_modified;
+                        let at = (t.timestamp(), t.timestamp_subsec_nanos());
+                        tags.push((repo, tag, Tag { digest, id }, at));
+                        None
+                    }
+                    _ => {
+                        doomed.push(meta.location);
+                        None
+                    }
                 };
-                self.scan(&e.path(), &child, idx, now)?;
+                futures::future::ready(Ok(out))
+            })
+            .map_ok(|(repo, digest, id, path)| async move {
+                let text = match os.get(&path).await {
+                    Ok(r) => r.bytes().await,
+                    Err(e) => Err(e),
+                };
+                match text {
+                    Ok(b) => Ok((repo, digest, id, path, Some(b))),
+                    Err(e) if is_not_found(&e) => Ok((repo, digest, id, path, None)),
+                    Err(e) => Err(e),
+                }
+            })
+            .try_buffer_unordered(RECORD_IO)
+            .try_collect::<Vec<_>>();
+        let (data, blobs, records) = futures::try_join!(data, blobs, records)?;
+
+        let mut l = Listed {
+            tags,
+            doomed,
+            ..Listed::default()
+        };
+        for meta in data {
+            match Key::parse(meta.location.as_ref()) {
+                Some(Key::Data(id)) => {
+                    l.data.insert(id, meta.size);
+                }
+                _ => l.doomed.push(meta.location),
             }
         }
-        Ok(())
-    }
-
-    fn load_manifest(
-        &self,
-        file: &str,
-        path: &Path,
-        idx: &Index,
-        repo: &Repo,
-    ) -> Option<(Digest, Manifest)> {
-        let d = Digest::from_hex(file).filter(|d| repo.links.contains_key(d))?;
-        let record = std::fs::read_to_string(path).ok()?;
-        let mut lines = record.lines();
-        let media_type = lines.next().filter(|m| !m.is_empty())?.to_owned();
-        let last_used = lines.next()?.parse().ok()?;
-        idx.blobs.get(&d)?;
-        let body = std::fs::read(self.blob_path(&d)).ok()?;
-        let (_, refs) = manifest_refs(&body).ok()?;
-        Some((
-            d,
-            Manifest {
-                media_type,
-                refs,
-                last_used,
-                persisted: last_used,
-            },
-        ))
+        for meta in blobs {
+            match Key::parse(meta.location.as_ref()) {
+                Some(Key::Marker(d, id)) => l.markers.push((d, id, meta.location)),
+                _ => l.doomed.push(meta.location),
+            }
+        }
+        for (repo, d, id, path, body) in records {
+            let m = body
+                .as_deref()
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .and_then(|t| Manifest::parse_record(t, id));
+            match m {
+                Some(m) => l.records.push((repo, d, m)),
+                None => l.doomed.push(path),
+            }
+        }
+        Ok(l)
     }
 
     /// The largest blob accepted.
@@ -437,113 +711,112 @@ impl Store {
         self.limits.max_blob
     }
 
-    fn blob_path(&self, d: &Digest) -> PathBuf {
-        self.root.join("blobs/sha256").join(d.hex())
+    fn index(&self) -> MutexGuard<'_, Index> {
+        lock(&self.index)
     }
 
-    fn repo_dir(&self, repo: &str) -> PathBuf {
-        self.root.join("repos").join(repo)
+    fn uploads(&self) -> MutexGuard<'_, HashMap<String, Slot>> {
+        lock(&self.uploads)
     }
 
-    /// The blob `d` as seen from `repo`: its path and size. Renews the link.
-    pub async fn blob(&self, repo: &str, d: &Digest) -> Option<(PathBuf, u64)> {
-        let mut idx = self.index.lock().await;
-        let size = *idx.blobs.get(d)?;
-        let t = idx.repos.get_mut(repo)?.links.get_mut(d)?;
-        *t = now_secs();
-        Some((self.blob_path(d), size))
+    fn quota(&self) -> MutexGuard<'_, Quota> {
+        lock(&self.quota)
     }
 
-    async fn link(&self, idx: &mut Index, repo: &str, d: &Digest) -> io::Result<()> {
-        let r = idx.repos.entry(repo.to_owned()).or_default();
-        if !r.links.contains_key(d) {
-            let dir = self.repo_dir(repo).join("_links");
-            tokio::fs::create_dir_all(&dir).await?;
-            tokio::fs::File::create(dir.join(d.hex())).await?;
+    /// Deletes `keys`. When the store fails any of them, every key it did not
+    /// confirm goes on the retry list; a key already gone counts as deleted.
+    async fn delete(&self, keys: Vec<Path>) {
+        if keys.is_empty() {
+            return;
         }
-        r.links.insert(d.clone(), now_secs());
-        Ok(())
+        let sent = keys.clone();
+        let mut done = HashSet::new();
+        let mut failed = false;
+        let mut results = self
+            .os
+            .delete_stream(stream::iter(keys.into_iter().map(Ok)).boxed());
+        while let Some(r) = results.next().await {
+            match r {
+                Ok(p) => {
+                    done.insert(p);
+                }
+                Err(e) if is_not_found(&e) => {}
+                Err(e) => {
+                    warn!(error = %e, "deleting a cache object");
+                    failed = true;
+                }
+            }
+        }
+        if failed {
+            lock(&self.retry).extend(sent.into_iter().filter(|p| !done.contains(p)));
+        }
     }
 
-    async fn write_tmp(&self, bytes: &[u8]) -> io::Result<PathBuf> {
-        let tmp = self.root.join("tmp").join(random_id()?);
-        let mut f = tokio::fs::File::create(&tmp).await?;
-        let r = async {
-            f.write_all(bytes).await?;
-            f.flush().await?;
-            f.sync_all().await
-        }
-        .await;
-        if let Err(e) = r {
-            remove(&tmp).await;
-            return Err(e);
-        }
-        Ok(tmp)
+    /// Deletes the keys on the retry list.
+    async fn retry_deletes(&self) {
+        let keys = std::mem::take(&mut *lock(&self.retry));
+        self.delete(keys).await;
     }
 
-    /// Moves the synced file `tmp` into the store as `d` (or drops it when
-    /// `d` is already stored) and links it into `repo`. Holds the index lock.
-    async fn commit(
+    /// The blob `d` as seen from `repo`. Renews the link.
+    pub fn blob(&self, repo: &str, d: &Digest) -> Option<Found> {
+        let mut idx = self.index();
+        let Index { blobs, repos } = &mut *idx;
+        let b = blobs.get(d)?;
+        *repos.get_mut(repo)?.links.get_mut(d)? = now_secs();
+        Some(Found {
+            size: b.size,
+            id: b.id.clone(),
+        })
+    }
+
+    /// The bytes of `found`, or the inclusive `range` of them. `None` when
+    /// garbage collection deleted the blob after it was found.
+    pub async fn read(
         &self,
-        idx: &mut Index,
-        repo: &str,
-        tmp: &Path,
-        d: &Digest,
-        size: u64,
-    ) -> io::Result<()> {
-        if idx.blobs.contains_key(d) {
-            remove(tmp).await;
-        } else {
-            tokio::fs::rename(tmp, self.blob_path(d)).await?;
-            idx.blobs.insert(d.clone(), size);
+        found: &Found,
+        range: Option<(u64, u64)>,
+    ) -> Result<Option<Body>, StoreError> {
+        let opts = GetOptions::default().with_range(range.map(|(s, e)| s..e + 1));
+        match self
+            .os
+            .get_opts(&Key::Data(found.id.clone()).path(), opts)
+            .await
+        {
+            Ok(r) => Ok(Some(r.into_stream())),
+            Err(e) if is_not_found(&e) => Ok(None),
+            Err(e) => Err(e.into()),
         }
-        self.link(idx, repo, d).await
     }
 
     /// Starts an upload into `repo` for `owner`. `None` when [`MAX_UPLOADS`]
     /// are open, or [`MAX_UPLOADS_PER_OWNER`] of the owner's.
-    pub async fn start_upload(&self, repo: &str, owner: &str) -> io::Result<Option<String>> {
-        let id = random_id()?;
-        let path = self.root.join("uploads").join(&id);
-        let file = tokio::fs::File::create(&path).await?;
+    pub fn start_upload(&self, repo: &str, owner: &str) -> io::Result<Option<String>> {
+        let id = Id::random()?;
         let up = Upload {
             repo: repo.to_owned(),
             owner: owner.to_owned(),
-            file,
-            path: path.clone(),
+            id: id.clone(),
+            part: None,
+            buf: Vec::new(),
+            permit: None,
             hasher: Context::new(&SHA256),
             size: 0,
             touched: Instant::now(),
         };
-        let full = {
-            let mut uploads = self.uploads();
-            let mut q = self.quota();
-            let slots = &mut q.owners.entry(owner.to_owned()).or_default().0;
-            let full = uploads.len() >= MAX_UPLOADS || *slots >= MAX_UPLOADS_PER_OWNER;
-            if !full {
-                *slots += 1;
-                uploads.insert(id.clone(), Arc::new(Mutex::new(up)));
+        let mut uploads = self.uploads();
+        let mut q = self.quota();
+        let held = q.owners.entry(owner.to_owned()).or_default();
+        if uploads.len() >= MAX_UPLOADS || held.slots >= MAX_UPLOADS_PER_OWNER {
+            if *held == Held::default() {
+                q.owners.remove(owner);
             }
-            full
-        };
-        if full {
-            self.release(owner, 0, 0);
-            remove(&path).await;
             return Ok(None);
         }
+        held.slots += 1;
+        let id = id.as_str().to_owned();
+        uploads.insert(id.clone(), Arc::new(tokio::sync::Mutex::new(up)));
         Ok(Some(id))
-    }
-
-    fn uploads(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Mutex<Upload>>>> {
-        self.uploads
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn quota(&self) -> std::sync::MutexGuard<'_, Quota> {
-        self.quota
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn owner_bytes(&self) -> u64 {
@@ -558,28 +831,38 @@ impl Store {
     fn reserve(&self, owner: &str, n: u64) -> Result<(), StoreError> {
         let max_owner = self.owner_bytes();
         let mut q = self.quota();
-        let held = q.owners.get(owner).map_or(0, |o| o.1);
+        let held = q.owners.get(owner).map_or(0, |o| o.bytes);
         if q.bytes.saturating_add(n) > self.limits.max_upload_bytes
             || held.saturating_add(n) > max_owner
         {
             return Err(StoreError::UploadSpace);
         }
         q.bytes += n;
-        q.owners.entry(owner.to_owned()).or_default().1 += n;
+        q.owners.entry(owner.to_owned()).or_default().bytes += n;
         Ok(())
     }
 
-    /// Gives back `slots` uploads and `bytes` of `owner`.
-    fn release(&self, owner: &str, slots: usize, bytes: u64) {
+    /// Gives back what `owner` held: `slots` uploads, `bytes` and `permits`.
+    fn release(&self, owner: &str, slots: usize, bytes: u64, permits: usize) {
         let mut q = self.quota();
         q.bytes = q.bytes.saturating_sub(bytes);
         if let Some(o) = q.owners.get_mut(owner) {
-            o.0 = o.0.saturating_sub(slots);
-            o.1 = o.1.saturating_sub(bytes);
-            if *o == (0, 0) {
+            o.slots = o.slots.saturating_sub(slots);
+            o.bytes = o.bytes.saturating_sub(bytes);
+            o.permits = o.permits.saturating_sub(permits);
+            if *o == Held::default() {
                 q.owners.remove(owner);
             }
         }
+    }
+
+    /// Ends `up`: gives back its slot, bytes and permit, drops its buffer,
+    /// and returns its multipart upload for the caller to abort or complete.
+    fn end(&self, up: &mut Upload) -> Option<Box<dyn MultipartUpload>> {
+        let permits = usize::from(up.permit.take().is_some());
+        up.buf = Vec::new();
+        self.release(&up.owner, 1, up.size, permits);
+        up.part.take()
     }
 
     /// The upload `id` of `repo`, locked for this request. `Err(())` when
@@ -594,12 +877,49 @@ impl Store {
     }
 
     /// Ends the upload `id` and deletes what it received.
-    pub async fn abort(&self, id: &str, up: OwnedMutexGuard<Upload>) {
+    pub async fn abort(&self, id: &str, mut up: OwnedMutexGuard<Upload>) {
         self.uploads().remove(id);
-        self.release(&up.owner, 1, up.size);
-        let path = up.path.clone();
+        let part = self.end(&mut up);
         drop(up);
-        remove(&path).await;
+        if let Some(p) = part {
+            abort_part(p).await;
+        }
+    }
+
+    /// Gives `up` a part permit before a request writes to it, unless the
+    /// store takes chunks directly, the request declares an empty body, or
+    /// `up` holds one. With none free, it first aborts the uploads that hold
+    /// one and have been idle for [`PART_IDLE`]. Fails with
+    /// [`StoreError::PartsBusy`] when still none is free, or when the owner
+    /// holds [`PART_PERMITS_PER_OWNER`]; the upload stays as it was.
+    pub async fn take_permit(&self, up: &mut Upload, empty: bool) -> Result<(), StoreError> {
+        if self.parts == Parts::Direct || empty || up.permit.is_some() {
+            return Ok(());
+        }
+        if self.try_permit(up) {
+            return Ok(());
+        }
+        self.expire_where(|u| u.permit.is_some() && u.touched.elapsed() >= PART_IDLE)
+            .await;
+        if self.try_permit(up) {
+            Ok(())
+        } else {
+            Err(StoreError::PartsBusy)
+        }
+    }
+
+    fn try_permit(&self, up: &mut Upload) -> bool {
+        let mut q = self.quota();
+        let held = q.owners.entry(up.owner.clone()).or_default();
+        if held.permits >= PART_PERMITS_PER_OWNER {
+            return false;
+        }
+        let Ok(p) = Arc::clone(&self.permits).try_acquire_owned() else {
+            return false;
+        };
+        held.permits += 1;
+        up.permit = Some(p);
+        true
     }
 
     /// Appends `body` to the upload, hashing as it streams. A gap of `idle`
@@ -623,15 +943,18 @@ impl Store {
                 Ok(Some(Err(e))) => return Err(StoreError::Body(e.to_string())),
                 Ok(Some(Ok(c))) => c,
             };
+            if chunk.is_empty() {
+                continue;
+            }
             let size = up.size.saturating_add(chunk.len() as u64);
             if size > self.limits.max_blob {
                 return Err(StoreError::TooLarge(self.limits.max_blob));
             }
             let n = chunk.len() as u64;
             self.reserve(&up.owner, n)?;
-            if let Err(e) = up.file.write_all(&chunk).await {
-                self.release(&up.owner, 0, n);
-                return Err(e.into());
+            if let Err(e) = self.write(up, &chunk).await {
+                self.release(&up.owner, 0, n, 0);
+                return Err(e);
             }
             up.hasher.update(&chunk);
             up.size = size;
@@ -639,8 +962,48 @@ impl Store {
         }
     }
 
-    /// Ends the upload `id` as blob `want`: verifies the digest, syncs, and
-    /// commits it into its repository. The upload is gone either way.
+    /// Writes `chunk`: on the volume as one part; on a bucket into the part
+    /// buffer, sending each full part and waiting for it before more of the
+    /// body is read, so an upload holds one buffer at most.
+    async fn write(&self, up: &mut Upload, chunk: &Bytes) -> Result<(), StoreError> {
+        if self.parts == Parts::Direct {
+            return Ok(self.send_part(up, chunk.clone()).await?);
+        }
+        // A request that declared an empty body and sent bytes all the same.
+        if up.permit.is_none() && !self.try_permit(up) {
+            return Err(StoreError::PartsBusy);
+        }
+        let mut rest = &chunk[..];
+        while !rest.is_empty() {
+            if up.buf.capacity() == 0 {
+                up.buf.reserve_exact(PART_SIZE);
+            }
+            let take = (PART_SIZE - up.buf.len()).min(rest.len());
+            up.buf.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if up.buf.len() == PART_SIZE {
+                let part = Bytes::from(std::mem::take(&mut up.buf));
+                self.send_part(up, part).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_part(&self, up: &mut Upload, part: Bytes) -> Result<(), object_store::Error> {
+        if up.part.is_none() {
+            let key = Key::Data(up.id.clone()).path();
+            up.part = Some(self.os.put_multipart(&key).await?);
+        }
+        match up.part.as_mut() {
+            Some(p) => p.put_part(PutPayload::from(part)).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Ends the upload `id` as blob `want`: verifies the digest, completes
+    /// its data object, or puts it whole if it never filled a part, writes
+    /// its marker and commits it into its repository. The upload is gone
+    /// either way; it keeps its permit until its last bytes are sent.
     pub async fn finish(
         &self,
         id: &str,
@@ -648,38 +1011,61 @@ impl Store {
         want: &Digest,
     ) -> Result<(), StoreError> {
         self.uploads().remove(id);
-        self.release(&up.owner, 1, up.size);
         let got = Digest::finish(up.hasher.clone());
-        let synced = async {
-            up.file.flush().await?;
-            up.file.sync_all().await
-        }
-        .await;
-        let (path, size, repo) = (up.path.clone(), up.size, up.repo.clone());
+        let (repo, size, data_id) = (up.repo.clone(), up.size, up.id.clone());
+        let buf = Bytes::from(std::mem::take(&mut up.buf));
+        let data = Key::Data(data_id.clone()).path();
+        let marker = Key::Marker(want.clone(), data_id.clone()).path();
+        let written = if &got == want {
+            let part = up.part.take();
+            async {
+                match part {
+                    Some(mut p) => {
+                        let sent = async {
+                            if !buf.is_empty() {
+                                p.put_part(PutPayload::from(buf)).await?;
+                            }
+                            p.complete().await
+                        }
+                        .await;
+                        if let Err(e) = sent {
+                            abort_part(p).await;
+                            return Err(e);
+                        }
+                    }
+                    None => {
+                        self.os.put(&data, PutPayload::from(buf)).await?;
+                    }
+                }
+                self.os.put(&marker, PutPayload::default()).await
+            }
+            .await
+            .map_err(StoreError::from)
+        } else {
+            Err(StoreError::DigestMismatch(want.clone()))
+        };
+        let part = self.end(&mut up);
         drop(up);
-        if &got != want {
-            remove(&path).await;
-            return Err(StoreError::DigestMismatch(want.clone()));
+        if let Some(p) = part {
+            abort_part(p).await;
         }
-        if let Err(e) = synced {
-            remove(&path).await;
-            return Err(e.into());
+        if let Err(e) = written {
+            if !matches!(e, StoreError::DigestMismatch(_)) {
+                self.delete(vec![marker, data]).await;
+            }
+            return Err(e);
         }
-        let mut idx = self.index.lock().await;
-        let r = self.commit(&mut idx, &repo, &path, want, size).await;
-        drop(idx);
-        if r.is_err() {
-            remove(&path).await;
-        }
-        Ok(r?)
+        let doomed = commit(&mut self.index(), &repo, want, Blob { size, id: data_id });
+        self.delete(doomed).await;
+        Ok(())
     }
 
     /// Stores a manifest and, for a tag, points the tag at it. Every blob it
     /// references must already be linked in `repo`, or in `fallback`, the
     /// trusted repository that a branch repository reads through: such a blob
     /// is then linked into `repo` too, so the branch cache holds everything it
-    /// references. The files are written and synced before the index lock and
-    /// only renamed under it.
+    /// references. The check runs before anything is written and again under
+    /// the lock that installs the manifest.
     pub async fn put_manifest(
         &self,
         repo: &str,
@@ -702,171 +1088,189 @@ impl Store {
         if media_type.contains('\n') {
             return Err(StoreError::ManifestInvalid("bad media type".to_owned()));
         }
+        borrowed(&self.index(), repo, fallback, &refs)?;
+
         let now = now_secs();
-        let dir = self.repo_dir(repo);
-        // Each temporary file that is not renamed into place is removed below.
-        let mut tmps: Vec<PathBuf> = Vec::new();
-        let r: Result<(), StoreError> = async {
-            tmps.push(self.write_tmp(body).await?);
-            tmps.push(
-                self.write_tmp(format!("{media_type}\n{now}\n").as_bytes())
-                    .await?,
-            );
-            let mut places = vec![dir.join("_manifests").join(d.hex())];
-            if let Reference::Tag(t) = reference {
-                tmps.push(self.write_tmp(d.to_string().as_bytes()).await?);
-                places.push(dir.join("_tags").join(t));
-            }
-            let mut idx = self.index.lock().await;
-            let linked = |idx: &Index, name: Option<&str>, r: &Digest| {
-                name.and_then(|n| idx.repos.get(n))
-                    .is_some_and(|x| x.links.contains_key(r))
-            };
-            if let Some(r) = refs.iter().find(|r| {
-                !idx.blobs.contains_key(*r)
-                    || !(linked(&idx, Some(repo), r) || linked(&idx, fallback, r))
-            }) {
-                return Err(StoreError::ManifestBlobUnknown(r.clone()));
-            }
-            let borrowed: Vec<Digest> = refs
-                .iter()
-                .filter(|r| !linked(&idx, Some(repo), r))
-                .cloned()
-                .collect();
-            self.commit(&mut idx, repo, &tmps[0], &d, body.len() as u64)
-                .await?;
-            for r in &borrowed {
-                self.link(&mut idx, repo, r).await?;
-            }
-            for (tmp, path) in tmps[1..].iter().zip(&places) {
-                if let Some(parent) = path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
+        let data_id = Id::random()?;
+        let m = Manifest {
+            media_type,
+            refs,
+            last_used: now,
+            persisted: now,
+            record: Id::random()?,
+        };
+        let tag = match reference {
+            Reference::Tag(t) => Some((t.clone(), Id::random()?)),
+            Reference::Digest(_) => None,
+        };
+        let data = Key::Data(data_id.clone()).path();
+        let mut rest = vec![
+            (Key::Marker(d.clone(), data_id.clone()).path(), Bytes::new()),
+            (
+                Key::Record {
+                    repo: repo.to_owned(),
+                    digest: d.clone(),
+                    id: m.record.clone(),
                 }
-                tokio::fs::rename(tmp, path).await?;
-            }
-            let r = idx.repos.entry(repo.to_owned()).or_default();
-            r.manifests.insert(
-                d.clone(),
-                Manifest {
-                    media_type,
-                    refs,
-                    last_used: now,
-                    persisted: now,
-                },
-            );
-            if let Reference::Tag(t) = reference {
-                r.tags.insert(t.clone(), d.clone());
-            }
-            Ok(())
+                .path(),
+                Bytes::from(m.record_text()),
+            ),
+        ];
+        if let Some((t, id)) = &tag {
+            let key = Key::Tag {
+                repo: repo.to_owned(),
+                tag: t.clone(),
+                digest: d.clone(),
+                id: id.clone(),
+            };
+            rest.push((key.path(), Bytes::new()));
+        }
+        let keys: Vec<Path> = std::iter::once(data.clone())
+            .chain(rest.iter().map(|(k, _)| k.clone()))
+            .collect();
+        // The data first, so a marker never names a missing object.
+        let written = async {
+            self.os
+                .put(&data, PutPayload::from(Bytes::copy_from_slice(body)))
+                .await?;
+            futures::future::try_join_all(
+                rest.into_iter()
+                    .map(|(k, b)| async move { self.os.put(&k, PutPayload::from(b)).await }),
+            )
+            .await
         }
         .await;
-        for tmp in &tmps {
-            remove(tmp).await;
+        if let Err(e) = written {
+            self.delete(keys).await;
+            return Err(e.into());
         }
-        r.map(|()| d)
-    }
 
-    /// The manifest `reference` of `repo`. Records the pull, and writes it to
-    /// the manifest's record at most every [`PERSIST_EVERY`]: outside the
-    /// index lock and best effort, so a full disk never fails a read.
-    pub async fn manifest(&self, repo: &str, reference: &Reference) -> Option<FoundManifest> {
-        let (found, due) = {
-            let mut idx = self.index.lock().await;
-            let Index { blobs, repos } = &mut *idx;
-            let r = repos.get_mut(repo)?;
-            let d = match reference {
-                Reference::Tag(t) => r.tags.get(t)?.clone(),
-                Reference::Digest(d) => d.clone(),
-            };
-            let size = *blobs.get(&d)?;
-            let m = r.manifests.get_mut(&d)?;
-            let now = now_secs();
-            m.last_used = now;
-            // A failed write is tried again after another PERSIST_EVERY.
-            let due = now.saturating_sub(m.persisted) >= PERSIST_EVERY;
-            if due {
-                m.persisted = now;
+        let (outcome, doomed) = {
+            let mut idx = self.index();
+            match borrowed(&idx, repo, fallback, &m.refs) {
+                Err(e) => (Err(e), keys),
+                Ok(borrowed) => {
+                    let blob = Blob {
+                        size: body.len() as u64,
+                        id: data_id,
+                    };
+                    let doomed = install(&mut idx, repo, &d, blob, &borrowed, m, tag);
+                    (Ok(()), doomed)
+                }
             }
-            let found = FoundManifest {
-                media_type: m.media_type.clone(),
-                size,
-                path: self.blob_path(&d),
-                digest: d,
-            };
-            (found, due.then_some(now))
         };
-        if let Some(now) = due
-            && let Err(e) = self.persist(repo, &found, now).await
-        {
-            warn!(repository = repo, digest = %found.digest, error = %e, "recording a manifest pull");
-        }
-        Some(found)
+        self.delete(doomed).await;
+        outcome.map(|()| d)
     }
 
-    /// Writes the pull time `now` into the record of `found`, unless garbage
-    /// collection has evicted it meanwhile.
-    async fn persist(&self, repo: &str, found: &FoundManifest, now: u64) -> io::Result<()> {
-        let record = format!("{}\n{now}\n", found.media_type);
-        let tmp = self.write_tmp(record.as_bytes()).await?;
-        let idx = self.index.lock().await;
-        let r = if idx
-            .repos
-            .get(repo)
-            .is_some_and(|r| r.manifests.contains_key(&found.digest))
-        {
-            let path = self
-                .repo_dir(repo)
-                .join("_manifests")
-                .join(found.digest.hex());
-            tokio::fs::rename(&tmp, path).await
-        } else {
-            Ok(())
+    /// The manifest `reference` of `repo`. Records the pull in memory; the
+    /// next collection writes it to the record.
+    pub fn manifest(&self, repo: &str, reference: &Reference) -> Option<FoundManifest> {
+        let mut idx = self.index();
+        let Index { blobs, repos } = &mut *idx;
+        let r = repos.get_mut(repo)?;
+        let d = match reference {
+            Reference::Tag(t) => r.tags.get(t)?.digest.clone(),
+            Reference::Digest(d) => d.clone(),
         };
-        drop(idx);
-        remove(&tmp).await;
-        r
+        let b = blobs.get(&d)?;
+        let m = r.manifests.get_mut(&d)?;
+        m.last_used = now_secs();
+        Some(FoundManifest {
+            media_type: m.media_type.clone(),
+            blob: Found {
+                size: b.size,
+                id: b.id.clone(),
+            },
+            digest: d,
+        })
     }
 
-    /// Deletes uploads idle for `max_age` that no request holds. Returns how many.
+    /// Deletes uploads that no request holds and that have been idle for
+    /// `max_age`, or for [`PART_IDLE`] while holding a part permit. Returns
+    /// how many.
     pub async fn expire_uploads(&self, max_age: Duration) -> usize {
-        let mut gone = Vec::new();
+        let part_idle = PART_IDLE.min(max_age);
+        self.expire_where(|u| {
+            let idle = u.touched.elapsed();
+            idle >= max_age || (u.permit.is_some() && idle >= part_idle)
+        })
+        .await
+    }
+
+    /// Deletes the uploads that no request holds and that `doomed` picks.
+    async fn expire_where(&self, doomed: impl Fn(&Upload) -> bool) -> usize {
+        let mut parts = Vec::new();
+        let mut n = 0;
         self.uploads().retain(|_, slot| match slot.try_lock() {
-            Ok(up) if up.touched.elapsed() >= max_age => {
-                self.release(&up.owner, 1, up.size);
-                gone.push(up.path.clone());
+            Ok(mut up) if doomed(&up) => {
+                parts.extend(self.end(&mut up));
+                n += 1;
                 false
             }
             _ => true,
         });
-        for p in &gone {
-            remove(p).await;
+        for p in parts {
+            abort_part(p).await;
         }
-        gone.len()
+        n
     }
 
-    /// Runs one garbage collection (see [`gc`]). Blobs are moved aside under
-    /// the index lock and deleted after it is released, so deleting large
-    /// files does not hold up requests.
+    /// Runs one garbage collection (see [`gc`]): deletes the retry list,
+    /// applies the plan to the index under the lock, deletes what it removed
+    /// after releasing it, then writes the records whose last-used time
+    /// changed.
     pub async fn gc(&self, budgets: &dyn Budgets, grace: Duration) -> GcReport {
-        let mut idx = self.index.lock().await;
+        self.retry_deletes().await;
+        let (report, rounds) = self.apply(budgets, grace);
+        for round in rounds {
+            self.delete(round).await;
+        }
+        self.write_last_used().await;
+        report
+    }
+
+    /// Applies one plan. Returns the keys to delete in three rounds: records
+    /// and tag markers, then blob markers, then data objects, so a crash
+    /// between rounds leaves only what the next open cleans.
+    fn apply(&self, budgets: &dyn Budgets, grace: Duration) -> (GcReport, [Vec<Path>; 3]) {
+        let mut idx = self.index();
         let plan = gc::plan(&idx, budgets, now_secs(), grace.as_secs());
         let mut report = GcReport::default();
+        let [mut repo_keys, mut markers, mut data] = [Vec::new(), Vec::new(), Vec::new()];
         for (name, d, reason) in &plan.evict {
-            let dir = self.repo_dir(name);
-            remove(&dir.join("_manifests").join(d.hex())).await;
             let Some(repo) = idx.repos.get_mut(name) else {
                 continue;
             };
-            repo.manifests.remove(d);
+            let Some(m) = repo.manifests.remove(d) else {
+                continue;
+            };
+            repo_keys.push(
+                Key::Record {
+                    repo: name.clone(),
+                    digest: d.clone(),
+                    id: m.record,
+                }
+                .path(),
+            );
             let tags: Vec<String> = repo
                 .tags
                 .iter()
-                .filter(|(_, t)| *t == d)
+                .filter(|(_, t)| t.digest == *d)
                 .map(|(k, _)| k.clone())
                 .collect();
             for t in tags {
-                remove(&dir.join("_tags").join(&t)).await;
-                repo.tags.remove(&t);
+                if let Some(old) = repo.tags.remove(&t) {
+                    repo_keys.push(
+                        Key::Tag {
+                            repo: name.clone(),
+                            tag: t,
+                            digest: old.digest,
+                            id: old.id,
+                        }
+                        .path(),
+                    );
+                }
             }
             match reason {
                 Reason::Pool => report.evicted_pool += 1,
@@ -874,44 +1278,200 @@ impl Store {
             }
         }
         for (name, d) in &plan.unlink {
-            remove(&self.repo_dir(name).join("_links").join(d.hex())).await;
             if let Some(repo) = idx.repos.get_mut(name) {
                 repo.links.remove(d);
             }
         }
-        let mut doomed = Vec::new();
         for d in &plan.delete {
-            let Some(size) = idx.blobs.remove(d) else {
+            let Some(b) = idx.blobs.remove(d) else {
                 continue;
             };
             report.deleted_blobs += 1;
-            report.freed_bytes += size;
-            let aside = self.root.join("tmp").join(format!("gc-{}", d.hex()));
-            match tokio::fs::rename(self.blob_path(d), &aside).await {
-                Ok(()) => doomed.push(aside),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    warn!(digest = %d, error = %e, "moving a cache blob aside; deleting it in place");
-                    remove(&self.blob_path(d)).await;
-                }
-            }
+            report.freed_bytes += b.size;
+            markers.push(Key::Marker(d.clone(), b.id.clone()).path());
+            data.push(Key::Data(b.id).path());
         }
         idx.repos
             .retain(|_, r| !(r.links.is_empty() && r.manifests.is_empty() && r.tags.is_empty()));
-        drop(idx);
-        for p in &doomed {
-            remove(p).await;
+        (report, [repo_keys, markers, data])
+    }
+
+    /// Writes each manifest whose last-used time differs from its record to
+    /// a fresh record key, and swaps the new key in where the index still
+    /// names the old one. A failed write leaves the manifest changed for the
+    /// next pass.
+    async fn write_last_used(&self) {
+        let changed: Vec<(String, Digest, Id, u64, String)> = {
+            let idx = self.index();
+            idx.repos
+                .iter()
+                .flat_map(|(name, r)| {
+                    r.manifests
+                        .iter()
+                        .filter(|(_, m)| m.last_used != m.persisted)
+                        .map(move |(d, m)| {
+                            (
+                                name.clone(),
+                                d.clone(),
+                                m.record.clone(),
+                                m.last_used,
+                                m.record_text(),
+                            )
+                        })
+                })
+                .collect()
+        };
+        if changed.is_empty() {
+            return;
         }
-        report
+        let written: Vec<_> = stream::iter(changed)
+            .map(|(repo, d, old, used, text)| async move {
+                let id = Id::random()?;
+                let key = Key::Record {
+                    repo: repo.clone(),
+                    digest: d.clone(),
+                    id: id.clone(),
+                };
+                self.os.put(&key.path(), PutPayload::from(text)).await?;
+                Ok::<_, StoreError>((repo, d, old, used, id))
+            })
+            .buffer_unordered(RECORD_IO)
+            .filter_map(|r| async move {
+                r.inspect_err(|e| warn!(error = %e, "recording manifest pulls"))
+                    .ok()
+            })
+            .collect()
+            .await;
+        let doomed: Vec<Path> = {
+            let mut idx = self.index();
+            written
+                .into_iter()
+                .map(|(repo, d, old, used, id)| {
+                    let m = idx
+                        .repos
+                        .get_mut(&repo)
+                        .and_then(|r| r.manifests.get_mut(&d))
+                        .filter(|m| m.record == old);
+                    // The new key replaces the old one, or loses to a push or
+                    // an eviction that came in between.
+                    let gone = match m {
+                        Some(m) => {
+                            m.record = id;
+                            m.persisted = used;
+                            old
+                        }
+                        None => id,
+                    };
+                    Key::Record {
+                        repo,
+                        digest: d,
+                        id: gone,
+                    }
+                    .path()
+                })
+                .collect()
+        };
+        self.delete(doomed).await;
     }
 
     /// Totals for the gauges.
-    pub async fn stats(&self) -> Stats {
-        let idx = self.index.lock().await;
+    pub fn stats(&self) -> Stats {
+        let idx = self.index();
         Stats {
-            bytes: idx.blobs.values().sum(),
+            bytes: idx.blobs.values().map(|b| b.size).sum(),
             blobs: idx.blobs.len() as u64,
             manifests: idx.repos.values().map(|r| r.manifests.len() as u64).sum(),
+        }
+    }
+
+    /// Every key the index names.
+    #[cfg(test)]
+    pub(super) fn keys(&self) -> std::collections::BTreeSet<String> {
+        let idx = self.index();
+        let mut out = std::collections::BTreeSet::new();
+        for (d, b) in &idx.blobs {
+            out.insert(Key::Data(b.id.clone()).to_string());
+            out.insert(Key::Marker(d.clone(), b.id.clone()).to_string());
+        }
+        for (name, r) in &idx.repos {
+            for (d, m) in &r.manifests {
+                let k = Key::Record {
+                    repo: name.clone(),
+                    digest: d.clone(),
+                    id: m.record.clone(),
+                };
+                out.insert(k.to_string());
+            }
+            for (tag, t) in &r.tags {
+                let k = Key::Tag {
+                    repo: name.clone(),
+                    tag: tag.clone(),
+                    digest: t.digest.clone(),
+                    id: t.id.clone(),
+                };
+                out.insert(k.to_string());
+            }
+        }
+        out
+    }
+
+    /// Every key in the store.
+    #[cfg(test)]
+    pub(super) async fn listed(&self) -> std::collections::BTreeSet<String> {
+        self.os
+            .list(None)
+            .map_ok(|m| m.location.to_string())
+            .try_collect()
+            .await
+            .unwrap_or_default()
+    }
+
+    /// The last-used time of each manifest record in the store, read from
+    /// the store.
+    #[cfg(test)]
+    pub(super) async fn recorded_times(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for key in self.listed().await {
+            if !key.contains("/_manifests/") {
+                continue;
+            }
+            let Ok(r) = self.os.get(&Path::from(key)).await else {
+                continue;
+            };
+            let text = r.bytes().await.unwrap_or_default();
+            let text = String::from_utf8_lossy(&text);
+            out.extend(text.lines().nth(1).and_then(|l| l.parse::<u64>().ok()));
+        }
+        out
+    }
+
+    /// The blobs linked in `repo`.
+    #[cfg(test)]
+    pub(super) fn links(&self, repo: &str) -> Vec<Digest> {
+        self.index()
+            .repos
+            .get(repo)
+            .map(|r| r.links.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether every manifest's record holds its last-used time.
+    #[cfg(test)]
+    pub(super) fn persisted(&self) -> bool {
+        self.index()
+            .repos
+            .values()
+            .flat_map(|r| r.manifests.values())
+            .all(|m| m.last_used == m.persisted)
+    }
+
+    /// Sets every manifest's last-used time to `t`, as a pull at `t` would.
+    #[cfg(test)]
+    pub(super) fn set_last_used(&self, t: u64) {
+        for r in self.index().repos.values_mut() {
+            for m in r.manifests.values_mut() {
+                m.last_used = t;
+            }
         }
     }
 }
@@ -920,41 +1480,71 @@ impl Store {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::*;
+    use object_store::memory::InMemory;
 
-    /// Recording a pull is bookkeeping: when the disk refuses the write, the
-    /// manifest is still served.
+    use super::*;
+    use crate::registry::testing::Probe;
+
+    const LIMITS: StoreLimits = StoreLimits {
+        max_blob: 1 << 20,
+        max_upload_bytes: 4 << 20,
+    };
+
+    /// Recording a pull is bookkeeping: when the store refuses the write, the
+    /// manifest is still served, and the next pass tries again.
     #[tokio::test]
     async fn a_failed_pull_record_does_not_fail_the_read() {
-        let root = std::env::temp_dir().join(format!("bk-store-persist-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let limits = StoreLimits {
-            max_blob: 1 << 20,
-            max_upload_bytes: 4 << 20,
-        };
-        let store = Store::open(&root, limits).unwrap();
+        let probe = Arc::new(Probe::new(Arc::new(InMemory::new())));
+        let store = Store::open(probe.clone(), LIMITS, Parts::Buffered)
+            .await
+            .unwrap();
         let body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
         let tag = Reference::Tag("t".into());
         let d = store
             .put_manifest("ns/p/app", None, &tag, None, body)
             .await
             .unwrap();
-        store
-            .index
-            .lock()
-            .await
-            .repos
-            .get_mut("ns/p/app")
-            .unwrap()
-            .manifests
-            .get_mut(&d)
-            .unwrap()
-            .persisted = 0;
-        // No temporary file can be created any more.
-        std::fs::remove_dir_all(root.join("tmp")).unwrap();
-        std::fs::write(root.join("tmp"), b"").unwrap();
-        let found = store.manifest("ns/p/app", &tag).await.unwrap();
+        store.set_last_used(1);
+        probe.fail_puts(true);
+        let big = gc::FixedBudgets {
+            pool: u64::MAX,
+            total: u64::MAX,
+        };
+        store.gc(&big, Duration::from_hours(1)).await;
+        assert!(!store.persisted());
+        let found = store.manifest("ns/p/app", &tag).unwrap();
         assert_eq!(found.digest, d);
-        std::fs::remove_dir_all(&root).ok();
+        assert!(store.read(&found.blob, None).await.unwrap().is_some());
+        // Once the store answers again, the pass writes the record.
+        probe.fail_puts(false);
+        store.gc(&big, Duration::from_hours(1)).await;
+        assert!(store.persisted());
+        assert_eq!(store.keys(), store.listed().await);
+    }
+
+    #[test]
+    fn records_round_trip() {
+        let m = Manifest {
+            media_type: "application/vnd.oci.image.index.v1+json".into(),
+            refs: {
+                let mut r = vec![Digest::of(b"a"), Digest::of(b"b")];
+                r.sort();
+                r
+            },
+            last_used: 42,
+            persisted: 42,
+            record: Id::random().unwrap(),
+        };
+        let back = Manifest::parse_record(&m.record_text(), m.record.clone()).unwrap();
+        assert_eq!(
+            (back.media_type, back.refs, back.last_used),
+            (m.media_type, m.refs, m.last_used)
+        );
+        for bad in ["", "\n1\n", "x\nnot a time\n", "x\n1\nsha256:00\n"] {
+            assert!(
+                Manifest::parse_record(bad, m.record.clone()).is_none(),
+                "{bad:?}"
+            );
+        }
     }
 }

@@ -1,0 +1,11 @@
+edge: {endpoint: "tcp://bk.example.com:8444", serverName: bk.example.com}
+cache:
+  store:
+    url: s3://example-build-cache/buildkit
+    options: {region: eu-west-1, endpoint: "https://s3.example.com"}
+    secretName: cache-store-credentials
+  serviceAccount:
+    annotations: {eks.amazonaws.com/role-arn: "arn:aws:iam::111111111111:role/example-build-cache"}
+  persistence: {size: 150Gi, storageClass: fast}
+  podLabels: {team: builds}
+gateway: {enabled: false}

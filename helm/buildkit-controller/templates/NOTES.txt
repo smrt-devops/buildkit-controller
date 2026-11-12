@@ -168,6 +168,12 @@ List this cluster's pod, service and node ranges:
   helm upgrade {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} --reuse-values \
     --set 'workerNetwork.clusterCIDRs={10.244.0.0/16,10.96.0.0/12}'
 {{- end }}
+{{- if and .Values.cache.enabled .Values.cache.store.url }}
+
+cache.store.url is set, so the registry keeps its cache in the object store and has no
+volume. cache.persistence is ignored. Moving an existing release between the volume and a
+store needs the steps in the chart README, "Build cache".
+{{- end }}
 {{- if not .Values.pools }}
 
 The chart created no pools. Add them under `pools:` in values, or apply BuildKitPool objects separately.

@@ -1,0 +1,144 @@
+{
+  "uid": "buildkit-pools",
+  "title": "BuildKit pools and allocations",
+  "description": "Pool size against its ceiling and floor, the claim queue, allocation latency and why workers are retired.",
+  "tags": ["buildkit"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "templating": {
+    "list": [
+      {"name": "datasource", "label": "Data source", "type": "datasource", "query": "prometheus", "current": {}},
+      {"name": "namespace", "label": "Namespace", "type": "query", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "query": {"query": "label_values(buildkit_pool_max, namespace)", "refId": "namespace"}, "definition": "label_values(buildkit_pool_max, namespace)", "refresh": 2, "includeAll": true, "multi": true, "allValue": ".*", "current": {"selected": true, "text": "All", "value": "$__all"}, "sort": 1},
+      {"name": "pool", "label": "Pool", "type": "query", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "query": {"query": "label_values(buildkit_pool_max{namespace=~\"$namespace\"}, pool)", "refId": "pool"}, "definition": "label_values(buildkit_pool_max{namespace=~\"$namespace\"}, pool)", "refresh": 2, "includeAll": true, "multi": true, "allValue": ".*", "current": {"selected": true, "text": "All", "value": "$__all"}, "sort": 1}
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "Worker pods by state",
+      "description": "Worker pods of each selected pool by state: warm (free and ready), starting, allocated (held by a client) and draining. Mostly starting means workers are slow to become ready: check image pulls and node capacity. Mostly draining means pods are stuck deleting.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (namespace, pool, state) (buildkit_pool_pods{namespace=~\"$namespace\",pool=~\"$pool\"})", "legendFormat": "{{namespace}}/{{pool}} {{state}}"}]
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Allocated workers against scaling.max",
+      "description": "Workers held by clients next to each pool's ceiling (scaling.max). A line that sits on its ceiling while claims wait means demand is above capacity: raise scaling.max if the nodes can take it, or accept the queue.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (namespace, pool) (buildkit_pool_pods{state=\"allocated\",namespace=~\"$namespace\",pool=~\"$pool\"})", "legendFormat": "{{namespace}}/{{pool}} allocated"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "max by (namespace, pool) (buildkit_pool_max{namespace=~\"$namespace\",pool=~\"$pool\"})", "legendFormat": "{{namespace}}/{{pool}} max"}
+      ]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "Utilisation",
+      "description": "Allocated workers as a share of scaling.max. It stays under 0.8 when capacity is comfortable. Above that for hours, plan more capacity before queue timeouts start. Below 0.2 all day means scaling.max is higher than the pool needs.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (namespace, pool) (buildkit_pool_pods{state=\"allocated\",namespace=~\"$namespace\",pool=~\"$pool\"}) / on (namespace, pool) max by (namespace, pool) (buildkit_pool_max{namespace=~\"$namespace\",pool=~\"$pool\"})", "legendFormat": "{{namespace}}/{{pool}}"}]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "Warm workers against the desired floor",
+      "description": "Free, ready workers next to the floor the pool is asked to keep (scaling.min, or the active schedule window's floor). Warm below desired for long means the pool cannot refill: check the starting count and node capacity. Warm far above desired is spare capacity you pay for.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (namespace, pool) (buildkit_pool_pods{state=\"warm\",namespace=~\"$namespace\",pool=~\"$pool\"})", "legendFormat": "{{namespace}}/{{pool}} warm"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "max by (namespace, pool) (buildkit_pool_desired_warm{namespace=~\"$namespace\",pool=~\"$pool\"})", "legendFormat": "{{namespace}}/{{pool}} desired"}
+      ]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Claims waiting",
+      "description": "Claims queued for a worker, by pool. Short spikes at the start of a CI burst are normal. A queue that stays non-zero while allocated sits at scaling.max is demand above capacity. A queue with spare capacity means workers start too slowly.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (namespace, pool) (buildkit_pool_waiting{namespace=~\"$namespace\",pool=~\"$pool\"})", "legendFormat": "{{namespace}}/{{pool}}"}]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Queue wait",
+      "description": "Time claims spent queued, 50th and 95th percentile, split by how they ended: ok (bound) or timeout (ran out of queue time). Timeouts mean callers gave up: add capacity or warm workers. A high ok p95 means callers wait for cold starts.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.5, sum by (le, result) (rate(buildkit_queue_wait_seconds_bucket{namespace=~\"$namespace\",pool=~\"$pool\"}[$__rate_interval])))", "legendFormat": "p50 {{result}}"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.95, sum by (le, result) (rate(buildkit_queue_wait_seconds_bucket{namespace=~\"$namespace\",pool=~\"$pool\"}[$__rate_interval])))", "legendFormat": "p95 {{result}}"}
+      ]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Allocation latency by path",
+      "description": "Time from claim creation to bind, 50th and 95th percentile, for warm binds (a free worker was ready) and cold binds (the claim waited for one). Warm should be well under a second. A high cold latency is your worker start time: raise scaling.min so that fewer claims go cold.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.5, sum by (le, path) (rate(buildkit_allocation_duration_seconds_bucket{namespace=~\"$namespace\",pool=~\"$pool\"}[$__rate_interval])))", "legendFormat": "p50 {{path}}"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.95, sum by (le, path) (rate(buildkit_allocation_duration_seconds_bucket{namespace=~\"$namespace\",pool=~\"$pool\"}[$__rate_interval])))", "legendFormat": "p95 {{path}}"}
+      ]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Warm and cold binds",
+      "description": "Bound claims per second by path. The share of cold binds is how often the warm pool was empty. If cold binds are common, raise scaling.min or add a schedule window for your busy hours.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (path) (rate(buildkit_allocation_duration_seconds_count{namespace=~\"$namespace\",pool=~\"$pool\"}[$__rate_interval]))", "legendFormat": "{{path}}"}]
+    },
+    {
+      "id": 9, "type": "timeseries", "title": "Allocation outcomes",
+      "description": "Allocation results per second by pool and result. ok is a bound claim. pool_exhausted is a queue timeout. pod_lost and upstream_error mean a worker went away while claimed. Failures that are not pool_exhausted point at the API or the CA: see the overview and the edge and API dashboards.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (namespace, pool, result) (rate(buildkit_allocations_total{result!=\"ok\",namespace=~\"$namespace\",pool=~\"$pool\"}[$__rate_interval]))", "legendFormat": "{{namespace}}/{{pool}} {{result}}"}]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Worker releases by reason",
+      "description": "Workers retired after an allocation, per second, by reason. released is the normal end. allocation_idle is a claim nobody used. expired is the TTL running out under a long build. failed, pod_lost and start_timeout mean a worker broke: check the node and the pod events.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (reason) (rate(buildkit_releases_total{namespace=~\"$namespace\",pool=~\"$pool\"}[$__rate_interval]))", "legendFormat": "{{reason}}"}]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Build duration (time a worker was held)",
+      "description": "How long workers were held from bind to retirement, 50th and 95th percentile, for workers that ended with released (the build finished). It is the length of your builds. Use the p95 to set the allocation TTL above your longest builds and to size scaling.max against build concurrency.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 40},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.5, sum by (le, namespace, pool) (rate(buildkit_allocation_held_seconds_bucket{reason=\"released\",namespace=~\"$namespace\",pool=~\"$pool\"}[$__rate_interval])))", "legendFormat": "p50 {{namespace}}/{{pool}}"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.95, sum by (le, namespace, pool) (rate(buildkit_allocation_held_seconds_bucket{reason=\"released\",namespace=~\"$namespace\",pool=~\"$pool\"}[$__rate_interval])))", "legendFormat": "p95 {{namespace}}/{{pool}}"}
+      ]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Held time of workers that did not end normally",
+      "description": "95th percentile hold time for workers retired for a reason other than released. A cluster of expired near your TTL means builds outgrow it. allocation_idle near the idle timeout is a claim nobody used. Short failed or start_timeout values mean workers break early.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 40},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.95, sum by (le, reason) (rate(buildkit_allocation_held_seconds_bucket{reason!=\"released\",namespace=~\"$namespace\",pool=~\"$pool\"}[$__rate_interval])))", "legendFormat": "{{reason}}"}]
+    },
+    {
+      "id": 13, "type": "timeseries", "title": "Claims by phase",
+      "description": "BuildKitClaims in the leader's store by phase. Pending is waiting for a worker, Bound is in use. Expired, Lost and Failed linger briefly before the tidy pass deletes them. A growing count of any of them means the tidy pass is not keeping up or the leader is changing.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 48},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (phase) (buildkit_claims)", "legendFormat": "{{phase}}"}]
+    },
+    {
+      "id": 14, "type": "timeseries", "title": "Claim tidy results and write conflicts",
+      "description": "What the leader's tidy pass did to claims (per hour, by result), and claim patches it lost to another writer. idle and abandoned are callers that never used or never released a worker. A burst of conflicts means two writers fight over a claim.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 48},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (result) (increase(buildkit_claim_reconciles_total[1h]))", "legendFormat": "{{result}}"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum(increase(buildkit_claim_conflicts_total{namespace=~\"$namespace\",pool=~\"$pool\"}[1h]))", "legendFormat": "conflicts"}
+      ]
+    }
+  ]
+}

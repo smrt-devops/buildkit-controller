@@ -19,11 +19,27 @@
 //! and its command spells that as `ran-$((1))-<name>`, so only the step's
 //! output carries the marker.
 //!
+//! `--store minio|azure` runs the same scenarios with the registry's store
+//! in `MinIO` or Azurite, deployed in the cluster as `store`
+//! and reached through `BUILDKIT_CACHE_STORE_URL` and
+//! `BUILDKIT_CACHE_STORE_OPT_*` (the Secret `cache-store` holds credentials,
+//! passed through `envFrom` with that prefix). Two things only a store can
+//! show are added: after start-up the store has seen a listing (see
+//! [`Store::listed`]), and scenario `i` deletes the registry pod and expects a
+//! daemon with no local cache to still hit the cache the dead pod served.
+//!
+//! Wall time, measured with every image already built and loaded: volume 36 s,
+//! `MinIO` 43 s, Azurite 46 s; a cold controller image build adds about 2 min 20 s.
+//! Every wait is at most 90 s, except the kind cluster create (120 s), the buildkitd pods'
+//! readiness (180 s) and the registry rollout (120 s), which the volume run
+//! already needs.
+//!
 //! The registry's grants come from its static grants file, its certs from a
 //! test CA made here. Every kind and kubectl call gets the private kubeconfig
 //! under `target/registry-verify`; the task deletes the cluster on every exit
 //! path.
 
+use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
@@ -65,8 +81,12 @@ fn branch_repo(scope: &str) -> String {
     format!("{HOST}/{NS}/{POOL}/{scope}")
 }
 
-/// The registry: Deployment, Service, grants and buildkitd config.
-fn manifests() -> String {
+/// The registry: Deployment, Service, grants and buildkitd config. `store` is
+/// where it keeps its blobs: its volume when `None`.
+fn manifests(store: Option<Store>) -> String {
+    // A store registry starts at 0: it needs its bucket, which is made later.
+    let replicas = u8::from(store.is_none());
+    let (args, env, volumes, mounts) = store.map_or_else(volume_parts, Store::registry_parts);
     format!(
         "\
 apiVersion: v1
@@ -95,7 +115,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata: {{name: buildkit-cache, namespace: {NS}}}
 spec:
-  replicas: 1
+  replicas: {replicas}
   selector: {{matchLabels: {{app: buildkit-cache}}}}
   template:
     metadata: {{labels: {{app: buildkit-cache}}}}
@@ -110,12 +130,11 @@ spec:
         - name: cache
           image: {CONTROLLER_IMAGE}
           imagePullPolicy: Never
-          args: [registry, --log-format=text, --tls-dir=/etc/tls, --data-dir=/data,
-                 --grants-file=/etc/grants/grants.yaml]
+          args: [registry, --log-format=text, --tls-dir=/etc/tls, {args}--grants-file=/etc/grants/grants.yaml]
           env:
             - name: POD_NAME
               valueFrom: {{fieldRef: {{fieldPath: metadata.name}}}}
-          securityContext:
+{env}          securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: {{drop: [ALL]}}
@@ -128,12 +147,10 @@ spec:
           volumeMounts:
             - {{name: tls, mountPath: /etc/tls, readOnly: true}}
             - {{name: grants, mountPath: /etc/grants, readOnly: true}}
-            - {{name: data, mountPath: /data}}
-      volumes:
+{mounts}      volumes:
         - {{name: tls, secret: {{secretName: cache-tls}}}}
         - {{name: grants, configMap: {{name: cache-grants}}}}
-        - {{name: data, emptyDir: {{}}}}
----
+{volumes}---
 apiVersion: v1
 kind: Service
 metadata: {{name: buildkit-cache, namespace: {NS}}}
@@ -144,6 +161,290 @@ spec:
     - {{name: ops, port: 8080, targetPort: ops}}
 "
     )
+}
+
+/// The registry's arguments, extra environment, volumes and mounts when it
+/// keeps its blobs on its own volume. Each string is spliced into the
+/// Deployment: the last three are whole lines or empty.
+fn volume_parts() -> (String, String, String, String) {
+    (
+        "--store-url=file:///data, ".into(),
+        String::new(),
+        "        - {name: data, emptyDir: {}}\n".into(),
+        "            - {name: data, mountPath: /data}\n".into(),
+    )
+}
+
+/// The bucket or container the registry's store lives in.
+const BUCKET: &str = "bk-cache";
+/// The prefix of a store option's environment variable.
+const OPT: &str = "BUILDKIT_CACHE_STORE_OPT_";
+/// The Secret of the store's credentials, passed through `envFrom` with [`OPT`].
+const STORE_SECRET: &str = "cache-store";
+/// Emulator credentials: `MinIO`'s are made up here, and Azurite's account and
+/// key are the well-known ones every Azurite accepts. None is a real secret.
+const MINIO_USER: &str = "bkadmin";
+const MINIO_PASSWORD: &str = "bkadmin-secret";
+const AZURE_ACCOUNT: &str = "devstoreaccount1";
+const AZURE_KEY: &str =
+    "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+
+/// Creates the container over the Azure Blob REST API, with a `SharedKey`
+/// signature, because the Azurite image carries no storage client. Arguments:
+/// host, port, account, key, container. A 409 means it exists.
+const AZURE_MKCONTAINER: &str = r#"const http = require("http"), crypto = require("crypto");
+const [host, port, acct, key, container] = process.argv.slice(1);
+const date = new Date().toUTCString(), ver = "2021-08-06";
+const sts = `PUT\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:${date}\nx-ms-version:${ver}\n/${acct}/${acct}/${container}\nrestype:container`;
+const sig = crypto.createHmac("sha256", Buffer.from(key, "base64")).update(sts).digest("base64");
+const req = http.request({host, port, method: "PUT", path: `/${acct}/${container}?restype=container`,
+  headers: {"x-ms-date": date, "x-ms-version": ver, "Content-Length": 0, Authorization: `SharedKey ${acct}:${sig}`}},
+  r => { console.log(r.statusCode); process.exit(r.statusCode === 201 || r.statusCode === 409 ? 0 : 1); });
+req.on("error", e => { console.log(e.message); process.exit(1); });
+req.end();"#;
+
+/// An object store the registry can keep its blobs in, run in the cluster.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Store {
+    /// `MinIO`, through the `s3://` scheme.
+    Minio,
+    /// Azurite, through `az://`.
+    Azure,
+}
+
+impl Store {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 2] = [Self::Minio, Self::Azure];
+
+    /// The image as `(tag, index digest)`, pulled by digest and tagged locally
+    /// (see `gateway::ensure_image`). The `minio/minio` repositories serve no
+    /// pullable pinned release any more, so `MinIO` comes from the Bitnami
+    /// archive, which carries the server and `mc` at one fixed release.
+    pub(crate) const fn image(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Minio => (
+                "docker.io/bitnamilegacy/minio:2025.7.23-debian-12-r3",
+                "sha256:953d489a81cc4de7975f90e07202189c4325da39b0b92470b6a13c7ea99e36cd",
+            ),
+            Self::Azure => (
+                "mcr.microsoft.com/azure-storage/azurite:3.35.0",
+                "sha256:647c63a91102a9d8e8000aab803436e1fc85fbb285e7ce830a82ee5d6661cf37",
+            ),
+        }
+    }
+
+    const fn port(self) -> u16 {
+        match self {
+            Self::Minio => 9000,
+            Self::Azure => 10000,
+        }
+    }
+
+    /// Where the store answers in the cluster.
+    fn endpoint(self) -> String {
+        format!("http://store.{NS}.svc:{}", self.port())
+    }
+
+    /// The registry's `BUILDKIT_CACHE_STORE_URL`.
+    fn url(self) -> String {
+        let scheme = match self {
+            Self::Minio => "s3",
+            Self::Azure => "az",
+        };
+        format!("{scheme}://{BUCKET}")
+    }
+
+    /// The registry's plain options, as `(key in the variable name, value)`.
+    fn options(self) -> Vec<(&'static str, String)> {
+        let http = ("ALLOW_HTTP", "true".to_owned());
+        match self {
+            Self::Minio => vec![
+                ("ENDPOINT", self.endpoint()),
+                http,
+                ("REGION", "us-east-1".into()),
+            ],
+            Self::Azure => vec![
+                ("ENDPOINT", format!("{}/{AZURE_ACCOUNT}", self.endpoint())),
+                http,
+                ("ACCOUNT_NAME", AZURE_ACCOUNT.into()),
+            ],
+        }
+    }
+
+    /// The credentials the Secret [`STORE_SECRET`] holds, as `(key, value)`.
+    fn credentials(self) -> Vec<(&'static str, &'static str)> {
+        match self {
+            Self::Minio => vec![
+                ("ACCESS_KEY_ID", MINIO_USER),
+                ("SECRET_ACCESS_KEY", MINIO_PASSWORD),
+            ],
+            Self::Azure => vec![("ACCESS_KEY", AZURE_KEY)],
+        }
+    }
+
+    /// The registry's arguments, extra environment, volumes and mounts (see
+    /// [`volume_parts`]): no volume, the URL and options as environment, the
+    /// credentials through `envFrom`.
+    fn registry_parts(self) -> (String, String, String, String) {
+        let mut env = String::new();
+        let url = self.url();
+        let _ = writeln!(
+            env,
+            "            - {{name: BUILDKIT_CACHE_STORE_URL, value: \"{url}\"}}"
+        );
+        for (key, value) in self.options() {
+            let _ = writeln!(
+                env,
+                "            - {{name: {OPT}{key}, value: \"{value}\"}}"
+            );
+        }
+        let _ = write!(
+            env,
+            "          envFrom:\n            - prefix: {OPT}\n              secretRef: {{name: {STORE_SECRET}}}\n"
+        );
+        (String::new(), env, String::new(), String::new())
+    }
+
+    /// The store's own Deployment and Service, and the credentials Secret.
+    fn manifest(self) -> String {
+        let (tag, _) = self.image();
+        let port = self.port();
+        let (command, args, env, ready, user) = match self {
+            Self::Minio => (
+                "command: [/opt/bitnami/minio/bin/minio]\n          ",
+                "args: [server, /data, --address, \":9000\"]\n          ".to_owned(),
+                format!(
+                    "env:
+            - {{name: MINIO_ROOT_USER, value: {MINIO_USER}}}
+            - {{name: MINIO_ROOT_PASSWORD, value: {MINIO_PASSWORD}}}
+            - {{name: MINIO_PROMETHEUS_AUTH_TYPE, value: public}}
+          volumeMounts:
+            - {{name: data, mountPath: /data}}
+          "
+                ),
+                "httpGet: {path: /minio/health/ready, port: 9000}",
+                "securityContext: {runAsUser: 1001, runAsGroup: 1001, fsGroup: 1001}",
+            ),
+            Self::Azure => (
+                "command: [azurite-blob]\n          ",
+                "args: [--blobHost, \"0.0.0.0\", --skipApiVersionCheck, --disableProductStyleUrl]\n          ".to_owned(),
+                String::new(),
+                "tcpSocket: {port: 10000}",
+                "securityContext: {}",
+            ),
+        };
+        let data = self
+            .credentials()
+            .iter()
+            .fold(String::new(), |mut s, (k, v)| {
+                let _ = writeln!(s, "  {k}: \"{v}\"");
+                s
+            });
+        let secret = format!(
+            "apiVersion: v1\nkind: Secret\nmetadata: {{name: {STORE_SECRET}, namespace: {NS}}}\nstringData:\n{data}---\n"
+        );
+        format!(
+            "\
+{secret}apiVersion: apps/v1
+kind: Deployment
+metadata: {{name: store, namespace: {NS}}}
+spec:
+  replicas: 1
+  selector: {{matchLabels: {{app: store}}}}
+  template:
+    metadata: {{labels: {{app: store}}}}
+    spec:
+      automountServiceAccountToken: false
+      {user}
+      containers:
+        - name: store
+          image: {tag}
+          imagePullPolicy: Never
+          {command}{args}{env}readinessProbe:
+            {ready}
+            periodSeconds: 2
+          ports:
+            - {{name: store, containerPort: {port}}}
+      volumes:
+        - {{name: data, emptyDir: {{}}}}
+---
+apiVersion: v1
+kind: Service
+metadata: {{name: store, namespace: {NS}}}
+spec:
+  selector: {{app: store}}
+  ports:
+    - {{name: store, port: {port}, targetPort: store}}
+"
+        )
+    }
+
+    /// How many listings of the bucket `text` shows: `MinIO`'s metrics, or an
+    /// emulator's request log.
+    fn count_listings(self, text: &str) -> f64 {
+        match self {
+            Self::Minio => sum(text, "minio_s3_requests_total", &["api=\"listobjectsv2\""]),
+            Self::Azure => text
+                .lines()
+                .filter(|l| {
+                    // A blob listing names the container and `comp=list`;
+                    // the account-level listing has no `restype=container`.
+                    l.contains(&format!("GET /{AZURE_ACCOUNT}/{BUCKET}?"))
+                        && l.contains("comp=list")
+                        && l.contains("restype=container")
+                })
+                .fold(0.0, |n, _| n + 1.0),
+        }
+    }
+
+    /// The text [`Store::count_listings`] reads.
+    fn evidence(self, env: &Cluster) -> Result<String> {
+        match self {
+            Self::Minio => {
+                let url = format!("{}/minio/v2/metrics/cluster", self.endpoint());
+                let (ok, text) = exec(env, "trusted", &format!("wget -qO- {url}"))?;
+                ensure!(ok, "MinIO metrics fetch failed: {text}");
+                Ok(text)
+            }
+            Self::Azure => env.kubectl(&["-n", NS, "logs", "deploy/store"]),
+        }
+    }
+
+    /// Whether the store has seen a listing of the bucket.
+    fn listed(self, env: &Cluster) -> Result<bool> {
+        Ok(self.count_listings(&self.evidence(env)?) > 0.0)
+    }
+
+    /// Waits for the store, then makes the bucket or container.
+    fn create_bucket(self, env: &Cluster) -> Result<()> {
+        env.kubectl(&[
+            "-n",
+            NS,
+            "rollout",
+            "status",
+            "deploy/store",
+            "--timeout=90s",
+        ])?;
+        let in_store = |script: &str| {
+            env.kubectl(&["-n", NS, "exec", "deploy/store", "--", "sh", "-c", script])
+        };
+        match self {
+            Self::Minio => {
+                let mc = "/opt/bitnami/minio-client/bin/mc";
+                in_store(&format!(
+                    "export MC_CONFIG_DIR=/tmp/mc; {mc} alias set l http://127.0.0.1:9000 {MINIO_USER} {MINIO_PASSWORD} \
+                     && {mc} mb --ignore-existing l/{BUCKET}"
+                ))
+                .map(drop)
+            }
+            Self::Azure => {
+                let script = format!(
+                    "node -e '{AZURE_MKCONTAINER}' 127.0.0.1 10000 {AZURE_ACCOUNT} {AZURE_KEY} {BUCKET}"
+                );
+                in_store(&script).map(drop)
+            }
+        }
+    }
 }
 
 /// A rootless buildkitd pod named `name` with its client cert under /certs.
@@ -327,6 +628,7 @@ impl Drop for Cleanup {
             &["get", "pods", "-A", "-o", "wide"][..],
             &["-n", NS, "describe", "pods"][..],
             &["-n", NS, "logs", "deploy/buildkit-cache", "--tail=80"][..],
+            &["-n", NS, "logs", "deploy/store", "--tail=40"][..],
         ] {
             if let Ok(o) = self.0.kubectl_raw(args, None) {
                 println!(
@@ -355,7 +657,7 @@ impl Report {
     }
 }
 
-pub(crate) fn registry_verify() -> Result<()> {
+pub(crate) fn registry_verify(store: Option<Store>) -> Result<()> {
     let work = root().join("target/registry-verify");
     std::fs::create_dir_all(&work)?;
     let cleanup = Cleanup(
@@ -367,7 +669,11 @@ pub(crate) fn registry_verify() -> Result<()> {
     crate::image::load_controller(env)?;
     crate::image::ensure_worker()?;
     status(&mut crate::kube::kind_load(WORKER_IMAGE, env.name()))?;
-    deploy(env, &work)?;
+    if let Some(store) = store {
+        crate::gateway::ensure_image(store.image().0, store.image().1)?;
+        status(&mut crate::kube::kind_load(store.image().0, env.name()))?;
+    }
+    deploy(env, &work, store)?;
 
     let mut r = Report {
         passed: 0,
@@ -436,6 +742,9 @@ pub(crate) fn registry_verify() -> Result<()> {
         refused == 0.0,
         &format!("{refused} refused connections"),
     );
+    if let Some(store) = store {
+        store_scenarios(env, &mut r, store)?;
+    }
 
     println!("registry-verify: {} passed, {} failed", r.passed, r.failed);
     if r.failed > 0 {
@@ -537,7 +846,7 @@ fn branch_scenarios(
 }
 
 /// Certs, the registry, and the buildkitd pods with their contexts.
-fn deploy(env: &Cluster, work: &Path) -> Result<()> {
+fn deploy(env: &Cluster, work: &Path, store: Option<Store>) -> Result<()> {
     env.kubectl(&["create", "namespace", NS])?;
     env.kubectl(&[
         "label",
@@ -569,18 +878,13 @@ fn deploy(env: &Cluster, work: &Path) -> Result<()> {
             &[("client.crt", &crt), ("client.key", &key), ("ca.crt", &ca)],
         )?;
     }
-    env.apply(&manifests())?;
+    if let Some(store) = store {
+        env.apply(&store.manifest())?;
+    }
+    env.apply(&manifests(store))?;
     for pod in PODS {
         env.apply(&buildkitd(pod))?;
     }
-    env.kubectl(&[
-        "-n",
-        NS,
-        "rollout",
-        "status",
-        "deploy/buildkit-cache",
-        "--timeout=120s",
-    ])?;
     for pod in PODS {
         env.kubectl(&[
             "-n",
@@ -593,6 +897,19 @@ fn deploy(env: &Cluster, work: &Path) -> Result<()> {
         let (ok, out) = exec(env, pod, PREPARE)?;
         ensure!(ok, "preparing the build context in {pod}: {out}");
     }
+    if let Some(store) = store {
+        // The registry opens its bucket at start-up, so the bucket comes first.
+        store.create_bucket(env)?;
+        env.kubectl(&["-n", NS, "scale", "deploy/buildkit-cache", "--replicas=1"])?;
+    }
+    env.kubectl(&[
+        "-n",
+        NS,
+        "rollout",
+        "status",
+        "deploy/buildkit-cache",
+        "--timeout=120s",
+    ])?;
     // The registry answers metrics before the first build.
     crate::proc::poll(
         "the cache registry's metrics",
@@ -600,7 +917,83 @@ fn deploy(env: &Cluster, work: &Path) -> Result<()> {
         Duration::from_secs(1),
         || Ok(metric(env, "buildkit_registry_denied_total", &[]).ok()),
     )?;
+    if let Some(store) = store {
+        // Start-up lists the store to rebuild the index, so it has seen a listing.
+        crate::proc::until("the store to see a listing", Duration::from_mins(1), || {
+            Ok(store.listed(env).ok().filter(|seen| *seen))
+        })?;
+    }
     Ok(())
+}
+
+/// Scenario i, the one the volume cannot pass: the registry pod is deleted,
+/// and a daemon with no local cache (the reader, after a full prune) still
+/// hits the cache the new pod serves from the store.
+fn store_scenarios(env: &Cluster, r: &mut Report, store: Store) -> Result<()> {
+    let pods = |env: &Cluster| {
+        env.kubectl(&[
+            "-n",
+            NS,
+            "get",
+            "pods",
+            "-l",
+            "app=buildkit-cache",
+            "-o",
+            "jsonpath={range .items[*]}{.metadata.name} {.status.containerStatuses[0].ready}{\"\\n\"}{end}",
+        ])
+    };
+    let old = pods(env)?;
+    let old: Vec<&str> = old.lines().filter_map(|l| l.split(' ').next()).collect();
+    env.kubectl(&[
+        "-n",
+        NS,
+        "delete",
+        "pod",
+        "-l",
+        "app=buildkit-cache",
+        "--wait=true",
+    ])?;
+    let up = crate::proc::until("a new registry pod", Duration::from_secs(90), || {
+        Ok(ready_replacement(&pods(env)?, &old))
+    })
+    .is_ok();
+    // Ready is the pod's word; the Service routes to it a moment later.
+    crate::proc::until(
+        "the registry port to accept connections",
+        Duration::from_mins(1),
+        || {
+            let probe = format!("nc -z -w 2 {} 5000", HOST.split(':').next().unwrap_or(HOST));
+            Ok(exec(env, "reader", &probe).ok().filter(|(ok, _)| *ok))
+        },
+    )?;
+    let (pruned, out) = exec(
+        env,
+        "reader",
+        &format!("buildctl --addr {SOCKET} prune --all"),
+    )?;
+    ensure!(pruned, "pruning the reader's local cache: {out}");
+    let flags = format!("--import-cache type=registry,ref={}:main", repo());
+    let (ok, log) = exec(env, "reader", &build(&flags))?;
+    let hit = !ran(&log, SHARED);
+    let pass = up && ok && hit;
+    r.check(
+        "i/the cache survives deleting the registry pod",
+        pass,
+        &format!("new pod ready={up}, build ok={ok}, RUN step hit={hit}, store {store:?}"),
+    );
+    if !pass {
+        println!("{log}");
+    }
+    Ok(())
+}
+
+/// The name of a ready pod in `listing` (lines of `name ready`) that is not
+/// in `old`.
+fn ready_replacement(listing: &str, old: &[&str]) -> Option<String> {
+    listing.lines().find_map(|l| {
+        let (name, ready) = l.split_once(' ')?;
+        (ready.trim() == "true" && !old.contains(&name)).then(|| name.to_owned())
+    })
 }
 
 #[cfg(test)]
@@ -633,5 +1026,137 @@ buildkit_registry_requests_total{route=\"blob\",method=\"PUT\",status=\"201\"} 7
         assert!(!ran(&hit, STEP), "the command text is not the marker");
         assert!(ran(&miss, STEP));
         assert!(!ran(&miss, SHARED));
+    }
+
+    #[test]
+    fn the_volume_manifest_keeps_the_data_directory() {
+        let m = manifests(None);
+        assert!(m.contains("--store-url=file:///data"));
+        assert!(m.contains("replicas: 1"));
+        assert!(m.contains("mountPath: /data"));
+        assert!(!m.contains("BUILDKIT_CACHE_STORE"));
+    }
+
+    #[test]
+    fn a_store_manifest_points_the_registry_at_the_bucket() {
+        for store in Store::ALL {
+            let m = manifests(Some(store));
+            assert!(
+                m.contains(&format!(
+                    "name: BUILDKIT_CACHE_STORE_URL, value: \"{}\"",
+                    store.url()
+                )),
+                "{store:?}"
+            );
+            assert!(
+                !m.contains("--store-url"),
+                "the URL comes from the environment"
+            );
+            assert!(!m.contains("mountPath: /data"), "no volume holds the blobs");
+            assert!(
+                m.contains("replicas: 0"),
+                "the registry waits for its bucket"
+            );
+            for (key, _) in store.options() {
+                assert!(m.contains(&format!("name: {OPT}{key},")), "{store:?} {key}");
+            }
+            // Credentials only ever come through the Secret.
+            for (_, secret) in store.credentials() {
+                assert!(!m.contains(secret), "{store:?} leaks a credential");
+                assert!(store.manifest().contains(secret));
+            }
+            assert!(m.contains("envFrom"), "{store:?}");
+        }
+        assert!(manifests(Some(Store::Minio)).contains("s3://bk-cache"));
+        assert!(manifests(Some(Store::Azure)).contains("az://bk-cache"));
+    }
+
+    #[test]
+    fn option_keys_are_distinct_upper_case_names() {
+        for store in Store::ALL {
+            let keys: Vec<_> = store.options().into_iter().map(|(k, _)| k).collect();
+            let mut sorted = keys.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), keys.len(), "{store:?}");
+            for key in keys
+                .iter()
+                .chain(store.credentials().iter().map(|(k, _)| k))
+            {
+                assert!(
+                    key.bytes().all(|b| b.is_ascii_uppercase() || b == b'_'),
+                    "{key}"
+                );
+            }
+            // Never a key the URL owns (the registry refuses it).
+            assert!(
+                !keys
+                    .iter()
+                    .any(|k| k.contains("BUCKET") || k.contains("CONTAINER"))
+            );
+        }
+    }
+
+    #[test]
+    fn store_images_are_pinned_by_digest_and_used_by_tag() {
+        for store in Store::ALL {
+            let (tag, digest) = store.image();
+            let hex = digest.strip_prefix("sha256:").expect("a sha256 digest");
+            assert_eq!(hex.len(), 64, "{tag}");
+            assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()), "{tag}");
+            assert!(
+                tag.rsplit_once(':').is_some_and(|(_, v)| !v.contains('/'))
+                    && !tag.ends_with(":latest")
+            );
+            let m = store.manifest();
+            assert!(m.contains(&format!("image: {tag}\n")));
+            assert!(m.contains("imagePullPolicy: Never"));
+        }
+        let tags: Vec<_> = Store::ALL.iter().map(|s| s.image().0).collect();
+        assert_eq!(tags.len(), 2);
+        assert!(tags[0] != tags[1]);
+    }
+
+    #[test]
+    fn minio_serves_unauthenticated_metrics() {
+        let m = Store::Minio.manifest();
+        assert!(m.contains("MINIO_PROMETHEUS_AUTH_TYPE, value: public"));
+    }
+
+    #[test]
+    fn minio_listings_come_from_the_listobjectsv2_counter() {
+        let none = "\
+minio_s3_requests_total{api=\"getbucketlocation\",server=\"x:9000\"} 3
+minio_s3_requests_total{api=\"listobjectsv2\",server=\"x:9000\"} 0
+";
+        let some = none.replace(
+            "listobjectsv2\",server=\"x:9000\"} 0",
+            "listobjectsv2\",server=\"x:9000\"} 2",
+        );
+        assert!(Store::Minio.count_listings(none) < 1.0);
+        assert!((Store::Minio.count_listings(&some) - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn azure_listings_are_container_blob_listings_only() {
+        let log = "\
+127.0.0.1 - - [12/Nov/2026:14:47:41 +0000] \"PUT /devstoreaccount1/bk-cache?restype=container HTTP/1.1\" 201 -
+127.0.0.1 - - [12/Nov/2026:14:47:42 +0000] \"GET /devstoreaccount1/bk-cache?prefix=data%2F&restype=container&comp=list HTTP/1.1\" 200 -
+127.0.0.1 - - [12/Nov/2026:14:47:43 +0000] \"GET /devstoreaccount1?comp=list HTTP/1.1\" 200 -
+127.0.0.1 - - [12/Nov/2026:14:47:44 +0000] \"GET /devstoreaccount1/bk-cache/data/abc HTTP/1.1\" 200 -
+";
+        assert!((Store::Azure.count_listings(log) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_replacement_pod_is_a_ready_pod_with_a_new_name() {
+        let old = ["cache-1"];
+        assert_eq!(ready_replacement("cache-1 true\n", &old), None);
+        assert_eq!(ready_replacement("cache-2 false\n", &old), None);
+        assert_eq!(ready_replacement("", &old), None);
+        assert_eq!(
+            ready_replacement("cache-1 true\ncache-2 true\n", &old).as_deref(),
+            Some("cache-2")
+        );
     }
 }

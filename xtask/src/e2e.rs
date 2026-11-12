@@ -52,6 +52,9 @@ const CACHE_HOST: &str = "buildkit-controller-registry.bk-system.svc:5000";
 /// deletes it. v0.1.0 upgrade shim: remove in the release after 0.2.0.
 const OLD_VOLUME: &str = "v010-volume";
 const AUD: &str = "buildkit-controller";
+/// The Services that serve `/metrics`, on a port named `metrics`.
+const CONTROLLER_METRICS_SERVICE: &str = "buildkit-controller-metrics";
+const REGISTRY_SERVICE: &str = "buildkit-controller-registry";
 
 /// Kind's pod and service ranges, set in `xtask/fixtures/e2e/kind.yaml`. The
 /// controller lists them as cluster ranges, and the pools open them (the
@@ -679,6 +682,7 @@ fn run(env: &Cluster, work: &Path) -> Result<()> {
     );
 
     gateway_options(env, &c, &pool, &issuer)?;
+    dashboard_samples(env)?;
     println!("e2e: all scenarios passed");
     Ok(())
 }
@@ -847,16 +851,64 @@ fn gateway_options(env: &Cluster, c: &Client, pool: &str, issuer: &Issuer) -> Re
     Ok(())
 }
 
-/// The value of `sample` (name and labels, as exposed) on the cache registry's
-/// `/metrics`, read through the API server's Service proxy; 0 when absent.
-fn registry_metric(env: &Cluster, sample: &str) -> Result<f64> {
-    let text = env.kubectl(&[
+/// `/metrics` of a metrics Service in the chart's namespace, read through the
+/// API server's Service proxy.
+fn scrape(env: &Cluster, service: &str) -> Result<String> {
+    env.kubectl(&[
         "get",
         "--raw",
-        &format!("/api/v1/namespaces/{NS}/services/http:buildkit-controller-registry:metrics/proxy/metrics"),
-    ])?;
+        &format!("/api/v1/namespaces/{NS}/services/http:{service}:metrics/proxy/metrics"),
+    ])
+}
+
+/// The value of `sample` (name and labels, as exposed) on the cache registry's
+/// `/metrics`; 0 when absent.
+fn registry_metric(env: &Cluster, sample: &str) -> Result<f64> {
+    let text = scrape(env, REGISTRY_SERVICE)?;
     Ok(text
         .lines()
         .find_map(|l| l.strip_prefix(sample)?.trim().parse().ok())
         .unwrap_or(0.0))
+}
+
+/// Scenario k, at the end of the suite: both metrics Services have a sample
+/// for every selector the dashboards use on the families this suite exercises
+/// (allocations, pool pods, edge connections, registry requests, claims). A
+/// renamed family or a series that is never created shows here instead of as
+/// an empty panel. The controller restarts after the last upgrade and only
+/// its leader exports the pool series, so the scrape retries for two minutes.
+fn dashboard_samples(env: &Cluster) -> Result<()> {
+    let selectors = crate::dashboards::e2e_selectors()?;
+    until(
+        "a sample for every dashboard selector",
+        Duration::from_mins(2),
+        || {
+            let controller = scrape(env, CONTROLLER_METRICS_SERVICE)?;
+            let registry = scrape(env, REGISTRY_SERVICE)?;
+            let missing: Vec<String> = selectors
+                .iter()
+                .filter(|s| {
+                    let text = if s.name.starts_with("buildkit_registry_") {
+                        &registry
+                    } else {
+                        &controller
+                    };
+                    !s.has_sample(text)
+                })
+                .map(crate::dashboards::Selector::key)
+                .collect();
+            ensure!(
+                missing.is_empty(),
+                "no sample for {}:\n{}",
+                missing.len(),
+                missing.join("\n")
+            );
+            Ok(Some(()))
+        },
+    )?;
+    println!(
+        "PASS k: both metrics Services have a sample for each of the {} dashboard selectors on the families this suite exercises",
+        selectors.len()
+    );
+    Ok(())
 }

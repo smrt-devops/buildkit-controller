@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use super::backend::{DEFAULT_URL, StoreUrl};
 use crate::config::LogFormat;
 
 /// `buildkit-controller registry [flags]`.
@@ -24,13 +25,11 @@ pub struct RegistryArgs {
         default_value = "0.0.0.0:8080"
     )]
     pub ops_listen: SocketAddr,
-    /// The store: one directory on one volume.
-    #[arg(
-        long,
-        env = "BUILDKIT_CACHE_DATA_DIR",
-        default_value = "/var/lib/buildkit-cache"
-    )]
-    pub data_dir: PathBuf,
+    /// The store, as a URL: `file:///<absolute path>` for a directory on a
+    /// volume, or `s3://`, `gs://` or `az://<bucket>[/<prefix>]`. Options are
+    /// the variables `BUILDKIT_CACHE_STORE_OPT_<key>`, with the provider's keys.
+    #[arg(long, env = "BUILDKIT_CACHE_STORE_URL", default_value = DEFAULT_URL, value_parser = parse_store_url)]
+    pub store_url: StoreUrl,
     /// Holds `tls.crt` and `tls.key` (the serving cert, from the internal CA) and
     /// `ca.crt` (the client CA, the only anchor for the workers' registry client
     /// certs). Re-read every minute.
@@ -49,8 +48,8 @@ pub struct RegistryArgs {
     /// and every pool gets `--pool-max-size`.
     #[arg(long, env = "BUILDKIT_CACHE_GRANTS_FILE")]
     pub grants_file: Option<PathBuf>,
-    /// Budget of the whole volume, e.g. `50Gi`.
-    #[arg(long, env = "BUILDKIT_CACHE_MAX_SIZE", default_value = "50Gi", value_parser = parse_size)]
+    /// Budget of the whole store, e.g. `40Gi`.
+    #[arg(long, env = "BUILDKIT_CACHE_MAX_SIZE", default_value = "40Gi", value_parser = parse_size)]
     pub max_size: u64,
     /// Budget of a pool without `cache.maxSize` (repositories under `<namespace>/<pool>/`).
     #[arg(long, env = "BUILDKIT_CACHE_POOL_MAX_SIZE", default_value = "10Gi", value_parser = parse_size)]
@@ -59,7 +58,7 @@ pub struct RegistryArgs {
     #[arg(long, env = "BUILDKIT_CACHE_MAX_BLOB_SIZE", default_value = "5Gi", value_parser = parse_size)]
     pub max_blob_size: u64,
     /// Bytes all uploads in progress may hold together; one worker may hold
-    /// a quarter. The volume needs room for `--max-size` plus this.
+    /// a quarter. The store needs room for `--max-size` plus this.
     #[arg(long, env = "BUILDKIT_CACHE_MAX_UPLOAD_SIZE", default_value = "10Gi", value_parser = parse_size)]
     pub max_upload_size: u64,
     /// Time between garbage collections, e.g. `10m`.
@@ -71,6 +70,26 @@ pub struct RegistryArgs {
     /// Log encoding.
     #[arg(long, env = "LOG_FORMAT", value_enum, default_value = "json")]
     pub log_format: LogFormat,
+}
+
+/// The variable that named the data directory before the store URL. Clap
+/// ignores unknown variables, so a stale setting would fall back to the
+/// default store without a word; the role refuses to start instead.
+pub const OLD_DATA_DIR: &str = "BUILDKIT_CACHE_DATA_DIR";
+
+/// Fails when [`OLD_DATA_DIR`] is set, with `value` its value.
+pub fn refuse_data_dir(value: Option<std::ffi::OsString>) -> anyhow::Result<()> {
+    match value {
+        Some(v) => anyhow::bail!(
+            "{OLD_DATA_DIR} is no longer read; unset it and set BUILDKIT_CACHE_STORE_URL=file://{} instead",
+            std::path::Path::new(&v).display()
+        ),
+        None => Ok(()),
+    }
+}
+
+fn parse_store_url(s: &str) -> Result<StoreUrl, String> {
+    StoreUrl::parse(s).map_err(|e| format!("{e:#}"))
 }
 
 /// Bytes, with an optional `Ki`, `Mi`, `Gi` or `Ti` suffix.
@@ -130,7 +149,117 @@ mod tests {
         let a = RegistryArgs::try_parse_from(["registry"]).unwrap();
         assert_eq!(a.listen.port(), 5000);
         assert_eq!(a.max_blob_size, 5 << 30);
+        assert_eq!(a.max_size, 40 << 30);
+        assert_eq!(
+            a.store_url,
+            StoreUrl::File("/var/lib/buildkit-cache".into())
+        );
         assert!(a.grants_file.is_none());
+    }
+
+    #[test]
+    fn the_old_data_dir_variable_is_refused() {
+        assert!(refuse_data_dir(None).is_ok());
+        let e = refuse_data_dir(Some("/data".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains(OLD_DATA_DIR) && e.contains("BUILDKIT_CACHE_STORE_URL=file:///data"),
+            "{e}"
+        );
+        assert!(RegistryArgs::try_parse_from(["registry", "--data-dir=/data"]).is_err());
+        assert!(RegistryArgs::try_parse_from(["registry", "--store-url=s3a://bucket"]).is_err());
+    }
+
+    /// The `env` of the `registry` container in a rendered chart, with the
+    /// `envFrom` prefix of its Secret.
+    fn rendered_env(golden: &str) -> (Vec<(String, String)>, String) {
+        let docs: Vec<serde_json::Value> = serde_saphyr::from_multiple(golden).unwrap();
+        let c = docs
+            .iter()
+            .filter(|d| d["kind"] == "StatefulSet")
+            .flat_map(|d| {
+                d["spec"]["template"]["spec"]["containers"]
+                    .as_array()
+                    .unwrap()
+            })
+            .find(|c| c["name"] == "registry")
+            .unwrap();
+        let env = c["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| {
+                let value = e["value"].as_str()?;
+                Some((e["name"].as_str().unwrap().to_owned(), value.to_owned()))
+            })
+            .collect();
+        let prefix = c["envFrom"][0]["prefix"].as_str().unwrap().to_owned();
+        (env, prefix)
+    }
+
+    /// Command-line arguments for the variables the role reads through clap.
+    /// A variable the role reads nowhere fails the test.
+    fn args_from_env(env: &[(String, String)]) -> Vec<String> {
+        use clap::CommandFactory;
+        let cmd = RegistryArgs::command();
+        let mut args = vec!["registry".to_owned()];
+        for (k, v) in env {
+            if k.starts_with(super::super::backend::OPTION_PREFIX) {
+                continue;
+            }
+            let arg = cmd
+                .get_arguments()
+                .find(|a| a.get_env().is_some_and(|e| e == k.as_str()))
+                .unwrap_or_else(|| panic!("the chart sets {k}, which the role does not read"));
+            args.push(format!("--{}={v}", arg.get_long().unwrap()));
+        }
+        args
+    }
+
+    /// The chart's rendered registry env, fed to the role, gives back the
+    /// store URL and its options: the env names and the option prefix of the
+    /// chart and the role cannot drift apart.
+    #[test]
+    fn the_rendered_chart_env_reaches_the_role() {
+        use super::super::backend::{Cloud, Provider, StoreConfig};
+        use object_store::aws::AmazonS3ConfigKey;
+        const GOLDEN: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../xtask/fixtures/helm-test/golden/cache-store.yaml"
+        ));
+        let (mut env, prefix) = rendered_env(GOLDEN);
+        let a = RegistryArgs::try_parse_from(args_from_env(&env)).unwrap();
+        assert_eq!(
+            a.store_url,
+            StoreUrl::Bucket {
+                provider: Provider::S3,
+                bucket: "example-build-cache".into(),
+                prefix: Some("buildkit".into()),
+            }
+        );
+        assert_eq!(a.store_url.parts(), super::super::store::Parts::Buffered);
+        // A key of the Secret arrives through envFrom with the prefix.
+        env.push((format!("{prefix}access_key_id"), "AKIDEXAMPLE".into()));
+        let c = StoreConfig::new(a.store_url.clone(), env.clone()).unwrap();
+        let Some(Cloud::S3(s)) = &c.cloud else {
+            panic!("{:?}", c.cloud)
+        };
+        assert_eq!(
+            s.options,
+            vec![
+                (AmazonS3ConfigKey::AccessKeyId, "AKIDEXAMPLE".to_owned()),
+                (
+                    AmazonS3ConfigKey::Endpoint,
+                    "https://s3.example.com".to_owned()
+                ),
+                (AmazonS3ConfigKey::Region, "eu-west-1".to_owned()),
+            ]
+        );
+        // A misspelt Secret key stops the role, naming the key.
+        env.push((format!("{prefix}regoin"), "eu-west-1".into()));
+        let e = StoreConfig::new(a.store_url, env).unwrap_err().to_string();
+        assert!(e.contains("`regoin`"), "{e}");
     }
 
     #[test]
