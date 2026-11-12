@@ -6,13 +6,90 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 
 use super::store::{GcReport, Stats};
+use crate::metrics_doc::{Def, Handle, Label, Labels, Role, register_table};
 use crate::runtime::metrics::Metrics;
 
-type Labels = Vec<(&'static str, String)>;
 type HistogramFamily = Family<Labels, Histogram, fn() -> Histogram>;
 
-const BUCKETS: [f64; 14] = [
+/// Request duration buckets, in seconds.
+pub const BUCKETS: [f64; 14] = [
     0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0,
+];
+
+const ROUTES: &[&str] = &["base", "blob", "upload", "manifest", "other"];
+const METHODS: &[&str] = &["GET", "HEAD", "POST", "PATCH", "PUT", "DELETE", "other"];
+const ACTIONS: &[&str] = &["pull", "push"];
+const REFUSALS: &[&str] = &[
+    "tls_error",
+    "handshake_timeout",
+    "bad_certificate",
+    "client_auth_eku",
+    "bad_san",
+];
+const BUDGETS: &[&str] = &["pool", "volume"];
+
+/// The cache registry's families.
+pub const TABLE: [Def; 10] = [
+    Def::counter(
+        "registry_requests",
+        Role::Registry,
+        &[
+            Label::closed("route", ROUTES),
+            Label::closed("method", METHODS),
+            Label::open("status"),
+        ],
+        "Registry requests by matched route, method and HTTP status. `other` is any unmatched path or method",
+    ),
+    Def::histogram(
+        "registry_request_duration_seconds",
+        Role::Registry,
+        &[Label::closed("route", ROUTES)],
+        &BUCKETS,
+        "Registry request duration until the response head",
+    ),
+    Def::counter(
+        "registry_denied",
+        Role::Registry,
+        &[Label::closed("action", ACTIONS)],
+        "Requests refused by the worker's grant, by the action asked for. Denied `push` is expected for untrusted allocations",
+    ),
+    Def::counter(
+        "registry_connections_refused",
+        Role::Registry,
+        &[Label::closed("reason", REFUSALS)],
+        "Connections closed before a request: a failed or timed-out handshake, or a client certificate that names no worker",
+    ),
+    Def::counter(
+        "registry_received_bytes",
+        Role::Registry,
+        &[],
+        "Blob and manifest bytes received in pushes",
+    ),
+    Def::counter(
+        "registry_gc_evicted_manifests",
+        Role::Registry,
+        &[Label::closed("budget", BUDGETS)],
+        "Manifests evicted by garbage collection to fit a budget: `pool` is a pool's share, `volume` is the whole store",
+    ),
+    Def::counter(
+        "registry_gc_deleted_blobs",
+        Role::Registry,
+        &[],
+        "Blobs deleted by garbage collection",
+    ),
+    Def::gauge(
+        "registry_stored_bytes",
+        Role::Registry,
+        &[],
+        "Bytes of blobs in the store. Compare it with the store budget (`--max-size`)",
+    ),
+    Def::gauge("registry_blobs", Role::Registry, &[], "Blobs in the store"),
+    Def::gauge(
+        "registry_manifests",
+        Role::Registry,
+        &[],
+        "Manifests in the store, over all repositories",
+    ),
 ];
 
 fn histogram() -> Histogram {
@@ -57,53 +134,40 @@ impl RegistryMetrics {
     pub fn register(metrics: &Metrics) -> Self {
         let m = Self::default();
         metrics.with_registry(|r| {
-            r.register(
-                "registry_requests",
-                "Cache registry requests by route, method and status",
-                m.requests.clone(),
-            );
-            r.register(
-                "registry_request_duration_seconds",
-                "Cache registry request duration until the response head",
-                m.duration.clone(),
-            );
-            r.register(
-                "registry_denied",
-                "Cache registry requests refused by the grant, by action",
-                m.denied.clone(),
-            );
-            r.register(
-                "registry_connections_refused",
-                "Connections closed before a request: failed handshake or a client certificate that names no worker",
-                m.refused.clone(),
-            );
-            r.register(
-                "registry_received_bytes",
-                "Blob and manifest bytes received in pushes",
-                m.received.clone(),
-            );
-            r.register(
-                "registry_gc_evicted_manifests",
-                "Manifests evicted by garbage collection, by budget",
-                m.evicted.clone(),
-            );
-            r.register(
-                "registry_gc_deleted_blobs",
-                "Blobs deleted by garbage collection",
-                m.deleted_blobs.clone(),
-            );
-            r.register(
-                "registry_stored_bytes",
-                "Bytes of blobs in the store",
-                m.stored_bytes.clone(),
-            );
-            r.register("registry_blobs", "Blobs in the store", m.blobs.clone());
-            r.register(
-                "registry_manifests",
-                "Manifests in the store, over all repositories",
-                m.manifests.clone(),
+            register_table(
+                r,
+                Role::Registry,
+                &TABLE,
+                vec![
+                    ("registry_requests", Handle::new(m.requests.clone())),
+                    (
+                        "registry_request_duration_seconds",
+                        Handle::new(m.duration.clone()),
+                    ),
+                    ("registry_denied", Handle::new(m.denied.clone())),
+                    (
+                        "registry_connections_refused",
+                        Handle::new(m.refused.clone()),
+                    ),
+                    ("registry_received_bytes", Handle::new(m.received.clone())),
+                    (
+                        "registry_gc_evicted_manifests",
+                        Handle::new(m.evicted.clone()),
+                    ),
+                    (
+                        "registry_gc_deleted_blobs",
+                        Handle::new(m.deleted_blobs.clone()),
+                    ),
+                    ("registry_stored_bytes", Handle::new(m.stored_bytes.clone())),
+                    ("registry_blobs", Handle::new(m.blobs.clone())),
+                    ("registry_manifests", Handle::new(m.manifests.clone())),
+                ],
             );
         });
+        TABLE[1].seed(None, &m.duration);
+        TABLE[2].seed(None, &m.denied);
+        TABLE[3].seed(None, &m.refused);
+        TABLE[5].seed(None, &m.evicted);
         m
     }
 

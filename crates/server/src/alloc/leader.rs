@@ -28,6 +28,7 @@ use super::backend::Write;
 use super::claims::{self, reason};
 use super::pods::{ann, fmt_ts, is_ready};
 use super::{BindConfig, Binder, Shared};
+use crate::metrics_doc::{Def, Handle, Label, Role, register_table};
 use crate::reconcile::driver::{Trigger, schedule};
 use crate::render::{ANN_ALLOC, ANN_CLAIM, ANN_OWNER, FREE, LABEL_POOL};
 use crate::runtime::AppContext;
@@ -45,6 +46,33 @@ pub const ALLOCATION_IDLE: &str = "allocation_idle";
 
 type Labels = Vec<(&'static str, String)>;
 
+const PHASES: &[&str] = &["Pending", "Bound", "Expired", "Lost", "Failed"];
+const TIDY_RESULTS: &[&str] = &[
+    "failed",
+    "expired",
+    "lost",
+    "idle",
+    "abandoned",
+    "collected",
+    "released",
+];
+
+/// The claim families, the leader's.
+pub const CLAIM_TABLE: [Def; 2] = [
+    Def::gauge(
+        "claims",
+        Role::Controller,
+        &[Label::closed("phase", PHASES)],
+        "BuildKitClaims in the leader's store by phase. Cleared when the leader's term ends",
+    ),
+    Def::counter(
+        "claim_reconciles",
+        Role::Controller,
+        &[Label::closed("result", TIDY_RESULTS)],
+        "What the leader's tidy pass did to claims. `failed`: a claim from a namespace it does not serve. `expired`: a bound claim's TTL ran out. `lost`: its worker went away. `idle`: a delivered claim went unused. `abandoned`: a CI claim whose client is gone was deleted. `collected`: a finished CI claim was deleted. `released`: the worker of a gone or ended claim was retired",
+    ),
+];
+
 /// Claim metric families.
 #[derive(Clone, Debug, Default)]
 struct ClaimMetrics {
@@ -53,10 +81,35 @@ struct ClaimMetrics {
 }
 
 impl ClaimMetrics {
+    fn register(&self, metrics: &crate::runtime::metrics::Metrics) {
+        metrics.with_registry(|r| {
+            register_table(
+                r,
+                Role::Controller,
+                &CLAIM_TABLE,
+                vec![
+                    ("claims", Handle::new(self.claims.clone())),
+                    ("claim_reconciles", Handle::new(self.reconciles.clone())),
+                ],
+            );
+        });
+        CLAIM_TABLE[1].seed(None, &self.reconciles);
+    }
+
     fn count(&self, result: &str) {
         self.reconciles
             .get_or_create(&vec![("result", result.to_owned())])
             .inc();
+    }
+}
+
+/// Drops the `buildkit_claims` series when the term ends, so a replica that
+/// lost the Lease stops exporting a count only the leader keeps.
+struct TermClaims(Family<Labels, Gauge>);
+
+impl Drop for TermClaims {
+    fn drop(&mut self) {
+        self.0.clear();
     }
 }
 
@@ -102,18 +155,7 @@ impl Component for Allocator {
                 shared.metrics(&ctx),
             ));
             let metrics = ClaimMetrics::default();
-            ctx.metrics().with_registry(|r| {
-                r.register(
-                    "claims",
-                    "BuildKitClaims in the store, by phase",
-                    metrics.claims.clone(),
-                );
-                r.register(
-                    "claim_reconciles",
-                    "Claim reconcile outcomes",
-                    metrics.reconciles.clone(),
-                );
-            });
+            metrics.register(ctx.metrics());
             let work: Arc<dyn LeaderWork> = Arc::new(Term {
                 ctx: ctx.clone(),
                 binder,
@@ -151,6 +193,7 @@ impl LeaderWork for Term {
 
 /// One leadership term: pool passes and tidying, until dropped.
 async fn run_term(t: Term, term: u64) {
+    let _claims = TermClaims(t.metrics.claims.clone());
     info!(term, component = "allocator", "allocator running");
     let claim_triggers = stream::unfold(t.ctx.claim_events(), |mut sub| async move {
         let ev = sub.recv().await?;
@@ -653,5 +696,39 @@ mod listed_tests {
             .map(|p| p.metadata.name.clone().unwrap())
             .collect();
         assert_eq!(names, ["w-a", "w-none", "old-a"]);
+    }
+}
+
+/// Registers the claim families in `metrics`, as a leader term does.
+#[cfg(test)]
+pub(crate) fn register_claims_for_test(metrics: &crate::runtime::metrics::Metrics) {
+    ClaimMetrics::default().register(metrics);
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::{ClaimMetrics, TermClaims};
+    use crate::runtime::metrics::Metrics;
+
+    #[test]
+    fn claims_clear_when_the_term_ends() {
+        let m = Metrics::new();
+        let claims = ClaimMetrics::default();
+        claims.register(&m);
+        {
+            let _term = TermClaims(claims.claims.clone());
+            claims
+                .claims
+                .get_or_create(&vec![("phase", "Bound".to_owned())])
+                .set(3);
+            claims.count("expired");
+            assert!(m.render().contains("buildkit_claims{phase=\"Bound\"} 3"));
+        }
+        let text = m.render();
+        assert!(!text.contains("buildkit_claims{"), "{text}");
+        assert!(
+            text.contains("buildkit_claim_reconciles_total{result=\"expired\"} 1"),
+            "counters stay: {text}"
+        );
     }
 }

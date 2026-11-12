@@ -30,7 +30,9 @@ use super::pods::{ann, fmt_ts, key_alloc_id, of_pool};
 use super::pool::{MIN_TTL, access_rules, pool_ready, seconds};
 use crate::auth::Identity;
 use crate::pki::{AllocId, ClientPublicKey, Namespace, PoolName};
-use crate::render::{ANN_ALLOC, ANN_BRANCH_SCOPE, ANN_CLAIM, ANN_OWNER, LABEL_POOL};
+use crate::render::{
+    ANN_ALLOC, ANN_BRANCH_SCOPE, ANN_CLAIM, ANN_CREATED_AT, ANN_OWNER, LABEL_POOL,
+};
 use crate::runtime::stores::{ClaimEvent, ClaimSubscription};
 
 /// How long `POST /v1/allocations` waits for the claim to bind.
@@ -584,6 +586,12 @@ impl Front {
             claims::ANN_SEEN_AT.to_owned(),
             fmt_ts(OffsetDateTime::now_utc()),
         )]);
+        annotations.insert(
+            ANN_CREATED_AT.to_owned(),
+            jiff::Timestamp::now()
+                .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string(),
+        );
         if let Some(b) = cache::branch_scope(&pool, who) {
             annotations.insert(ANN_BRANCH_SCOPE.to_owned(), b);
         }

@@ -31,6 +31,7 @@ use prometheus_client::metrics::family::Family;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::cidr::{Cidr, CidrError};
+use crate::metrics_doc::{Def, Handle, Label, Role, register_table};
 use crate::runtime::metrics::Metrics;
 
 /// The 12-byte v2 signature.
@@ -233,6 +234,37 @@ pub struct Client {
     pub origin: Origin,
 }
 
+const RESULTS: &[&str] = &[
+    "proxied",
+    "local",
+    "timeout",
+    "truncated",
+    "io_error",
+    "bad_signature",
+    "bad_version",
+    "bad_command",
+    "oversized",
+    "short",
+    "unsupported_family",
+];
+
+/// The PROXY protocol counters of the API and edge listeners, registered when
+/// the listener enables it.
+pub const TABLE: [Def; 2] = [
+    Def::counter(
+        "api_proxy_protocol_headers",
+        Role::Controller,
+        &[Label::closed("result", RESULTS)],
+        "PROXY protocol v2 headers read on the API listener, one per connection from a trusted source. `proxied` and `local` were accepted; the rest are the reason the connection was closed",
+    ),
+    Def::counter(
+        "edge_proxy_protocol_headers",
+        Role::Controller,
+        &[Label::closed("result", RESULTS)],
+        "PROXY protocol v2 headers read on the edge listener, one per connection from a trusted source. `proxied` and `local` were accepted; the rest are the reason the connection was closed",
+    ),
+];
+
 /// `buildkit_<listener>_proxy_protocol_headers_total{result}`: one per
 /// connection from a trusted source. `result` is `proxied`, `local`, or the
 /// reason the connection was closed ([`ProxyError::label`]).
@@ -240,17 +272,25 @@ pub struct Client {
 pub struct ProxyMetrics(Family<Vec<(&'static str, String)>, Counter>);
 
 impl ProxyMetrics {
-    /// Registers the family for `listener` (`api` or `edge`).
+    /// Registers the family for `listener` (`api` or `edge`), starting each
+    /// result at 0.
     #[must_use]
     pub fn register(metrics: &Metrics, listener: &'static str) -> Self {
         let m = Self::default();
+        let def = if listener == "api" {
+            &TABLE[0]
+        } else {
+            &TABLE[1]
+        };
         metrics.with_registry(|r| {
-            r.register(
-                format!("{listener}_proxy_protocol_headers"),
-                "PROXY protocol headers from trusted sources, by result",
-                m.0.clone(),
+            register_table(
+                r,
+                Role::Controller,
+                std::slice::from_ref(def),
+                vec![(def.name, Handle::new(m.0.clone()))],
             );
         });
+        def.seed(None, &m.0);
         m
     }
 

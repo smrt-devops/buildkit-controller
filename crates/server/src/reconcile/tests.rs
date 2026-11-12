@@ -114,6 +114,7 @@ pub(super) fn pod(slot: u32) -> WorkerPod {
         template_hash: Some("h".into()),
         expires_at: None,
         expires_at_raw: None,
+        allocated_at: None,
         worker_cert_not_after: Some(later(30 * 86_400)),
         internal_ca: Some(fp()[..16].to_owned()),
         evicted: false,
@@ -355,6 +356,7 @@ fn expiry_retires_allocated_with_expected_id() {
         uid: "uid-0".into(),
         alloc_id: ALLOC_ID.into(),
         expires_at: Some("2026-01-01T00:00:00Z".into()),
+        allocated_at: None,
         reason: RetireReason::Expired,
     }));
 
@@ -395,6 +397,7 @@ fn start_timeout_retire_of_an_allocated_pod_tests_the_expires_at_it_saw() {
         uid: "uid-0".into(),
         alloc_id: ALLOC_ID.into(),
         expires_at: Some("2026-01-01T00:03:00Z".into()),
+        allocated_at: None,
         reason: RetireReason::StartTimeout,
     }));
 }

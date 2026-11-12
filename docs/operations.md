@@ -269,32 +269,27 @@ The registry is one pod with one volume. Builds that start while it restarts run
 
 ## Observability
 
-Metrics are on the ops port (8080, `/metrics`) through the `<fullname>-metrics` Service (`buildkit-controller-metrics` with the default naming). Set `metrics.serviceMonitor.enabled` to `true`, or `auto` to create it only when the Prometheus Operator CRD exists. The cache registry is a separate pod and serves its own `/metrics` on the `metrics` port of the `<fullname>-registry` Service. The chart's ServiceMonitor does not select it, so add a scrape for that Service to collect the `buildkit_registry_*` metrics. All names start with `buildkit_`, and no metric has a per-allocation or per-pod label. The table in Observability below lists the ones to watch. Logs are JSON on stderr, so a log shipper must read stderr, and they never contain tokens, private keys or Secret data.
+Metrics are on the ops port (8080, `/metrics`) through the `<fullname>-metrics` Service (`buildkit-controller-metrics` with the default naming). Set `metrics.serviceMonitor.enabled` to `true`, or `auto` to create it only when the Prometheus Operator CRD exists. The cache registry is a separate pod and serves its own `/metrics` on the `metrics` port of the `<fullname>-registry` Service. The chart's ServiceMonitor does not select it, so add a scrape for that Service to collect the registry metrics. The registry exports only its own families, so a query on the controller metrics never sees a registry series. No metric has a per-allocation or per-pod label. Logs are JSON on stderr, so a log shipper must read stderr, and they never contain tokens, private keys or Secret data.
 
-Metrics to watch:
+The [metrics reference](metrics.md) lists every metric with its labels, the values each label takes, and the histogram buckets. It is generated from the code. Counters and histograms start at 0 when the process starts, or when a pool first appears, so `rate()` and `increase()` see the first event.
+
+Metrics to start with:
 
 | Metric | Use |
 |---|---|
-| `buildkit_allocations_total{result}` | Allocation outcomes. `result` is `ok` or the error code the client got (`pool_exhausted` when a claim hit its queue timeout, `pool_not_found`, `ca_unavailable` and so on). The API counts its refusals, and the leader counts how each claim ended. A rise in `pool_exhausted` or `ca_unavailable` needs action. |
-| `buildkit_allocation_duration_seconds{path}` | Claim creation to bind, `warm` or `cold`. |
-| `buildkit_queue_wait_seconds{result}` | Time claims waited in the queue; `result` is `ok` when they bound and `timeout` when they ran out. Demand above `scaling.max`. |
-| `buildkit_pool_waiting` | Pending claims of the pool, exact. The queue length. |
-| `buildkit_pool_pods{state}`, `buildkit_pool_desired_warm` | Pool state (leader only). |
-| `buildkit_claims{phase}`, `buildkit_claim_reconciles_total{result}` | Claims by phase and the outcomes of the leader's tidy pass (for example `collected`, `released`, `idle`). |
-| `buildkit_claim_conflicts_total` | Claim patches that lost a race, because the claim changed or was deleted. A few are normal; for a steady rate, read the leader's logs. |
-| `buildkit_cache_allocations_total{tier}` | Allocations whose response carried cache flags, by `trusted` or `untrusted` tier. |
-| `buildkit_releases_total{reason}` | Pod retirements by reason: `released` (the claim was deleted or ended), `allocation_idle` (a delivered claim nobody used, see [Abandoned allocations](#abandoned-allocations)), `pod_lost`, `expired`, `failed`, `start_timeout`, `unready`, `ca_replaced`, `stale_template`, `cert_expiring`, `out_of_range` and `idle`. |
-| `buildkit_edge_connections_total{result}` | Edge outcomes. Every edge metric carries a `transport` label, `tcp` for the edge port and `tunnel` for a connection that came through `/v1/tunnel`. Failures include `tls_error`, `expired` and `upstream_error`. Refusals for a connection cap are `handshake_limit` and `peer_handshake_limit` (the oldest handshake in progress, closed for a newer one, replica-wide or from one address), `connection_limit` (`edge.maxConnections`), `namespace_limit` (a quarter of `edge.maxConnections` for the allocations of one pool namespace) and `allocation_limit` (64 connections for one allocation on one replica). |
-| `buildkit_watch_namespace_unlisted{kind,namespace}` | 1 while a pool or pod watch runs without a namespace it cannot list. See [Kubernetes API outages](#kubernetes-api-outages). |
-| `buildkit_leader` | Sum across replicas must be 1. |
+| `buildkit_leader` | The sum across replicas must be 1. |
 | `buildkit_ca_valid`, `buildkit_cert_not_after_seconds{kind}` | CA and certificate health. |
+| `buildkit_allocations_total{result}` | Allocation outcomes. A rise in `pool_exhausted` (a claim hit its queue timeout) or `ca_unavailable` needs action. |
+| `buildkit_pool_pods{state}`, `buildkit_pool_max`, `buildkit_pool_desired_warm`, `buildkit_pool_waiting` | Pool size against its ceiling and floor, and the queue length. Waiting claims with `allocated` at `buildkit_pool_max` mean demand above `scaling.max`. |
+| `buildkit_allocation_duration_seconds{path}`, `buildkit_queue_wait_seconds{result}` | Claim creation to bind (`warm` or `cold`), and time spent queued. |
+| `buildkit_allocation_held_seconds{reason}` | How long workers were held. Use it to size `scaling.max` and the TTLs. |
+| `buildkit_releases_total{reason}` | Why workers were retired: `released`, `allocation_idle` (a delivered claim nobody used, see [Abandoned allocations](#abandoned-allocations)), `pod_lost`, `expired`, `failed`, `start_timeout` or `ca_replaced`. |
+| `buildkit_edge_connections_total{result,transport}` | Edge outcomes, for the edge port (`tcp`) and for `/v1/tunnel` (`tunnel`). Failures include `tls_error`, `expired` and `upstream_error`. A connection cap shows as `handshake_limit`, `peer_handshake_limit`, `connection_limit` (`edge.maxConnections`), `namespace_limit` (a quarter of `edge.maxConnections` for the allocations of one pool namespace) or `allocation_limit` (64 connections for one allocation on one replica). |
+| `buildkit_watch_errors_total{kind}`, `buildkit_watch_namespace_unlisted{kind,namespace}` | Kubernetes watch trouble. See [Kubernetes API outages](#kubernetes-api-outages). |
 | `buildkit_auth_total{result}`, `buildkit_jwks_fetch_total{result}` | Login failures and issuer reachability. |
-| `buildkit_registry_stored_bytes`, `buildkit_registry_blobs`, `buildkit_registry_manifests` | The cache registry's store (cache pod). Compare `stored_bytes` with `cache.maxSize`. |
-| `buildkit_registry_requests_total{route,method,status}`, `buildkit_registry_request_duration_seconds{route}` | Registry traffic and latency. A run of `5xx` or `429` statuses means the cache is failing or uploads hit their limit. |
-| `buildkit_registry_denied_total{action}` | Pushes or pulls the registry refused for a worker's allocation. `push` denials are expected for untrusted builds. A burst of `pull` denials is not. |
-| `buildkit_registry_connections_refused_total{reason}` | Connections closed before a request: a failed handshake, or a client certificate that names no worker. |
-| `buildkit_registry_received_bytes_total` | Bytes pushed. |
-| `buildkit_registry_gc_evicted_manifests_total{budget}`, `buildkit_registry_gc_deleted_blobs_total` | What garbage collection removed. `budget` is `pool` or `volume`. |
+| `buildkit_registry_stored_bytes` | The cache registry's store size (cache pod). Compare it with `cache.maxSize`. |
+| `buildkit_registry_requests_total{route,method,status}` | Registry traffic. A run of `5xx` or `429` statuses means the cache is failing or uploads hit their limit. |
+| `buildkit_registry_denied_total{action}` | Pushes or pulls refused for a worker's allocation. `push` denials are expected for untrusted builds. A burst of `pull` denials is not. |
 
 Suggested alerts, with thresholds to tune:
 

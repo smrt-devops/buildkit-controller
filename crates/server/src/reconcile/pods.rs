@@ -5,8 +5,8 @@ use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::jiff::Timestamp;
 
 use crate::render::{
-    ANN_ALLOC, ANN_EXPIRES_AT, ANN_INTERNAL_CA, ANN_WORKER_CERT_NOT_AFTER, LABEL_POOL,
-    LABEL_TEMPLATE_HASH,
+    ANN_ALLOC, ANN_ALLOCATED_AT, ANN_EXPIRES_AT, ANN_INTERNAL_CA, ANN_WORKER_CERT_NOT_AFTER,
+    LABEL_POOL, LABEL_TEMPLATE_HASH,
 };
 
 /// Name of `pod` if it is foreign to the pool (`Observed::foreign_pods`): in
@@ -98,6 +98,8 @@ pub struct WorkerPod {
     pub expires_at: Option<Timestamp>,
     /// `P expires-at` as written, which an expiry retire tests.
     pub expires_at_raw: Option<String>,
+    /// `P allocated-at`: when the pod was bound.
+    pub allocated_at: Option<Timestamp>,
     /// `P worker-cert-not-after`.
     pub worker_cert_not_after: Option<Timestamp>,
     /// `P internal-ca` (16 hex chars).
@@ -175,6 +177,7 @@ impl WorkerPod {
                 .cloned(),
             expires_at: ts(ANN_EXPIRES_AT),
             expires_at_raw: ann(ANN_EXPIRES_AT).cloned(),
+            allocated_at: ts(ANN_ALLOCATED_AT),
             worker_cert_not_after: ts(ANN_WORKER_CERT_NOT_AFTER),
             internal_ca: ann(ANN_INTERNAL_CA).cloned(),
             evicted: status.and_then(|s| s.reason.as_ref()).is_some(),

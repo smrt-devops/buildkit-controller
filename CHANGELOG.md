@@ -7,6 +7,23 @@ All notable changes are listed here, newest first.
 ### Added
 
 - `cache.podLabels` adds labels to the cache registry pod.
+- `docs/metrics.md` lists every metric with its type, labels, the values each label takes, and the histogram buckets. `cargo xtask crdgen` generates it from the same tables that register the metrics, and `cargo xtask crdgen --check` fails when it is stale.
+- `buildkit_pool_max{namespace,pool}` exports `scaling.max`, so a dashboard can show utilisation against it. `buildkit_pool_desired_warm` already carries the effective floor, schedule windows included.
+- `buildkit_allocation_held_seconds{namespace,pool,reason}` records how long a worker was held, with the same reasons as `buildkit_releases_total`.
+- The API stamps the annotation `buildkit.smrt-devops.net/created-at` (RFC 3339 with milliseconds) on each claim it creates. `buildkit_allocation_duration_seconds` and `buildkit_queue_wait_seconds` measure from it, so a warm bind no longer rounds to a whole second. A claim without it falls back to `creationTimestamp`.
+
+### Changed
+
+- Counters and histograms whose labels all take a closed set of values start at 0. The series without a pool exist from start-up, and a pool's series appear when the process first sees the pool and go when it is deleted. Before, a series appeared at its first event, so `rate()` and `increase()` missed that event. HTTP `status` is open, so the common statuses (200, 201, 202, 400, 401, 403, 404, 409, 429, 503) start at 0 and others appear on use.
+- `buildkit_claims{phase}` is cleared when a replica's leader term ends, like the pool gauges, so it no longer stays at its last value on a replica that lost the Lease.
+- The cache registry pod no longer exports controller-only families (`buildkit_leader`, `buildkit_ca_valid`, `buildkit_cert_not_after_seconds`, `buildkit_cert_load_errors_total`, `buildkit_leader_transitions_total`, `buildkit_releases_total`). It exports its own `buildkit_registry_*` families and the watch error counters of its pod and pool watches.
+- Metric help text says what each series means, and `docs/operations.md` keeps a short list of metrics to start with and the alerts, and links to the reference.
+
+### Upgrading from 0.4.0
+
+- Alerts that read `buildkit_leader` or `buildkit_ca_valid` no longer see the registry pod's constant 0 when both Services are scraped under one selector. If you relied on those series being present for the registry pod, drop that expectation.
+- `docs/operations.md` no longer lists `unready`, `stale_template`, `cert_expiring`, `out_of_range` and `idle` as `buildkit_releases_total` reasons. The code only writes `released`, `allocation_idle`, `pod_lost`, `expired`, `failed`, `start_timeout` and `ca_replaced`.
+- Allocations and queue waits from claims created before the upgrade still use `creationTimestamp` until they bind or time out.
 
 ## 0.4.0
 
