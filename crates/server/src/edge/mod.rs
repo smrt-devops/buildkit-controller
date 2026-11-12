@@ -19,7 +19,7 @@
 mod handler;
 mod listener;
 mod material;
-mod metrics;
+pub mod metrics;
 mod pods;
 mod proxy;
 mod revoke;

@@ -54,6 +54,8 @@ const CRD_PATH: &str = "helm/buildkit-controller/crds/buildkitpools.yaml";
 /// chart's `crds/`: Helm installs them on first install, and an upgrade
 /// applies them by hand first.
 const CLAIM_CRD_PATH: &str = "helm/buildkit-controller/crds/buildkitclaims.yaml";
+/// Repository-relative path of the generated metrics reference.
+const METRICS_DOC_PATH: &str = "docs/metrics.md";
 
 /// Repository automation tasks.
 #[derive(Debug, Parser)]
@@ -68,7 +70,7 @@ struct Cli {
 enum Task {
     /// Print the workspace root directory.
     Root,
-    /// Write the `BuildKitPool` CRD YAML into the Helm chart.
+    /// Write the CRD YAML into the Helm chart and the metrics reference into `docs/`.
     Crdgen {
         /// Do not write. Exit non-zero if the file is missing or stale.
         #[arg(long)]
@@ -240,7 +242,12 @@ fn crdgen(check: bool) -> Result<()> {
     let pool = render_crd(&buildkit_controller_api::v1alpha1::crd())?;
     write_or_check(CRD_PATH, &pool, check)?;
     let claim = render_crd(&buildkit_controller_api::claim::crd())?;
-    write_or_check(CLAIM_CRD_PATH, &claim, check)
+    write_or_check(CLAIM_CRD_PATH, &claim, check)?;
+    write_or_check(
+        METRICS_DOC_PATH,
+        &buildkit_controller::metrics_doc::render_markdown(),
+        check,
+    )
 }
 
 fn write_or_check(rel: &str, want: &str, check: bool) -> Result<()> {

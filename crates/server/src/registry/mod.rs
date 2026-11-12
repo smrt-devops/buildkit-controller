@@ -14,7 +14,7 @@ mod auth;
 mod config;
 mod gc;
 mod listener;
-mod metrics;
+pub mod metrics;
 mod pods;
 mod store;
 #[cfg(test)]
@@ -52,7 +52,7 @@ pub async fn run(args: RegistryArgs, shutdown: CancellationToken) -> anyhow::Res
         version = env!("CARGO_PKG_VERSION"),
         "cache registry starting"
     );
-    let metrics = Arc::new(Metrics::new());
+    let metrics = Arc::new(Metrics::for_registry());
     let readiness = Arc::new(Readiness::default());
     let ready = readiness.register("registry_listener");
     let ops_stop = CancellationToken::new();

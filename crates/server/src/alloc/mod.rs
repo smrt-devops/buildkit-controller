@@ -73,8 +73,7 @@ impl Shared {
             .metrics
             .get_or_init(|| AllocMetrics::with_releases(ctx.metrics().releases()))
             .clone();
-        self.registered
-            .call_once(|| ctx.metrics().with_registry(|r| m.register(r)));
+        self.registered.call_once(|| m.register(ctx.metrics()));
         m
     }
 

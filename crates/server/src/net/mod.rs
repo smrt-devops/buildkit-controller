@@ -7,7 +7,7 @@
 //! the per-address caps and the logs.
 
 mod cidr;
-mod proxy_protocol;
+pub mod proxy_protocol;
 #[cfg(test)]
 mod tests;
 

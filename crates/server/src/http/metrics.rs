@@ -5,14 +5,68 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::histogram::Histogram;
 
 use crate::auth::JwksFetchResult;
+use crate::metrics_doc::{Def, Handle, Label, Labels, Role, Values, register_table};
 use crate::runtime::metrics::Metrics;
 
-type Labels = Vec<(&'static str, String)>;
 type HistogramFamily = Family<Labels, Histogram, fn() -> Histogram>;
 
-/// bucket set, in seconds.
-const BUCKETS: [f64; 16] = [
+/// Bucket set, in seconds.
+pub const BUCKETS: [f64; 16] = [
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+];
+
+/// Route templates of `buildkit_http_requests_total{route}`.
+const ROUTES: &[&str] = &[
+    "/v1/allocations",
+    "/v1/allocations/{id}",
+    "/v1/pools",
+    "/v1/tunnel",
+    "other",
+];
+/// Statuses that start at 0; others appear on use.
+const STATUSES: &[&str] = &[
+    "200", "201", "202", "400", "401", "403", "404", "409", "429", "503",
+];
+const AUTH_METHODS: &[&str] = &["oidc", "serviceaccount"];
+const AUTH_RESULTS: &[&str] = &["ok", "invalid", "unknown_issuer", "error"];
+const JWKS_RESULTS: &[&str] = &["ok", "error"];
+
+/// The HTTP API's families.
+pub const TABLE: [Def; 4] = [
+    Def::counter(
+        "http_requests",
+        Role::Controller,
+        &[
+            Label::closed("route", ROUTES),
+            Label {
+                name: "status",
+                values: Values::Seeded(STATUSES),
+            },
+        ],
+        "API requests by matched route template and HTTP status. `other` is any unmatched path",
+    ),
+    Def::histogram(
+        "http_request_duration_seconds",
+        Role::Controller,
+        &[Label::closed("route", ROUTES)],
+        &BUCKETS,
+        "API request duration until the response head. A tunnel request ends when the tunnel closes",
+    ),
+    Def::counter(
+        "auth",
+        Role::Controller,
+        &[
+            Label::closed("method", AUTH_METHODS),
+            Label::closed("result", AUTH_RESULTS),
+        ],
+        "Bearer token checks. `invalid`: bad or expired token. `unknown_issuer`: no configured issuer matches. `error`: the keys or the TokenReview call were unavailable",
+    ),
+    Def::counter(
+        "jwks_fetch",
+        Role::Controller,
+        &[Label::open("issuer"), Label::closed("result", JWKS_RESULTS)],
+        "Fetches of an OIDC issuer's signing keys, by configured issuer URL",
+    ),
 ];
 
 fn histogram() -> Histogram {
@@ -40,24 +94,29 @@ impl Default for HttpMetrics {
 }
 
 impl HttpMetrics {
-    /// Fresh families registered in `metrics`.
+    /// Fresh families registered in `metrics`, their starting series created.
     #[must_use]
     pub fn register(metrics: &Metrics) -> Self {
         let m = Self::default();
         metrics.with_registry(|r| {
-            r.register(
-                "http_requests",
-                "HTTP API requests by route template and status",
-                m.requests.clone(),
+            register_table(
+                r,
+                Role::Controller,
+                &TABLE,
+                vec![
+                    ("http_requests", Handle::new(m.requests.clone())),
+                    (
+                        "http_request_duration_seconds",
+                        Handle::new(m.duration.clone()),
+                    ),
+                    ("auth", Handle::new(m.auth.clone())),
+                    ("jwks_fetch", Handle::new(m.jwks.clone())),
+                ],
             );
-            r.register(
-                "http_request_duration_seconds",
-                "HTTP API request duration until the response head",
-                m.duration.clone(),
-            );
-            r.register("auth", "bearer token authentications", m.auth.clone());
-            r.register("jwks_fetch", "OIDC JWKS fetch attempts", m.jwks.clone());
         });
+        TABLE[0].seed(None, &m.requests);
+        TABLE[1].seed(None, &m.duration);
+        TABLE[2].seed(None, &m.auth);
         m
     }
 
