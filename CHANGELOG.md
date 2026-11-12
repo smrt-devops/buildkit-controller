@@ -2,6 +2,12 @@
 
 All notable changes are listed here, newest first.
 
+## 0.5.0
+
+### Added
+
+- `cache.podLabels` adds labels to the cache registry pod.
+
 ## 0.4.0
 
 0.4.0 makes the tunnel the default way to reach the controller. Builds run inside a WebSocket on the API route (`/v1/tunnel`), so one hostname and one HTTPS route are enough behind any gateway, including ones that terminate TLS. Read "Upgrading from 0.3.0" before upgrading.
