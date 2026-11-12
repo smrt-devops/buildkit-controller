@@ -43,7 +43,7 @@
     },
     {
       "id": 4, "type": "timeseries", "title": "Warm workers against the desired floor",
-      "description": "Free, ready workers next to the floor the pool is asked to keep (scaling.minWarm, or the active schedule window's floor). Warm below desired for long means the pool cannot refill: check the starting count and node capacity. Warm far above desired is spare capacity you pay for.",
+      "description": "Free, ready workers next to the floor the pool is asked to keep (scaling.min, or the active schedule window's floor). Warm below desired for long means the pool cannot refill: check the starting count and node capacity. Warm far above desired is spare capacity you pay for.",
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
       "targets": [
@@ -71,7 +71,7 @@
     },
     {
       "id": 7, "type": "timeseries", "title": "Allocation latency by path",
-      "description": "Time from claim creation to bind, 50th and 95th percentile, for warm binds (a free worker was ready) and cold binds (the claim waited for one). Warm should be well under a second. A high cold latency is your worker start time: raise scaling.minWarm so that fewer claims go cold.",
+      "description": "Time from claim creation to bind, 50th and 95th percentile, for warm binds (a free worker was ready) and cold binds (the claim waited for one). Warm should be well under a second. A high cold latency is your worker start time: raise scaling.min so that fewer claims go cold.",
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
       "fieldConfig": {"defaults": {"unit": "s"}},
@@ -82,7 +82,7 @@
     },
     {
       "id": 8, "type": "timeseries", "title": "Warm and cold binds",
-      "description": "Bound claims per second by path. The share of cold binds is how often the warm pool was empty. If cold binds are common, raise scaling.minWarm or add a schedule window for your busy hours.",
+      "description": "Bound claims per second by path. The share of cold binds is how often the warm pool was empty. If cold binds are common, raise scaling.min or add a schedule window for your busy hours.",
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
       "fieldConfig": {"defaults": {"unit": "ops"}},
