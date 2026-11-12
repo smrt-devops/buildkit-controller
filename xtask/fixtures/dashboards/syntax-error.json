@@ -1,0 +1,13 @@
+{
+  "uid": "fixture-syntax",
+  "title": "Fixture syntax",
+  "templating": {"list": [{"name": "datasource", "type": "datasource", "query": "prometheus"}]},
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "Panel",
+      "description": "Allocation outcomes per second. Check the result label.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (result (rate(buildkit_allocations_total[5m]))"}]
+    }
+  ]
+}

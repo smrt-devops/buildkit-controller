@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 mod alloc_verify;
 mod api_verify;
 mod claim_verify;
+mod dashboards;
 mod docs;
 mod drain_verify;
 mod e2e;
@@ -70,7 +71,7 @@ struct Cli {
 enum Task {
     /// Print the workspace root directory.
     Root,
-    /// Write the CRD YAML into the Helm chart and the metrics reference into `docs/`.
+    /// Write the CRD YAML into the Helm chart, the metrics reference and the dashboard panel tables into `docs/`.
     Crdgen {
         /// Do not write. Exit non-zero if the file is missing or stale.
         #[arg(long)]
@@ -247,7 +248,8 @@ fn crdgen(check: bool) -> Result<()> {
         METRICS_DOC_PATH,
         &buildkit_controller::metrics_doc::render_markdown(),
         check,
-    )
+    )?;
+    write_or_check(dashboards::DOC_PATH, &dashboards::render_doc()?, check)
 }
 
 fn write_or_check(rel: &str, want: &str, check: bool) -> Result<()> {

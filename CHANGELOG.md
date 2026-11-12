@@ -14,6 +14,7 @@ All notable changes are listed here, newest first.
 - `buildkit_pool_max{namespace,pool}` exports `scaling.max`, so a dashboard can show utilisation against it. `buildkit_pool_desired_warm` already carries the effective floor, schedule windows included.
 - `buildkit_allocation_held_seconds{namespace,pool,reason}` records how long a worker was held, with the same reasons as `buildkit_releases_total`.
 - The API stamps the annotation `buildkit.smrt-devops.net/created-at` (RFC 3339 with milliseconds) on each claim it creates. `buildkit_allocation_duration_seconds` and `buildkit_queue_wait_seconds` measure from it, so a warm bind no longer rounds to a whole second. A claim without it falls back to `creationTimestamp`.
+- Four Grafana dashboards in `examples/grafana` (overview, pools and allocations, edge and API, build cache), with a Data source variable and namespace and pool variables. A description on every panel says what it shows and what to do. `docs/dashboards.md` covers import and scraping and lists the panels, and `cargo xtask crdgen --check` fails when its panel tables are stale. A unit test checks every query against the declared metric families and labels. The cache dashboard has no store-operation panels yet, because the registry does not export those metrics.
 
 ### Changed
 

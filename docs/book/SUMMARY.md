@@ -8,6 +8,7 @@
 - [Architecture](docs/architecture.md)
 - [Operations](docs/operations.md)
 - [Metrics reference](docs/metrics.md)
+- [Dashboards](docs/dashboards.md)
 - [Helm chart](helm/buildkit-controller/README.md)
 - [Performance](docs/performance.md)
 
