@@ -258,7 +258,7 @@ pools: []
 # The built-in build cache: a registry that only worker pods reach, over mTLS with the
 # internal CA. Allocations name it in their --cache-to and --cache-from flags; callers a
 # pool's spec.workers.cache.writers rules do not trust (fork pull requests, by default)
-# get --cache-from only. One replica with one volume: while it restarts, builds run
+# get --cache-from only. One replica with one volume or one store: while it restarts, builds run
 # uncached. false: no registry, and allocations carry no cache flags.
 cache:
   enabled: true

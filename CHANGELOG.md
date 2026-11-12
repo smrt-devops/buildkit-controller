@@ -32,8 +32,10 @@ All notable changes are listed here, newest first.
 
 - The cache starts cold. On its first start the registry deletes the 0.4 files on its volume, which frees their space, and the first builds after the upgrade export their cache again.
 - Rolling back to 0.4 on the same volume needs the registry PVC deleted first: 0.4 cannot read the 0.5 layout.
+- Moving a release between the volume and an object store (`cache.store.url`, either way) makes `helm upgrade` fail until you delete the registry StatefulSet with `--cascade=orphan` and rerun it; moving from the volume to a store also leaves the PVC `data-<fullname>-registry-0` to delete once the new pod is Ready. No data moves, and the cache starts cold. See "Moving between the volume and a store" in `docs/operations.md`.
+- The ServiceMonitor now selects the registry metrics port. Remove any scrape of the registry Service that you added by hand.
 - If you run the `registry` role yourself, replace `--data-dir` or `BUILDKIT_CACHE_DATA_DIR=<dir>` with `BUILDKIT_CACHE_STORE_URL=file://<dir>`, and set `--max-size` if you relied on the old 50Gi default.
-- Alerts that read `buildkit_leader` or `buildkit_ca_valid` no longer see the registry pod's constant 0 when both Services are scraped under one selector. If you relied on those series being present for the registry pod, drop that expectation.
+- The registry role no longer exports the controller-only families (`buildkit_leader`, `buildkit_ca_valid`, `buildkit_cert_not_after_seconds`, `buildkit_cert_load_errors_total`, `buildkit_leader_transitions_total`, `buildkit_releases_total`). Alerts that read `buildkit_leader` or `buildkit_ca_valid` no longer see the registry pod's constant 0 when both Services are scraped under one selector. If you relied on those series being present for the registry pod, drop that expectation.
 - `docs/operations.md` no longer lists `unready`, `stale_template`, `cert_expiring`, `out_of_range` and `idle` as `buildkit_releases_total` reasons. The code only writes `released`, `allocation_idle`, `pod_lost`, `expired`, `failed`, `start_timeout` and `ca_replaced`.
 - Allocations and queue waits from claims created before the upgrade still use `creationTimestamp` until they bind or time out.
 
