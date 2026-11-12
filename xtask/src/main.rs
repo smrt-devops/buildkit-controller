@@ -164,10 +164,22 @@ enum Task {
     },
 }
 
+/// The repository root: the parent of the xtask manifest directory. `cargo run`
+/// sets `CARGO_MANIFEST_DIR` for the process, and that names the worktree being
+/// run. The compile-time value would name whichever worktree last compiled the
+/// binary when worktrees share a target directory, so it is only the fallback.
 pub(crate) fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map_or_else(PathBuf::new, Path::to_path_buf)
+    root_from(
+        std::env::var_os("CARGO_MANIFEST_DIR").as_deref(),
+        env!("CARGO_MANIFEST_DIR"),
+    )
+}
+
+fn root_from(runtime: Option<&std::ffi::OsStr>, compiled: &str) -> PathBuf {
+    let dir = runtime
+        .filter(|v| !v.is_empty())
+        .map_or(Path::new(compiled), Path::new);
+    dir.parent().map_or_else(PathBuf::new, Path::to_path_buf)
 }
 
 /// Placeholders every fixture under `xtask/fixtures` may use, so an image bump
@@ -453,6 +465,18 @@ fn kind_cluster(base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_prefers_the_runtime_manifest_dir() {
+        use std::ffi::OsStr;
+        let compiled = "/a/xtask";
+        assert_eq!(
+            root_from(Some(OsStr::new("/b/xtask")), compiled),
+            Path::new("/b")
+        );
+        assert_eq!(root_from(None, compiled), Path::new("/a"));
+        assert_eq!(root_from(Some(OsStr::new("")), compiled), Path::new("/a"));
+    }
 
     /// Image references live in code; fixtures name them by placeholder, so a
     /// bump cannot leave a fixture on the old tag (pods then sit in
