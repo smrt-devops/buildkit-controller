@@ -6,6 +6,9 @@ All notable changes are listed here, newest first.
 
 ### Added
 
+- `cache.store.url` (`s3://`, `gs://` or `az://`), `cache.store.options` and `cache.store.secretName` keep the cache registry's data in an object store. The StatefulSet then has no volume and `cache.persistence` is ignored. The registry gets `BUILDKIT_CACHE_STORE_URL` (the volume's `file://` URL by default) and one `BUILDKIT_CACHE_STORE_OPT_<key>` per option; the Secret joins them through `envFrom`. See `examples/helm-values-store-s3.yaml`.
+- `cache.serviceAccount.annotations` annotates the registry ServiceAccount, for a workload-identity role.
+- `helm upgrade` fails up front when it would add or drop the registry volume claims, which the API server refuses to update, and prints the steps to switch a release between the volume and a store (chart README, "Build cache").
 - `cache.podLabels` adds labels to the cache registry pod.
 - `docs/metrics.md` lists every metric with its type, labels, the values each label takes, and the histogram buckets. `cargo xtask crdgen` generates it from the same tables that register the metrics, and `cargo xtask crdgen --check` fails when it is stale.
 - `buildkit_pool_max{namespace,pool}` exports `scaling.max`, so a dashboard can show utilisation against it. `buildkit_pool_desired_warm` already carries the effective floor, schedule windows included.
@@ -14,6 +17,7 @@ All notable changes are listed here, newest first.
 
 ### Changed
 
+- The ServiceMonitor now selects the registry metrics port as well as the controller's, with one object. Remove a hand-added scrape of the registry.
 - Counters and histograms whose labels all take a closed set of values start at 0. The series without a pool exist from start-up, and a pool's series appear when the process first sees the pool and go when it is deleted. Before, a series appeared at its first event, so `rate()` and `increase()` missed that event. HTTP `status` is open, so the common statuses (200, 201, 202, 400, 401, 403, 404, 409, 429, 503) start at 0 and others appear on use.
 - `buildkit_claims{phase}` is cleared when a replica's leader term ends, like the pool gauges, so it no longer stays at its last value on a replica that lost the Lease.
 - The cache registry pod no longer exports controller-only families (`buildkit_leader`, `buildkit_ca_valid`, `buildkit_cert_not_after_seconds`, `buildkit_cert_load_errors_total`, `buildkit_leader_transitions_total`, `buildkit_releases_total`). It exports its own `buildkit_registry_*` families and the watch error counters of its pod and pool watches.

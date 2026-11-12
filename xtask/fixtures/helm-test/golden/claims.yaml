@@ -783,6 +783,7 @@ spec:
             - {name: BUILDKIT_CACHE_MAX_BLOB_SIZE, value: "5Gi"}
             - {name: BUILDKIT_CACHE_MAX_UPLOAD_SIZE, value: "10Gi"}
             - {name: BUILDKIT_CACHE_GC_INTERVAL, value: "10m"}
+            - {name: BUILDKIT_CACHE_STORE_URL, value: "file:///var/lib/buildkit-cache"}
             - {name: BUILDKIT_CACHE_WATCH_NAMESPACES, value: "ci"}
           ports:
             - {name: registry, containerPort: 5000}
@@ -830,8 +831,9 @@ metadata:
 spec:
   selector:
     matchLabels:
-      app.kubernetes.io/name: buildkit-controller
       app.kubernetes.io/instance: bk
-      app.kubernetes.io/component: metrics
+    matchExpressions:
+      - {key: app.kubernetes.io/name, operator: In, values: [buildkit-controller, buildkit-registry]}
+      - {key: app.kubernetes.io/component, operator: In, values: [metrics, registry]}
   endpoints:
     - {port: metrics, path: /metrics, interval: 15s}

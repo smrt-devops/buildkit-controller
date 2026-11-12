@@ -1,0 +1,49 @@
+# Values for: helm install bk helm/buildkit-controller -n buildkit-system -f helm-values-store-s3.yaml
+#
+# helm-values.yaml with the build cache in an S3 bucket instead of a volume. The registry
+# pod then has no PersistentVolumeClaim, so the cache survives a pod or node loss. The bucket
+# needs a role that can list, get, put and delete under the prefix; the registry reaches it
+# through the ServiceAccount annotation below (EKS IRSA or Pod Identity both work). gs:// and
+# az:// work the same way with the platform's own workload identity.
+#
+# Moving an existing release from the volume to a store (or back) needs three steps first, in
+# helm/buildkit-controller/README.md#build-cache.
+replicaCount: 2
+
+edge:
+  serverName: bk.example.com
+
+watchNamespaces: [ci]
+
+auth:
+  oidc:
+    - url: https://token.actions.githubusercontent.com
+      audiences: [buildkit-controller]
+
+cache:
+  store:
+    url: s3://example-build-cache/buildkit
+    options:
+      region: eu-west-1
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::111111111111:role/example-build-cache
+
+gateway:
+  api:
+    parentRefs: [{name: bk, namespace: gateway-system, sectionName: api}]
+
+pools:
+  - name: amd64
+    namespace: ci
+    spec:
+      platforms: [linux/amd64]
+      scaling:
+        max: 10
+      access:
+        rules:
+          - oidc:
+              issuer: https://token.actions.githubusercontent.com
+              claims:
+                repository_owner_id: "12345678"   # the org's numeric id (gh api orgs/<org> --jq .id)
+                event_name: push

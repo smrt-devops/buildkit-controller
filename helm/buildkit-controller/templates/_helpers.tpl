@@ -164,3 +164,21 @@ claim its publicKey. Probes: a field each CRD gained in 0.2.0. Offline renders (
   {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+The API server refuses any update to a StatefulSet's volumeClaimTemplates, so an upgrade
+that moves the registry between the volume and an object store (cache.store.url) cannot
+apply. Against a cluster, fail it up front, in both directions, with the way through. Offline
+renders (helm template) see no StatefulSet and skip the check.
+*/}}
+{{- define "bkc.registryStoreGuard" -}}
+{{- $name := printf "%s-registry" (include "bkc.fullname" .) -}}
+{{- $live := lookup "apps/v1" "StatefulSet" .Release.Namespace $name -}}
+{{- if $live -}}
+  {{- $hasClaims := gt (len (dig "spec" "volumeClaimTemplates" list $live)) 0 -}}
+  {{- $wantClaims := not .Values.cache.store.url -}}
+  {{- if ne $hasClaims $wantClaims -}}
+    {{- fail (printf "cache.store.url would %s the volumeClaimTemplates of StatefulSet %s, and the API server refuses that update. The cache starts cold after the switch; no data moves. Run:\n  kubectl -n %s delete statefulset %s --cascade=orphan\n  rerun this helm upgrade with the new cache.store.url (empty for the volume)\n  kubectl -n %s delete pvc data-%s-0   # volume to store only, after the new pod is Ready" (ternary "add" "drop" $wantClaims) $name .Release.Namespace $name .Release.Namespace $name) -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}

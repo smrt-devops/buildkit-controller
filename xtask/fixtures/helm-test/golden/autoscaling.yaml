@@ -616,6 +616,7 @@ spec:
             - {name: BUILDKIT_CACHE_MAX_BLOB_SIZE, value: "5Gi"}
             - {name: BUILDKIT_CACHE_MAX_UPLOAD_SIZE, value: "10Gi"}
             - {name: BUILDKIT_CACHE_GC_INTERVAL, value: "10m"}
+            - {name: BUILDKIT_CACHE_STORE_URL, value: "file:///var/lib/buildkit-cache"}
           ports:
             - {name: registry, containerPort: 5000}
             - {name: ops, containerPort: 8080}

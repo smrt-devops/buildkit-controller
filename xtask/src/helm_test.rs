@@ -20,17 +20,71 @@ use crate::{root, yaml_files};
 const CHART: &str = "helm/buildkit-controller";
 const FIXTURES: &str = "xtask/fixtures/helm-test";
 /// Example values files that must render.
-const EXAMPLES: [&str; 2] = ["examples/helm-values.yaml", "examples/helm-values-tcp.yaml"];
+const EXAMPLES: [&str; 3] = [
+    "examples/helm-values.yaml",
+    "examples/helm-values-tcp.yaml",
+    "examples/helm-values-store-s3.yaml",
+];
 /// Kinds the chart renders only when the cluster serves them.
 const API_VERSIONS: [&str; 1] = ["gateway.envoyproxy.io/v1alpha1/BackendTrafficPolicy"];
 
 /// A NOTES.txt line, whether the install notes of the fixture must show it, and the fixture.
-const NOTES: [(&str, bool, &str); 4] = [
+const NOTES: [(&str, bool, &str); 6] = [
+    ("cache.persistence is ignored", true, "cache-store"),
+    ("cache.persistence is ignored", false, "default"),
     ("Builds tunnel through the API", true, "default"),
     ("Builds tunnel through the API", false, "gateway-tcp-edge"),
     ("workerNetwork.clusterCIDRs is empty", true, "default"),
     ("workerNetwork.clusterCIDRs is empty", false, "all-options"),
 ];
+
+/// Whether a label selector (`matchLabels` and `matchExpressions`) selects `labels`.
+fn selects(selector: &serde_json::Value, labels: &serde_json::Value) -> bool {
+    let has = |k: &str| labels.get(k).and_then(|v| v.as_str());
+    let by_label = selector["matchLabels"]
+        .as_object()
+        .is_none_or(|m| m.iter().all(|(k, v)| has(k) == v.as_str()));
+    let by_expr = selector["matchExpressions"].as_array().is_none_or(|es| {
+        es.iter().all(|e| {
+            let values: Vec<&str> = e["values"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            match (
+                e["operator"].as_str(),
+                has(e["key"].as_str().unwrap_or_default()),
+            ) {
+                (Some("In"), Some(v)) => values.contains(&v),
+                (Some("NotIn"), v) => v.is_none_or(|v| !values.contains(&v)),
+                (Some("Exists"), v) => v.is_some(),
+                (Some("DoesNotExist"), v) => v.is_none(),
+                _ => false,
+            }
+        })
+    });
+    by_label && by_expr
+}
+
+/// The names of the rendered Services that the rendered `ServiceMonitor` selects, or an
+/// error when the render holds no `ServiceMonitor`.
+fn monitored_services(rendered: &str) -> Result<Vec<String>> {
+    let docs: Vec<serde_json::Value> =
+        serde_saphyr::from_multiple(rendered).context("parsing the render")?;
+    let monitor = docs
+        .iter()
+        .find(|d| d["kind"] == "ServiceMonitor")
+        .context("the render has no ServiceMonitor")?;
+    let mut names: Vec<String> = docs
+        .iter()
+        .filter(|d| {
+            d["kind"] == "Service"
+                && selects(&monitor["spec"]["selector"], &d["metadata"]["labels"])
+        })
+        .filter_map(|d| d["metadata"]["name"].as_str().map(str::to_owned))
+        .collect();
+    names.sort();
+    Ok(names)
+}
 
 /// Why an invalid fixture is wrong, or `None` when it was rejected for its `# expect:` reason.
 fn judge(expect: Option<&str>, accepted: bool, stderr: &str) -> Option<String> {
@@ -109,6 +163,16 @@ pub(crate) fn helm_test(update: bool) -> Result<()> {
         }
         println!("PASS {name}");
         passed += 1;
+    }
+    let sm = dir.join("all-options.yaml");
+    let rendered = helm(&root, "template", &sm)?;
+    match monitored_services(&String::from_utf8_lossy(&rendered.stdout)) {
+        Ok(names) if matches!(names.as_slice(), [m, r] if m.ends_with("-metrics") && r.ends_with("-registry")) => {
+            println!("PASS servicemonitor selects the controller metrics and registry Services");
+            passed += 1;
+        }
+        Ok(names) => failures.push(format!("servicemonitor selects {names:?}, want the controller metrics and registry Services only")),
+        Err(e) => failures.push(format!("servicemonitor: {e:#}")),
     }
     for (line, want, fixture) in NOTES {
         let values = dir.join(format!("{fixture}.yaml"));
