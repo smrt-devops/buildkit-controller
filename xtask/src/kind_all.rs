@@ -218,9 +218,6 @@ fn prebuild() -> Result<()> {
         crate::image::ensure_worker()?;
         crate::image::ensure(crate::e2e::REGISTRY_IMAGE)?;
         crate::gateway::ensure_image(crate::gateway::SOCAT.0, crate::gateway::SOCAT.1)?;
-        for store in crate::registry_verify::Store::ALL {
-            crate::gateway::ensure_image(store.image().0, store.image().1)?;
-        }
         join(host)
     })
 }

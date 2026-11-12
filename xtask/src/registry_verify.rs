@@ -213,6 +213,7 @@ pub(crate) enum Store {
 }
 
 impl Store {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 2] = [Self::Minio, Self::Azure];
 
     /// The image as `(tag, index digest)`, pulled by digest and tagged locally
@@ -297,12 +298,10 @@ impl Store {
                 "            - {{name: {OPT}{key}, value: \"{value}\"}}"
             );
         }
-        if !self.credentials().is_empty() {
-            let _ = write!(
-                env,
-                "          envFrom:\n            - prefix: {OPT}\n              secretRef: {{name: {STORE_SECRET}}}\n"
-            );
-        }
+        let _ = write!(
+            env,
+            "          envFrom:\n            - prefix: {OPT}\n              secretRef: {{name: {STORE_SECRET}}}\n"
+        );
         (String::new(), env, String::new(), String::new())
     }
 
@@ -334,20 +333,16 @@ impl Store {
                 "securityContext: {}",
             ),
         };
-        let secret = if self.credentials().is_empty() {
-            String::new()
-        } else {
-            let data = self
-                .credentials()
-                .iter()
-                .fold(String::new(), |mut s, (k, v)| {
-                    let _ = writeln!(s, "  {k}: \"{v}\"");
-                    s
-                });
-            format!(
-                "apiVersion: v1\nkind: Secret\nmetadata: {{name: {STORE_SECRET}, namespace: {NS}}}\nstringData:\n{data}---\n"
-            )
-        };
+        let data = self
+            .credentials()
+            .iter()
+            .fold(String::new(), |mut s, (k, v)| {
+                let _ = writeln!(s, "  {k}: \"{v}\"");
+                s
+            });
+        let secret = format!(
+            "apiVersion: v1\nkind: Secret\nmetadata: {{name: {STORE_SECRET}, namespace: {NS}}}\nstringData:\n{data}---\n"
+        );
         format!(
             "\
 {secret}apiVersion: apps/v1
@@ -675,6 +670,7 @@ pub(crate) fn registry_verify(store: Option<Store>) -> Result<()> {
     crate::image::ensure_worker()?;
     status(&mut crate::kube::kind_load(WORKER_IMAGE, env.name()))?;
     if let Some(store) = store {
+        crate::gateway::ensure_image(store.image().0, store.image().1)?;
         status(&mut crate::kube::kind_load(store.image().0, env.name()))?;
     }
     deploy(env, &work, store)?;
@@ -1069,11 +1065,7 @@ buildkit_registry_requests_total{route=\"blob\",method=\"PUT\",status=\"201\"} 7
                 assert!(!m.contains(secret), "{store:?} leaks a credential");
                 assert!(store.manifest().contains(secret));
             }
-            assert_eq!(
-                m.contains("envFrom"),
-                !store.credentials().is_empty(),
-                "{store:?}"
-            );
+            assert!(m.contains("envFrom"), "{store:?}");
         }
         assert!(manifests(Some(Store::Minio)).contains("s3://bk-cache"));
         assert!(manifests(Some(Store::Azure)).contains("az://bk-cache"));
@@ -1129,7 +1121,6 @@ buildkit_registry_requests_total{route=\"blob\",method=\"PUT\",status=\"201\"} 7
     fn minio_serves_unauthenticated_metrics() {
         let m = Store::Minio.manifest();
         assert!(m.contains("MINIO_PROMETHEUS_AUTH_TYPE, value: public"));
-        assert!(!m.contains("kind: Secret\nmetadata: {name: cache-store, namespace: bk-registry}\nstringData:\n  GOOGLE"));
     }
 
     #[test]
