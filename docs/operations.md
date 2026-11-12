@@ -133,7 +133,7 @@ Pod addresses change when the Envoy pods are rescheduled. Pin them to a node poo
 
 - Pool size. Set `scaling.max` to the number of builds you want to run at once. Each worker pod requests 500m CPU, 1Gi memory and 1Gi ephemeral storage by default, with limits of 4Gi memory and 20Gi ephemeral storage. Override these in `spec.template.spec.containers[0].resources`. Limits must include `memory` and `ephemeral-storage`.
 - Worker storage. A worker has no volume. Its BuildKit state is an `emptyDir` that disappears with the pod, and the ephemeral-storage limit bounds it. `spec.workers.stateSizeLimit` caps the `emptyDir` explicitly.
-- Cache volume. The cache registry keeps its store on one PVC (`cache.persistence`, 60Gi by default, the cluster's default StorageClass unless `cache.persistence.storageClass` is set). The volume must hold `cache.maxSize` (40Gi) plus `cache.maxUploadSize` (10Gi): blobs of uploads in progress sit on the volume beside the stored cache until their upload ends, and garbage collection only enforces `maxSize` on what is stored. A volume smaller than the sum can fill during a burst of pushes, and then writes fail and builds run uncached. When you raise `cache.maxSize`, raise `cache.persistence.size` with it. `cache.poolMaxSize` (10Gi) caps each pool that sets no `spec.workers.cache.maxSize`, and the pools' budgets together can exceed `cache.maxSize`, in which case the volume budget decides. Resize the claim with your storage class's volume expansion, or recreate it (the cache restarts empty). See [Build cache](architecture.md#build-cache).
+- Cache storage. With the default volume, the cache registry keeps its store on one PVC (`cache.persistence`, 60Gi by default, the cluster's default StorageClass unless `cache.persistence.storageClass` is set). With an object store (`cache.store.url`) there is no volume to size; see [Sizing a store](#sizing-a-store). The rest of this item is about the volume. It must hold `cache.maxSize` (40Gi) plus `cache.maxUploadSize` (10Gi): blobs of uploads in progress sit on the volume beside the stored cache until their upload ends, and garbage collection only enforces `maxSize` on what is stored. A volume smaller than the sum can fill during a burst of pushes, and then writes fail and builds run uncached. When you raise `cache.maxSize`, raise `cache.persistence.size` with it. `cache.poolMaxSize` (10Gi) caps each pool that sets no `spec.workers.cache.maxSize`, and the pools' budgets together can exceed `cache.maxSize`, in which case the budget of the whole store decides. Resize the claim with your storage class's volume expansion, or recreate it (the cache restarts empty). See [Build cache](architecture.md#build-cache).
 - Controller. The chart defaults are 2 replicas, a 100m CPU and 128Mi memory request, and a 1536Mi memory limit. The edge copies bytes for every build, so watch CPU on the replicas under heavy load and raise `replicaCount` or enable `autoscaling` (CPU-based HPA). The limit is the baseline (about 14 MiB) plus `edge.maxConnections` times 460 KiB (200 KiB for a `tcp://` connection: two 64 KiB copy buffers and two TLS sessions; 460 KiB for a tunnelled connection at worst: the 200 KiB of a TCP edge connection, a 64 KiB HTTP/2 stream window, up to 128 KiB of WebSocket read buffer and message, and one 65 KiB outgoing frame), plus `edge.maxHandshakes` times 280 KiB for a handshake in progress. Tunnels share the handshake budget. At the defaults (2000 connections, 1024 handshakes) the total is about 1.16 GiB, so the 1536Mi limit leaves about 344 MiB of margin. Lower `edge.maxConnections` or `edge.maxHandshakes` to lower the limit, or raise `resources.limits.memory` together with them. One allocation may hold at most 64 edge connections per replica; a plain build uses 2. Per replica, the edge allows 2000 established connections (`edge.maxConnections`), a quarter of them for the allocations of one pool namespace, and 1024 connections in the TLS handshake (`edge.maxHandshakes`), 32 of them from one client address (`edge.maxHandshakesPerIp`). Over a handshake cap the edge closes the oldest handshake in progress, not the new connection, and it closes a connection that sends no TLS ClientHello within 2 s. The edge accepts TLS 1.3 only. The API allows 4096 connections (`api.maxConnections`), 128 of them from one client address (`api.maxConnectionsPerIp`). An IPv6 client address is its /64 on the edge and its /56 on the API. Other connections over a cap are closed on accept and logged at `debug`. ServiceAccount tokens that are not cached cost a TokenReview: at most 50 a second and `auth.serviceAccount.maxConcurrentReviews` (32) in flight per replica, 4 of them for one client address. The per-address caps count the source address the controller sees, so they need source-IP preservation. With `service.type: LoadBalancer` the chart sets `service.externalTrafficPolicy: Local` for that. Behind a Gateway without [PROXY protocol](#proxy-protocol), with `Cluster`, a load balancer that rewrites the source, a proxy, or runners behind one NAT address, many clients share one address. Turn on PROXY protocol where the proxy supports it, or raise `api.maxConnectionsPerIp`, `edge.maxHandshakesPerIp` and `auth.serviceAccount.maxReviewsPerIp`, or set them to 0 to disable them. Behind a Gateway the chart already sets `edge.maxHandshakesPerIp` to 0 (see [Exposure](#exposure)).
 - Load balancer and gateway. Queued requests are short polls, so only long quiet builds need the idle timeout of the load balancer or gateway raised. See [Exposure](#exposure) and the table in [the chart README](../helm/buildkit-controller/README.md#load-balancer-idle-timeout).
 - Quotas. Pods count against the pool namespace's ResourceQuota. A refused create shows as `Degraded=True/PodCreateFailed`.
@@ -237,12 +237,209 @@ The chart runs the cache registry by default (`cache.enabled`). How it works is 
 | `cache.maxBlobSize` | `5Gi` | A larger layer is refused. |
 | `cache.maxUploadSize` | `10Gi` | Bytes that uploads in progress may hold together. One worker may hold a quarter of it, or one `cache.maxBlobSize` if that is larger, and a worker gets `429` beyond that. |
 | `cache.gcInterval` | `10m` | Time between garbage collections. |
-| `cache.persistence.size`, `.storageClass` | `60Gi`, cluster default | The volume. |
+| `cache.persistence.size`, `.storageClass` | `60Gi`, cluster default | The volume. Used only when `cache.store.url` is empty. |
+| `cache.store.url`, `.options`, `.secretName` | empty (the volume) | An object store instead of the volume. See [Choosing the volume or a store](#choosing-the-volume-or-a-store). |
+| `cache.serviceAccount.annotations`, `cache.podLabels` | `{}` | Workload identity for the store. |
 
-Each value is also a flag of the `registry` role (`--max-size`, `--pool-max-size`, `--max-blob-size`, `--max-upload-size`, `--gc-interval`) with the environment variable `BUILDKIT_CACHE_MAX_SIZE` and so on, if you run the role yourself. The flags have the chart's defaults, except `--max-size`, the budget of the whole store, which defaults to 40Gi, so set it to fit your volume. The role finds its store through `BUILDKIT_CACHE_STORE_URL` (`--store-url`), default `file:///var/lib/buildkit-cache`; it refuses to start while the old `BUILDKIT_CACHE_DATA_DIR` is set.
+Each value is also a flag of the `registry` role (`--max-size`, `--pool-max-size`, `--max-blob-size`, `--max-upload-size`, `--gc-interval`) with the environment variable `BUILDKIT_CACHE_MAX_SIZE` and so on, if you run the role yourself. The flags have the chart's defaults, except `--max-size`, the budget of the whole store, which defaults to 40Gi, so set it to fit your volume or store. The role finds its store through `BUILDKIT_CACHE_STORE_URL` (`--store-url`), default `file:///var/lib/buildkit-cache`; it refuses to start while the old `BUILDKIT_CACHE_DATA_DIR` is set.
 
 The registry takes at most 64 connections from one address and gives each TLS handshake 5 s. It holds at most 16 manifest bodies in memory at once. A manifest push that finds no free slot gets `429` at once, and its body must arrive within 30 s. A trusted caller keeps its share of the upload space until its uploads end or expire after 1 hour idle, so one trusted tenant can make other tenants' exports fail with `429` for that long. Exports carry `ignore-error=true`, so those builds still succeed, uncached.
+### Choosing the volume or a store
+
+The registry keeps its data in one of two places, and the chart picks which from `cache.store.url`.
+
+| | Volume (`cache.store.url` empty, the default) | Object store (`s3://`, `gs://` or `az://`) |
+|---|---|---|
+| Where the data lives | One PVC (`cache.persistence`) on the registry pod's node pool | A bucket or container, under the URL's prefix |
+| Pod | StatefulSet with a `volumeClaimTemplates` entry | StatefulSet with no volume claim and no data volume; the root filesystem stays read-only |
+| Pod or node loss | The cache survives on the PVC | The cache survives in the store |
+| What you size | The volume, to `cache.maxSize` plus `cache.maxUploadSize` | Nothing on the cluster; see [Sizing a store](#sizing-a-store) |
+| Credentials | None | Workload identity or a Secret |
+
+Both forms run one replica. Pick the volume when you have a fast StorageClass and no cloud account to give the registry. Pick a store when you want the cache to outlive the node pool, or the cluster has no suitable StorageClass. The registry needs only the store's list, get, put and delete rights under its prefix; the controller's RBAC does not change.
+
+Set the URL and, where the store needs them, options and credentials:
+
+| Value | Meaning |
+|---|---|
+| `cache.store.url` | `s3://<bucket>[/<prefix>]`, `gs://<bucket>[/<prefix>]` or `az://<container>[/<prefix>]`. Empty keeps the volume. The registry refuses every other scheme. |
+| `cache.store.options` | Provider settings, such as `region` or `endpoint`. One registry variable `BUILDKIT_CACHE_STORE_OPT_<key>` per entry. Values are strings. |
+| `cache.store.secretName` | A Secret in the release namespace. The kubelet passes its keys to the registry with the same `BUILDKIT_CACHE_STORE_OPT_` prefix, so a key is an option. Use it for static credentials. |
+| `cache.serviceAccount.annotations` | Annotations on the registry ServiceAccount `<fullname>-registry`, for workload identity. |
+| `cache.podLabels` | Extra labels on the registry pod, for platforms whose webhook selects pods by label. |
+
+With a store URL the chart ignores `cache.persistence`, and the install notes say so. Do not set a store URL and also expect a volume.
+
+Use a prefix, or a bucket of its own, that nothing else writes to. The registry trusts what it finds under its prefix when it rebuilds its index at start, so anyone who can write there can plant cache content. Its credentials should name that prefix and nothing wider.
+
+#### Option keys
+
+Options are the provider's own configuration keys: `region`, `endpoint`, `allow_http`, `access_key_id`, `secret_access_key` and `session_token` for S3; `service_account_key` for GCS; `account_name` and `account_key` for Azure. Names are matched in lower case, so a Secret key `ACCESS_KEY_ID` and `access_key_id` are the same key.
+
+The registry reads each `BUILDKIT_CACHE_STORE_OPT_<key>` variable and refuses to start, naming the key, when:
+
+- the key is not one its provider knows. A typo fails at start-up and never silently does nothing;
+- two names are aliases of one key, such as `region` and `aws_region`;
+- the key sets the bucket or container, because the URL owns it;
+- the URL is a `file` URL, which takes no options.
+
+The same key in `cache.store.options` and in the Secret is not caught: the kubelet lets the explicit option win before the registry starts, so it sees one variable. Do not set a key in both.
+
+The registry's own settings of the store client come first, and your options override them. Credentials the platform injects (web identity tokens, container credentials, the instance metadata service, GKE Workload Identity, Azure workload identity) are found without any option. A misspelt raw provider variable such as `AWS_ALLOW_HTTP` is ignored without a word, because platforms inject variables the registry does not know, so set settings through `cache.store.options`, where a typo is an error. The chart never sets raw provider variables. Logs name option keys and never print their values.
+
+#### AWS S3
+
+Create the bucket, then give the registry a role. The policy below limits it to one bucket and the prefix `buildkit/`. Replace `example-build-cache` and the prefix with yours:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::example-build-cache",
+      "Condition": {"StringLike": {"s3:prefix": ["buildkit", "buildkit/*"]}}
+    },
+    {
+      "Sid": "ObjectsUnderPrefix",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+      "Resource": "arn:aws:s3:::example-build-cache/buildkit/*"
+    }
+  ]
+}
+```
+
+With EKS Pod Identity, let the Pod Identity agent hand the role to the registry's ServiceAccount. The role's trust policy names the service principal `pods.eks.amazonaws.com` with `sts:AssumeRole` and `sts:TagSession`. Associate the role with the ServiceAccount:
+
+```bash
+aws eks create-pod-identity-association --cluster-name <cluster> \
+  --namespace <release namespace> --service-account <fullname>-registry \
+  --role-arn arn:aws:iam::<account>:role/<registry role>
+```
+
+`<fullname>` is `buildkit-controller` with the default naming. Pod Identity needs no annotation. With IRSA, set `cache.serviceAccount.annotations` to `eks.amazonaws.com/role-arn: <role arn>` instead. The values:
+
+```yaml
+cache:
+  store:
+    url: s3://example-build-cache/buildkit
+    options:
+      region: eu-west-1
+```
+
+A full file is [`examples/helm-values-store-s3.yaml`](../examples/helm-values-store-s3.yaml).
+
+Add the lifecycle rule from [Lifecycle rule](#lifecycle-rule) to the bucket before the first build.
+
+#### MinIO and other S3-compatible stores
+
+Point the registry at the endpoint and give it keys from a Secret. MinIO over plain HTTP needs `allow_http`:
+
+```yaml
+cache:
+  store:
+    url: s3://build-cache/buildkit
+    options:
+      endpoint: http://minio.minio.svc:9000
+      region: us-east-1
+      allow_http: "true"
+    secretName: buildkit-cache-store
+```
+
+```bash
+kubectl -n buildkit-system create secret generic buildkit-cache-store \
+  --from-literal=access_key_id=<key> --from-literal=secret_access_key=<secret>
+```
+
+Create the bucket first, and give the key list, get, put, delete and multipart rights under the prefix. Leave out `allow_http` for an `https://` endpoint.
+
+#### Google Cloud Storage
+
+Bind the registry's Kubernetes ServiceAccount to a Google service account with Workload Identity, and annotate it:
+
+```yaml
+cache:
+  store:
+    url: gs://example-build-cache/buildkit
+  serviceAccount:
+    annotations:
+      iam.gke.io/gcp-service-account: registry@<project>.iam.gserviceaccount.com
+```
+
+The Google service account needs `roles/iam.workloadIdentityUser` for the member `serviceAccount:<project>.svc.id.goog[<release namespace>/<fullname>-registry]`, and a role on the bucket that lists, reads, creates and deletes objects (`roles/storage.objectUser` does). Use a bucket of its own, so that the grant does not reach other data. The registry finds the credentials through the metadata server.
+
+#### Azure Blob Storage
+
+The account name is an option, and the container is the first part of the URL. For workload identity, annotate the ServiceAccount with the identity's client ID and label the pod so that the platform's webhook injects the token:
+
+```yaml
+cache:
+  store:
+    url: az://build-cache/buildkit
+    options:
+      account_name: examplecachestore
+  serviceAccount:
+    annotations:
+      azure.workload.identity/client-id: <client id>
+  podLabels:
+    azure.workload.identity/use: "true"
+```
+
+The identity needs a role that reads, writes and deletes blobs in the container, such as Storage Blob Data Contributor scoped to it, and a federated credential for the subject `system:serviceaccount:<release namespace>:<fullname>-registry`.
+
+#### Lifecycle rule
+
+An upload that is in progress when the registry stops leaves an incomplete multipart upload that no listing shows, and that the store bills for. Add a rule to the bucket that aborts incomplete multipart uploads one day after they start. For S3:
+
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket example-build-cache \
+  --lifecycle-configuration '{"Rules":[{"ID":"abort-incomplete-uploads","Status":"Enabled","Filter":{"Prefix":"buildkit/"},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":1}}]}'
+```
+
+Use the same rule in any S3-compatible store that supports it. GCS needs no rule, because the registry aborts through the API. Azure has no abort: uncommitted blocks expire after 7 days by themselves.
+
+#### Sizing a store
+
+There is no disk to size. The registry still enforces `cache.maxSize` on what it has stored, and still gives each pool `cache.poolMaxSize` unless the pool sets its own budget, so those values decide how much the bucket holds. Between garbage collections the stored cache can grow past `maxSize`, and uploads in progress hold up to `cache.maxUploadSize` more. Pick a bucket quota, if you set one, above their sum. The registry keeps its index in memory (a few hundred bytes per blob) and buffers up to 5 MiB for each upload in progress, so the pod's 512Mi memory limit, not the store, is what bounds a busy registry. Raise `cache.resources.limits.memory` before you raise the number of concurrent uploads.
+
+At start the registry lists the store and reads each manifest record once, and the pod is not ready until that is done. The wait grows with the number of manifests, and a cache of several thousand manifests takes seconds.
+
+#### When the store fails
+
+| Situation | What happens |
+|---|---|
+| The store is unreachable at start, or the bucket does not exist | The registry retries with a back-off from 1 s to 30 s and logs each failure at `warn`. `/readyz` reports `registry_store` not ready, so the Service has no endpoint and builds run uncached. `/healthz` stays healthy, so the pod is not restarted. |
+| A bad URL or option at start | The process exits and names the key. |
+| The store fails after start | A GET or write answers `503` with `Retry-After: 5`, after the client's retries within 15 s. The volume answers the same for a disk error. |
+| HEAD of a blob or manifest | Answered from memory, so it works during an outage. |
+| An upload or a manifest push fails | `503`. The upload is aborted, nothing enters the index, and the keys the push wrote are deleted later. |
+
+Exports carry `ignore-error=true`, so an outage costs cache writes, never a build. A build that is importing from the cache when the store fails can fail: a long layer download cannot resume after a transient error once it has run for 15 s, so the worker sees a truncated body and that import step fails. This is the same as a registry restart.
+
+Readiness never clears once the registry is up. During an outage after start the pod stays in the Service and answers `503`, so a one-replica cache does not turn an outage into refused connections.
+
+#### Moving between the volume and a store
+
+The API server refuses any change to a StatefulSet's `volumeClaimTemplates`, and switching between the two forms adds or drops one. `helm upgrade` therefore fails up front, in either direction, and prints these steps:
+
+```bash
+kubectl -n <namespace> delete statefulset <fullname>-registry --cascade=orphan
+# rerun your helm upgrade with the new cache.store.url (empty for the volume)
+kubectl -n <namespace> delete pvc data-<fullname>-registry-0   # volume to store only, once the new pod is Ready
+```
+
+The orphaned pod keeps serving until the new StatefulSet replaces it. The chart sets no retention policy, so the PVC stays until the third command. No data moves in either direction, and the cache starts cold after the switch. A switch from a store to the volume has no third step, because the store's objects stay in the bucket: delete them when you no longer need them.
+
+#### Upgrading to 0.5.0 and rolling back
+
+The 0.5.0 registry uses a new layout, and every 0.4 cache starts cold. On a volume, the first start deletes the 0.4 files, which frees their space. Rolling back to 0.4 on the same volume needs the PVC deleted first, because 0.4 would read the 0.5 directories as blobs: scale the StatefulSet to zero, delete `data-<fullname>-registry-0`, then install 0.4. The `registry` role's `--data-dir` and `BUILDKIT_CACHE_DATA_DIR` are replaced by `--store-url` and `BUILDKIT_CACHE_STORE_URL`, and the role refuses to start while the old variable is set.
+
 ### Sizing the volume
+
+This section is about the default volume. With a store URL, see [Sizing a store](#sizing-a-store).
 
 Size `cache.persistence.size` to at least `cache.maxSize` plus `cache.maxUploadSize`. The defaults are 40Gi plus 10Gi, so the 60Gi volume has 10Gi to spare. Garbage collection holds the stored cache to `maxSize` every `gcInterval`, but between runs the store can grow past it, and uploads in progress add up to `maxUploadSize` more on top. A pool budget (`spec.workers.cache.maxSize`) cuts only that pool. Blobs of uploads that no manifest references yet count against both budgets. When the volume is full, pushes fail and pulls keep working.
 
@@ -261,15 +458,15 @@ Every branch of a repository shares its shared cache, so pin `event_name` and `r
 
 The rights come from the worker pod's live allocation, so they end with it, and a build cannot read or write the cache of another repository. Anyone who may patch pods in a pool namespace can change that allocation, and so write any cache of the pool. Within one repository's shared cache, the untrusted builds of the repository read everything that a trusted build exported, intermediate stages included (`mode=max`). Keep secrets out of every build stage that a trusted build caches. `spec.workers.cache.scope: pool` makes every caller of a pool share one cache: use it only when they are one trust domain. Branch caches stay per repository under it.
 
-Branch caches count against the pool's budget (`spec.workers.cache.maxSize`) with everything else, and the least recently used manifests go first. A burst of pull request builds can therefore evict older manifests of the shared cache. The registry stores a layer once, however many caches of the volume link it. A branch build does not upload a layer that the shared cache already holds. Its manifest may reference that layer, and the registry links it into the branch cache. The registry links only layers of the build's own shared cache. The build uploads a layer that another repository or branch holds, because the registry does not mount blobs across repositories.
+Branch caches count against the pool's budget (`spec.workers.cache.maxSize`) with everything else, and the least recently used manifests go first. A burst of pull request builds can therefore evict older manifests of the shared cache. The registry stores a layer once, however many caches of the store link it. A branch build does not upload a layer that the shared cache already holds. Its manifest may reference that layer, and the registry links it into the branch cache. The registry links only layers of the build's own shared cache. The build uploads a layer that another repository or branch holds, because the registry does not mount blobs across repositories.
 
 ### When the cache pod restarts
 
-The registry is one pod with one volume. Builds that start while it restarts run uncached. A running build that imported from it before the restart can fail when it fetches a layer it matched, because `ignore-error=true` covers only the export. A node drain moves the pod, so drain during a quiet period. The store survives the restart on its volume. To empty the cache, scale the StatefulSet to zero, delete the PVC `data-<fullname>-registry-0`, and scale it back to one.
+The registry is one pod, with one volume or one store. Builds that start while it restarts run uncached. A running build that imported from it before the restart can fail when it fetches a layer it matched, because `ignore-error=true` covers only the export. A node drain moves the pod, so drain during a quiet period. The cache survives the restart, on its volume or in its store, and the pod is ready again once it has rebuilt its index (see [Sizing a store](#sizing-a-store)). To empty the cache on a volume, scale the StatefulSet to zero, delete the PVC `data-<fullname>-registry-0`, and scale it back to one. To empty it in a store, scale the StatefulSet to zero, delete every object under the URL's prefix with the provider's tools, and scale it back to one.
 
 ## Observability
 
-Metrics are on the ops port (8080, `/metrics`) through the `<fullname>-metrics` Service (`buildkit-controller-metrics` with the default naming). Set `metrics.serviceMonitor.enabled` to `true`, or `auto` to create it only when the Prometheus Operator CRD exists. The cache registry is a separate pod and serves its own `/metrics` on the `metrics` port of the `<fullname>-registry` Service. The chart's ServiceMonitor does not select it, so add a scrape for that Service to collect the registry metrics. The registry exports only its own families, so a query on the controller metrics never sees a registry series. No metric has a per-allocation or per-pod label. Logs are JSON on stderr, so a log shipper must read stderr, and they never contain tokens, private keys or Secret data.
+Metrics are on the ops port (8080, `/metrics`) through the `<fullname>-metrics` Service (`buildkit-controller-metrics` with the default naming). Set `metrics.serviceMonitor.enabled` to `true`, or `auto` to create it only when the Prometheus Operator CRD exists. The cache registry is a separate pod and serves its own `/metrics` on the `metrics` port of the `<fullname>-registry` Service. The chart's ServiceMonitor selects it as well, with the same object, so a scrape of that Service that you added by hand would scrape it twice: remove it. The registry exports only its own families, so a query on the controller metrics never sees a registry series. No metric has a per-allocation or per-pod label. Logs are JSON on stderr, so a log shipper must read stderr, and they never contain tokens, private keys or Secret data.
 
 The [metrics reference](metrics.md) lists every metric with its labels, the values each label takes, and the histogram buckets. It is generated from the code. Counters and histograms start at 0 when the process starts, or when a pool first appears, so `rate()` and `increase()` see the first event.
 
@@ -289,7 +486,7 @@ Metrics to start with:
 | `buildkit_edge_connections_total{result,transport}` | Edge outcomes, for the edge port (`tcp`) and for `/v1/tunnel` (`tunnel`). Failures include `tls_error`, `expired` and `upstream_error`. A connection cap shows as `handshake_limit`, `peer_handshake_limit`, `connection_limit` (`edge.maxConnections`), `namespace_limit` (a quarter of `edge.maxConnections` for the allocations of one pool namespace) or `allocation_limit` (64 connections for one allocation on one replica). |
 | `buildkit_watch_errors_total{kind}`, `buildkit_watch_namespace_unlisted{kind,namespace}` | Kubernetes watch trouble. See [Kubernetes API outages](#kubernetes-api-outages). |
 | `buildkit_auth_total{result}`, `buildkit_jwks_fetch_total{result}` | Login failures and issuer reachability. |
-| `buildkit_registry_stored_bytes` | The cache registry's store size (cache pod). Compare it with `cache.maxSize`. |
+| `buildkit_registry_stored_bytes` | The size of what the cache registry stores, on its volume or in its store (cache pod). Compare it with `cache.maxSize`. |
 | `buildkit_registry_requests_total{route,method,status}` | Registry traffic. A run of `5xx` or `429` statuses means the cache is failing or uploads hit their limit. |
 | `buildkit_registry_denied_total{action}` | Pushes or pulls refused for a worker's allocation. `push` denials are expected for untrusted builds. A burst of `pull` denials is not. |
 
@@ -302,7 +499,7 @@ Suggested alerts, with thresholds to tune:
 | CA expiring | `min(buildkit_cert_not_after_seconds{kind=~"client_ca|internal_ca"}) - time() < 365 * 86400` | 1h |
 | Pool saturated | `buildkit_pool_waiting > 0` | 10m |
 | Queue timeouts | `sum(rate(buildkit_allocations_total{result="pool_exhausted"}[10m])) > 0` | 10m |
-| Cache volume nearly full | `buildkit_registry_stored_bytes > 0.9 * <cache.maxSize in bytes>` | 15m |
+| Cache nearly at its budget (volume or store) | `buildkit_registry_stored_bytes > 0.9 * <cache.maxSize in bytes>` | 15m |
 | Cache failing | `sum(rate(buildkit_registry_requests_total{status=~"5.."}[5m])) > 0` | 10m |
 | Allocation failures | `sum(rate(buildkit_allocations_total{result!="ok"}[5m])) / sum(rate(buildkit_allocations_total[5m])) > 0.05` | 10m |
 | JWKS fetch failing | `increase(buildkit_jwks_fetch_total{result="error"}[10m]) > 5` | 10m |

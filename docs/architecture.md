@@ -104,7 +104,7 @@ The owner is per run attempt, not per job. All jobs of one attempt, such as the 
 
 ## Build cache
 
-Builds get a cache from the cache registry, a built-in role of the controller binary. It runs as a one-replica StatefulSet `<fullname>-registry` with one volume, and the chart turns it on by default (`cache.enabled`). It serves the part of the OCI distribution API that BuildKit's registry cache exporter and importer use: blob upload, blob and manifest read, and manifest write. It serves nothing else, and it verifies each blob against its digest as the blob streams in.
+Builds get a cache from the cache registry, a built-in role of the controller binary. It runs as a one-replica StatefulSet `<fullname>-registry` with one volume, or with an object store in its place (`cache.store.url`), and the chart turns it on by default (`cache.enabled`). It serves the part of the OCI distribution API that BuildKit's registry cache exporter and importer use: blob upload, blob and manifest read, and manifest write. It serves nothing else, and it verifies each blob against its digest as the blob streams in.
 
 The allocation response carries the cache flags, and the client passes them to buildx. A trusted build gets:
 
@@ -140,7 +140,7 @@ The registry identifies the worker by its certificate and finds the pod in its w
 
 A pull from the branch scope that finds nothing there is answered from the allocation's own scope, for HEAD and GET, by tag or digest, with ranges. Pushes never fall back, and nothing else does: a trusted or read-only worker, another branch's scope and another repository are never read this way.
 
-A trusted allocation never gets a branch scope, even when its pod carries the annotation. A worker with no live allocation gets nothing. A build cannot read or write another scope's or another branch's cache, whatever `--cache-to` it passes. The registry never mounts a blob from one repository into another. A layer reaches a cache by an upload into it, with one exception. A manifest pushed to a branch scope may reference a layer that the allocation's own scope holds, and the registry then links that layer into the branch scope. BuildKit needs this, because its HEAD for the layer succeeds through the fallback and it skips the upload. The branch could already read that layer, so the link exposes nothing. The registry refuses a layer that only another repository or another branch holds. It stores each layer once on the volume, however many caches link it. The registry trusts the annotations on the pod, so anyone who may patch pods in a pool namespace can write any cache of that pool. Grant `pods/patch` there only to cluster admins.
+A trusted allocation never gets a branch scope, even when its pod carries the annotation. A worker with no live allocation gets nothing. A build cannot read or write another scope's or another branch's cache, whatever `--cache-to` it passes. The registry never mounts a blob from one repository into another. A layer reaches a cache by an upload into it, with one exception. A manifest pushed to a branch scope may reference a layer that the allocation's own scope holds, and the registry then links that layer into the branch scope. BuildKit needs this, because its HEAD for the layer succeeds through the fallback and it skips the upload. The branch could already read that layer, so the link exposes nothing. The registry refuses a layer that only another repository or another branch holds. It stores each layer once, however many caches link it. The registry trusts the annotations on the pod, so anyone who may patch pods in a pool namespace can write any cache of that pool. Grant `pods/patch` there only to cluster admins.
 
 ### Scope and trust tiers
 
@@ -164,10 +164,10 @@ An untrusted OIDC caller whose token has a `ref` claim (`refs/heads/<branch>`, `
 
 ### Limits and garbage collection
 
-- `spec.workers.cache.maxSize` caps what a pool's caches hold together. A pool without it gets the chart's `cache.poolMaxSize`. The chart's `cache.maxSize` caps the whole volume.
+- `spec.workers.cache.maxSize` caps what a pool's caches hold together. A pool without it gets the chart's `cache.poolMaxSize`. The chart's `cache.maxSize` caps the whole store, the volume or the object store.
 - Every manifest records its last pull or push time. A pull that a branch scope falls back for records the use on the shared manifest and layers it read, and creates nothing in the branch scope. Garbage collection (`cache.gcInterval`, 10 minutes by default) keeps the newest first while they fit the budget: manifests by last use, and blobs of uploads that no manifest references yet by upload time, which count against the budget too. An item that does not fit is removed and the scan goes on, so one oversized push cannot empty a pool. A mark and sweep then deletes the blobs that nothing references. While the registry cannot list pools, it evicts nothing for a pool budget.
-- A blob over `cache.maxBlobSize` is refused. Upload sessions expire after 1 hour idle. `cache.maxUploadSize` bounds the bytes that uploads in progress hold together, so size the volume to `cache.maxSize` plus `cache.maxUploadSize` ([sizing](operations.md#sizing)).
-- One replica means one volume. Builds that start while the cache pod restarts run uncached, and a build that imported from it before the restart can fail when it fetches a layer. The cache is an accelerator, so the allocation does not wait for it.
+- A blob over `cache.maxBlobSize` is refused. Upload sessions expire after 1 hour idle. `cache.maxUploadSize` bounds the bytes that uploads in progress hold together, so on a volume, size it to `cache.maxSize` plus `cache.maxUploadSize` ([sizing](operations.md#sizing)).
+- One replica means one volume or one store. Builds that start while the cache pod restarts run uncached, and a build that imported from it before the restart can fail when it fetches a layer. The cache is an accelerator, so the allocation does not wait for it.
 
 ## BuildKitClaim
 
