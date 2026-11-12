@@ -274,7 +274,7 @@ Use a prefix, or a bucket of its own, that nothing else writes to. The registry 
 
 #### Option keys
 
-Options are the provider's own configuration keys: `region`, `endpoint`, `allow_http`, `access_key_id`, `secret_access_key` and `session_token` for S3; `service_account_key` for GCS; `account_name` and `account_key` for Azure. Names are matched in lower case, so a Secret key `ACCESS_KEY_ID` and `access_key_id` are the same key.
+Options are the provider's own configuration keys: `region`, `endpoint`, `allow_http`, `access_key_id`, `secret_access_key` and `session_token` for S3; `service_account_key` for GCS; `account_name` and `account_key` for Azure. Names are matched in lower case, so `ACCESS_KEY_ID` and `access_key_id` name the same key.
 
 The registry reads each `BUILDKIT_CACHE_STORE_OPT_<key>` variable and refuses to start, naming the key, when:
 
@@ -283,7 +283,7 @@ The registry reads each `BUILDKIT_CACHE_STORE_OPT_<key>` variable and refuses to
 - the key sets the bucket or container, because the URL owns it;
 - the URL is a `file` URL, which takes no options.
 
-The same key in `cache.store.options` and in the Secret is not caught: the kubelet lets the explicit option win before the registry starts, so it sees one variable. Do not set a key in both.
+The same name in `cache.store.options` and in the Secret is not caught: the kubelet lets the explicit option win before the registry starts, so it sees one variable. Do not set a name in both. Two spellings of one key (`region` in the options and `REGION` in the Secret, which the registry reads as two variables) fail start-up.
 
 The registry's own settings of the store client come first, and your options override them. Credentials the platform injects (web identity tokens, container credentials, the instance metadata service, GKE Workload Identity, Azure workload identity) are found without any option. A misspelt raw provider variable such as `AWS_ALLOW_HTTP` is ignored without a word, because platforms inject variables the registry does not know, so set settings through `cache.store.options`, where a typo is an error. The chart never sets raw provider variables. Logs name option keys and never print their values.
 
@@ -330,7 +330,7 @@ cache:
       region: eu-west-1
 ```
 
-A full file is [`examples/helm-values-store-s3.yaml`](../examples/helm-values-store-s3.yaml).
+A full file is [`examples/helm-values-store-s3.yaml`](../examples/helm-values-store-s3.yaml). It uses IRSA, so for Pod Identity drop its `role-arn` annotation: the IRSA webhook would otherwise inject a token that the credential chain prefers.
 
 Add the lifecycle rule from [Lifecycle rule](#lifecycle-rule) to the bucket before the first build.
 
@@ -394,6 +394,8 @@ The identity needs a role that reads, writes and deletes blobs in the container,
 
 An upload that is in progress when the registry stops leaves an incomplete multipart upload that no listing shows, and that the store bills for. Add a rule to the bucket that aborts incomplete multipart uploads one day after they start. For S3:
 
+This command replaces the bucket's whole lifecycle configuration. On a bucket that already has rules, merge this rule into them instead of running it as written.
+
 ```bash
 aws s3api put-bucket-lifecycle-configuration --bucket example-build-cache \
   --lifecycle-configuration '{"Rules":[{"ID":"abort-incomplete-uploads","Status":"Enabled","Filter":{"Prefix":"buildkit/"},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":1}}]}'
@@ -403,7 +405,7 @@ Use the same rule in any S3-compatible store that supports it. GCS needs no rule
 
 #### Sizing a store
 
-There is no disk to size. The registry still enforces `cache.maxSize` on what it has stored, and still gives each pool `cache.poolMaxSize` unless the pool sets its own budget, so those values decide how much the bucket holds. Between garbage collections the stored cache can grow past `maxSize`, and uploads in progress hold up to `cache.maxUploadSize` more. Pick a bucket quota, if you set one, above their sum. The registry keeps its index in memory (a few hundred bytes per blob) and buffers up to 5 MiB for each upload in progress, so the pod's 512Mi memory limit, not the store, is what bounds a busy registry. Raise `cache.resources.limits.memory` before you raise the number of concurrent uploads.
+There is no disk to size. The registry still enforces `cache.maxSize` on what it has stored, and still gives each pool `cache.poolMaxSize` unless the pool sets its own budget, so those values decide how much the bucket holds. Between garbage collections the stored cache can grow past `maxSize`, and uploads in progress hold up to `cache.maxUploadSize` more. Pick a bucket quota, if you set one, above their sum. The registry keeps its index in memory (a few hundred bytes per blob). Upload part buffers are capped at a fixed 48 uploads (12 per worker) of 5 MiB each. An upload beyond that gets `429` with `Retry-After: 1` and the client retries. None of this is configurable.
 
 At start the registry lists the store and reads each manifest record once, and the pod is not ready until that is done. The wait grows with the number of manifests, and a cache of several thousand manifests takes seconds.
 
@@ -423,7 +425,7 @@ Readiness never clears once the registry is up. During an outage after start the
 
 #### Moving between the volume and a store
 
-The API server refuses any change to a StatefulSet's `volumeClaimTemplates`, and switching between the two forms adds or drops one. `helm upgrade` therefore fails up front, in either direction, and prints these steps:
+The API server refuses any change to a StatefulSet's `volumeClaimTemplates`, and switching between the two forms adds or drops one. `helm upgrade` therefore fails up front, in either direction, and prints steps like these:
 
 ```bash
 kubectl -n <namespace> delete statefulset <fullname>-registry --cascade=orphan
