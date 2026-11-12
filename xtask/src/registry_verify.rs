@@ -19,8 +19,8 @@
 //! and its command spells that as `ran-$((1))-<name>`, so only the step's
 //! output carries the marker.
 //!
-//! `--store minio|gcs|azure` runs the same scenarios with the registry's store
-//! in `MinIO`, fake-gcs-server or Azurite, deployed in the cluster as `store`
+//! `--store minio|azure` runs the same scenarios with the registry's store
+//! in `MinIO` or Azurite, deployed in the cluster as `store`
 //! and reached through `BUILDKIT_CACHE_STORE_URL` and
 //! `BUILDKIT_CACHE_STORE_OPT_*` (the Secret `cache-store` holds credentials,
 //! passed through `envFrom` with that prefix). Two things only a store can
@@ -30,8 +30,7 @@
 //!
 //! Wall time, measured with every image already built and loaded: volume 36 s,
 //! `MinIO` 43 s, Azurite 46 s; a cold controller image build adds about 2 min 20 s.
-//! fake-gcs-server cannot run the registry (see [`Store::Gcs`]). Every wait is at
-//! most 90 s, except the kind cluster create (120 s), the buildkitd pods'
+//! Every wait is at most 90 s, except the kind cluster create (120 s), the buildkitd pods'
 //! readiness (180 s) and the registry rollout (120 s), which the volume run
 //! already needs.
 //!
@@ -209,16 +208,12 @@ req.end();"#;
 pub(crate) enum Store {
     /// `MinIO`, through the `s3://` scheme.
     Minio,
-    /// fake-gcs-server, through `gs://`. The registry's GCS client lists through
-    /// the XML API (`GET /<bucket>?list-type=2`), which the fake answers 404, so
-    /// this variant fails at the registry's start-up.
-    Gcs,
     /// Azurite, through `az://`.
     Azure,
 }
 
 impl Store {
-    pub(crate) const ALL: [Self; 3] = [Self::Minio, Self::Gcs, Self::Azure];
+    pub(crate) const ALL: [Self; 2] = [Self::Minio, Self::Azure];
 
     /// The image as `(tag, index digest)`, pulled by digest and tagged locally
     /// (see `gateway::ensure_image`). The `minio/minio` repositories serve no
@@ -230,10 +225,6 @@ impl Store {
                 "docker.io/bitnamilegacy/minio:2025.7.23-debian-12-r3",
                 "sha256:953d489a81cc4de7975f90e07202189c4325da39b0b92470b6a13c7ea99e36cd",
             ),
-            Self::Gcs => (
-                "docker.io/fsouza/fake-gcs-server:1.52.2",
-                "sha256:d47b4cf8b87006cab8fbbecfa5f06a2a3c5722e464abddc0d107729663d40ec4",
-            ),
             Self::Azure => (
                 "mcr.microsoft.com/azure-storage/azurite:3.35.0",
                 "sha256:647c63a91102a9d8e8000aab803436e1fc85fbb285e7ce830a82ee5d6661cf37",
@@ -244,7 +235,6 @@ impl Store {
     const fn port(self) -> u16 {
         match self {
             Self::Minio => 9000,
-            Self::Gcs => 4443,
             Self::Azure => 10000,
         }
     }
@@ -258,7 +248,6 @@ impl Store {
     fn url(self) -> String {
         let scheme = match self {
             Self::Minio => "s3",
-            Self::Gcs => "gs",
             Self::Azure => "az",
         };
         format!("{scheme}://{BUCKET}")
@@ -272,11 +261,6 @@ impl Store {
                 ("ENDPOINT", self.endpoint()),
                 http,
                 ("REGION", "us-east-1".into()),
-            ],
-            Self::Gcs => vec![
-                ("BASE_URL", self.endpoint()),
-                http,
-                ("SKIP_SIGNATURE", "true".into()),
             ],
             Self::Azure => vec![
                 ("ENDPOINT", format!("{}/{AZURE_ACCOUNT}", self.endpoint())),
@@ -293,7 +277,6 @@ impl Store {
                 ("ACCESS_KEY_ID", MINIO_USER),
                 ("SECRET_ACCESS_KEY", MINIO_PASSWORD),
             ],
-            Self::Gcs => vec![],
             Self::Azure => vec![("ACCESS_KEY", AZURE_KEY)],
         }
     }
@@ -342,16 +325,6 @@ impl Store {
                 ),
                 "httpGet: {path: /minio/health/ready, port: 9000}",
                 "securityContext: {runAsUser: 1001, runAsGroup: 1001, fsGroup: 1001}",
-            ),
-            Self::Gcs => (
-                "",
-                format!(
-                    "args: [-scheme, http, -port, \"{port}\", -backend, memory, -external-url, \"{}\"]\n          ",
-                    self.endpoint()
-                ),
-                String::new(),
-                "tcpSocket: {port: 4443}",
-                "securityContext: {}",
             ),
             Self::Azure => (
                 "command: [azurite-blob]\n          ",
@@ -416,19 +389,6 @@ spec:
     fn count_listings(self, text: &str) -> f64 {
         match self {
             Self::Minio => sum(text, "minio_s3_requests_total", &["api=\"listobjectsv2\""]),
-            Self::Gcs => text
-                .lines()
-                .filter(|l| {
-                    // A listing is a GET of the bucket's `o` collection; a
-                    // GET of one object has a name after it.
-                    let Some((_, rest)) = l.split_once("GET ") else {
-                        return false;
-                    };
-                    let path = rest.split(' ').next().unwrap_or_default();
-                    path.strip_prefix(&format!("/storage/v1/b/{BUCKET}/o"))
-                        .is_some_and(|tail| tail.is_empty() || tail.starts_with('?'))
-                })
-                .fold(0.0, |n, _| n + 1.0),
             Self::Azure => text
                 .lines()
                 .filter(|l| {
@@ -451,7 +411,7 @@ spec:
                 ensure!(ok, "MinIO metrics fetch failed: {text}");
                 Ok(text)
             }
-            Self::Gcs | Self::Azure => env.kubectl(&["-n", NS, "logs", "deploy/store"]),
+            Self::Azure => env.kubectl(&["-n", NS, "logs", "deploy/store"]),
         }
     }
 
@@ -481,21 +441,6 @@ spec:
                      && {mc} mb --ignore-existing l/{BUCKET}"
                 ))
                 .map(drop)
-            }
-            // The fake's image has no shell: a buildkitd pod's busybox makes
-            // the request.
-            Self::Gcs => {
-                let (ok, out) = exec(
-                    env,
-                    "trusted",
-                    &format!(
-                        "wget -qO- --header 'Content-Type: application/json' \
-                         --post-data '{{\"name\":\"{BUCKET}\"}}' {}/storage/v1/b",
-                        self.endpoint()
-                    ),
-                )?;
-                ensure!(ok, "creating the bucket in fake-gcs-server: {out}");
-                Ok(())
             }
             Self::Azure => {
                 let script = format!(
@@ -1131,7 +1076,6 @@ buildkit_registry_requests_total{route=\"blob\",method=\"PUT\",status=\"201\"} 7
             );
         }
         assert!(manifests(Some(Store::Minio)).contains("s3://bk-cache"));
-        assert!(manifests(Some(Store::Gcs)).contains("gs://bk-cache"));
         assert!(manifests(Some(Store::Azure)).contains("az://bk-cache"));
     }
 
@@ -1177,8 +1121,8 @@ buildkit_registry_requests_total{route=\"blob\",method=\"PUT\",status=\"201\"} 7
             assert!(m.contains("imagePullPolicy: Never"));
         }
         let tags: Vec<_> = Store::ALL.iter().map(|s| s.image().0).collect();
-        assert_eq!(tags.len(), 3);
-        assert!(tags[0] != tags[1] && tags[1] != tags[2] && tags[0] != tags[2]);
+        assert_eq!(tags.len(), 2);
+        assert!(tags[0] != tags[1]);
     }
 
     #[test]
@@ -1200,19 +1144,6 @@ minio_s3_requests_total{api=\"listobjectsv2\",server=\"x:9000\"} 0
         );
         assert!(Store::Minio.count_listings(none) < 1.0);
         assert!((Store::Minio.count_listings(&some) - 2.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn gcs_listings_are_gets_of_the_bucket_collection_only() {
-        let log = "\
-time=2026-11-12T14:47:19.699Z level=INFO msg=\"10.0.0.1 - - [12/Nov/2026:14:47:19 +0000] \\\"POST /storage/v1/b HTTP/1.1\\\" 200 337\\n\"
-time=2026-11-12T14:47:19.708Z level=INFO msg=\"10.0.0.1 - - [12/Nov/2026:14:47:19 +0000] \\\"GET /storage/v1/b/bk-cache/o?prefix=data/&delimiter= HTTP/1.1\\\" 200 27\\n\"
-time=2026-11-12T14:47:19.709Z level=INFO msg=\"10.0.0.1 - - [12/Nov/2026:14:47:19 +0000] \\\"GET /storage/v1/b/bk-cache/o HTTP/1.1\\\" 200 27\\n\"
-time=2026-11-12T14:47:19.710Z level=INFO msg=\"10.0.0.1 - - [12/Nov/2026:14:47:19 +0000] \\\"GET /storage/v1/b/bk-cache/o/data%2Fabc HTTP/1.1\\\" 200 5\\n\"
-time=2026-11-12T14:47:19.711Z level=INFO msg=\"10.0.0.1 - - [12/Nov/2026:14:47:19 +0000] \\\"GET /storage/v1/b/other/o?prefix=x HTTP/1.1\\\" 200 5\\n\"
-";
-        assert!((Store::Gcs.count_listings(log) - 2.0).abs() < f64::EPSILON);
-        assert!(Store::Gcs.count_listings("") < 1.0);
     }
 
     #[test]
