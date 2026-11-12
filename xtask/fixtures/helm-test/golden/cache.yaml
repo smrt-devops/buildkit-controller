@@ -589,6 +589,7 @@ spec:
         app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/version: "0.4.0"
         helm.sh/chart: buildkit-controller-0.4.0
+        team: builds
       annotations:
         team: ci
     spec:

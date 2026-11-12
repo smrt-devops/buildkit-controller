@@ -274,6 +274,8 @@ cache:
   resources:
     requests: {cpu: 100m, memory: 128Mi}
     limits: {memory: 512Mi}
+  # Extra labels on the registry pod, for policy selectors and tooling.
+  podLabels: {}
   podAnnotations: {}
   nodeSelector: {}
   tolerations: []
