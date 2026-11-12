@@ -60,7 +60,7 @@ pub const TABLE: [Def; 8] = [
         "pool_desired_warm",
         Role::Controller,
         &POOL,
-        "Free workers the pool is asked to keep now: scaling.minWarm, or the active schedule window's floor (status.desiredWarm)",
+        "Free workers the pool is asked to keep now: scaling.min, or the active schedule window's floor (status.desiredWarm)",
     ),
     Def::gauge(
         "pool_waiting",

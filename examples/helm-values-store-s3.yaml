@@ -3,8 +3,9 @@
 # helm-values.yaml with the build cache in an S3 bucket instead of a volume. The registry
 # pod then has no PersistentVolumeClaim, so the cache survives a pod or node loss. The bucket
 # needs a role that can list, get, put and delete under the prefix; the registry reaches it
-# through the ServiceAccount annotation below (EKS IRSA or Pod Identity both work). gs:// and
-# az:// work the same way with the platform's own workload identity.
+# through the platform's workload identity. IRSA uses the annotation below; Pod Identity uses an
+# association and no annotation; Azure workload identity also needs cache.podLabels. gs:// and
+# az:// work the same way.
 #
 # Moving an existing release from the volume to a store (or back) needs three steps first, in
 # helm/buildkit-controller/README.md#build-cache.

@@ -385,7 +385,7 @@ pub(super) fn open_volume(root: &Path) -> anyhow::Result<Arc<dyn ObjectStore>> {
 
 /// Removes every file under `root` that is not a key of the layout, then
 /// every empty directory below `root`. Returns how many files it removed.
-pub fn sweep(root: &Path) -> std::io::Result<u64> {
+fn sweep(root: &Path) -> std::io::Result<u64> {
     fn walk(root: &Path, dir: &Path, removed: &mut u64) -> std::io::Result<()> {
         for e in std::fs::read_dir(dir)? {
             let e = e?;

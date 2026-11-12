@@ -36,13 +36,15 @@ use tracing::{info, warn};
 
 pub use api::{MAX_MANIFEST, Registry, handle};
 pub use auth::{Action, Authorizer, Grant, PeerError, StaticGrants, Writes, peer_identity};
-pub use backend::{StoreConfig, StoreUrl};
+pub use backend::StoreUrl;
 pub use config::{RegistryArgs, parse_duration, parse_size};
 pub use gc::{Budgets, FixedBudgets, Reason};
 pub use listener::{Limits, server_config};
 pub use metrics::RegistryMetrics;
 pub use pods::{PodGrants, PoolBudgets, grant_of};
 pub use store::{Digest, Parts, Reference, Stats, Store, StoreError, StoreLimits};
+
+use backend::StoreConfig;
 
 use crate::runtime::metrics::Metrics;
 use crate::runtime::readiness::{Readiness, ReadyFlag};

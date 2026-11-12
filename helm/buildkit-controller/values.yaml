@@ -273,8 +273,9 @@ cache:
     storageClass: ""
   # An object store instead of the volume. "" keeps the volume. With a URL (s3://bucket/prefix,
   # gs://bucket/prefix, az://container/prefix) the StatefulSet has no volume and persistence is
-  # ignored. Credentials come from the platform (IRSA, Pod Identity, GKE or Azure workload
-  # identity: see serviceAccount.annotations) or from a Secret.
+  # ignored. Credentials come from the platform or from a Secret. IRSA uses the annotation in
+  # serviceAccount.annotations; Pod Identity uses an association and no annotation; Azure
+  # workload identity also needs cache.podLabels.
   store:
     url: ""
     # Provider settings, one registry variable BUILDKIT_CACHE_STORE_OPT_<key> each, such as
