@@ -16,6 +16,7 @@ mod config;
 mod gc;
 mod layout;
 mod listener;
+mod metered;
 pub mod metrics;
 mod pods;
 mod store;
@@ -28,22 +29,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use object_store::ObjectStore;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 pub use api::{MAX_MANIFEST, Registry, handle};
 pub use auth::{Action, Authorizer, Grant, PeerError, StaticGrants, Writes, peer_identity};
-pub use backend::StoreUrl;
+pub use backend::{StoreConfig, StoreUrl};
 pub use config::{RegistryArgs, parse_duration, parse_size};
 pub use gc::{Budgets, FixedBudgets, Reason};
 pub use listener::{Limits, server_config};
 pub use metrics::RegistryMetrics;
 pub use pods::{PodGrants, PoolBudgets, grant_of};
-pub use store::{Digest, Reference, Stats, Store, StoreError, StoreLimits};
+pub use store::{Digest, Parts, Reference, Stats, Store, StoreError, StoreLimits};
 
 use crate::runtime::metrics::Metrics;
-use crate::runtime::readiness::Readiness;
+use crate::runtime::readiness::{Readiness, ReadyFlag};
 use crate::runtime::stores::StoreFreshness;
 use crate::telemetry::ops;
 
@@ -58,9 +60,14 @@ pub async fn run(args: RegistryArgs, shutdown: CancellationToken) -> anyhow::Res
         "cache registry starting"
     );
     config::refuse_data_dir(std::env::var_os(config::OLD_DATA_DIR))?;
+    let env = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+    let store_config = StoreConfig::new(args.store_url.clone(), env)?;
     let metrics = Arc::new(Metrics::for_registry());
     let readiness = Arc::new(Readiness::default());
     let ready = readiness.register("registry_listener");
+    let store_ready = readiness.register("registry_store");
+    let registry_metrics = RegistryMetrics::register(&metrics);
     let ops_stop = CancellationToken::new();
     let ops_task = tokio::spawn(ops::serve(
         ops::bind(args.ops_listen)?,
@@ -74,22 +81,24 @@ pub async fn run(args: RegistryArgs, shutdown: CancellationToken) -> anyhow::Res
     let stop = CancellationToken::new();
     let (auth, budgets) = authorizer(&args, &metrics, &readiness, &stop).await?;
     let (files, tls) = listener::load(&args.tls_dir)?;
-    let store = {
-        // The volume sweep walks the whole tree, and finishes before serving.
-        let url = args.store_url.clone();
-        let os = tokio::task::spawn_blocking(move || url.open()).await??;
-        let limits = StoreLimits {
-            max_blob: args.max_blob_size,
-            max_upload_bytes: args.max_upload_size,
-        };
-        Store::open(os, limits)
-            .await
-            .with_context(|| format!("opening the store at {}", args.store_url))?
+    // The volume sweep walks the whole tree, and finishes before serving.
+    let os = tokio::task::spawn_blocking(move || store_config.open()).await??;
+    let os: Arc<dyn ObjectStore> = Arc::new(metered::Metered::new(os, registry_metrics.clone()));
+    let limits = StoreLimits {
+        max_blob: args.max_blob_size,
+        max_upload_bytes: args.max_upload_size,
+    };
+    let Some(store) = open_store(os, limits, args.store_url.parts(), &store_ready, &shutdown).await
+    else {
+        stop.cancel();
+        ops_stop.cancel();
+        let _ = ops_task.await;
+        return Ok(());
     };
     let reg = Arc::new(Registry {
         store,
         auth,
-        metrics: RegistryMetrics::register(&metrics),
+        metrics: registry_metrics,
         manifest_puts: tokio::sync::Semaphore::new(api::MANIFEST_PUTS),
     });
 
@@ -124,6 +133,35 @@ pub async fn run(args: RegistryArgs, shutdown: CancellationToken) -> anyhow::Res
     let _ = ops_task.await;
     info!("cache registry stopped");
     Ok(())
+}
+
+/// Opens the store on `os`, and sets `ready` once it has. While the store
+/// fails, as when it is unreachable or the bucket is missing, it retries
+/// with backoff from 1 s to 30 s, and `/readyz` reports `registry_store`
+/// not ready; `/healthz` stays healthy, so the pod is not restarted.
+/// `None` once `stop` is cancelled.
+async fn open_store(
+    os: Arc<dyn ObjectStore>,
+    limits: StoreLimits,
+    parts: Parts,
+    ready: &ReadyFlag,
+    stop: &CancellationToken,
+) -> Option<Store> {
+    let mut wait = Duration::from_secs(1);
+    loop {
+        match Store::open(Arc::clone(&os), limits, parts).await {
+            Ok(store) => {
+                ready.set();
+                return Some(store);
+            }
+            Err(e) => warn!(error = %e, retry_secs = wait.as_secs(), "opening the store"),
+        }
+        tokio::select! {
+            () = stop.cancelled() => return None,
+            () = tokio::time::sleep(wait) => {}
+        }
+        wait = (wait * 2).min(Duration::from_secs(30));
+    }
 }
 
 /// Garbage collection and upload expiry, every `interval` until `stop`.

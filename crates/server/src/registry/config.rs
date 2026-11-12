@@ -26,7 +26,8 @@ pub struct RegistryArgs {
     )]
     pub ops_listen: SocketAddr,
     /// The store, as a URL: `file:///<absolute path>` for a directory on a
-    /// volume.
+    /// volume, or `s3://`, `gs://` or `az://<bucket>[/<prefix>]`. Options are
+    /// the variables `BUILDKIT_CACHE_STORE_OPT_<key>`, with the provider's keys.
     #[arg(long, env = "BUILDKIT_CACHE_STORE_URL", default_value = DEFAULT_URL, value_parser = parse_store_url)]
     pub store_url: StoreUrl,
     /// Holds `tls.crt` and `tls.key` (the serving cert, from the internal CA) and
@@ -167,7 +168,98 @@ mod tests {
             "{e}"
         );
         assert!(RegistryArgs::try_parse_from(["registry", "--data-dir=/data"]).is_err());
-        assert!(RegistryArgs::try_parse_from(["registry", "--store-url=s3://bucket"]).is_err());
+        assert!(RegistryArgs::try_parse_from(["registry", "--store-url=s3a://bucket"]).is_err());
+    }
+
+    /// The `env` of the `registry` container in a rendered chart, with the
+    /// `envFrom` prefix of its Secret.
+    fn rendered_env(golden: &str) -> (Vec<(String, String)>, String) {
+        let docs: Vec<serde_json::Value> = serde_saphyr::from_multiple(golden).unwrap();
+        let c = docs
+            .iter()
+            .filter(|d| d["kind"] == "StatefulSet")
+            .flat_map(|d| {
+                d["spec"]["template"]["spec"]["containers"]
+                    .as_array()
+                    .unwrap()
+            })
+            .find(|c| c["name"] == "registry")
+            .unwrap();
+        let env = c["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| {
+                let value = e["value"].as_str()?;
+                Some((e["name"].as_str().unwrap().to_owned(), value.to_owned()))
+            })
+            .collect();
+        let prefix = c["envFrom"][0]["prefix"].as_str().unwrap().to_owned();
+        (env, prefix)
+    }
+
+    /// Command-line arguments for the variables the role reads through clap.
+    /// A variable the role reads nowhere fails the test.
+    fn args_from_env(env: &[(String, String)]) -> Vec<String> {
+        use clap::CommandFactory;
+        let cmd = RegistryArgs::command();
+        let mut args = vec!["registry".to_owned()];
+        for (k, v) in env {
+            if k.starts_with(super::super::backend::OPTION_PREFIX) {
+                continue;
+            }
+            let arg = cmd
+                .get_arguments()
+                .find(|a| a.get_env().is_some_and(|e| e == k.as_str()))
+                .unwrap_or_else(|| panic!("the chart sets {k}, which the role does not read"));
+            args.push(format!("--{}={v}", arg.get_long().unwrap()));
+        }
+        args
+    }
+
+    /// The chart's rendered registry env, fed to the role, gives back the
+    /// store URL and its options: the env names and the option prefix of the
+    /// chart and the role cannot drift apart.
+    #[test]
+    fn the_rendered_chart_env_reaches_the_role() {
+        use super::super::backend::{Cloud, Provider, StoreConfig};
+        use object_store::aws::AmazonS3ConfigKey;
+        const GOLDEN: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../xtask/fixtures/helm-test/golden/cache-store.yaml"
+        ));
+        let (mut env, prefix) = rendered_env(GOLDEN);
+        let a = RegistryArgs::try_parse_from(args_from_env(&env)).unwrap();
+        assert_eq!(
+            a.store_url,
+            StoreUrl::Bucket {
+                provider: Provider::S3,
+                bucket: "example-build-cache".into(),
+                prefix: Some("buildkit".into()),
+            }
+        );
+        assert_eq!(a.store_url.parts(), super::super::store::Parts::Buffered);
+        // A key of the Secret arrives through envFrom with the prefix.
+        env.push((format!("{prefix}access_key_id"), "AKIDEXAMPLE".into()));
+        let c = StoreConfig::new(a.store_url.clone(), env.clone()).unwrap();
+        let Some(Cloud::S3(s)) = &c.cloud else {
+            panic!("{:?}", c.cloud)
+        };
+        assert_eq!(
+            s.options,
+            vec![
+                (AmazonS3ConfigKey::AccessKeyId, "AKIDEXAMPLE".to_owned()),
+                (
+                    AmazonS3ConfigKey::Endpoint,
+                    "https://s3.example.com".to_owned()
+                ),
+                (AmazonS3ConfigKey::Region, "eu-west-1".to_owned()),
+            ]
+        );
+        // A misspelt Secret key stops the role, naming the key.
+        env.push((format!("{prefix}regoin"), "eu-west-1".into()));
+        let e = StoreConfig::new(a.store_url, env).unwrap_err().to_string();
+        assert!(e.contains("`regoin`"), "{e}");
     }
 
     #[test]
