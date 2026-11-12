@@ -273,6 +273,8 @@ Metrics are on the ops port (8080, `/metrics`) through the `<fullname>-metrics` 
 
 The [metrics reference](metrics.md) lists every metric with its labels, the values each label takes, and the histogram buckets. It is generated from the code. Counters and histograms start at 0 when the process starts, or when a pool first appears, so `rate()` and `increase()` see the first event.
 
+Four Grafana dashboards for these metrics are in `examples/grafana`; see [Dashboards](dashboards.md).
+
 Metrics to start with:
 
 | Metric | Use |

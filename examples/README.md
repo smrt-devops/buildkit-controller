@@ -15,6 +15,8 @@ Every pool example uses the `ci` namespace, which you create first and label for
 | [helm-values-tcp.yaml](helm-values-tcp.yaml) | The same install with a `tcp://` `edge.endpoint`: TLS passthrough for the edge instead of the tunnel, and the only mode the curl recipe supports. |
 | [claim-pod.yaml](claim-pod.yaml) | A `BuildKitClaim` and a pod that runs `buildctl` with the Secret it gets, both in the namespace `apps`. Needs `apps` in `claims.namespaces` and a pool rule `claims: {namespaces: [apps]}`. |
 
+The [grafana](grafana) directory holds four Grafana dashboards for the controller and the cache registry. See [docs/dashboards.md](../docs/dashboards.md).
+
 A multi-platform build needs no extra setting with the default tunnel. With a `tcp://` endpoint (helm-values-tcp.yaml) it needs `edge.allocationDomain`, with wildcard DNS for that domain pointing at the edge address. See [docs/operations.md](../docs/operations.md).
 
 The field reference is [generated CRD](../helm/buildkit-controller/crds/buildkitpools.yaml) (`kubectl explain bkp.spec` prints the same text). Check them with `kubectl apply --dry-run=server` against a cluster that has the CRD installed. `pool-github-oidc.yaml` and `pool-gitlab-oidc.yaml` need a matching `auth.oidc` issuer in the Helm values, or the pool shows `Degraded=True/UnknownIssuer`.

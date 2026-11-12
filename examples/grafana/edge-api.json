@@ -1,0 +1,124 @@
+{
+  "uid": "buildkit-edge-api",
+  "title": "BuildKit edge and API",
+  "description": "Client connections to the mTLS edge, the HTTP API, login checks and OIDC key fetches.",
+  "tags": ["buildkit"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "templating": {
+    "list": [
+      {"name": "datasource", "label": "Data source", "type": "datasource", "query": "prometheus", "current": {}},
+      {"name": "namespace", "label": "Namespace", "type": "query", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "query": {"query": "label_values(buildkit_pool_max, namespace)", "refId": "namespace"}, "definition": "label_values(buildkit_pool_max, namespace)", "refresh": 2, "includeAll": true, "multi": true, "allValue": ".*", "current": {"selected": true, "text": "All", "value": "$__all"}, "sort": 1},
+      {"name": "pool", "label": "Pool", "type": "query", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "query": {"query": "label_values(buildkit_pool_max{namespace=~\"$namespace\"}, pool)", "refId": "pool"}, "definition": "label_values(buildkit_pool_max{namespace=~\"$namespace\"}, pool)", "refresh": 2, "includeAll": true, "multi": true, "allValue": ".*", "current": {"selected": true, "text": "All", "value": "$__all"}, "sort": 1}
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "Edge connections by result",
+      "description": "Client connections to the edge per second by outcome. ok is a proxied connection. tls_error and bad_san are clients that failed the certificate check, upstream_error is a worker that could not be reached, and the limit results are caps (edge.maxConnections and per-allocation limits). Rising non-ok results mean clients cannot build: start with the result named in the legend.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (result) (rate(buildkit_edge_connections_total{namespace=~\"$namespace\",pool=~\"$pool\"}[$__rate_interval]))", "legendFormat": "{{result}}"}]
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Edge failure ratio by transport",
+      "description": "Share of edge connections that did not end ok, for the tcp edge port and for the API tunnel. Under 1 percent is normal. A jump on one transport only points at that path: the Gateway's TLS route for tcp, the API route for tunnel.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (transport) (rate(buildkit_edge_connections_total{result!=\"ok\",namespace=~\"$namespace\",pool=~\"$pool\"}[$__rate_interval])) / sum by (transport) (rate(buildkit_edge_connections_total{namespace=~\"$namespace\",pool=~\"$pool\"}[$__rate_interval]))", "legendFormat": "{{transport}}"}]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "Active connections",
+      "description": "Proxied connections open now, by pool and transport. Each is a running build. Compare it with edge.maxConnections: a line near the cap means new connections start to be refused with connection_limit.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (namespace, pool, transport) (buildkit_edge_active_connections{namespace=~\"$namespace\",pool=~\"$pool\"})", "legendFormat": "{{namespace}}/{{pool}} {{transport}}"}]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "Bytes proxied",
+      "description": "Bytes per second between clients and workers, by direction. client_to_worker is context and cache pushes, worker_to_client is pulls and exports. Use it to size the edge replicas' network and to spot a build that moves far more than usual.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "fieldConfig": {"defaults": {"unit": "Bps"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (direction, transport) (rate(buildkit_edge_bytes_total[$__rate_interval]))", "legendFormat": "{{direction}} {{transport}}"}]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Client handshake latency",
+      "description": "Client TLS handshake time at the edge, 50th and 99th percentile by transport, including certificate verification. Milliseconds are normal. Seconds mean the edge is CPU starved or clients connect over a bad network.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.5, sum by (le, transport) (rate(buildkit_edge_handshake_seconds_bucket[$__rate_interval])))", "legendFormat": "p50 {{transport}}"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.99, sum by (le, transport) (rate(buildkit_edge_handshake_seconds_bucket[$__rate_interval])))", "legendFormat": "p99 {{transport}}"}
+      ]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Upstream connect latency",
+      "description": "Time from the end of the client handshake to the end of the TLS handshake with the worker: the edge's own overhead. It should stay in milliseconds. A rise means the worker pods or the pod network are slow to accept connections.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.5, sum by (le, transport) (rate(buildkit_edge_upstream_connect_seconds_bucket[$__rate_interval])))", "legendFormat": "p50 {{transport}}"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.99, sum by (le, transport) (rate(buildkit_edge_upstream_connect_seconds_bucket[$__rate_interval])))", "legendFormat": "p99 {{transport}}"}
+      ]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Connections closed by revocation",
+      "description": "Live connections closed because their allocation ended, per second, by reason. released and pod_gone follow normal teardown. expired means a build outlived its certificate: raise the allocation TTL. drain is a shutdown that ran out of drain time: lengthen the drain time before the next rollout.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (reason) (rate(buildkit_edge_revocations_total[$__rate_interval]))", "legendFormat": "{{reason}}"}]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "API requests by route and status",
+      "description": "API requests per second by matched route and HTTP status. 401 and 403 are caller access problems, 429 is rate limiting, 503 means the API is not ready. A sustained 5xx on /v1/allocations needs the controller logs.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (route, status) (rate(buildkit_http_requests_total[$__rate_interval]))", "legendFormat": "{{route}} {{status}}"}]
+    },
+    {
+      "id": 9, "type": "timeseries", "title": "API request latency",
+      "description": "95th percentile API duration until the response head, by route. The tunnel route is left out because a tunnel request lasts as long as the build. Allocation requests that wait for a worker long-poll, so a high /v1/allocations p95 can mean a queue: see the pools dashboard.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "histogram_quantile(0.95, sum by (le, route) (rate(buildkit_http_request_duration_seconds_bucket{route!=\"/v1/tunnel\"}[$__rate_interval])))", "legendFormat": "{{route}}"}]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Login checks by method and result",
+      "description": "Bearer token checks per second. invalid is a bad or expired token, unknown_issuer is a token from an issuer you did not configure, error means the issuer's keys or the TokenReview call were unavailable. A rise in error is an outage of the identity side: see the JWKS panel.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (method, result) (rate(buildkit_auth_total[$__rate_interval]))", "legendFormat": "{{method}} {{result}}"}]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "OIDC key fetches by issuer",
+      "description": "Fetches of each OIDC issuer's signing keys per second, by result. error means the controller cannot reach the issuer, so tokens from it stop validating once the cached keys age out. Check the issuer URL, its certificate and the controller's egress.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 40},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "targets": [{"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (issuer, result) (rate(buildkit_jwks_fetch_total[$__rate_interval]))", "legendFormat": "{{issuer}} {{result}}"}]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "PROXY protocol headers",
+      "description": "PROXY protocol v2 headers read per second on the API and edge listeners, by result. proxied and local are accepted. Anything else closed the connection: bad_signature or unsupported_family usually means the load balancer sends a different protocol version than the controller expects.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 40},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (result) (rate(buildkit_api_proxy_protocol_headers_total[$__rate_interval]))", "legendFormat": "api {{result}}"},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum by (result) (rate(buildkit_edge_proxy_protocol_headers_total[$__rate_interval]))", "legendFormat": "edge {{result}}"}
+      ]
+    }
+  ]
+}
