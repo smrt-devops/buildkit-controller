@@ -239,7 +239,7 @@ The chart runs the cache registry by default (`cache.enabled`). How it works is 
 | `cache.gcInterval` | `10m` | Time between garbage collections. |
 | `cache.persistence.size`, `.storageClass` | `60Gi`, cluster default | The volume. |
 
-Each value is also a flag of the `registry` role (`--max-size`, `--pool-max-size`, `--max-blob-size`, `--max-upload-size`, `--gc-interval`) with the environment variable `BUILDKIT_CACHE_MAX_SIZE` and so on, if you run the role yourself. The flags have the chart's defaults, except `--max-size`, which defaults to 50Gi, so set it to fit your volume.
+Each value is also a flag of the `registry` role (`--max-size`, `--pool-max-size`, `--max-blob-size`, `--max-upload-size`, `--gc-interval`) with the environment variable `BUILDKIT_CACHE_MAX_SIZE` and so on, if you run the role yourself. The flags have the chart's defaults, except `--max-size`, the budget of the whole store, which defaults to 40Gi, so set it to fit your volume. The role finds its store through `BUILDKIT_CACHE_STORE_URL` (`--store-url`), default `file:///var/lib/buildkit-cache`; it refuses to start while the old `BUILDKIT_CACHE_DATA_DIR` is set.
 
 The registry takes at most 64 connections from one address and gives each TLS handshake 5 s. It holds at most 16 manifest bodies in memory at once. A manifest push that finds no free slot gets `429` at once, and its body must arrive within 30 s. A trusted caller keeps its share of the upload space until its uploads end or expire after 1 hour idle, so one trusted tenant can make other tenants' exports fail with `429` for that long. Exports carry `ignore-error=true`, so those builds still succeed, uncached.
 ### Sizing the volume

@@ -3,7 +3,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +11,10 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use bytes::Bytes;
 
+use object_store::ObjectStore;
+
 use super::store::MAX_UPLOADS_PER_OWNER;
+use super::testing::Probe;
 use super::*;
 use crate::pki::WorkerIdentity;
 
@@ -56,32 +59,68 @@ fn dir(name: &str) -> PathBuf {
     d
 }
 
-fn registry(dir: &std::path::Path, max_blob: u64) -> Registry {
+/// The volume at `dir`, swept as the role opens it.
+fn volume(dir: &Path) -> Arc<dyn ObjectStore> {
+    StoreUrl::File(dir.to_owned()).open().unwrap()
+}
+
+fn limits(max_blob: u64) -> StoreLimits {
+    StoreLimits {
+        max_blob,
+        max_upload_bytes: 4 * max_blob,
+    }
+}
+
+async fn registry(dir: &Path, max_blob: u64) -> Registry {
+    registry_on(volume(dir), limits(max_blob)).await
+}
+
+async fn registry_on(os: Arc<dyn ObjectStore>, limits: StoreLimits) -> Registry {
     Registry {
-        store: Store::open(
-            dir,
-            StoreLimits {
-                max_blob,
-                max_upload_bytes: 4 * max_blob,
-            },
-        )
-        .unwrap(),
+        store: Store::open(os, limits).await.unwrap(),
         auth: Arc::new(grants()),
         metrics: RegistryMetrics::default(),
         manifest_puts: tokio::sync::Semaphore::new(super::api::MANIFEST_PUTS),
     }
 }
 
-fn fixture(name: &str) -> Fixture {
-    fixture_max(name, 1 << 20)
+async fn fixture(name: &str) -> Fixture {
+    fixture_max(name, 1 << 20).await
 }
 
-fn fixture_max(name: &str, max_blob: u64) -> Fixture {
+async fn fixture_max(name: &str, max_blob: u64) -> Fixture {
     let dir = dir(name);
     Fixture {
-        reg: registry(&dir, max_blob),
+        reg: registry(&dir, max_blob).await,
         dir,
     }
+}
+
+/// Files the volume at `dir` has staged for writes in progress.
+fn staged(dir: &Path) -> usize {
+    fn walk(d: &Path) -> usize {
+        std::fs::read_dir(d).map_or(0, |rd| {
+            rd.flatten()
+                .map(|e| {
+                    if e.path().is_dir() {
+                        walk(&e.path())
+                    } else {
+                        usize::from(e.file_name().to_string_lossy().contains('#'))
+                    }
+                })
+                .sum()
+        })
+    }
+    walk(dir)
+}
+
+/// Whether the store holds a key that starts with `prefix`.
+async fn has_key(reg: &Registry, prefix: &str) -> bool {
+    reg.store
+        .listed()
+        .await
+        .iter()
+        .any(|k| k.starts_with(prefix))
 }
 
 struct Resp {
@@ -184,7 +223,7 @@ async fn put_index(reg: &Registry, pod: &str, repo: &str, tag: &str, blobs: &[&D
 
 #[tokio::test]
 async fn base_answers_only_a_granted_worker() {
-    let f = fixture("base");
+    let f = fixture("base").await;
     let r = call(&f.reg, "writer", Method::GET, "/v2/", &[], b"").await;
     assert_eq!(r.status, StatusCode::OK);
     assert_eq!(r.header("docker-distribution-api-version"), "registry/2.0");
@@ -197,7 +236,7 @@ async fn base_answers_only_a_granted_worker() {
 
 #[tokio::test]
 async fn chunked_upload_then_head_get_and_range() {
-    let f = fixture("chunked");
+    let f = fixture("chunked").await;
     let reg = &f.reg;
     let r = call(
         reg,
@@ -300,7 +339,7 @@ async fn chunked_upload_then_head_get_and_range() {
 
 #[tokio::test]
 async fn a_wrong_digest_stores_nothing() {
-    let f = fixture("mismatch");
+    let f = fixture("mismatch").await;
     let r = call(
         &f.reg,
         "writer",
@@ -329,18 +368,13 @@ async fn a_wrong_digest_stores_nothing() {
         .await;
         assert_eq!(r.status, StatusCode::NOT_FOUND);
     }
-    assert_eq!(std::fs::read_dir(f.dir.join("uploads")).unwrap().count(), 0);
-    assert_eq!(
-        std::fs::read_dir(f.dir.join("blobs/sha256"))
-            .unwrap()
-            .count(),
-        0
-    );
+    assert_eq!(staged(&f.dir), 0);
+    assert!(f.reg.store.listed().await.is_empty());
 }
 
 #[tokio::test]
 async fn blobs_over_the_limit_are_refused_and_the_upload_ends() {
-    let f = fixture_max("large", 8);
+    let f = fixture_max("large", 8).await;
     for headers in [&[][..], &[("content-length", "10")][..]] {
         let r = call(
             &f.reg,
@@ -368,12 +402,12 @@ async fn blobs_over_the_limit_are_refused_and_the_upload_ends() {
         let r = call(&f.reg, "writer", Method::PATCH, &loc, &[], b"0").await;
         assert_eq!(r.status, StatusCode::NOT_FOUND);
     }
-    assert_eq!(std::fs::read_dir(f.dir.join("uploads")).unwrap().count(), 0);
+    assert_eq!(staged(&f.dir), 0);
 }
 
 #[tokio::test]
 async fn manifests_need_their_blobs_and_resolve_by_tag_and_digest() {
-    let f = fixture("manifests");
+    let f = fixture("manifests").await;
     let reg = &f.reg;
     let layer = Digest::of(b"layer");
     let r = put_index(reg, "writer", "ns/p/app", "cache", &[&layer]).await;
@@ -469,7 +503,7 @@ async fn manifests_need_their_blobs_and_resolve_by_tag_and_digest() {
 
 #[tokio::test]
 async fn every_route_enforces_the_grant() {
-    let f = fixture("grants");
+    let f = fixture("grants").await;
     let reg = &f.reg;
     let d = push_blob(reg, "writer", "ns/p/app", b"data").await;
     let r = put_index(reg, "writer", "ns/p/app", "t", &[&d]).await;
@@ -554,7 +588,7 @@ async fn every_route_enforces_the_grant() {
 
 #[tokio::test]
 async fn blobs_are_per_repository_and_never_mount_across() {
-    let f = fixture("mount");
+    let f = fixture("mount").await;
     let reg = &f.reg;
     let d = push_blob(reg, "other", "ns/p/other", b"secret layer").await;
     // Known by digest elsewhere is not visible here.
@@ -587,7 +621,7 @@ async fn blobs_are_per_repository_and_never_mount_across() {
 /// branch scope; one branch never reaches another's.
 #[tokio::test]
 async fn branch_scopes_follow_the_table() {
-    let f = fixture("branch");
+    let f = fixture("branch").await;
     let reg = &f.reg;
     let shared = push_blob(reg, "writer", "ns/p/app", b"base layer").await;
     assert_eq!(
@@ -649,10 +683,14 @@ async fn branch_scopes_follow_the_table() {
     let r = put_index(reg, "branch2", "ns/p/br2", "main", &[&own]).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{:?}", r.body);
     // The layer both scopes hold is stored once.
-    let files = std::fs::read_dir(f.dir.join("blobs/sha256"))
-        .unwrap()
+    let markers = reg
+        .store
+        .listed()
+        .await
+        .into_iter()
+        .filter(|k| k.starts_with("blobs/"))
         .count();
-    assert_eq!(files, 4, "two layers and two manifests");
+    assert_eq!(markers, 4, "two layers and two manifests");
 }
 
 /// A read of a branch scope that lacks a manifest or blob is answered from
@@ -661,7 +699,7 @@ async fn branch_scopes_follow_the_table() {
 /// nothing into the branch scope.
 #[tokio::test]
 async fn a_branch_scope_reads_through_to_its_trusted_scope() {
-    let f = fixture("fallback");
+    let f = fixture("fallback").await;
     let reg = &f.reg;
     let shared = push_blob(reg, "writer", "ns/p/app", b"base layer").await;
     let r = put_index(reg, "writer", "ns/p/app", "main", &[&shared]).await;
@@ -730,7 +768,8 @@ async fn a_branch_scope_reads_through_to_its_trusted_scope() {
         let r = get(pod, Method::GET, "/v2/ns/p/br/manifests/main".into(), &[]).await;
         assert_eq!(r.status, StatusCode::FORBIDDEN, "{pod}");
     }
-    assert!(!f.dir.join("repos/ns/p/br").exists());
+    assert!(reg.store.links("ns/p/br").is_empty());
+    assert!(!has_key(reg, "repos/ns/p/br/").await);
     // A push names the branch scope only. A manifest may reference what the
     // trusted scope holds, and the branch then links it itself.
     let own = push_blob(reg, "branch", "ns/p/br", b"branch layer").await;
@@ -770,19 +809,19 @@ async fn a_branch_scope_reads_through_to_its_trusted_scope() {
 /// refused push links nothing, not even the references it could borrow.
 #[tokio::test]
 async fn a_branch_manifest_borrows_only_from_its_own_trusted_scope() {
-    let f = fixture("borrow");
+    let f = fixture("borrow").await;
     let reg = &f.reg;
     let shared = push_blob(reg, "writer", "ns/p/app", b"base layer").await;
     let elsewhere = push_blob(reg, "other", "ns/p/other", b"other repository").await;
     let theirs = push_blob(reg, "branch2", "ns/p/br2", b"other branch").await;
-    let link = |d: &Digest| f.dir.join("repos/ns/p/br/_links").join(d.hex());
+    let link = |d: &Digest| reg.store.links("ns/p/br").contains(d);
     for d in [&elsewhere, &theirs] {
         for refs in [vec![d], vec![&shared, d]] {
             let r = put_index(reg, "branch", "ns/p/br", "main", &refs).await;
             assert_eq!(r.status, StatusCode::BAD_REQUEST, "{d}");
             assert_eq!(r.code(), "MANIFEST_BLOB_UNKNOWN", "{d}");
-            assert!(!link(d).exists(), "{d}");
-            assert!(!link(&shared).exists(), "{d}");
+            assert!(!link(d), "{d}");
+            assert!(!link(&shared), "{d}");
         }
     }
     let r = call(
@@ -803,18 +842,13 @@ async fn a_branch_manifest_borrows_only_from_its_own_trusted_scope() {
     // layer from the same trusted scope into its own branch only.
     let r = put_index(reg, "branch", "ns/p/br", "main", &[&shared]).await;
     assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
-    assert!(link(&shared).exists());
-    assert!(
-        !f.dir
-            .join("repos/ns/p/br2/_links")
-            .join(shared.hex())
-            .exists()
-    );
+    assert!(link(&shared));
+    assert!(!reg.store.links("ns/p/br2").contains(&shared));
 }
 
 #[tokio::test]
 async fn names_and_routes_outside_the_subset_are_refused() {
-    let f = fixture("routes");
+    let f = fixture("routes").await;
     let reg = &f.reg;
     for (m, uri, status, code) in [
         (
@@ -892,7 +926,7 @@ async fn names_and_routes_outside_the_subset_are_refused() {
 async fn the_store_survives_a_restart() {
     let dir = dir("restart");
     let d = {
-        let reg = registry(&dir, 1 << 20);
+        let reg = registry(&dir, 1 << 20).await;
         let d = push_blob(&reg, "writer", "ns/p/app", b"kept").await;
         assert_eq!(
             put_index(&reg, "writer", "ns/p/app", "t", &[&d])
@@ -912,7 +946,7 @@ async fn the_store_survives_a_restart() {
         .await;
         d
     };
-    let reg = registry(&dir, 1 << 20);
+    let reg = registry(&dir, 1 << 20).await;
     let r = call(
         &reg,
         "reader",
@@ -933,8 +967,8 @@ async fn the_store_survives_a_restart() {
     )
     .await;
     assert_eq!(&r.body[..], b"kept");
-    assert_eq!(std::fs::read_dir(dir.join("uploads")).unwrap().count(), 0);
-    let s = reg.store.stats().await;
+    assert_eq!(staged(&dir), 0);
+    let s = reg.store.stats();
     assert_eq!((s.blobs, s.manifests), (2, 1));
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -953,7 +987,7 @@ async fn open_upload(reg: &Registry, pod: &str, repo: &str) -> Resp {
 
 #[tokio::test]
 async fn one_worker_cannot_hold_every_upload_slot() {
-    let f = fixture("slots");
+    let f = fixture("slots").await;
     let reg = &f.reg;
     for _ in 0..MAX_UPLOADS_PER_OWNER {
         assert_eq!(
@@ -984,12 +1018,13 @@ async fn open_uploads_are_bounded_in_bytes_per_worker_and_in_total() {
     // One worker may hold max(12 / 4, 8) = 8 bytes; all of them 12.
     let reg = Registry {
         store: Store::open(
-            &dir,
+            volume(&dir),
             StoreLimits {
                 max_blob: 8,
                 max_upload_bytes: 12,
             },
         )
+        .await
         .unwrap(),
         auth: Arc::new(grants()),
         metrics: RegistryMetrics::default(),
@@ -1043,7 +1078,7 @@ async fn open_uploads_are_bounded_in_bytes_per_worker_and_in_total() {
 
 #[tokio::test]
 async fn idle_uploads_expire() {
-    let f = fixture("expire");
+    let f = fixture("expire").await;
     let r = call(
         &f.reg,
         "writer",
@@ -1058,12 +1093,12 @@ async fn idle_uploads_expire() {
     assert_eq!(f.reg.store.expire_uploads(Duration::ZERO).await, 1);
     let r = call(&f.reg, "writer", Method::PATCH, &loc, &[], b"x").await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
-    assert_eq!(std::fs::read_dir(f.dir.join("uploads")).unwrap().count(), 0);
+    assert_eq!(staged(&f.dir), 0);
 }
 
 #[tokio::test]
 async fn gc_sweeps_unreferenced_blobs_and_evicts_over_budget() {
-    let f = fixture("gc");
+    let f = fixture("gc").await;
     let reg = &f.reg;
     let kept = push_blob(reg, "writer", "ns/p/app", b"referenced").await;
     let orphan = push_blob(reg, "writer", "ns/p/app", b"orphan").await;
@@ -1073,7 +1108,7 @@ async fn gc_sweeps_unreferenced_blobs_and_evicts_over_budget() {
             .status,
         StatusCode::CREATED
     );
-    let blob_file = |d: &Digest| f.dir.join("blobs/sha256").join(d.hex());
+    let stored = async |d: &Digest| has_key(reg, &format!("blobs/sha256/{}/", d.hex())).await;
     let big = FixedBudgets {
         pool: u64::MAX,
         total: u64::MAX,
@@ -1084,7 +1119,7 @@ async fn gc_sweeps_unreferenced_blobs_and_evicts_over_budget() {
     assert_eq!(r.deleted_blobs, 0);
     let r = reg.store.gc(&big, Duration::ZERO).await;
     assert_eq!((r.deleted_blobs, r.freed_bytes), (1, 6));
-    assert!(!blob_file(&orphan).exists() && blob_file(&kept).exists());
+    assert!(!stored(&orphan).await && stored(&kept).await);
     let head = |d: &Digest| format!("/v2/ns/p/app/blobs/{d}");
     assert_eq!(
         call(reg, "reader", Method::HEAD, &head(&orphan), &[], b"")
@@ -1116,9 +1151,10 @@ async fn gc_sweeps_unreferenced_blobs_and_evicts_over_budget() {
     )
     .await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
-    assert!(!blob_file(&kept).exists());
-    assert!(!f.dir.join("repos/ns/p/app/_tags/t").exists());
-    assert_eq!(reg.store.stats().await, Stats::default());
+    assert!(!stored(&kept).await);
+    assert!(!has_key(reg, "repos/ns/p/app/_tags/t/").await);
+    assert_eq!(reg.store.keys(), reg.store.listed().await);
+    assert_eq!(reg.store.stats(), Stats::default());
 }
 
 /// Certificates for the TLS test, signed by one test CA.
@@ -1178,7 +1214,7 @@ async fn the_listener_admits_only_worker_client_certs() {
     let server = tokio::spawn(listener::serve(
         tcp,
         rx,
-        Arc::new(registry(&dir, 1 << 20)),
+        Arc::new(registry(&dir, 1 << 20).await),
         Limits::default(),
         stop.clone(),
     ));
@@ -1274,7 +1310,7 @@ async fn the_listener_admits_only_worker_client_certs() {
 /// uploads, and so the quota, of the previous one.
 #[tokio::test]
 async fn a_new_incarnation_of_a_pod_has_its_own_upload_quota() {
-    let f = fixture("incarnation");
+    let f = fixture("incarnation").await;
     let reg = &f.reg;
     for _ in 0..MAX_UPLOADS_PER_OWNER {
         assert_eq!(
@@ -1302,7 +1338,7 @@ async fn slow_manifest_pushes_cannot_block_others() {
     use super::api::{MANIFEST_BODY, MANIFEST_PUTS};
     use futures::StreamExt;
     let dir = dir("slow-manifest");
-    let reg = Arc::new(registry(&dir, 1 << 20));
+    let reg = Arc::new(registry(&dir, 1 << 20).await);
     let d = push_blob(&reg, "writer", "ns/p/app", b"layer").await;
     let mut drips = Vec::new();
     for _ in 0..MANIFEST_PUTS {
@@ -1334,5 +1370,305 @@ async fn slow_manifest_pushes_cannot_block_others() {
     assert!(started.elapsed() <= MANIFEST_BODY + Duration::from_secs(1));
     let r = put_index(&reg, "writer", "ns/p/app", "t", &[&d]).await;
     assert_eq!(r.status, StatusCode::CREATED);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+const BIG: FixedBudgets = FixedBudgets {
+    pool: u64::MAX,
+    total: u64::MAX,
+};
+
+/// Runs a collection in the background and returns once it has applied its
+/// plan to the index, while the probe holds its deletes.
+async fn collect_held(
+    reg: &Arc<Registry>,
+    probe: &Probe,
+    budgets: FixedBudgets,
+    applied: impl Fn(Stats) -> bool,
+) -> tokio::task::JoinHandle<super::store::GcReport> {
+    probe.hold_deletes();
+    let gc = tokio::spawn({
+        let reg = Arc::clone(reg);
+        async move { reg.store.gc(&budgets, Duration::ZERO).await }
+    });
+    while !applied(reg.store.stats()) {
+        tokio::task::yield_now().await;
+    }
+    gc
+}
+
+/// Collection removes digest D from the index, and a re-upload of D lands
+/// before the collection deletes D's old objects. The re-upload writes fresh
+/// keys, so the old deletes do not touch it.
+#[tokio::test]
+async fn gc_racing_a_reupload_of_a_blob_keeps_the_index_and_store_agreeing() {
+    let dir = dir("race-blob");
+    let probe = Arc::new(Probe::new(volume(&dir)));
+    let reg = Arc::new(registry_on(probe.clone(), limits(1 << 20)).await);
+    let d = push_blob(&reg, "writer", "ns/p/app", b"layer").await;
+    let gc = collect_held(&reg, &probe, BIG, |s| s.blobs == 0).await;
+    push_blob(&reg, "writer", "ns/p/app", b"layer").await;
+    probe.release_deletes();
+    assert_eq!(gc.await.unwrap().deleted_blobs, 1);
+    assert_eq!(reg.store.keys(), reg.store.listed().await);
+    let r = call(
+        &reg,
+        "reader",
+        Method::GET,
+        &format!("/v2/ns/p/app/blobs/{d}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(&r.body[..], b"layer");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The same for a manifest and its tag: collection evicts them, the push
+/// comes again before the old record and tag marker are deleted, and the
+/// new ones survive, in the index, in the store and after a restart.
+#[tokio::test]
+async fn gc_racing_a_repush_of_a_manifest_and_tag_keeps_the_index_and_store_agreeing() {
+    let dir = dir("race-manifest");
+    let probe = Arc::new(Probe::new(volume(&dir)));
+    let reg = Arc::new(registry_on(probe.clone(), limits(1 << 20)).await);
+    let l = push_blob(&reg, "writer", "ns/p/app", b"layer").await;
+    let r = put_index(&reg, "writer", "ns/p/app", "t", &[&l]).await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    let none = FixedBudgets {
+        pool: 0,
+        total: u64::MAX,
+    };
+    let gc = collect_held(&reg, &probe, none, |s| s.manifests == 0 && s.blobs == 0).await;
+    push_blob(&reg, "writer", "ns/p/app", b"layer").await;
+    let r = put_index(&reg, "writer", "ns/p/app", "t", &[&l]).await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    probe.release_deletes();
+    assert_eq!(gc.await.unwrap().evicted_pool, 1);
+    assert_eq!(reg.store.keys(), reg.store.listed().await);
+    let get = async |reg: &Registry| {
+        call(
+            reg,
+            "reader",
+            Method::GET,
+            "/v2/ns/p/app/manifests/t",
+            &[],
+            b"",
+        )
+        .await
+    };
+    assert_eq!(&get(&reg).await.body[..], &index_of(&[&l])[..]);
+    drop(reg);
+    let reg = registry(&dir, 1 << 20).await;
+    assert_eq!(&get(&reg).await.body[..], &index_of(&[&l])[..]);
+    assert_eq!(reg.store.keys(), reg.store.listed().await);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Unscripted: collections and re-uploads of one digest run at once, again
+/// and again, and the index and the store agree after each round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_and_reuploads_running_at_once_keep_the_index_and_store_agreeing() {
+    let f = fixture("race-free").await;
+    let reg = &f.reg;
+    for _ in 0..20 {
+        let (_, d) = tokio::join!(
+            reg.store.gc(&BIG, Duration::ZERO),
+            push_blob(reg, "writer", "ns/p/app", b"layer")
+        );
+        let r = put_index(reg, "writer", "ns/p/app", "t", &[&d]).await;
+        assert!(
+            [StatusCode::CREATED, StatusCode::BAD_REQUEST].contains(&r.status),
+            "{:?}",
+            r.body
+        );
+        assert_eq!(reg.store.keys(), reg.store.listed().await);
+    }
+}
+
+/// At open, a data object no marker names is an orphan, and keys that name
+/// nothing stored go too: a marker without data, a second marker for a
+/// stored digest, a record of a missing manifest, a tag of a missing
+/// manifest. The first collection, which the role runs at start, deletes
+/// them; what the store holds is still served.
+#[tokio::test]
+async fn an_orphan_data_object_is_deleted_at_open() {
+    use object_store::{ObjectStoreExt, PutPayload};
+    let dir = dir("orphan");
+    let d = {
+        let reg = registry(&dir, 1 << 20).await;
+        let d = push_blob(&reg, "writer", "ns/p/app", b"kept").await;
+        let r = put_index(&reg, "writer", "ns/p/app", "t", &[&d]).await;
+        assert_eq!(r.status, StatusCode::CREATED);
+        d
+    };
+    let id = || super::layout::Id::random().unwrap();
+    let missing = Digest::of(b"missing");
+    let os = volume(&dir);
+    let (orphan, extra) = (id(), id());
+    let junk = [
+        format!("data/{orphan}"),
+        format!("data/{extra}"),
+        format!("blobs/sha256/{}/{}", missing.hex(), id()),
+        format!("blobs/sha256/{}/{extra}", d.hex()),
+        format!("repos/ns/p/app/_manifests/{}/{}", missing.hex(), id()),
+        format!("repos/ns/p/app/_tags/t2/{}/{}", missing.hex(), id()),
+    ];
+    for k in &junk {
+        // A second marker of a stored digest names the same verified bytes.
+        let body = if k.starts_with("data/") { "kept" } else { "" };
+        os.put(&k.as_str().into(), PutPayload::from(body))
+            .await
+            .unwrap();
+    }
+    let reg = registry(&dir, 1 << 20).await;
+    let listed = reg.store.listed().await;
+    assert!(junk.iter().all(|k| listed.contains(k)));
+    reg.store.gc(&BIG, UPLOAD_TTL).await;
+    let listed = reg.store.listed().await;
+    // Of two markers for one digest the open keeps one, either one.
+    let markers_of_d = listed
+        .iter()
+        .filter(|k| k.starts_with(&format!("blobs/sha256/{}/", d.hex())))
+        .count();
+    assert_eq!(markers_of_d, 1, "{listed:?}");
+    let duplicate = [
+        format!("data/{extra}"),
+        format!("blobs/sha256/{}/{extra}", d.hex()),
+    ];
+    assert!(
+        !junk
+            .iter()
+            .filter(|k| !duplicate.contains(k))
+            .any(|k| listed.contains(k)),
+        "{listed:?}"
+    );
+    assert_eq!(reg.store.keys(), listed);
+    let r = call(
+        &reg,
+        "reader",
+        Method::GET,
+        &format!("/v2/ns/p/app/blobs/{d}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(&r.body[..], b"kept");
+    let s = reg.store.stats();
+    assert_eq!((s.blobs, s.manifests), (2, 1));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The open lists the store and reads each manifest record once: never a
+/// manifest body, a blob or a tag.
+#[tokio::test]
+async fn the_open_reads_no_manifest_body_and_no_tag() {
+    let dir = dir("open-gets");
+    {
+        let reg = registry(&dir, 1 << 20).await;
+        let a = push_blob(&reg, "writer", "ns/p/app", b"a").await;
+        let b = push_blob(&reg, "writer", "ns/p/app", b"b").await;
+        for (tag, refs) in [("t1", vec![&a]), ("t2", vec![&a, &b])] {
+            let r = put_index(&reg, "writer", "ns/p/app", tag, &refs).await;
+            assert_eq!(r.status, StatusCode::CREATED);
+        }
+        let r = put_index(&reg, "branch", "ns/p/br", "t1", &[&a]).await;
+        assert_eq!(r.status, StatusCode::CREATED);
+    }
+    let probe = Arc::new(Probe::new(volume(&dir)));
+    let reg = registry_on(probe.clone(), limits(1 << 20)).await;
+    let gets = probe.gets();
+    assert_eq!(gets.len(), 3, "{gets:?}");
+    assert!(gets.iter().all(|k| k.contains("/_manifests/")), "{gets:?}");
+    // Links came back from the records: the branch reads its borrowed layer.
+    let r = call(
+        &reg,
+        "branch",
+        Method::GET,
+        &format!("/v2/ns/p/br/blobs/{}", Digest::of(b"a")),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(&r.body[..], b"a");
+    let r = call(
+        &reg,
+        "reader",
+        Method::GET,
+        "/v2/ns/p/app/manifests/t2",
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A 0.4 volume: its files sit where 0.5 needs directories. The open removes
+/// every file without a 0.5 key shape before it serves, so a push of the same
+/// digest and tag succeeds.
+#[tokio::test]
+async fn the_0_4_tree_is_swept_before_serving() {
+    let dir = dir("sweep");
+    let d = Digest::of(b"layer");
+    let old = [
+        format!("blobs/sha256/{}", d.hex()),
+        format!("repos/ns/p/app/_links/{}", d.hex()),
+        format!("repos/ns/p/app/_manifests/{}", d.hex()),
+        "repos/ns/p/app/_tags/t".to_owned(),
+        "uploads/0123".to_owned(),
+        "tmp/gc-0123".to_owned(),
+        format!("data/{}#7", super::layout::Id::random().unwrap()),
+    ];
+    for f in &old {
+        let p = dir.join(f);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"0.4").unwrap();
+    }
+    let reg = registry(&dir, 1 << 20).await;
+    for f in &old {
+        assert!(!dir.join(f).exists(), "{f}");
+    }
+    for gone in ["uploads", "tmp", "repos"] {
+        assert!(!dir.join(gone).exists(), "{gone}");
+    }
+    assert_eq!(push_blob(&reg, "writer", "ns/p/app", b"layer").await, d);
+    let r = put_index(&reg, "writer", "ns/p/app", "t", &[&d]).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    assert_eq!(reg.store.keys(), reg.store.listed().await);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A store that refuses writes answers 503 with a retry hint, and the upload
+/// leaves nothing behind.
+#[tokio::test]
+async fn a_failing_store_answers_503_and_keeps_nothing() {
+    let dir = dir("unavailable");
+    let probe = Arc::new(Probe::new(volume(&dir)));
+    let reg = registry_on(probe.clone(), limits(1 << 20)).await;
+    probe.fail_puts(true);
+    let loc = open_upload(&reg, "writer", "ns/p/app")
+        .await
+        .header("location")
+        .to_owned();
+    let d = Digest::of(b"data");
+    let r = call(
+        &reg,
+        "writer",
+        Method::PUT,
+        &format!("{loc}?digest={d}"),
+        &[],
+        b"data",
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.code().as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, "UNKNOWN")
+    );
+    assert_eq!(r.header("retry-after"), "5");
+    let r = put_index(&reg, "writer", "ns/p/app", "t", &[]).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(reg.store.listed().await.is_empty());
+    assert_eq!(staged(&dir), 0);
     std::fs::remove_dir_all(dir).unwrap();
 }

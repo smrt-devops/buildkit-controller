@@ -36,6 +36,7 @@ clap = { workspace = true }
 jsonwebtoken = { workspace = true }
 jiff = { workspace = true }
 json-patch = { workspace = true }
+object_store = { workspace = true }
 k8s-openapi = { workspace = true }
 kube = { workspace = true, features = ["ring", "jsonpatch"] }
 pem = { workspace = true }
@@ -57,6 +58,7 @@ tokio-rustls = { workspace = true, features = ["ring"] }
 tokio-tungstenite = { workspace = true }
 tokio-util = { version = "0.7.20", features = ["io"] }
 toml_edit = "0.25.17"
+url = "2.5.8"
 tower = { version = "0.5.3", features = ["util"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -64,6 +66,7 @@ webpki-roots = { workspace = true }
 x509-parser = { workspace = true }
 
 [dev-dependencies]
+async-trait = "0.1.92"
 hyper = { workspace = true, features = ["client"] }
 insta = { workspace = true }
 proptest = { workspace = true }
