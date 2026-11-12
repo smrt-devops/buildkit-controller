@@ -11,8 +11,6 @@ Four Grafana dashboards in [`examples/grafana`](../examples/grafana) cover the c
 
 Each dashboard has a Data source variable, and the namespace and pool variables list the pools from `buildkit_pool_max`. Every panel has a description that says what it shows and what to do about it. Hover the `i` in the panel's corner to read it, or see the [panel tables](#panels) below.
 
-The cache dashboard has no panels for store operations (the latency and errors of the store's own reads and writes), because the registry does not export `buildkit_registry_store_operations_*` yet.
-
 ## Scraping
 
 Prometheus must scrape both metrics Services, because the cache panels read the registry pod and everything else reads the controller replicas.
@@ -79,6 +77,9 @@ File: [`cache.json`](../examples/grafana/cache.json).
 | Bytes received in pushes | `sum(rate(buildkit_registry_received_bytes_total[$__rate_interval]))` | Blob and manifest bytes the registry receives per second from cache pushes. Trusted builds push after they finish. A sustained high rate with a low hit ratio means builds push layers that nobody reuses. |
 | Denied requests and refused connections | `sum by (action) (rate(buildkit_registry_denied_total[$__rate_interval]))`<br>`sum by (reason) (rate(buildkit_registry_connections_refused_total[$__rate_interval]))` | Requests refused for a worker's grant, by action, and connections closed before a request, by reason. Push denials are expected for untrusted builds. A burst of pull denials or of bad_san and bad_certificate refusals means workers present the wrong certificate: check the pool's cache setup. |
 | Cache allocations by tier | `sum by (namespace, pool, tier) (rate(buildkit_cache_allocations_total{namespace=~"$namespace",pool=~"$pool"}[$__rate_interval]))` | Claims that bound with cache flags per second, by pool and tier. trusted builds read and write the cache, untrusted ones only read it. A pool with no cache allocations does not use the cache: check its cache settings and the caller's access rule. |
+| Store operations by kind and result | `sum by (op) (rate(buildkit_registry_store_operations_total{result="ok"}[$__rate_interval]))`<br>`sum by (op) (rate(buildkit_registry_store_operations_total{result="error"}[$__rate_interval]))` | Calls the registry makes to its store (the volume or a bucket) per second, by operation and result. Errors are drawn in red. A get or delete of a missing key is ok, so errors are real failures. Sustained errors mean the store is unreachable or its credentials expired: builds continue uncached. Check the registry logs and readiness. |
+| Store operation error ratio | `sum by (op) (rate(buildkit_registry_store_operations_total{result="error"}[$__rate_interval])) / sum by (op) (rate(buildkit_registry_store_operations_total[$__rate_interval]))` | Share of store calls that failed, by operation. It should sit at 0. A rising ratio means the store is unreachable or its credentials expired: builds continue uncached, and pushes are lost. Check the registry logs and readiness, then the volume or the bucket and its credentials. |
+| Store operation latency by kind | `histogram_quantile(0.5, sum by (op, le) (rate(buildkit_registry_store_operation_duration_seconds_bucket[$__rate_interval])))`<br>`histogram_quantile(0.95, sum by (op, le) (rate(buildkit_registry_store_operation_duration_seconds_bucket[$__rate_interval])))` | Median and 95th percentile duration of store calls, by operation. A get is timed until the response head and a list until its last page. A p95 that climbs for every operation means a slow volume or bucket: builds wait on cache reads and pushes. Check the store's own health and the registry logs. |
 
 ### BuildKit edge and API
 
