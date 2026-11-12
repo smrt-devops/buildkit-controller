@@ -276,6 +276,26 @@
             "storageClass": {"type": "string", "maxLength": 253}
           }
         },
+        "store": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "url": {"anyOf": [{"const": ""}, {"type": "string", "pattern": "^(s3|gs|az)://"}]},
+            "options": {
+              "type": "object",
+              "propertyNames": {"pattern": "^[A-Za-z0-9_]+$"},
+              "additionalProperties": {"type": "string"}
+            },
+            "secretName": {"type": "string", "maxLength": 253}
+          }
+        },
+        "serviceAccount": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "annotations": {"type": "object", "additionalProperties": {"type": "string"}}
+          }
+        },
         "resources": {"type": "object"},
         "podLabels": {"type": "object", "additionalProperties": {"type": "string"}},
         "podAnnotations": {"type": "object"},

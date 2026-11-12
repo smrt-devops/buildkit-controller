@@ -1,4 +1,5 @@
 {{- if .Values.cache.enabled }}
+{{- include "bkc.registryStoreGuard" . }}
 {{- $fn := include "bkc.fullname" . -}}
 {{- $ns := .Release.Namespace -}}
 {{- $name := printf "%s-registry" $fn -}}
@@ -8,12 +9,16 @@
   (dict "apiGroups" (list "buildkit.smrt-devops.net") "resources" (list "buildkitpools") "verbs" (list "get" "list" "watch"))
   (dict "apiGroups" (list "") "resources" (list "pods") "verbs" (list "get" "list" "watch")) -}}
 {{- $subjects := list (dict "kind" "ServiceAccount" "name" $name "namespace" $ns) -}}
+{{- $store := .Values.cache.store -}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: {{ $name }}
   namespace: {{ $ns }}
   labels: {{- $labels | nindent 4 }}
+  {{- with .Values.cache.serviceAccount.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
 ---
 {{- /* The registry reads worker pods and pools to authorize each worker: in watchNamespaces, or cluster-wide. */}}
 {{- range $i, $wns := $watch }}
@@ -139,9 +144,18 @@ spec:
             - {name: BUILDKIT_CACHE_MAX_BLOB_SIZE, value: {{ .Values.cache.maxBlobSize | quote }}}
             - {name: BUILDKIT_CACHE_MAX_UPLOAD_SIZE, value: {{ .Values.cache.maxUploadSize | quote }}}
             - {name: BUILDKIT_CACHE_GC_INTERVAL, value: {{ .Values.cache.gcInterval | quote }}}
+            - {name: BUILDKIT_CACHE_STORE_URL, value: {{ default "file:///var/lib/buildkit-cache" $store.url | quote }}}
+            {{- range $k, $v := $store.options }}
+            - {name: {{ printf "BUILDKIT_CACHE_STORE_OPT_%s" $k }}, value: {{ $v | quote }}}
+            {{- end }}
             {{- with $watch }}
             - {name: BUILDKIT_CACHE_WATCH_NAMESPACES, value: {{ join "," . | quote }}}
             {{- end }}
+          {{- with $store.secretName }}
+          envFrom:
+            - prefix: BUILDKIT_CACHE_STORE_OPT_
+              secretRef: {name: {{ . | quote }}}
+          {{- end }}
           ports:
             - {name: registry, containerPort: 5000}
             - {name: ops, containerPort: {{ .Values.metrics.port }}}
@@ -153,7 +167,9 @@ spec:
             periodSeconds: 5
           resources: {{- toYaml .Values.cache.resources | nindent 12 }}
           volumeMounts:
+            {{- if not $store.url }}
             - {name: data, mountPath: /var/lib/buildkit-cache}
+            {{- end }}
             - {name: tls, mountPath: /etc/buildkit-cache/tls, readOnly: true}
       volumes:
         - name: tls
@@ -168,6 +184,7 @@ spec:
       {{- with .Values.cache.affinity }}
       affinity: {{- toYaml . | nindent 8 }}
       {{- end }}
+  {{- if not $store.url }}
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -178,4 +195,5 @@ spec:
         {{- end }}
         resources:
           requests: {storage: {{ .Values.cache.persistence.size | quote }}}
+  {{- end }}
 {{- end }}

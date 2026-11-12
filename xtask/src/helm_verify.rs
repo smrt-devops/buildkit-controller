@@ -329,6 +329,27 @@ fn verify(env: &Cluster) -> Result<()> {
     );
     println!("PASS cache registry Ready, no RBAC denial in its logs");
 
+    // An upgrade that would drop the registry volume is refused up front, with the way through.
+    let out = crate::proc::run(env.helm_cmd().args([
+        "upgrade",
+        "bk",
+        &chart,
+        "-n",
+        NS,
+        "-f",
+        &values,
+        "--set",
+        "cache.store.url=s3://x/y",
+        "--dry-run=server",
+    ]))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    ensure!(
+        !out.status.success() && stderr.contains("would drop the volumeClaimTemplates"),
+        "helm upgrade to a cache store: expected the volume guard to fail it, got {}: {stderr}",
+        out.status
+    );
+    println!("PASS helm upgrade refuses a switch from the volume to a cache store");
+
     // An upgrade against a pool CRD older than the chart fails to render.
     env.kubectl(&[
         "patch",
