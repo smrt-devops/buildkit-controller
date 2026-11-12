@@ -114,6 +114,9 @@ pub trait PoolSeries: Send + Sync {
 #[derive(Default)]
 struct Pools {
     seen: HashSet<(String, String)>,
+    /// Pools that were seen and are gone. A late write recreates their series, so
+    /// every scrape forgets them again. Bounded by the pools ever deleted.
+    gone: HashSet<(String, String)>,
     hooks: Vec<Arc<dyn PoolSeries>>,
 }
 
@@ -230,6 +233,7 @@ impl Metrics {
     /// A pool exists. The first call per pool creates its starting series.
     pub fn pool_seen(&self, namespace: &str, pool: &str) {
         let mut p = self.lock_pools();
+        p.gone.remove(&(namespace.to_owned(), pool.to_owned()));
         if p.seen.insert((namespace.to_owned(), pool.to_owned())) {
             for h in &p.hooks {
                 h.seed(namespace, pool);
@@ -241,6 +245,7 @@ impl Metrics {
     pub fn pool_gone(&self, namespace: &str, pool: &str) {
         let mut p = self.lock_pools();
         if p.seen.remove(&(namespace.to_owned(), pool.to_owned())) {
+            p.gone.insert((namespace.to_owned(), pool.to_owned()));
             for h in &p.hooks {
                 h.forget(namespace, pool);
             }
@@ -269,6 +274,12 @@ impl Metrics {
         }
         for (ns, pool) in &now {
             self.pool_seen(ns, pool);
+        }
+        let p = self.lock_pools();
+        for (ns, pool) in p.gone.difference(&now) {
+            for h in &p.hooks {
+                h.forget(ns, pool);
+            }
         }
     }
 

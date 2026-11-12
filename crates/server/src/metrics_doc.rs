@@ -477,6 +477,34 @@ mod tests {
         );
     }
 
+    /// A write that lands after the pool is gone and scraped is cleaned at the next scrape.
+    #[test]
+    fn a_late_write_for_a_deleted_pool_is_forgotten_at_the_next_scrape() {
+        use kube::ResourceExt;
+        use kube::runtime::{reflector, watcher};
+
+        let m = Metrics::new();
+        let alloc = AllocMetrics::with_releases(m.releases(), m.held());
+        alloc.register(&m);
+        let pool = crate::render::fixtures::pool("late", serde_json::json!({})).unwrap();
+        let ns = pool.namespace().unwrap();
+        let (store, mut writer) = reflector::store();
+        writer.apply_watcher_event(&watcher::Event::Apply(pool.clone()));
+        m.follow_pools(store);
+        assert!(m.render().contains("pool=\"late\""));
+        writer.apply_watcher_event(&watcher::Event::Delete(pool));
+        assert!(
+            !m.render().contains("pool=\"late\""),
+            "forgotten at the first scrape"
+        );
+        alloc.release(&ns, "late", "released", Some(1.0));
+        alloc.allocation(&ns, "late", "ok");
+        assert!(
+            !m.render().contains("pool=\"late\""),
+            "the next scrape forgets the late write"
+        );
+    }
+
     #[test]
     fn closed_counters_and_histograms_without_a_pool_start_at_zero() {
         let text = controller().render();
