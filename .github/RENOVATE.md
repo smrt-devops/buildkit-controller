@@ -12,6 +12,7 @@ Renovate groups updates by manager, and each group runs before 10am UTC on Monda
 - Helm chart dependencies form one group.
 - Lock files are refreshed on the first day of each month.
 
+An open update pull request is rebased only when it conflicts with main, and only inside the schedule (`rebaseWhen: conflicted`, `updateNotScheduled: false`). A push to main therefore does not restart the checks on every open update. To bring one up to date by hand, tick the rebase box in its description.
 ## Merging
 
 Renovate never merges. A maintainer reviews and merges every update pull request once the required status checks pass. Renovate proposes a release only once it is three days old (`minimumReleaseAge`). Security vulnerability alerts get the `security` label.

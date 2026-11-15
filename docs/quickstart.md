@@ -128,7 +128,7 @@ permissions:
   id-token: write
   contents: read
 steps:
-  - uses: actions/checkout@v4
+  - uses: actions/checkout@v7
   - uses: smrt-devops/buildkit-controller/action@v0.5.0   # pin a release tag or a commit SHA
     with:
       url: https://bk.example.com   # https://bk.example.com:8443 with a LoadBalancer

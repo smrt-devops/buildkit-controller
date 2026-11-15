@@ -78,6 +78,7 @@
   },
   "schedule": ["before 10am on monday"],
   "timezone": "UTC",
-  "rebaseWhen": "behind-base-branch",
+  "rebaseWhen": "conflicted",
+  "updateNotScheduled": false,
   "separateMinorPatch": true
 }
