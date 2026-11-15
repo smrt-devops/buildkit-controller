@@ -17,15 +17,15 @@ jobs:
   # Builds the mdBook site on every pull request, which also fails on a
   # broken repository link. Deploys only from main.
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       MDBOOK_VERSION: "0.5.4"
       MDBOOK_SHA256: "3f28de05dafca9d0f2eab99c662116b0e37b89b1d96a08f8f430b9eeae958cd7"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install checksum-pinned mdBook
         run: |
           set -euo pipefail
@@ -44,7 +44,7 @@ jobs:
   deploy:
     if: github.event_name != 'pull_request'
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       pages: write
       id-token: write

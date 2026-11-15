@@ -60,7 +60,7 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: smrt-devops/buildkit-controller/action@v0.5.0   # or a commit SHA
         with:
           url: https://bk.example.com
