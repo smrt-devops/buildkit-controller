@@ -726,8 +726,7 @@ buildctl --addr unix:///run/user/1000/buildkit/buildkitd.sock build --frontend d
         .iter()
         .flat_map(|s| &s.conditions)
         .find(|c| c.type_ == "Ready")
-        .map(|c| c.message.clone())
-        .unwrap_or_default();
+        .map_or_default(|c| c.message.clone());
     assert!(
         message.contains("spec.network.egress.allowCIDRs[1]")
             && message.contains("169.254.169.254/32")

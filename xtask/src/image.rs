@@ -313,8 +313,7 @@ fn inputs_label(tag: &str) -> String {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .unwrap_or_default()
+        .map_or_default(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
 }
 
 /// The controller image of this checkout, tagged by a prefix of its inputs

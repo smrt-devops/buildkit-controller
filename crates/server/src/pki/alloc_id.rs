@@ -96,19 +96,27 @@ macro_rules! name_type {
 
 name_type!(
     /// A Kubernetes namespace (DNS-1123 label, at most 63 bytes).
-    Namespace, |s| is_label(s, 63), IdError::Namespace
+    Namespace,
+    |s| is_label(s, 63),
+    IdError::Namespace
 );
 name_type!(
     /// A pool name (DNS-1123 label, at most 52 bytes).
-    PoolName, |s| is_label(s, 52), IdError::Pool
+    PoolName,
+    |s| is_label(s, 52),
+    IdError::Pool
 );
 name_type!(
     /// A pod `metadata.uid` (lowercase canonical UUID).
-    PodUid, is_uid, IdError::PodUid
+    PodUid,
+    is_uid,
+    IdError::PodUid
 );
 name_type!(
     /// An allocation id (26 chars of lowercase RFC 4648 base32).
-    AllocId, is_alloc_id, IdError::AllocId
+    AllocId,
+    is_alloc_id,
+    IdError::AllocId
 );
 
 /// The identity bound into an allocation cert:

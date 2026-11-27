@@ -503,9 +503,7 @@ impl Front {
             id: field(&s.allocation_id)?,
             namespace: c.spec.pool_ref.namespace.clone(),
             pool: c.spec.pool_ref.name.clone(),
-            owner: claims::caller(c, &self.namespace)
-                .map(|c| c.owner)
-                .unwrap_or_default(),
+            owner: claims::caller(c, &self.namespace).map_or_default(|c| c.owner),
             endpoint: field(&s.endpoint)?,
             server_name: field(&s.server_name)?,
             ca_cert: self.certs.ca_cert_pem(&bundle),

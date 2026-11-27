@@ -51,6 +51,13 @@
       "groupName": "OIDC dependencies"
     },
     {
+      "description": "rust-toolchain.toml, the builder image and rust-version move in one pull request",
+      "matchPackageNames": ["rust"],
+      "groupName": "Rust toolchain",
+      "commitMessagePrefix": "chore(rust):",
+      "separateMinorPatch": false
+    },
+    {
       "matchUpdateTypes": ["major"],
       "labels": ["dependencies", "major-update"],
       "enabled": true
@@ -70,6 +77,23 @@
     "assignees": [],
     "reviewers": []
   },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The rust builder image that xtask checks against rust-toolchain.toml",
+      "managerFilePatterns": ["/^docker/builder-image$/"],
+      "matchStrings": ["(?<depName>rust):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]+)"],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "The workspace rust-version, kept equal to the toolchain",
+      "managerFilePatterns": ["/^Cargo\\.toml$/"],
+      "matchStrings": ["\\nrust-version = \"(?<currentValue>[0-9.]+)\""],
+      "depNameTemplate": "rust",
+      "datasourceTemplate": "docker"
+    }
+  ],
   "ignoreDeps": [],
   "rangeStrategy": "update-lockfile",
   "lockFileMaintenance": {

@@ -505,10 +505,7 @@ fn phase(s: &BuildKitClaimStatus) -> ClaimPhase {
 }
 
 fn why(s: &BuildKitClaimStatus) -> String {
-    s.conditions
-        .first()
-        .map(|c| c.reason.clone())
-        .unwrap_or_default()
+    s.conditions.first().map_or_default(|c| c.reason.clone())
 }
 
 /// Pending claims bind oldest first. The claim left over waits `Queued` and

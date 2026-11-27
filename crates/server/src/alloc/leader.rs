@@ -445,7 +445,7 @@ async fn release_idle(b: &Binder, c: &BuildKitClaim, idle_timeout: &str) -> Opti
         alloc_id = s.and_then(|s| s.allocation_id.as_deref()).unwrap_or_default(),
         pod = s.and_then(|s| s.pod.as_deref()).unwrap_or_default(),
         idle_timeout,
-        last_active = claims::last_active(c).map(fmt_ts).unwrap_or_default(),
+        last_active = claims::last_active(c).map_or_default(fmt_ts),
         "released an idle allocation"
     );
     Some("idle")

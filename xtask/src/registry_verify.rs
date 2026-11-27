@@ -1114,7 +1114,7 @@ buildkit_registry_requests_total{route=\"blob\",method=\"PUT\",status=\"201\"} 7
         }
         let tags: Vec<_> = Store::ALL.iter().map(|s| s.image().0).collect();
         assert_eq!(tags.len(), 2);
-        assert!(tags[0] != tags[1]);
+        assert_ne!(tags[0], tags[1]);
     }
 
     #[test]

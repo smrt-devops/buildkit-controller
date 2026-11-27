@@ -273,7 +273,7 @@ async fn failed_self_issue_is_retried_on_a_timer_not_at_renew_at() {
     let calls = Arc::clone(&fails);
     let loader = t.loader.with_issue_serving(Box::new(move |b, n, now| {
         if calls
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
             .is_ok()
         {
             return Err("injected".into());
@@ -587,7 +587,7 @@ fn a_retry_reissues_only_the_cert_that_failed() {
     let calls = Arc::clone(&fails);
     let mut loader = t.loader.with_issue_serving(Box::new(move |b, n, now| {
         if calls
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
             .is_ok()
         {
             return Err("injected".into());

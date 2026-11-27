@@ -1307,9 +1307,7 @@ async fn the_listener_admits_only_worker_client_certs(kind) {
 
     let client = |identity: Option<(String, String)>| {
         let mut b = reqwest::Client::builder()
-            .use_rustls_tls()
-            .tls_built_in_root_certs(false)
-            .add_root_certificate(reqwest::Certificate::from_pem(ca.pem().as_bytes()).unwrap());
+            .tls_certs_only([reqwest::Certificate::from_pem(ca.pem().as_bytes()).unwrap()]);
         if let Some((c, k)) = identity {
             b = b.identity(reqwest::Identity::from_pem(format!("{c}{k}").as_bytes()).unwrap());
         }

@@ -360,8 +360,7 @@ fn platforms(pool: &BuildKitPool) -> Vec<String> {
         .spec
         .node_selector
         .get("kubernetes.io/arch")
-        .map(|a| vec![format!("linux/{a}")])
-        .unwrap_or_default()
+        .map_or_default(|a| vec![format!("linux/{a}")])
 }
 
 /// The `allowHosts` names of `pool` that did not resolve, and those whose known

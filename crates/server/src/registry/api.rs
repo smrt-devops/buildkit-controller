@@ -557,9 +557,7 @@ fn start_upload(
 }
 
 fn query(req: &Request<Body>) -> HashMap<String, String> {
-    Query::<HashMap<String, String>>::try_from_uri(req.uri())
-        .map(|q| q.0)
-        .unwrap_or_default()
+    Query::<HashMap<String, String>>::try_from_uri(req.uri()).map_or_default(|q| q.0)
 }
 
 /// `0-<last byte>`, or `0-0` for nothing yet.

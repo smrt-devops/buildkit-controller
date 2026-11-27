@@ -1417,9 +1417,9 @@ spec:
                                 claims:
                                   description: |-
                                     Claims lists the names of resources, defined in spec.resourceClaims, that are used by this container.
-                                    
+
                                     This field depends on the DynamicResourceAllocation feature gate.
-                                    
+
                                     This field is immutable. It can only be set for containers.
                                   items:
                                     description: ResourceClaim references one entry in PodSpec.ResourceClaims.
@@ -1443,41 +1443,41 @@ spec:
                                   additionalProperties:
                                     description: |-
                                       Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.
-                                      
+
                                       The serialization format is:
-                                      
+
                                       ``` <quantity>        ::= <signedNumber><suffix>
-                                      
+
                                       	(Note that <suffix> may be empty, from the "" case in <decimalSI>.)
-                                      
+
                                       <digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= "+" | "-" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei
-                                      
+
                                       	(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)
-                                      
+
                                       <decimalSI>       ::= m | "" | k | M | G | T | P | E
-                                      
+
                                       	(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)
-                                      
+
                                       <decimalExponent> ::= "e" <signedNumber> | "E" <signedNumber> ```
-                                      
+
                                       No matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.
-                                      
+
                                       When a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.
-                                      
+
                                       Before serializing, Quantity will be put in "canonical form". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:
-                                      
+
                                       - No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.
-                                      
+
                                       The sign will be omitted unless the number is negative.
-                                      
+
                                       Examples:
-                                      
+
                                       - 1.5 will be serialized as "1500m" - 1.5Gi will be serialized as "1536Mi"
-                                      
+
                                       Note that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.
-                                      
+
                                       Non-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)
-                                      
+
                                       This format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation.
                                     x-kubernetes-int-or-string: true
                                   description: "Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
@@ -1486,41 +1486,41 @@ spec:
                                   additionalProperties:
                                     description: |-
                                       Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.
-                                      
+
                                       The serialization format is:
-                                      
+
                                       ``` <quantity>        ::= <signedNumber><suffix>
-                                      
+
                                       	(Note that <suffix> may be empty, from the "" case in <decimalSI>.)
-                                      
+
                                       <digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= "+" | "-" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei
-                                      
+
                                       	(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)
-                                      
+
                                       <decimalSI>       ::= m | "" | k | M | G | T | P | E
-                                      
+
                                       	(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)
-                                      
+
                                       <decimalExponent> ::= "e" <signedNumber> | "E" <signedNumber> ```
-                                      
+
                                       No matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.
-                                      
+
                                       When a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.
-                                      
+
                                       Before serializing, Quantity will be put in "canonical form". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:
-                                      
+
                                       - No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.
-                                      
+
                                       The sign will be omitted unless the number is negative.
-                                      
+
                                       Examples:
-                                      
+
                                       - 1.5 will be serialized as "1500m" - 1.5Gi will be serialized as "1536Mi"
-                                      
+
                                       Note that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.
-                                      
+
                                       Non-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)
-                                      
+
                                       This format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation.
                                     x-kubernetes-int-or-string: true
                                   description: "Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
@@ -1562,13 +1562,13 @@ spec:
                                   recursiveReadOnly:
                                     description: |-
                                       RecursiveReadOnly specifies whether read-only mounts should be handled recursively.
-                                      
+
                                       If ReadOnly is false, this field has no meaning and must be unspecified.
-                                      
+
                                       If ReadOnly is true, and this field is set to Disabled, the mount is not made recursively read-only.  If this field is set to IfPossible, the mount is made recursively read-only, if it is supported by the container runtime.  If this field is set to Enabled, the mount is made recursively read-only if it is supported by the container runtime, otherwise the pod will not be started and an error will be generated to indicate the reason.
-                                      
+
                                       If this field is set to IfPossible or Enabled, MountPropagation must be set to None (or be unspecified, which defaults to None).
-                                      
+
                                       If this field is not specified, it is treated as an equivalent of Disabled.
                                     type: string
                                   subPath:
@@ -1752,7 +1752,7 @@ spec:
                             matchLabelKeys:
                               description: |-
                                 MatchLabelKeys is a set of pod label keys to select the pods over which spreading will be calculated. The keys are used to lookup values from the incoming pod labels, those key-value labels are ANDed with labelSelector to select the group of existing pods over which spreading will be calculated for the incoming pod. The same key is forbidden to exist in both MatchLabelKeys and LabelSelector. MatchLabelKeys cannot be set when LabelSelector isn't set. Keys that don't exist in the incoming pod labels will be ignored. A null or empty list means only match against labelSelector.
-                                
+
                                 This is a beta field and requires the MatchLabelKeysInPodTopologySpread feature gate to be enabled (enabled by default).
                               items:
                                 type: string
@@ -1764,20 +1764,20 @@ spec:
                             minDomains:
                               description: |-
                                 MinDomains indicates a minimum number of eligible domains. When the number of eligible domains with matching topology keys is less than minDomains, Pod Topology Spread treats "global minimum" as 0, and then the calculation of Skew is performed. And when the number of eligible domains with matching topology keys equals or greater than minDomains, this value has no effect on scheduling. As a result, when the number of eligible domains is less than minDomains, scheduler won't schedule more than maxSkew Pods to those domains. If value is nil, the constraint behaves as if MinDomains is equal to 1. Valid values are integers greater than 0. When value is not nil, WhenUnsatisfiable must be DoNotSchedule.
-                                
+
                                 For example, in a 3-zone cluster, MaxSkew is set to 2, MinDomains is set to 5 and pods with the same labelSelector spread as 2/2/2: | zone1 | zone2 | zone3 | |  P P  |  P P  |  P P  | The number of domains is less than 5(MinDomains), so "global minimum" is treated as 0. In this situation, new pod with the same labelSelector cannot be scheduled, because computed skew will be 3(3 - 0) if new Pod is scheduled to any of the three zones, it will violate MaxSkew.
                               format: int32
                               type: integer
                             nodeAffinityPolicy:
                               description: |-
                                 NodeAffinityPolicy indicates how we will treat Pod's nodeAffinity/nodeSelector when calculating pod topology spread skew. Options are: - Honor: only nodes matching nodeAffinity/nodeSelector are included in the calculations. - Ignore: nodeAffinity/nodeSelector are ignored. All nodes are included in the calculations.
-                                
+
                                 If this value is nil, the behavior is equivalent to the Honor policy.
                               type: string
                             nodeTaintsPolicy:
                               description: |-
                                 NodeTaintsPolicy indicates how we will treat node taints when calculating pod topology spread skew. Options are: - Honor: nodes without taints, along with tainted nodes for which the incoming pod has a toleration, are included. - Ignore: node taints are ignored. All nodes are included.
-                                
+
                                 If this value is nil, the behavior is equivalent to the Ignore policy.
                               type: string
                             topologyKey:
