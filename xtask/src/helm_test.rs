@@ -48,8 +48,7 @@ fn selects(selector: &serde_json::Value, labels: &serde_json::Value) -> bool {
         es.iter().all(|e| {
             let values: Vec<&str> = e["values"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_default();
+                .map_or_default(|a| a.iter().filter_map(|v| v.as_str()).collect());
             match (
                 e["operator"].as_str(),
                 has(e["key"].as_str().unwrap_or_default()),

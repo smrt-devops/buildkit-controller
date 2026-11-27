@@ -196,7 +196,6 @@ fn pod_owner(name: &str, uid: &str) -> OwnerReference {
 }
 
 /// `f` cut off after `timeout`.
-#[must_use]
 pub fn bounded(
     timeout: std::time::Duration,
     f: BoxFuture<'static, Result<(), String>>,

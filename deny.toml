@@ -8,6 +8,10 @@ ignore = [
   # bincode 1.3.3 is complete and frozen, not vulnerable. promql-parser reaches
   # it through lrpar, and only xtask (publish = false) depends on that parser.
   { id = "RUSTSEC-2025-0141", reason = "unmaintained, no vulnerability; reached only through the xtask dashboard check" },
+  # object_store has no release without chrono and humantime yet, and the
+  # xtask promql-parser also uses chrono. Neither advisory is a vulnerability.
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no vulnerability; reached through object_store and the xtask promql-parser" },
+  { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained, no vulnerability; reached through object_store" },
 ]
 
 [licenses]

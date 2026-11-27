@@ -86,9 +86,11 @@ impl Client {
     /// Creates a client for `base_url`, for example `https://bk.example.com:8443`, that sends a
     /// bearer `token`. `ca_pem` adds a trusted root for the serving certificate.
     pub fn new(base_url: &str, token: &str, ca_pem: Option<&[u8]>) -> Result<Self, ClientError> {
+        // reqwest is built without a rustls provider. An error means one is already installed.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let mut b = reqwest::Client::builder().timeout(Duration::from_mins(2));
         if let Some(pem) = ca_pem {
-            b = b.add_root_certificate(Certificate::from_pem(pem).map_err(ClientError::BadCa)?);
+            b = b.tls_certs_merge([Certificate::from_pem(pem).map_err(ClientError::BadCa)?]);
         }
         Ok(Self {
             http: b.build()?,

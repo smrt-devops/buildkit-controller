@@ -82,6 +82,10 @@ impl Fake {
     }
 }
 
+#[allow(
+    clippy::unused_async_trait_impl,
+    reason = "the fake mirrors the async trait"
+)]
 impl KubeOps for Fake {
     async fn apply<K: Applied>(&self, obj: &K) -> OpResult {
         if let Some(g) = &self.gate {

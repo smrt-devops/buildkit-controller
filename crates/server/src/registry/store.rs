@@ -1451,8 +1451,7 @@ impl Store {
         self.index()
             .repos
             .get(repo)
-            .map(|r| r.links.keys().cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|r| r.links.keys().cloned().collect())
     }
 
     /// Whether every manifest's record holds its last-used time.

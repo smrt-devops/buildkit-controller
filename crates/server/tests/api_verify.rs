@@ -393,13 +393,10 @@ fn metric(m: &Metrics, needle: &str) -> u64 {
 fn client(api: SocketAddr, ca: Option<&str>) -> reqwest::Client {
     let b = reqwest::Client::builder()
         .resolve(SERVER_NAME, api)
-        .tls_built_in_root_certs(false)
         .timeout(Duration::from_mins(2));
     match ca {
-        Some(pem) => {
-            b.add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
-        }
-        None => b.danger_accept_invalid_certs(true),
+        Some(pem) => b.tls_certs_only([reqwest::Certificate::from_pem(pem.as_bytes()).unwrap()]),
+        None => b.tls_danger_accept_invalid_certs(true),
     }
     .build()
     .unwrap()

@@ -48,7 +48,7 @@ impl Probe {
 
     /// The keys read so far.
     pub fn gets(&self) -> Vec<String> {
-        self.gets.lock().map(|g| g.clone()).unwrap_or_default()
+        self.gets.lock().map_or_default(|g| g.clone())
     }
 
     /// Multipart uploads started so far.

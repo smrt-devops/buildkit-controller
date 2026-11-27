@@ -147,7 +147,7 @@ fn api_server_blip(env: &Cluster, replicas: &[Replica]) -> Result<()> {
         );
         std::thread::sleep(Duration::from_millis(250));
     }
-    let outage = back_at.map(|t| t - start).unwrap_or_default();
+    let outage = back_at.map_or_default(|t| t - start);
     println!(
         "PASS API server restart: down {outage:.1?}, pod watch errors on every replica, /readyz 200 in all {samples} samples through the relist"
     );

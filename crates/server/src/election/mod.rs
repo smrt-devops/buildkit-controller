@@ -258,7 +258,7 @@ impl<A: LeaseApi, C: Clock> Elector<A, C> {
 
     fn spec_for(&self, prev: Option<&LeaseSnapshot>, acquire: bool) -> LeaseSpec {
         let now = MicroTime(k8s_openapi::jiff::Timestamp::now());
-        let mut spec = prev.map(|p| p.spec.clone()).unwrap_or_default();
+        let mut spec = prev.map_or_default(|p| p.spec.clone());
         spec.holder_identity = Some(self.identity.clone());
         spec.lease_duration_seconds = Some(self.secs());
         spec.renew_time = Some(now.clone());

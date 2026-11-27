@@ -38,7 +38,6 @@ jsonwebtoken = { workspace = true }
 jiff = { workspace = true }
 json-patch = { workspace = true }
 object_store = { workspace = true }
-object_store_reqwest = { workspace = true }
 k8s-openapi = { workspace = true }
 kube = { workspace = true, features = ["ring", "jsonpatch"] }
 pem = { workspace = true }

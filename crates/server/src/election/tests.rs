@@ -132,7 +132,7 @@ impl LeaseApi for Fake {
         self.replaces.fetch_add(1, Ordering::SeqCst);
         let hang = self
             .hang_replaces
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok();
         if hang {
             std::future::pending::<()>().await;

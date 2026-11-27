@@ -481,7 +481,6 @@ impl NamespaceReport {
 /// Whenever every namespace is current or given up again, the stream sends
 /// the whole store as a fresh list (`Init` .. `InitDone`), so the store's
 /// readiness follows the namespaces that can be listed.
-#[must_use]
 pub fn tolerant_watch<K>(
     client: Client,
     namespaces: &[String],
